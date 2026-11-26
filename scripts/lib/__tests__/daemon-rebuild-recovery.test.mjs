@@ -314,9 +314,9 @@ describe('SMOKE-ENVTIMEOUT-BUDGET recovery', () => {
     const runSmoke = vi.fn(async () => {
       let t = 0;
       return runLiveSmokeWithRetry({ root: f.root, env: { WE_SMOKE_LOAD_SCALE: '0', WE_SMOKE_BUSY_LOAD_RATIO: '1e9',
-        WE_SMOKE_RECONCILE_MS: '300000', WE_SMOKE_GH_ENV_PROBE: '0' }, clock: () => t,
+        WE_SMOKE_RECONCILE_MS: '300000', WE_SMOKE_DISPATCH_PASS_MS: '600000', WE_SMOKE_GH_ENV_PROBE: '0' }, clock: () => t,
         refreshAuth: async ({ env }) => ({ env }), sleep: async () => {}, retries: 0,
-        runChild: budgetedRunChild({ deadline: 1700000, now: () => t, runChild: async (cmd, args, opts) => {
+        runChild: budgetedRunChild({ deadline: 3150000, now: () => t, runChild: async (cmd, args, opts) => {
           if (args[0] === 'scripts/conveyor/reconcile-pass.mjs' && args.includes(`--repo=${CONSTELLATION_REPOS.we.slug}`)) {
             t += opts.timeoutMs;
             throw new Error(`timed out after ${opts.timeoutMs}ms (process group killed)`);

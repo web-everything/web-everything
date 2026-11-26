@@ -328,7 +328,12 @@ At the failure-set level, env-timeout requires a fresh, unflagged qualifying tim
 same attempt. Every other failed row must pass timeout validation, be a transient failure from
 an eligible check, or contain only gate-observed budget refusals and independently validated
 remaining failures. Bounded kills require measured row time of at least `cap * 0.9`; other timeout
-signatures use the configured `minElapsedMs`. Boot entries and every attempt keep the full-cap
+signatures use the configured `minElapsedMs`. Non-boot children must also reach their requested
+cap: a reported kill cap reduced to the remaining shared budget cannot qualify. Gate-recorded
+child timing takes precedence over aggregate row timing. Every part of aggregated failure text
+must describe a timeout; an independent non-timeout error keeps the row code. If a flagged row's
+remaining child failures fail validation, it stays code without falling back to row timing.
+Boot entries and every attempt keep the full-cap
 rule above, using final outcomes so import failures on stdout remain code failures. A flagged
 row is neutral and can never supply the required timeout. Child GitHub error text cannot grant
 neutrality. Checks cannot set the gate flag or its remaining-failure evidence themselves.

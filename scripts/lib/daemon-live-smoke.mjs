@@ -1038,7 +1038,8 @@ export async function runLiveSmoke({
           return out;
         }
         catch (e) {
-          childFailures.push({ ok: false, ms: clock() - start, mayBeTransient: check.mayBeTransient !== false,
+          childFailures.push({ ok: false, ms: clock() - start, requestedTimeoutMs: opts?.timeoutMs,
+            mayBeTransient: check.mayBeTransient !== false,
             detail: `child failed: ${firstLine(e)}`,
             budgetSkipped: outOfBudget && /^skipped: rebuild smoke budget exhausted \(\d+ms left\)$/.test(firstLine(e)) });
           throw e;
@@ -1073,6 +1074,7 @@ export async function runLiveSmoke({
           || (r.mayBeTransient !== false && isTransientDetail(r.detail)));
       const completedAt = clock();
       results.push({ name: check.name, ms: completedAt - startedAt, ...result, completedAt,
+        childFailures: childFailures.length ? childFailures : undefined,
         budgetInterrupted: budgetInterrupted ? true : undefined,
         budgetFailures: budgetInterrupted ? budgetFailures : undefined, mayBeTransient: check.mayBeTransient !== false });
       // Both external probes have completed before the expensive tree checks begin. Budgets are a fresh
@@ -1381,7 +1383,17 @@ export function isEnvTimeoutRow(row, { minElapsedMs = DEFAULT_ENV_TIMEOUT_MIN_EL
     });
   }
   const detail = String(row.detail ?? '');
-  if (!ENV_TIMEOUT_PATTERNS.some((re) => re.test(detail))) return false;
+  // Every aggregated failure must be timeout-shaped. A substring in one repo's error cannot
+  // excuse another repo's TypeError (or an unknown failure with no named error class).
+  if (/\b[A-Za-z]*Error\b[:\s]|Cannot find module/.test(detail)
+    || !detail.split(/;\s*(?=[\w/.-]+(?: PR #\d+)?: )|\r?\n/)
+      .every(part => ENV_TIMEOUT_PATTERNS.some(re => re.test(part)))) return false;
+  // The row clock can aggregate several children; validate each child's own requested budget
+  // and elapsed time instead. The gate writes this evidence after spreading the check result.
+  if (row.childFailures !== undefined && /timed out after \d+ms \(process group killed\)/.test(detail)) {
+    return Array.isArray(row.childFailures) && row.childFailures.length > 0
+      && row.childFailures.every(child => isEnvTimeoutRow(child, { minElapsedMs }));
+  }
   // `runBounded`'s OWN kill ("timed out after Nms (process group killed)") is the gate's clock, not tree text: the
   // row really spent its whole cap N. A cheap probe has a cap far under the 30s floor (live 2026-10-03 22:01 ET,
   // load 31 against the host core count: `tree-stays-clean`'s `git status` hit its 10s cap), and the floor then read that
@@ -1389,6 +1401,8 @@ export function isEnvTimeoutRow(row, { minElapsedMs = DEFAULT_ENV_TIMEOUT_MIN_EL
   // a cap that is a real budget: one under {@link MIN_OWN_CAP_MS} is a starved harness (the soak break
   // `broken-smoke-harness-holds-last-good` sets 1ms), which load cannot explain, so it keeps the 30s floor.
   const killed = /timed out after (\d+)ms \(process group killed\)$/.exec(detail);
+  if (killed && row.requestedTimeoutMs !== undefined
+    && Number(killed[1]) !== row.requestedTimeoutMs) return false;
   if (killed && Number(killed[1]) >= MIN_OWN_CAP_MS) return Number(row.ms) >= Number(killed[1]) * 0.9;
   // Background gh slots normally give up after 8s. Only markers emitted after throttleCause's exit/stderr
   // checks qualify; check elapsed time against their own wait, as for a bounded kill. With several failed
@@ -1406,9 +1420,9 @@ export function isEnvTimeoutRow(row, { minElapsedMs = DEFAULT_ENV_TIMEOUT_MIN_EL
 export function isEnvTimeoutFailureSet(results, opts = {}) {
   const failures = (Array.isArray(results) ? results : []).filter((r) => !r.ok);
   if (!failures.some((r) => !r.budgetInterrupted && !r.reused && isEnvTimeoutRow(r, opts))) return false;
-  return failures.every((r) => (r.budgetInterrupted === true && Array.isArray(r.budgetFailures)
+  return failures.every((r) => r.budgetInterrupted === true ? (Array.isArray(r.budgetFailures)
       && r.budgetFailures.every(child => isEnvTimeoutRow(child, opts)
-        || (child.mayBeTransient !== false && isTransientDetail(child.detail)))) || isEnvTimeoutRow(r, opts)
+        || (child.mayBeTransient !== false && isTransientDetail(child.detail)))) : isEnvTimeoutRow(r, opts)
     || (r.mayBeTransient !== false && isTransientDetail(r.detail)));
 }
 

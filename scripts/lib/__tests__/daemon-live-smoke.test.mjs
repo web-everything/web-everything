@@ -2251,7 +2251,7 @@ describe('a check that ran out of TIME under load is environment, never code (li
       if (args[1] === 'acquire') return JSON.stringify({ lane: 1 });
       return '';
     });
-    const r = await runLiveSmoke({ root: '/x', env: { WE_SMOKE_BUSY_LOAD_RATIO: '1e9' }, runChild, clock: () => t });
+    const r = await runLiveSmoke({ root: '/x', env: { WE_SMOKE_BUSY_LOAD_RATIO: '1e9', WE_SMOKE_RECONCILE_MS: '120000' }, runChild, clock: () => t });
     return r.results.find((x) => x.name === 'reconcile-dry-run');
   };
   it('reconcile-dry-run: every failing repo killed at its own cap → one env-timeout-shaped row', async () => {
@@ -2433,7 +2433,7 @@ const githubSmokeEnv = { WE_SMOKE_LOAD_SCALE: '0', WE_SMOKE_BUSY_LOAD_RATIO: '1e
 async function replayGithubOutage(host, options = {}) {
   const sleep = vi.fn(async () => {});
   const log = { error: vi.fn() };
-  const result = await runLiveSmokeWithRetry({ root: '/x', env: githubSmokeEnv, ...host,
+  const result = await runLiveSmokeWithRetry({ root: '/x', env: { ...githubSmokeEnv, WE_SMOKE_DISPATCH_PASS_MS: '330457' }, ...host,
     refreshAuth: async ({ env }) => ({ env: { ...env, GH_TOKEN: 'probe-marker' }, refresh: null }),
     sleep, log, retries: 2, backoffMs: 10, ...options });
   return { result, sleep, log };
@@ -2480,11 +2480,14 @@ describe('GitHub API outage — gate-owned confirmation, never tree-text launder
     let t = 0;
     let attempt = 0;
     const base = githubOutageHost({ dispatchTimeout: false });
-    const runChild = budgetedRunChild({ deadline: 360010, now: () => t,
+    const runChild = budgetedRunChild({ deadline: 300010, now: () => t,
       runChild: async (cmd, args, opts) => {
         if (cmd === 'node' && args[1] === 'list') attempt++;
         if (attempt === 2 && cmd === 'node' && args[0] === 'scripts/conveyor/reconcile-pass.mjs') {
-          t += opts.timeoutMs;
+          // Parallel repos each start with the full cap, then exhaust the deadline together.
+          const finish = t + opts.timeoutMs;
+          await Promise.resolve();
+          t = Math.max(t, finish);
           throw new Error(codeRow && args.includes(`--repo=${CONSTELLATION_REPOS.we.slug}`)
             ? 'exited 1: SyntaxError: Unexpected token'
             : `timed out after ${opts.timeoutMs}ms (process group killed)`);
@@ -2944,8 +2947,8 @@ describe('same-run smoke evidence', () => {
     const runChild = async (cmd, args, opts) => {
       calls.push([cmd, args]);
       if (cmd === 'node' && args[1] === 'list' && lists++ === 0) {
-        t += 120_000;
-        throw Error('timed out after 120000ms (process group killed)');
+        t += opts.timeoutMs;
+        throw Error(`timed out after ${opts.timeoutMs}ms (process group killed)`);
       }
       return defaults(cmd, args, opts);
     };
@@ -2980,8 +2983,8 @@ describe('same-run smoke evidence', () => {
       }
       if (cmd === 'node' && args[1] === 'list') {
         if (lists++ === 0) {
-          t += 120_000;
-          throw Error('timed out after 120000ms (process group killed)');
+          t += opts.timeoutMs;
+          throw Error(`timed out after ${opts.timeoutMs}ms (process group killed)`);
         }
         dirty = true;
         return '[]';
@@ -3105,14 +3108,14 @@ describe('SMOKE-ENVTIMEOUT-BUDGET failure sets', () => {
   });
 });
 
-function timeoutBudgetHost(mode = 'cut-dispatch') {
+function timeoutBudgetHost(mode = 'full-dispatch') {
   let t = 0;
   let attempt = 0;
   let statusCalls = 0;
   const caps = [];
   const defaults = withNewCheckDefaults(async (_cmd, args) => args[1] === 'list' ? '[]'
     : args[1] === 'acquire' ? '{"lane":1}' : '');
-  const runChild = budgetedRunChild({ deadline: mode === 'cut-dispatch' ? 1700000 : 1100000, now: () => t, runChild: async (cmd, args, opts) => {
+  const runChild = budgetedRunChild({ deadline: mode === 'full-dispatch' ? 3150000 : 1100000, now: () => t, runChild: async (cmd, args, opts) => {
     if (cmd === 'git' && args[0] === 'status') {
       attempt = Math.floor(statusCalls++ / 2) + 1;
       if (attempt === 2 && mode === 'only-skips') t = 1100000;
@@ -3129,7 +3132,7 @@ function timeoutBudgetHost(mode = 'cut-dispatch') {
     }
     if (args[2] === DISPATCH_DRY_RUN_SCRIPT) {
       if (attempt === 1 && mode === 'kept-flag') t = 1095000;
-      if (mode === 'cut-dispatch') {
+      if (mode === 'full-dispatch') {
         t += opts.timeoutMs;
         throw new Error(`timed out after ${opts.timeoutMs}ms (process group killed)`);
       }
@@ -3148,12 +3151,12 @@ async function replayTimeoutBudget(mode) {
 
 describe('SMOKE-ENVTIMEOUT-BUDGET retry wrapper', () => {
   it('runLiveSmokeWithRetry: an env-timeout retry that runs out of budget returns env-timeout', async () => {
-    const { result, host } = await replayTimeoutBudget('cut-dispatch');
+    const { result, host } = await replayTimeoutBudget('full-dispatch');
     expect(host.caps).toEqual([300000, 750000]);
     expect(result).toMatchObject({ verdict: 'env-timeout', attempts: 2, envTimeout: {
       first: expect.any(Array), retry: expect.any(Array) } });
     expect(result.smoke.results.find(r => r.name === 'tree-stays-clean').budgetInterrupted).toBe(true);
-    expect(result.smoke.results.find(r => r.name === 'dispatch-dry-run').ms).toBe(50000);
+    expect(result.smoke.results.find(r => r.name === 'dispatch-dry-run').ms).toBe(1500000);
   });
   it('runLiveSmokeWithRetry: second attempt with only budget skips stays code', async () => {
     const { result } = await replayTimeoutBudget('only-skips');
@@ -3181,6 +3184,47 @@ describe('SMOKE-ENVTIMEOUT-BUDGET retry wrapper', () => {
 
 
 describe('SMOKE-ENVTIMEOUT-BUDGET audit regressions', () => {
+  it('final audit 1: aggregate timeout text never excuses an independent non-timeout error', async () => {
+    const check = SMOKE_CHECKS.find(r => r.name === 'reconcile-dry-run');
+    for (const other of ['exited 1: TypeError: x is not a function', 'exited 1: invalid response']) {
+      for (const errors of [
+        ['scan exceeded its 120000ms budget', other],
+        [other, 'scan exceeded its 120000ms budget'],
+      ]) {
+        const row = await check.run({ root: '/x', repos: ['a/a', 'b/b'], budgets: { reconcileMs: 120000 }, env: {},
+          runChild: async (_cmd, args) => { throw new Error(errors[args[1] === '--repo=a/a' ? 0 : 1]); } });
+        const measured = { name: check.name, ...row, ms: 120000, mayBeTransient: false };
+        expect(isEnvTimeoutRow(measured)).toBe(false);
+        expect(isEnvTimeoutFailureSet([incidentTimeout, measured, await gateBudgetSkip()])).toBe(false);
+      }
+    }
+  });
+  it('final audit 2: a non-boot timeout on a reduced remaining-budget slice never qualifies', async () => {
+    let t = 0;
+    const caps = [];
+    const runChild = budgetedRunChild({ deadline: 1000, now: () => t,
+      runChild: withNewCheckDefaults(async (_cmd, args, opts) => {
+        if (args[0] === 'scripts/conveyor/reconcile-pass.mjs') {
+          caps.push(opts.timeoutMs);
+          t += 1000;
+          throw new Error('timed out after 1000ms (process group killed)');
+        }
+        return args[1] === 'list' ? '[]' : args[1] === 'acquire' ? '{"lane":1}' : '';
+      }) });
+    const smoke = await runLiveSmoke({ root: '/x', repos: ['a/a'], clock: () => t,
+      env: { ...githubSmokeEnv, WE_SMOKE_RECONCILE_MS: '60000' }, runChild });
+    expect(caps).toEqual([1000]);
+    const row = smoke.results.find(r => r.name === 'reconcile-dry-run');
+    expect(isEnvTimeoutRow(row)).toBe(false);
+    expect(isEnvTimeoutFailureSet([row, await gateBudgetSkip()])).toBe(false);
+  });
+  it('final audit 3: invalid flagged child evidence cannot fall through to aggregate row timing', async () => {
+    const row = { name: 'reconcile-dry-run', ok: false, ms: 60000, mayBeTransient: false,
+      detail: 'reconcile-pass dry-run failed: scan exceeded its 120000ms budget', budgetInterrupted: true,
+      budgetFailures: [{ ok: false, ms: 30000, mayBeTransient: false,
+        detail: 'child failed: scan exceeded its 120000ms budget' }] };
+    expect(isEnvTimeoutFailureSet([incidentTimeout, row, await gateBudgetSkip()], { minElapsedMs: 60000 })).toBe(false);
+  });
   async function mixed({ boot = false, message, elapsed = 30000, stdout, env = {} }) {
     let t = 0;
     const defaults = withNewCheckDefaults(async (_cmd, args) => args[1] === 'list' ? '[]'
