@@ -197,6 +197,7 @@ export { isGhDeferred, isGhThrottled } from './gh-deferred.mjs';
 import { markPrSnapshotDirty, repoFromGhArgs } from './pr-snapshot-store.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { readOperatorOverrides } from './operator-override-reader.mjs';
+import { readRebuildStateFile } from './daemon-last-good.mjs';
 import { resolveFinishedCiCacheSettings, finishedCiAuthScope, classifyFinishedCiRead, finishedCiCacheable, finishedCiStorable, finishedCiProofArgs, recordFinishedCiProof, finishedCiCacheGeneration, lookupFinishedCi, storeFinishedCi, invalidateForWrite } from './finished-ci-cache.mjs';
 
 // ── TUNING (env-overridable, mirroring heavy-admission.mjs's own resolve*() convention) ────────────────────
@@ -907,13 +908,18 @@ export function resetGhThrottleFailOpenWarning() { failOpenWarned = false; }
  * FAIL OPEN: run one throttle SETUP step (`mkdir` of the lock root, a points/slot acquire, a slot release). If
  * it throws, warn once on stderr, best-effort log a `fail_open` line (the `gh-call-failures` health smell reads
  * it), and return `fallback` — the caller then runs `gh` ungated. A throttle is a courtesy to GitHub's rate
- * limits; it must never be the reason a `gh` call does not run at all.
+ * limits. Batch and reserved reads instead use an explicit closed fallback; their executor never runs.
  */
-export function failOpenGate(stage, fn, { fallback, warn, logPath, op } = {}) {
+export function failOpenGate(stage, fn, { fallback, warn, logPath, op, pointsClosed, points } = {}) {
   try {
     return fn();
   } catch (e) {
     const reason = String((e && e.message) || e).split('\n')[0];
+    if (pointsClosed) {
+      if (logPath) recordGhCallLogEntry(logPath, { op: op || 'unknown', outcome: 'points_throttled', stage, reason });
+      return fallback;
+    }
+    if (points != null && stage === 'acquire' && logPath) recordGhCallLogEntry(logPath, { op: op || 'unknown', outcome: 'points_bypass_uncharged', reason: 'gate-exception', points });
     if (warn) warn(stage, reason);
     else if (!failOpenWarned) {
       failOpenWarned = true;
@@ -1352,10 +1358,6 @@ function readGhPointsBudgetState(lockRoot) {
   return null;
 }
 
-function writeGhPointsBudgetState(lockRoot, state) {
-  writeFileSync(ghPointsBudgetStatePath(lockRoot), JSON.stringify(state) + '\n', 'utf8');
-}
-
 /**
  * PURE decision: may `points` be spent right now against `state` (the current window's `{windowStartMs,
  * spent}`, or `null` for a never-yet-written one), and if not, how long until it may. A window whose age has
@@ -1375,37 +1377,224 @@ export function decideGhPointsSpend({ state, points, nowMs, budgetPerMin, window
   return { allowed: false, nextState: { windowStartMs, spent }, waitMs: windowMs - (nowMs - windowStartMs) };
 }
 
-/**
- * Cross-process-safe points-budget gate. Spins (bounded, injectable `sleep`/`now` for tests — no real
- * waiting) until `points` fits in the current 60s window or `timeoutMs` elapses, guarding the shared window
- * state with `file-locks.mjs#reserve`/`releaseLockDir` (a plain single-holder mutex, held only across one
- * tiny JSON read/write — see the module header's #3670 section for why this reuses that primitive rather than
- * inventing a new one). FAILS OPEN on timeout (`{ok:false, timedOut:true}`): a stuck budget gate must never
- * strand an otherwise-healthy `gh` call forever. Slot timeouts use the separate card 308 policy.
- */
+const GH_BUCKET_SIZE = 60;
+const validGhPoints = p => Number.isSafeInteger(p) && p >= 1 && p <= GH_BUCKET_SIZE;
+const GH_POINTS_STANDARD = Object.freeze({ pointsAlgorithm: 'bucket', pointsClasses: { batch: ['^rebuild-smoke'] },
+  pointsBucketAdoption: { requiredHead: '', daemons: [] } });
+
+/** Read every decision: rollback must reach already-running waiters. */
+export function resolveGhPointsSettings(env = process.env, { tool, toolFile = GH_SLOT_WAIT_TOOL_FILE } = {}) {
+  if (tool === undefined) {
+    try { tool = JSON.parse(readFileSync(toolFile, 'utf8'))?.ghThrottle; } catch { tool = {}; }
+  }
+  const r = cascadePolicy('ghThrottle', tool, { env, standard: GH_POINTS_STANDARD,
+    envValues: { pointsAlgorithm: env.WE_GH_THROTTLE_POINTS_ALGORITHM },
+    valid: { pointsAlgorithm: v => v === 'bucket' || v === 'window',
+      pointsClasses: v => v && Array.isArray(v.batch) && v.batch.every(p => typeof p === 'string'),
+      'pointsClasses.batch': v => Array.isArray(v) && v.every(p => typeof p === 'string'),
+      'pointsBucketAdoption.requiredHead': v => typeof v === 'string' && (v === '' || /^[a-f0-9]{40}$/.test(v)),
+      'pointsBucketAdoption.daemons': v => Array.isArray(v) && v.every(p => typeof p === 'string' && p.length > 0) },
+  });
+  return { ...GH_POINTS_STANDARD, ...r.value, source: r.sources };
+}
+
+export function classifyGhPoints({ caller, args = [], reserved = false, settings = GH_POINTS_STANDARD } = {}) {
+  if (reserved || classifyGhWrite(args) || ghCallerPriority(caller, args) === 'critical') return 'priority';
+  for (const pattern of settings.pointsClasses?.batch ?? []) {
+    try { if (new RegExp(pattern).test(normalizeGhCaller(caller))) return 'batch'; } catch { /* skip bad regex */ }
+  }
+  return 'standard';
+}
+
+/** Unknown adoption evidence always retains compat. The roster must enumerate every daemon clone. */
+export function ghPointsBucketAdopted(settings, { env = process.env,
+  readAdopted = root => readRebuildStateFile(root, env)?.adopted,
+  // Read-only ancestry probe (merge-base --is-ancestor); never a push, so the binary is a plain name, not a literal 'git' call site.
+  isAncestor = (required, head, root) => spawnSync(process.platform === 'win32' ? 'git.exe' : 'git', ['--no-replace-objects', '-C', root,
+    'merge-base', '--is-ancestor', required, head], { encoding: 'utf8', timeout: 2000, maxBuffer: 65536,
+      env: { PATH: process.env.PATH, HOME: process.env.HOME, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' } }).status === 0,
+} = {}) {
+  try {
+    if (typeof settings?.requiredHead !== 'string' || !/^[a-f0-9]{40}$/.test(settings.requiredHead)
+      || !Array.isArray(settings.daemons) || !settings.daemons.length) return false;
+    // Iteration visits sparse entries too: an omitted daemon is unknown evidence, never adoption.
+    for (const root of settings.daemons) {
+      if (typeof root !== 'string' || !root.trim()) return false;
+      const head = readAdopted(root)?.head;
+      if (typeof head !== 'string' || !/^[a-f0-9]{40}$/.test(head)
+        || isAncestor(settings.requiredHead, head, root) !== true) return false;
+    }
+    return true;
+  } catch { return false; }
+}
+
+const ghPidAlive = pid => {
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code !== 'ESRCH'; }
+};
+// Total validator: a null/primitive/array/sparse entry is invalid state (conservative reset), never a throw.
+// Array.from turns holes into undefined, which `every` would otherwise skip.
+const ghRecord = x => x !== null && typeof x === 'object' && !Array.isArray(x);
+const bucketStateValid = s => ghRecord(s) && Number.isFinite(s.tokens) && s.tokens >= -60 && s.tokens <= 60
+  && Number.isFinite(s.lastRefillMs) && ['compat', 'bucket'].includes(s.mode)
+  && Number.isFinite(s.legacyWindowStartMs) && Number.isFinite(s.legacyChargedByNew) && s.legacyChargedByNew >= 0
+  && Array.isArray(s.batchLog) && Array.from(s.batchLog).every(e => ghRecord(e) && Number.isFinite(e.ms) && validGhPoints(e.p))
+  && Array.isArray(s.tickets) && Array.from(s.tickets).every(t => ghRecord(t) && typeof t.owner === 'string'
+    && Number.isSafeInteger(t.pid) && t.pid > 0 && Number.isFinite(t.since) && validGhPoints(t.p));
+const resetGhBucket = ms => ({ tokens: -60, lastRefillMs: ms, batchLog: [{ ms, p: 60 }], tickets: [],
+  mode: 'compat', legacyWindowStartMs: ms, legacyChargedByNew: 0 });
+
+/** Pure refill/eligibility/charge core. No partial charge at the debt floor. */
+export function decideGhBucketSpend({ state, points = 1, pointClass = 'standard', nowMs, budgetPerMin,
+  owner, pid = process.pid, startedAt = nowMs, isPidAlive = ghPidAlive, bypass = false, eligible = true }) {
+  const s = bucketStateValid(state) ? { ...state } : resetGhBucket(nowMs);
+  s.tokens = Math.min(60, s.tokens + Math.max(0, nowMs - s.lastRefillMs) * budgetPerMin / 60000);
+  s.lastRefillMs = Math.max(nowMs, s.lastRefillMs);
+  s.batchLog = s.batchLog.filter(e => nowMs - e.ms < 60000);
+  s.tickets = s.tickets.filter(t => nowMs - t.since < 60000 && isPidAlive(t.pid)).sort((a, b) => a.since - b.since);
+  const batch = pointClass === 'batch', age = Math.max(0, nowMs - startedAt);
+  if (batch && age >= 20000 && age < 60000 && !s.tickets.some(t => t.owner === owner))
+    s.tickets = [...s.tickets, { owner, pid, since: startedAt, p: points }];
+  s.tickets.sort((a, b) => a.since - b.since);
+  const oldest = s.tickets[0], ticketed = s.tickets.some(t => t.owner === owner);
+  // Aged batch work must fit at capacity even when its cost leaves less than the usual reserve.
+  const floor = pointClass === 'priority' ? 0 : batch ? (ticketed ? Math.min(10, GH_BUCKET_SIZE - points) : 30) : 10 + (oldest?.p ?? 0);
+  const batchSpent = s.batchLog.reduce((n, e) => n + e.p, 0);
+  const normal = eligible && validGhPoints(points) && s.tokens - points >= floor
+    && (!batch || (batchSpent + points <= 60 && (!oldest || oldest.owner === owner)));
+  const forced = bypass && !batch && validGhPoints(points);
+  const allowed = normal || forced, charged = normal || (forced && s.tokens - points >= -60);
+  if (charged) {
+    s.tokens -= points;
+    if (batch) s.batchLog = [...s.batchLog, { ms: nowMs, p: points }];
+  }
+  if (allowed) s.tickets = s.tickets.filter(t => t.owner !== owner);
+  const deficitMs = Math.ceil(Math.max(0, floor + points - s.tokens) * 60000 / budgetPerMin);
+  let capMs = 0, remaining = batchSpent;
+  if (batch && remaining + points > 60) for (const e of [...s.batchLog].sort((a, b) => a.ms - b.ms)) {
+    remaining -= e.p; capMs = Math.max(0, e.ms + 60000 - nowMs);
+    if (remaining + points <= 60) break;
+  }
+
+  return { allowed, charged, nextState: s, bypass: bypass && !normal ? (charged ? 'charged' : 'overflow') : undefined,
+    waitMs: Math.max(1, Math.min(Math.max(deficitMs, capMs), batch && age < 20000 ? 20000 - age : Infinity)) };
+}
+
+function writeGhPointsAtomic(path, state) {
+  const temp = `${path}.tmp-${process.pid}-${randomUUID()}`;
+  try { writeFileSync(temp, JSON.stringify(state) + '\n', { encoding: 'utf8', flag: 'wx' }); renameSync(temp, path); }
+  finally { try { unlinkSync(temp); } catch { /* renamed or never created */ } }
+}
+function readGhPointsJson(path) { try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return null; } }
+const validLegacyPoints = s => s && Number.isFinite(s.windowStartMs) && Number.isFinite(s.spent) && s.spent >= 0;
+
+/** Same mutex as old builds; pendingLegacy journals a charge before either ledger can authorize another call.
+ * The separate second argument is a test-only evidence seam; production wrappers never forward it. */
 export function acquireGhPointsSync({
-  lockRoot, points = 1, budgetPerMin, owner, pid = process.pid,
+  lockRoot, points = 1, budgetPerMin = DEFAULT_GH_POINTS_BUDGET_PER_MIN, owner, pid = process.pid,
   now = () => Date.now(), sleep = sleepSyncMs, pollMs = DEFAULT_ACQUIRE_POLL_MS,
   timeoutMs = DEFAULT_ACQUIRE_TIMEOUT_MS, windowMs = GH_POINTS_WINDOW_MS,
-}) {
+  pointClass = 'standard', reserved = false, env = process.env, pointsAlgorithm, toolFile,
+  jitter = Math.random, isPidAlive = ghPidAlive, afterBucketWrite,
+}, { testOnlyAdoptionCheck } = {}) {
+  if (!validGhPoints(points) || !Number.isFinite(budgetPerMin) || budgetPerMin <= 0)
+    return { ok: false, closed: true, reason: 'invalid-cost', timedOut: true, waitedMs: 0 };
   mkdirSync(lockRoot, { recursive: true });
-  const startedAt = now();
+  const startedAt = now(), batch = pointClass === 'batch', closed = batch || reserved;
+  const deadlineMs = Math.min(timeoutMs, batch ? 60000 : 120000);
+  const bucketPath = join(lockRoot, 'points-bucket-state.json'), legacyPath = ghPointsBudgetStatePath(lockRoot);
+  const log = entry => recordGhCallLogEntry(ghThrottleLogPath(lockRoot), { op: 'points-budget', class: pointClass, ...entry });
+  let provenance;
   for (;;) {
-    const nowMs = now();
-    const nowIso = new Date(nowMs).toISOString();
-    const locked = reserve(lockRoot, POINTS_BUDGET_LOCK_KEY, owner, nowMs, nowIso, pid, 'unknown', POINTS_BUDGET_LOCK_LEASE_MINUTES);
-    let decision = null;
+    const nowMs = now(), waitedMs = Math.max(0, nowMs - startedAt), expired = waitedMs >= deadlineMs;
+    const settings = resolveGhPointsSettings(env, { toolFile });
+    const algorithm = pointsAlgorithm ?? settings.pointsAlgorithm;
+    // Ancestry can invoke local git; never hold the shared ledger mutex across that work.
+    let adopted = false;
+    if (algorithm === 'bucket') try { adopted = (testOnlyAdoptionCheck ? testOnlyAdoptionCheck(settings.pointsBucketAdoption)
+      : ghPointsBucketAdopted(settings.pointsBucketAdoption, { env })) === true; } catch { /* unknown retains compat */ }
+    const currentProvenance = JSON.stringify([algorithm, settings.source]);
+    if (provenance !== currentProvenance) { recordGhCallLogEntry(join(lockRoot, 'points-admission-settings.jsonl'), { outcome: 'points_settings', pointsAlgorithm: algorithm,
+      pointsClasses: settings.pointsClasses, source: settings.source }); provenance = currentProvenance; }
+    const locked = reserve(lockRoot, POINTS_BUDGET_LOCK_KEY, owner, nowMs, new Date(nowMs).toISOString(), pid,
+      entry => ghPidAlive(entry.pid) ? 'alive' : 'dead', POINTS_BUDGET_LOCK_LEASE_MINUTES);
+    let decision;
     if (locked.ok) {
       try {
-        decision = decideGhPointsSpend({ state: readGhPointsBudgetState(lockRoot), points, nowMs, budgetPerMin, windowMs });
-        if (decision.allowed) writeGhPointsBudgetState(lockRoot, decision.nextState);
-      } finally {
-        releaseLockDir(lockRoot, POINTS_BUDGET_LOCK_KEY);
-      }
+        if (algorithm === 'window') {
+          decision = decideGhPointsSpend({ state: readGhPointsBudgetState(lockRoot), points, nowMs, budgetPerMin, windowMs });
+          if (decision.allowed) { writeGhPointsAtomic(legacyPath, decision.nextState); return { ok: true, waitedMs, timedOut: false }; }
+        } else {
+          let s = readGhPointsJson(bucketPath), legacy = readGhPointsJson(legacyPath);
+          // A never-written bucket is a first start: full bucket (compat still checks the legacy window).
+          // Only an existing but unreadable/invalid file is conservative (-60 tokens, batch cap full).
+          if (s == null && !existsSync(bucketPath)) s = { ...resetGhBucket(nowMs), tokens: 60, batchLog: [] };
+          else if (!bucketStateValid(s)) { s = resetGhBucket(nowMs); log({ outcome: 'points_state_reset' }); }
+          const conservativeLegacy = () => {
+            // Recovery is unknown spend, never a charge attributable to this bucket build.
+            s.legacyChargedByNew = 0;
+            // Clear attribution durably first: a crash after the legacy rename must stay in compat.
+            writeGhPointsAtomic(bucketPath, s);
+            return { windowStartMs: nowMs, spent: budgetPerMin };
+          };
+          if (s.pendingLegacy) {
+            // A crash may precede OR follow the legacy rename. Max, never add, makes repair idempotent.
+            const pending = s.pendingLegacy;
+            if (!validLegacyPoints(pending)) { s = resetGhBucket(nowMs); legacy = conservativeLegacy(); }
+            else if (!validLegacyPoints(legacy)) {
+              // An absent ledger is an interrupted first write. An existing invalid ledger is full,
+              // even if its journal is old: never coerce bad spent values or serialize NaN as null.
+              legacy = existsSync(legacyPath) ? conservativeLegacy() : { ...pending };
+            } else if (legacy.windowStartMs === pending.windowStartMs)
+              legacy = { windowStartMs: pending.windowStartMs, spent: Math.max(legacy.spent, pending.spent) };
+            else legacy = conservativeLegacy();
+            writeGhPointsAtomic(legacyPath, legacy);
+            delete s.pendingLegacy;
+          }
+          const legacyCorrupt = !validLegacyPoints(legacy) && existsSync(legacyPath);
+          if (legacyCorrupt) {
+            legacy = conservativeLegacy();
+            // Persist once even when admission is refused, so retries share an expiring window.
+            writeGhPointsAtomic(legacyPath, legacy);
+          }
+          const oldSpend = legacyCorrupt || (validLegacyPoints(legacy) && legacy.spent > 0
+            && (legacy.windowStartMs !== s.legacyWindowStartMs || legacy.spent > s.legacyChargedByNew));
+          const mode = !oldSpend && adopted ? 'bucket' : 'compat';
+          if (s.mode !== mode) log({ outcome: 'points_mode', mode, reason: oldSpend ? 'old-spend' : 'adoption' });
+          s.mode = mode;
+          const legacyDecision = decideGhPointsSpend({ state: legacy, points, nowMs, budgetPerMin, windowMs });
+          decision = decideGhBucketSpend({ state: s, points, pointClass, nowMs, budgetPerMin, owner, pid,
+            startedAt, isPidAlive, bypass: expired && !closed,
+            eligible: (!closed || !expired || waitedMs === 0) && (mode === 'bucket' || legacyDecision.allowed) });
+          const admitted = decision.allowed;
+          let next = decision.nextState;
+          if (!admitted && expired) next.tickets = next.tickets.filter(t => t.owner !== owner);
+          if (admitted) {
+            const start = legacyDecision.nextState.windowStartMs;
+            const spent = legacyDecision.nextState.spent + (legacyDecision.allowed ? 0 : points);
+            next.legacyChargedByNew = (start === s.legacyWindowStartMs ? s.legacyChargedByNew : 0) + points;
+            next.legacyWindowStartMs = start;
+            next.pendingLegacy = { windowStartMs: start, spent };
+            writeGhPointsAtomic(bucketPath, next);
+            afterBucketWrite?.();
+            writeGhPointsAtomic(legacyPath, next.pendingLegacy);
+            delete next.pendingLegacy;
+          }
+          writeGhPointsAtomic(bucketPath, next);
+          if (admitted) {
+            if (decision.bypass) log({ outcome: decision.bypass === 'charged' ? 'points_bypass' : 'points_bypass_overflow', reason: 'timeout', points });
+            return { ok: true, waitedMs, timedOut: expired, bypass: decision.bypass };
+          }
+          decision = { allowed: false, waitMs: Math.min(Math.max(decision.waitMs, mode === 'compat' && !legacyDecision.allowed ? legacyDecision.waitMs : 0), batch && waitedMs < 20000 ? 20000 - waitedMs : Infinity) };
+        }
+      } finally { releaseLockDir(lockRoot, POINTS_BUDGET_LOCK_KEY); }
     }
-    if (decision && decision.allowed) return { ok: true, waitedMs: nowMs - startedAt, timedOut: false };
-    if (nowMs - startedAt >= timeoutMs) return { ok: false, waitedMs: nowMs - startedAt, timedOut: true };
-    sleep(decision ? Math.min(pollMs, Math.max(1, decision.waitMs)) : pollMs);
+    if (expired) {
+      if (algorithm === 'window') return { ok: false, waitedMs, timedOut: true }; // legacy shape, unchanged
+      if (closed) return { ok: false, closed, waitedMs, timedOut: true };
+      log({ outcome: 'points_bypass_uncharged', reason: 'lock-timeout', points });
+      return { ok: true, waitedMs, timedOut: true, bypass: 'uncharged' };
+    }
+    sleep(Math.min(Math.max(1, deadlineMs - waitedMs), Math.min(pollMs, Math.max(1, decision?.waitMs ?? pollMs)) + Math.floor(jitter() * 100)));
   }
 }
 
@@ -2115,6 +2304,9 @@ function runGhSyncUnmemoized(args, opts = {}) {
   const slotTimeoutMs = slotWaitPick.waitMs;
   // Reserved priority slot (drain freeze read): ONE extra slot above the cap that only an explicit read-only `throttle.reservedSlot` call may take; the points budget still applies.
   const reserved = ghReservedSlotEligible({ throttle, caller, args: args, isWrite });
+  const pointsClass = classifyGhPoints({ caller, args: args, reserved, settings: resolveGhPointsSettings(env, { toolFile: throttle.pointsToolFile }) });
+  const pointsClosed = reserved || pointsClass === 'batch' || !validGhPoints(points);
+  Object.assign(gateOpts, { pointsClosed, points });
   const slotCap = cap + (reserved ? 1 : 0);
   // The reserved read's whole budget (points wait + slot wait + child run) is its own call timeout, measured from here.
   const reservedCapMs = reserved ? ghReservedWaitCapMs(execOpts) : 0, reservedStartMs = reserved ? now() : 0;
@@ -2172,12 +2364,12 @@ function runGhSyncUnmemoized(args, opts = {}) {
     const waitStartedMs = Date.now();
     const acq = gated ? failOpenGate('acquire', () => {
       if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
-      const pointsGate = acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: reserved ? Math.min(acquireTimeoutMs, reservedCapMs) : acquireTimeoutMs, windowMs: pointsWindowMs });
+      const pointsGate = acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: reserved ? Math.min(acquireTimeoutMs, reservedCapMs) : acquireTimeoutMs, windowMs: pointsWindowMs, pointClass: pointsClass, reserved, env, pointsAlgorithm: throttle.pointsAlgorithm, toolFile: throttle.pointsToolFile, jitter: throttle.jitter });
       // A reserved read FAILS CLOSED if the points budget did not clear inside its own call bound (the freeze then holds).
-      if (reserved && pointsGate?.ok === false) return { ok: false, timedOut: true, waitedMs: reservedCapMs };
+      if (pointsGate?.closed || (pointsClosed && pointsGate?.ok === false)) return { ok: false, timedOut: true, waitedMs: pointsGate.waitedMs };
       return isGhWatch(args) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap: slotCap, owner, pid, pollMs, timeoutMs: reserved ? Math.max(0, Math.min(slotTimeoutMs, reservedCapMs - (now() - reservedStartMs))) : slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args, pid, nowMs: now(), timeoutMs: ghExecOptions(execOpts, args, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
-    }, { ...gateOpts, fallback: reserved ? RESERVED_CLOSED : { ok: false } }) : (reserved ? RESERVED_CLOSED : { ok: false });
-    const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv }, reserved ? { ...slotWait, onSlotTimeout: 'throttled' } : slotWait, waitClass, throttle.warn, slotWaitPick);
+    }, { ...gateOpts, fallback: pointsClosed ? RESERVED_CLOSED : { ok: false } }) : (pointsClosed ? RESERVED_CLOSED : { ok: false });
+    const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv }, pointsClosed ? { ...slotWait, onSlotTimeout: 'throttled' } : slotWait, waitClass, throttle.warn, slotWaitPick);
     if (throttledMessage) {
       recordGhWaitLogEntry(throttle.waitLogPath || join(lockRoot, GH_WAITLOG_FILENAME), { at: new Date(waitStartedMs).toISOString(), caller: ghWaitLogCaller(caller), op: ghOpLabel(args), waitMs: Date.now() - waitStartedMs, durMs: 0, ok: false });
       const error = new Error(throttledMessage);
@@ -2410,6 +2602,9 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
   const slotTimeoutMs = slotWaitPick.waitMs;
   // Reserved priority slot (drain freeze read): ONE extra slot above the cap that only an explicit read-only `throttle.reservedSlot` call may take; the points budget still applies.
   const reserved = ghReservedSlotEligible({ throttle, caller, args: argv, isWrite });
+  const pointsClass = classifyGhPoints({ caller, args: argv, reserved, settings: resolveGhPointsSettings(env, { toolFile: throttle.pointsToolFile }) });
+  const pointsClosed = reserved || pointsClass === 'batch' || !validGhPoints(points);
+  Object.assign(gateOpts, { pointsClosed, points });
   const slotCap = cap + (reserved ? 1 : 0);
   // The reserved read's whole budget (points wait + slot wait + child run) is its own call timeout, measured from here.
   const reservedCapMs = reserved ? ghReservedWaitCapMs({ timeout: throttle.reservedTimeoutMs }) : 0, reservedStartMs = reserved ? now() : 0;
@@ -2477,12 +2672,12 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
     // A nested call rides the outer's slot (and its already-charged points/write budget) — one call, one slot.
     const acq = gated && !outer ? failOpenGate('acquire', () => {
       if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
-      const pointsGate = acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: reserved ? Math.min(acquireTimeoutMs, reservedCapMs) : acquireTimeoutMs, windowMs: pointsWindowMs });
+      const pointsGate = acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: reserved ? Math.min(acquireTimeoutMs, reservedCapMs) : acquireTimeoutMs, windowMs: pointsWindowMs, pointClass: pointsClass, reserved, env, pointsAlgorithm: throttle.pointsAlgorithm, toolFile: throttle.pointsToolFile, jitter: throttle.jitter });
       // A reserved read FAILS CLOSED if the points budget did not clear inside its own call bound (the freeze then holds).
-      if (reserved && pointsGate?.ok === false) return { ok: false, timedOut: true, waitedMs: reservedCapMs };
+      if (pointsGate?.closed || (pointsClosed && pointsGate?.ok === false)) return { ok: false, timedOut: true, waitedMs: pointsGate.waitedMs };
       return isGhWatch(argv) ? { ok: false } : acquireGhSlotSync({ lockRoot, cap: slotCap, owner, pid, pollMs, timeoutMs: reserved ? Math.max(0, Math.min(slotTimeoutMs, reservedCapMs - (now() - reservedStartMs))) : slotTimeoutMs, now, sleep, meta: ghHolderMeta({ caller, args: argv, pid, nowMs: now(), timeoutMs: ghExecOptions(spawnOpts, argv, ghHolderPolicy(env)).timeout ?? 0 }), policy: ghHolderPolicy(env), logPath, warn: throttle.warn });
-    }, { ...gateOpts, fallback: reserved ? RESERVED_CLOSED : { ok: false } }) : (reserved ? RESERVED_CLOSED : { ok: false });
-    const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv, ...(outer ? { outer } : {}) }, reserved ? { ...slotWait, onSlotTimeout: 'throttled' } : slotWait, waitClass, throttle.warn, slotWaitPick);
+    }, { ...gateOpts, fallback: pointsClosed ? RESERVED_CLOSED : { ok: false } }) : (outer ? { ok: false } : pointsClosed ? RESERVED_CLOSED : { ok: false });
+    const throttledMessage = slotTimeoutMessage(logPath, acq, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv, ...(outer ? { outer } : {}) }, pointsClosed ? { ...slotWait, onSlotTimeout: 'throttled' } : slotWait, waitClass, throttle.warn, slotWaitPick);
     if (throttledMessage) return { status: 1, throttled: true, stdout: Buffer.alloc(0), stderr: Buffer.from(throttledMessage) };
     let r;
     try {

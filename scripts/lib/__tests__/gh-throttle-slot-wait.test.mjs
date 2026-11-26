@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { releaseGhSlotSync, acquireGhSlotSync, ghSlotWaitClass, ghSlotWaitMs, GH_SLOT_WAIT_STANDARD, resolveGhSlotWait, runGhSync, runGhCliPassthrough, isGhThrottled } from '../gh-throttle.mjs';
+import { releaseGhSlotSync, acquireGhSlotSync, ghSlotWaitClass, ghSlotWaitMs, GH_SLOT_WAIT_STANDARD, resolveGhSlotWait, runGhSync, runGhCliPassthrough, isGhThrottled } from './gh-throttle.window-fixture.mjs';
 import { isGhThrottled as sharedIsGhThrottled } from '../gh-deferred.mjs';
 
 const dirs = [];

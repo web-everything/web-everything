@@ -21,7 +21,7 @@ import {
   classifyGhRead, personalGhToken, resetPersonalGhTokenCacheForTest, looksLikeGhAuthFailure,
   resolvePersonalRouteEnabled, runGhCliPassthrough, ghAuthIdentity, writeBudgetBlock, readBudgetBlock,
   ghThrottleLogPath, looksLikePersonalAccessDenial, runGhSync, execFileSyncThrottled,
-} from '../gh-throttle.mjs';
+} from './gh-throttle.window-fixture.mjs';
 import { expectSecretAbsent, snapshotEnv } from './helpers/secret-absence.mjs';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'gh-personal-route-'));
