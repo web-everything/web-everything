@@ -14,6 +14,7 @@ import {
   watchDuplicatePrs,
   defaultListOpenPrs,
   defaultPostFinding,
+  runDuplicateWatchCli,
 } from '../duplicate-pr-watch.mjs';
 
 describe('the real incident that motivated this pass — the 2026-09-05 quadruple/double-PR storm', () => {
@@ -319,5 +320,24 @@ import { prFileContract } from './pr-file-test-helpers.mjs';
 prFileContract({
   name: 'duplicate-pr-watch', load: () => import('../duplicate-pr-watch.mjs'),
   reader: 'defaultListOpenPrs', run: 'watchDuplicatePrs',
+  cliMain: 'runDuplicateWatchCli',
   fields: 'number,headRefName,title,body,labels,files',
+});
+
+it('the callable CLI rejects an invalid verb without discovering PRs', async () => {
+  const { execFileSync } = await import('node:child_process');
+  const { writeAllSync, writeLineSync } = await import('../../lib/write-all-sync.mjs');
+  execFileSync.mockClear();
+  writeAllSync.mockClear();
+  writeLineSync.mockClear();
+  const savedExitCode = process.exitCode;
+  try {
+    runDuplicateWatchCli(['invalid', '--dry-run']);
+    expect(process.exitCode).toBe(2);
+    expect(writeLineSync).toHaveBeenCalledWith(2, expect.stringContaining('usage: duplicate-pr-watch.mjs sweep'));
+    expect(writeAllSync).not.toHaveBeenCalled();
+    expect(execFileSync).not.toHaveBeenCalled();
+  } finally {
+    process.exitCode = savedExitCode;
+  }
 });
