@@ -2,8 +2,9 @@
 import * as fs from 'node:fs';
 import { posix, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { findingKey } from '../lib/audit-finding-key.mjs';
-import { FINDING_CLASSES } from './audit-verdict.mjs';
+
+// Fixed v1 wire vocabulary. Keep rubric/identity runtime modules inert; tests pin parity.
+const FINDING_CLASSES = Object.freeze(['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'E1', 'E2', 'D1', 'D2', 'D3', 'X1', 'X2']);
 
 const MAX_BYTES = 1_048_576;
 const MAX_STRING_BYTES = 4096;
@@ -30,6 +31,10 @@ function branch(ref) {
   return ref.startsWith('refs/heads/') && ref.length > 11 && !controls.test(ref)
     && !/[\s~^:?*\[\\]/.test(ref) && !ref.includes('..') && !ref.includes('@{')
     && !ref.endsWith('.') && ref.split('/').every(p => p && !p.startsWith('.') && !p.endsWith('.lock'));
+}
+function findingPath(file) {
+  return !controls.test(file) && !/[\\|\s:]/.test(file) && !file.startsWith('/')
+    && posix.normalize(file) === file && file !== '.' && file !== '..' && !file.startsWith('../');
 }
 function validate(m) {
   object(m, ['schemaVersion', 'kind', 'synthetic', 'repo', 'pr', 'ref', 'questionHash', 'completeFromStart', 'provenance', 'rounds']);
@@ -65,9 +70,7 @@ function validate(m) {
       object(f, ['id', 'text', 'file', 'line', 'class']); strings(f, ['id', 'text', 'file', 'class']);
       requireThat(!ids.has(f.id) && positive(f.line) && FINDING_CLASSES.includes(f.class));
       ids.add(f.id);
-      requireThat(!controls.test(f.file) && posix.normalize(f.file) === f.file);
-      // Validate with the shared contract, but never count identity keys as novelty.
-      findingKey(f);
+      requireThat(findingPath(f.file));
     }
   }
 }

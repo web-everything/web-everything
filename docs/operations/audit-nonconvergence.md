@@ -58,9 +58,11 @@ more findings) or NOT WEAKENED (no findings).
 
 Each finding is exactly `{id, text, file, line, class}`. IDs are nonempty and
 row-local unique, original text is nonempty, line is a positive safe integer,
-and file is normalized repo-relative spelling validated by shared `findingKey`
-with controls rejected. Class is explicitly operator supplied from the shared
-closed FINDING_CLASSES vocabulary (B1–B7, E1–E2, D1–D3, X1–X2). No classification
+and file is normalized repo-relative spelling satisfying the shared `findingKey`
+path contract with controls rejected. Class is explicitly operator supplied from
+the closed v1 vocabulary (B1–B7, E1–E2, D1–D3, X1–X2). The diagnostic validates
+these wire rules locally so the rubric and identity runtime modules remain inert;
+tests pin parity with the shared contracts. No classification
 is inferred from prose. All findings survive output, including B1 and multiple
 IDs with the same class/file. Keys, symbols, renames and fingerprints do not
 establish novelty.

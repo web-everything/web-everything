@@ -1,11 +1,13 @@
 // @repo-scanning-test scope=files
 import { describe, it, expect } from 'vitest';
 import { readFileSync, writeFileSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join, posix, resolve } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { Writable } from 'node:stream';
 import { diagnose, readManifest, runCli } from '../audit-nonconvergence.mjs';
+import { FINDING_CLASSES } from '../audit-verdict.mjs';
+import { findingKey } from '../../lib/audit-finding-key.mjs';
 import { scopedScanFiles, SCAN_ROOT_ENV } from '../../lib/repo-scan-tests.mjs';
 
 const fixtures = resolve('scripts/operations/__tests__/fixtures/audit-nonconvergence');
@@ -37,6 +39,32 @@ function child(args, cwd) {
 }
 
 describe('diagnostic v1', () => {
+  it('v1_class_validation_matches_shared_vocabulary_without_runtime_imports', () => {
+    const candidates = new Set([...FINDING_CLASSES, '', 'unknown', 'B1\n', 'b1', 'B01', 'B10',
+      ...Array.from({length:260}, (_,i) => `${String.fromCharCode(65 + Math.floor(i / 10))}${i % 10}`)]);
+    for (const cls of candidates) {
+      const out = diagnose(manifest([[cls]]));
+      if (FINDING_CLASSES.includes(cls)) expect(out.exitCode, cls).toBe(0);
+      else incomplete(out, 'INVALID_MANIFEST');
+    }
+  });
+  it('v1_path_validation_preserves_shared_identity_and_stricter_manifest_rules', () => {
+    const paths = ['src/file.mjs', '.hidden', '@scope/file.mjs', 'src/é.mjs', 'src/a-b+c.mjs',
+      '', '.', '..', '/abs', '../escape', 'a/../../b', 'a/../b', './a', 'a//b', 'a/',
+      'a\\b', 'a|b', 'C:file', 'a b', 'a\tb', 'a\nb',
+      ...Array.from({length:256}, (_,i) => `a${String.fromCharCode(i)}b`)];
+    for (const file of paths) {
+      let valid = false;
+      try {
+        findingKey({file, class:'B1'});
+        valid = posix.normalize(file) === file && !/[\x00-\x1f\x7f-\x9f]/.test(file);
+      } catch { /* Invalid shared identities must remain invalid manifests. */ }
+      const m = manifest([['B1']]); m.rounds[0].findings[0].file = file;
+      const out = diagnose(m);
+      if (valid) expect(out.exitCode, JSON.stringify(file)).toBe(0);
+      else incomplete(out, 'INVALID_MANIFEST');
+    }
+  });
   it('two_new_classes_recommend_after_second_round', () => {
     expect(diagnose(seed())).toEqual({ exitCode: 10, result: load('two-new-classes.expected.json') });
     const m = seed();
