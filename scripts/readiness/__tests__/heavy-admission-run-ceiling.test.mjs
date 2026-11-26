@@ -17,6 +17,7 @@ afterEach(() => { rmSync(lockRoot, { recursive: true, force: true }); });
 // A zombie (state Z) is already dead: it only awaits reaping. Hosts whose PID 1 never reaps orphans (a Forge container)
 // leave it visible to kill(pid, 0) forever, so a dead-but-unreaped process counts as gone; a live process still fails.
 function isDead(pid) {
+  if (!(pid > 0)) throw new Error(`isDead needs a real pid, got ${pid}`); // pid 0 would probe our own process group
   try { process.kill(pid, 0); } catch (error) { return error?.code === 'ESRCH'; }
   // Positive evidence only: the process must be reported in state Z (terminated, awaiting a reaper). Any ps failure,
   // empty output or running state keeps it alive, so a live orphan still fails the assertion.
@@ -59,9 +60,14 @@ describe('runUnderAdmission — run ceiling counted from slot grant', () => {
     const url = `file://${join(process.cwd(), 'scripts/readiness/heavy-admission.mjs')}`;
     const wrapper = spawn(process.execPath, ['--input-type=module', '-e',
       `import{runUnderAdmission}from${JSON.stringify(url)};await runUnderAdmission({lockRoot:${JSON.stringify(lockRoot)},cap:1,owner:'W',command:${JSON.stringify(`sleep 60 & echo $! > ${pidFile3}; wait`)},runCeilingMs:60000,bypass:'no-pool',log:()=>{}});`], { stdio: ['ignore', 'ignore', 'inherit'] });
-    for (let i = 0; i < 150 && !existsSync(pidFile3); i++) await new Promise((res) => setTimeout(res, 100));
-    const orphan = Number(readFileSync(pidFile3, 'utf8'));
-    wrapper.kill('SIGKILL');
+    // `echo $! > file` creates the file before it writes the pid: existsSync alone can read '' (Number('') === 0, and
+    // kill(0, 0) hits our own group, so the "orphan" is never gone - the red main @ 93c579b93 shard-6 failure). Wait for a
+    // real pid, and never let the wrapper be killed before the sleep exists.
+    for (let i = 0; i < 300 && !(existsSync(pidFile3) && Number(readFileSync(pidFile3, 'utf8').trim()) > 0); i++) await new Promise((res) => setTimeout(res, 100));
+    const orphan = Number(readFileSync(pidFile3, 'utf8').trim());
+    expect(orphan).toBeGreaterThan(0);
+    expect(isDead(orphan)).toBe(false); // the descendant must be alive now, or "gone" below proves nothing about the watchdog
+    expect(wrapper.kill('SIGKILL')).toBe(true);
     await expectGone(orphan);
   }, 60_000);
   it('no runCeilingMs means no exec timeout; admittedArgv carries the flag only when asked', async () => {
