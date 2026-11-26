@@ -6,6 +6,7 @@ import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { execRead } from '../lib/proc-read.mjs';
 import { computeMainRedWindows, isWithinRedWindow, isMainCurrentlyRed } from './main-red-recovery.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
+import { FIX_RUN_INFRA_PATTERNS } from '../lib/fix-run-infra-patterns.mjs';
 
 export const FIX_HOLD_LABEL = 'hold:fix';
 export const fixLoopLedgerPath = (env = process.env) => env.WE_FIX_LOOP_LEDGER || join(homedir(), '.claude', 'conveyor', 'fix-loop-ledger.jsonl');
@@ -114,13 +115,7 @@ export function fixLoopState({ rows, repo, pr, head, now = Date.now(), config = 
     since: matches[0]?.at ?? null, sessions: matches.map(row => row.session).filter(session => typeof session === 'string') };
 }
 
-/** PRs #4992/#4993/#4965, 2026-10-12: failures before an agent runs are infrastructure, never repair evidence.
- * Card 5947 (live #5045, 2026-10-13) also classifies an absent CI failure. */
-export const FIX_RUN_INFRA_PATTERNS = Object.freeze([
-  /^no-finding:/i, /^no-ci-failure:/i, /^fix-run:/i, /^error:/i, /missing required flag/i, /has no fix launcher/i,
-  /launch did not complete/i, /lane-pool/i, /Operation not permitted/i, /EPERM/i, /EACCES/i,
-  /read-only file system/i, /index\.lock/i, /\.git\b/i, /sandbox/i, /could not (commit|push|stage)/i,
-]);
+export { FIX_RUN_INFRA_PATTERNS };
 /** Shared with the launcher: every emitted terminal must participate in session-log alignment. */
 export const FIX_RUN_OUTCOME = Object.freeze({
   FAILED: 'failed', NO_CHANGE: 'no-change', NO_CHANGE_UNPROVEN: 'no-change-unproven', PUSHED: 'pushed', LEASE_LOST: 'lease-lost',

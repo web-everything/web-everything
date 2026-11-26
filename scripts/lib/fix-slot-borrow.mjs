@@ -27,7 +27,7 @@ import { gateLaunch } from './resource-gate.mjs';
 import { isBorrowedRunnerDead, isPidAlive, resolveFixBorrowSettings } from './dispatch-throttle.mjs';
 
 import { pickChainRung, resolveFixExecutionMode } from './fix-executor-chain.mjs';
-import { FIX_RUN_INFRA_PATTERNS } from '../conveyor/fix-loop-ledger.mjs';
+import { FIX_RUN_INFRA_PATTERNS } from './fix-run-infra-patterns.mjs';
 import { readSettings } from './settings-files.mjs';
 import { readLockEntry, heartbeat } from '../readiness/file-locks.mjs';
 // Keep fix-run's static graph independent of the dispatch wrappers: use the light claim store.
