@@ -31,6 +31,9 @@ import { readLockEntry } from '../readiness/file-locks.mjs';
 import { verifyFinishBody } from '../lib/lane-verify.mjs';
 import { GATE_STARTED_MARKER, GATE_QUEUED_MARKER } from '../conveyor/verify-dispatch.mjs';
 import { CARD_ONLY_SKIP_GATE, shellQuote } from '../lib/verify-lane-gate.mjs';
+import { resolveOperation } from '../operations/run.mjs';
+import { runOperationCli } from '../operations/cli-adapter.mjs';
+import { createMemoryRunStore } from '../operations/run-store.mjs';
 
 const namedSuitesCommand = `npx vitest run ${JSON.parse(readFileSync(resolve(process.cwd(), 'scripts/verify-settings.json'), 'utf8')).alwaysRunTests.slice().sort().map(shellQuote).join(' ')} --passWithNoTests`;
 
@@ -1524,6 +1527,111 @@ describe('request with an explicit --gate when the default selection is blocked'
     const r = request('true');
     expect(r.status).toBe(0);
     expect(JSON.parse(r.stdout)).toMatchObject({ status: 'requested' });
+  });
+});
+
+describe('selection-bound gate hints', () => {
+  const testFile = 'src/repos/create.test.ts';
+  const prepText = (command = `npx vitest run ${testFile}`) => `# REPOS-CREATE\n\n## Scope\n- plateau-app:package.json\n- plateau-app:${testFile}\n\n## Acceptance\n1. **Tier-1 named failing regression test:** create a repository.\n   File: plateau-app:${testFile}.\n   Command (from plateau-app): \`${command}\`.\n2. Other acceptance.\n`;
+  function setup(text = prepText()) {
+    execFileSync('git', ['branch', 'origin/main'], { cwd: dir });
+    execFileSync('git', ['checkout', '-qb', 'lane/repos-create'], { cwd: dir });
+    execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/plateauapp/plateau-app.git'], { cwd: dir });
+    mkdirSync(join(dir, 'src/repos'), { recursive: true });
+    writeFileSync(join(dir, testFile), '// the proposed Tier-1 test\n');
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts: { test: 'vitest run' } }));
+    const designs = join(dir, 'workspace/.operations/handoff/designs');
+    mkdirSync(designs, { recursive: true });
+    if (text !== null) writeFileSync(join(designs, 'repos-create-prep-2026-11-26.md'), text);
+    return designs;
+  }
+  function refusal(json = true) {
+    const r = spawnSync(process.execPath, [VERIFY_LANE, 'request', ...(json ? ['--json'] : [])], {
+      cwd: dir, env: { ...process.env, HOME: dir, WE_DIFF_TEST_SELECTION: '0' },
+      encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024,
+    });
+    expect(r.error).toBeUndefined();
+    expect(r.status, r.stderr).toBe(3);
+    expect(existsSync(marker())).toBe(false);
+    return r;
+  }
+  async function format(raw, json) {
+    const spawnHome = vi.fn(() => raw);
+    const { declaration, registry, sinks, finish } = resolveOperation('verify', { verifyIO: { spawn: spawnHome } });
+    const outcome = await runOperationCli({ declaration, registry, sinks,
+      argv: [`--checkout=${dir}`, ...(json ? ['--json'] : [])],
+      store: createMemoryRunStore(), newRunId: () => 'verify-hint-replay',
+    });
+    expect(spawnHome).toHaveBeenCalledTimes(1);
+    expect(spawnHome.mock.calls[0][1]).toEqual([VERIFY_LANE, `--repo=${dir}`, '--json']);
+    const formatted = finish ? finish({ ...outcome, json }) : outcome;
+    expect(formatted.code).toBe(3);
+    return formatted.lines.join('\n');
+  }
+  it('local-selection-bound output says supply --gate and suggests the matching prep tier-1 file', async () => {
+    setup();
+    const raw = refusal();
+    const result = JSON.parse(raw.stdout);
+    expect(result.detail).toContain('supply --gate');
+    expect(result.hint).toMatchObject({ reason: 'prep-tier-1', testFile, argv: ['npx', 'vitest', 'run', testFile] });
+    expect(refusal(false).stderr).toContain(`--gate="npx vitest run ${testFile}"`);
+    for (const json of [false, true]) {
+      const output = await format(raw, json);
+      expect(output).toContain('local-selection-bound');
+      expect(output).toContain('WE_DIFF_TEST_SELECTION=0');
+      expect(output).toContain('supply --gate');
+      expect(output).toContain(testFile);
+    }
+  });
+  it('a suggested prep gate preserves exit 3 and refused status', async () => {
+    setup();
+    const raw = refusal();
+    expect(JSON.parse(raw.stdout)).toMatchObject({ status: 'selection-required', ok: false,
+      reason: 'local-selection-bound', redCause: 'refused', exitCode: 3,
+      hint: { reason: 'prep-tier-1', testFile } });
+    const output = JSON.parse(await format(raw, true));
+    expect(output.verdict).toMatchObject({ ok: false, status: 'refused', exitCode: 3,
+      reason: 'local-selection-bound', redCause: 'refused', passed: 0, unrun: 1 });
+    expect(output.verdict.checks[0].outcome).toBe('unrun');
+    expect(await format(raw, false)).not.toContain('verified green');
+    expect(existsSync(marker())).toBe(false);
+  });
+  it.each(['stdout', 'stderr', 'both'])('malicious prep gate text never executes while rendering a hint (%s)', async channel => {
+    setup();
+    const sideEffect = join(dir, 'executed');
+    const bad = [`npx vitest run ${testFile}; touch ${sideEffect}`, `npx vitest run $(touch ${sideEffect})`,
+      `npx vitest run \`touch ${sideEffect}\``, `npx vitest run ${testFile}\u001b[2J`,
+      `npx vitest run ${testFile}\u202e`, `npx vitest run ${testFile}\nnode -e 'process.exit(0)'`];
+    for (const command of bad) {
+      writeFileSync(join(dir, 'workspace/.operations/handoff/designs/repos-create-prep-2026-11-26.md'), prepText(command));
+      const raw = refusal();
+      expect(JSON.parse(raw.stdout).hint.argv).toBeUndefined();
+      expect(JSON.parse(raw.stdout).hint.reason).toBe('prep-invalid');
+      const replay = { status: 3, stdout: channel === 'stderr' ? '' : raw.stdout,
+        stderr: channel === 'stdout' ? '' : raw.stdout };
+      for (const json of [false, true]) {
+        const output = await format(replay, json);
+        expect(output).toContain('supply --gate');
+        expect(output).not.toContain(sideEffect);
+        expect(output).not.toContain('\u001b');
+      }
+      expect(existsSync(sideEffect)).toBe(false);
+    }
+  });
+  it.each(['missing', 'ambiguous', 'sibling', 'invalid'])('missing ambiguous or invalid prep gates produce only a generic explicit-gate hint (%s)', async kind => {
+    const designs = setup(kind === 'missing' ? null : kind === 'sibling'
+      ? prepText().replaceAll('plateau-app:', 'we:') : kind === 'invalid'
+        ? prepText('npx vitest run ../frontierui/escape.test.ts') : prepText());
+    if (kind === 'ambiguous') writeFileSync(join(designs, 'repos-create-prep-2026-11-25.md'), prepText());
+    const raw = refusal();
+    const result = JSON.parse(raw.stdout);
+    expect(result.detail).toContain('supply --gate');
+    expect(result.hint.argv).toBeUndefined();
+    expect(result.hint.reason).toBe({ missing: 'prep-missing', ambiguous: 'prep-ambiguous',
+      sibling: 'prep-invalid', invalid: 'prep-invalid' }[kind]);
+    expect(result).toMatchObject({ ok: false, redCause: 'refused', exitCode: 3 });
+    expect(JSON.parse(await format(raw, true)).verdict.status).toBe('refused');
+    expect(existsSync(marker())).toBe(false);
   });
 });
 

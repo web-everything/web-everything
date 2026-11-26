@@ -105,6 +105,7 @@ import { createRevertProbe } from './operations/mutation-check-io.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { publishGreen, executedTestCount, fullPhaseInventory } from './lib/verify-shared-marker.mjs';
 import { verifyPolicyKey, initializeVerifierIdentity } from './lib/verify-lane-gate.mjs';
+import { selectionRequiredResult } from './lib/verify-lane-gate.mjs';
 import { repoSlugFromRemote } from './lib/lane-verify.mjs';
 import { basename } from 'node:path';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
@@ -540,7 +541,7 @@ if (typeof flags.gate === 'string') {
   if (capRefusal) throw new Error(capRefusal);
 } else {
   const resolved = resolveBuildDefaultGate(process.env);
-  if (resolved.decision.mode === 'blocked') emit({ sha: headSha, status: 'selection-required', reason: 'local-selection-bound', ok: false, redCause: 'refused', redCauseFiles: [], detail: describeGate(resolved) }, 3);
+  if (resolved.decision.mode === 'blocked') emit(selectionRequiredResult({ sha: headSha, gate: resolved, repo: REPO, runGit: git }), 3);
   GATE = resolved.command;
   resolvedGate = resolved;
   // xpnhz4o — always SAY whether this is a selected run or a full-suite fallback, and why (stderr, so `--json`
