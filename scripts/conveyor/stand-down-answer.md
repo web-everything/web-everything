@@ -17,16 +17,15 @@ refuses unless a different unresolved escalation exists. A failed or ambiguous w
 automatically: inspect the thread before retrying. Concurrent invocations are not serialized by GitHub;
 the orchestrator must run this ceremony once per explicit instruction.
 
-Optional `--disposition=rearm-review` records that the operator ruled no code is owed. A trusted, exact
-answer targeting the latest terminal stand-down since fix-begin lets review be re-armed on the unchanged
-head by clearing earlier fix claims and the reviewed-head baseline; a fix-begin posted afterward starts
-a new round and still requires a change. The answer may be posted by the human operator or relayed on
-their explicit instruction by an allowlisted automation identity using its inherited credentials. Both
-readers recognize that same posted answer, so it needs no second post under human credentials.
-A new trusted stand-down after a later fix-begin reopens the answer window for that newest stand-down,
-even on the same head. A later fix-begin alone preserves the answered rearm; its new claims still count.
-Each stand-down can be rearmed only once, and a stale target cannot clear newer claims.
-Unrelated or nonexistent targets and other answers do not grant this exception.
+Optional `--disposition=rearm-review` clears earlier fix claims and the reviewed-head baseline when a trusted
+answer names the latest terminal stand-down in the fix window. A trusted `--no-code-owed` answer records the
+live head H; the first trusted fix-begin after it consumes eligibility and, only if its sha prefixes H, is the
+answered resume and not an empty round, so review re-arms pinned to H; any later claim or stand-down first
+counts that resume as a claim, so a pushed change still re-arms and an unchanged head requires a fresh answer.
+Legacy headless answers and plain rearm-review answers grant no resume exemption. A changes verdict clears it.
+The answer may be posted by the human operator or relayed on their explicit instruction by an allowlisted
+automation identity. Each stand-down can be rearmed only once; stale or nonexistent targets grant no exception.
+`--preview` runs identical validation and prints the typed JSON result and exact body without posting a comment.
 `--disposition=close-superseded` retains its existing close behavior.
 
 The bare `--no-code-owed` flag requires `--disposition=rearm-review` and records an explicit boolean
