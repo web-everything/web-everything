@@ -7,6 +7,8 @@ import { EventEmitter } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import * as handoff from '../worker-wrapper.mjs';
 import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -39,6 +41,112 @@ function spec(over = {}, dir = tmp()) {
   };
 }
 const read = (s) => tryReadCompletion(s.session, s.completionsDir);
+
+describe('worker context handoff', () => {
+  const sessionId = '12345678-1234-4234-8234-123456789abc';
+  function fixture() {
+    const cwd = tmp();
+    execFileSync('git', ['init', '-q', cwd]);
+    execFileSync('git', ['-C', cwd, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '--allow-empty', '-qm', 'fixture']);
+    const lease = { holder: 'holder-1', acquiredAt: new Date().toISOString(), ttlMinutes: 60 };
+    writeFileSync(join(cwd, '.git', '.lane-lease'), JSON.stringify(lease));
+    const s = spec({ cwd, sessionId, specDir: join(cwd, 'specs'), contextHandoff: { runId: 'attempt-1', leaseToken: 'holder-1' } });
+    mkdirSync(s.specDir);
+    const descriptor = handoff.workerCheckpointDescriptor(s);
+    const milestone = { task: '4001', step: 'tests', sequence: 1, completed: ['red'], pending: ['implement'], checks: [{ command: 'fixture check', result: 'failed' }], decisions: [], artifacts: ['evidence.json'], rollover: true };
+    return { s, descriptor, milestone, lease };
+  }
+
+  it('context rollover launches exactly one fresh worker from the latest durable milestone', async () => {
+    const { s } = fixture();
+    const script = join(s.cwd, 'worker.mjs');
+    const entry = fileURLToPath(new URL('../worker-wrapper.mjs', import.meta.url));
+    writeFileSync(script, `import { checkpointWorkerMilestone } from ${JSON.stringify(entry)};
+const context = JSON.parse(process.env.WE_WORKER_CHECKPOINT);
+if (context.sessionId === ${JSON.stringify(sessionId)}) {
+  for (const sequence of [1, 2]) checkpointWorkerMilestone({ task: '4001', step: 'milestone-' + sequence, sequence, completed: ['work-' + sequence], pending: ['finish'], checks: [{ command: 'fixture', result: 'green' }], decisions: [], artifacts: [], rollover: sequence >= 2 });
+} else {
+  if (!process.argv.at(-1).includes('work-2')) throw Error('lost latest milestone');
+}
+process.stdout.write(${JSON.stringify(claudeStdout(DONE))});`);
+    const writes = [];
+    const result = await runWorker({ ...s, argv: [script, '--session-id', sessionId, 'Disposable task'] }, {
+      head: () => execFileSync('git', ['-C', s.cwd, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
+      writeRecord: (rec, dir) => { writes.push(structuredClone(rec)); return writeCompletion(rec, dir); },
+    });
+    const starts = writes.filter(r => r.status === 'started');
+    expect(starts).toHaveLength(2);
+    expect(starts[1].sessionId).not.toBe(sessionId);
+    expect(result.envelope.headAfter).toBe(result.envelope.headBefore);
+    expect(result.envelope.outcome).toBe('done');
+    expect(JSON.parse(readFileSync(join(s.specDir, `${s.session}.checkpoint.json`))).sequence).toBe(2);
+    expect(() => handoff.claimWorkerSupervisor(s)).toThrow(/operator repair/);
+  });
+
+  it('atomic rename failure preserves the previous durable milestone', () => {
+    const { descriptor, milestone } = fixture();
+    handoff.checkpointWorkerMilestone(milestone, { descriptor });
+    expect(() => handoff.checkpointWorkerMilestone({ ...milestone, sequence: 2 }, { descriptor, renameFile: () => { throw Error('rename failed'); } })).toThrow('rename failed');
+    expect(handoff.readWorkerCheckpoint(descriptor).sequence).toBe(1);
+  });
+
+  it.each([
+    ['wrong-producer', { producer: 'other' }], ['wrong-run', { runId: 'old-attempt' }],
+    ['head-changed', { head: '0'.repeat(40) }], ['old-version', { v: 0 }],
+    ['required-evidence-missing', { checks: null }], ['untrusted-input-path', { repo: '/elsewhere' }],
+    ['wrong-session', { sessionId: 'other' }],
+  ])('refuses %s with an operator repair action', (_name, patch) => {
+    const { descriptor, milestone } = fixture();
+    handoff.checkpointWorkerMilestone(milestone, { descriptor });
+    const state = JSON.parse(readFileSync(descriptor.path));
+    writeFileSync(descriptor.path, JSON.stringify({ ...state, ...patch }));
+    expect(() => handoff.readWorkerCheckpoint(descriptor)).toThrow(/operator repair/);
+  });
+
+  it('refuses missing, corrupt, unreadable and oversized evidence', () => {
+    const { descriptor, milestone } = fixture();
+    expect(() => handoff.readWorkerCheckpoint(descriptor)).toThrow(/operator repair/);
+    writeFileSync(descriptor.path, '{');
+    expect(() => handoff.readWorkerCheckpoint(descriptor)).toThrow(/operator repair/);
+    rmSync(descriptor.path); mkdirSync(descriptor.path);
+    expect(() => handoff.readWorkerCheckpoint(descriptor)).toThrow(/operator repair/);
+    rmSync(descriptor.path, { recursive: true });
+    expect(() => handoff.checkpointWorkerMilestone({ ...milestone, completed: ['x'.repeat(70_000)] }, { descriptor })).toThrow(/incomplete.*operator repair/);
+  });
+
+  it('refuses duplicate or reordered milestones and stale leases', () => {
+    const { descriptor, milestone, s, lease } = fixture();
+    handoff.checkpointWorkerMilestone(milestone, { descriptor });
+    expect(() => handoff.checkpointWorkerMilestone(milestone, { descriptor })).toThrow(/sequence/);
+    expect(() => handoff.checkpointWorkerMilestone({ ...milestone, sequence: 0 }, { descriptor })).toThrow(/sequence/);
+    writeFileSync(join(s.cwd, '.git', '.lane-lease'), JSON.stringify({ ...lease, holder: 'replacement' }));
+    expect(() => handoff.readWorkerCheckpoint(descriptor)).toThrow(/lease.*operator repair/);
+    writeFileSync(join(s.cwd, '.git', '.lane-lease'), JSON.stringify({ ...lease, acquiredAt: '2000-01-01T00:00:00Z' }));
+    expect(() => handoff.readWorkerCheckpoint(descriptor)).toThrow(/lease.*operator repair/);
+  });
+
+  it('concurrent supervisors cannot claim the same run', () => {
+    const { s } = fixture();
+    handoff.claimWorkerSupervisor(s);
+    expect(() => handoff.claimWorkerSupervisor(s)).toThrow(/supervisor.*operator repair/);
+  });
+
+  it('crash after claim recovers only with dead supervisor and child; ambiguous launch pauses', () => {
+    const { s, descriptor, milestone } = fixture();
+    handoff.checkpointWorkerMilestone(milestone, { descriptor });
+    const claim = handoff.claimWorkerSupervisor(s);
+    const claimPath = join(s.specDir, `${s.session}.handoff.json`);
+    const previous = JSON.parse(readFileSync(claimPath));
+    expect(() => handoff.claimWorkerSupervisor(s, { isAlive: pid => pid === previous.ownerPid })).toThrow(/operator repair/);
+    const recovered = handoff.claimWorkerSupervisor(s, { isAlive: () => false });
+    expect(recovered.recovered).toBe(true);
+    expect(recovered.token).not.toBe(claim.token);
+    writeFileSync(claimPath, JSON.stringify({ ...previous, phase: 'spawning' }));
+    expect(() => handoff.claimWorkerSupervisor(s, { isAlive: () => false })).toThrow(/ambiguous.*operator repair/);
+    writeFileSync(claimPath, JSON.stringify({ ...previous, phase: 'running', childPid: 123 }));
+    expect(() => handoff.claimWorkerSupervisor(s, { isAlive: pid => pid === 123 })).toThrow(/child.*operator repair/);
+  });
+});
 
 describe('runWorker: the job record and the result channels', () => {
   it('captures opt-in smoke stderr and first output from a real child', async () => {

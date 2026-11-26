@@ -78,6 +78,16 @@ describe('wrappedTimeoutMs', () => {
 });
 
 describe('launchWrappedClaudeWorker', () => {
+  it('passes the context handoff contract through the existing guarded launch seam', () => {
+    const launch = vi.fn(() => ({ wrapperPid: 123 }));
+    const contextHandoff = { runId: 'attempt-1', leaseToken: 'holder-1' };
+    const options = { role: 'fix', session: 'fix-12', bgArgv: ['--bg', 'TASK'], cwd: tmp(), env: {}, contextHandoff, launch };
+    const refused = launchWrappedClaudeWorker(options);
+    expect(refused.refused).toBeTruthy();
+    expect(launch).not.toHaveBeenCalled();
+    launchWrappedClaudeWorker({ ...options, route: { provider: 'claude' } });
+    expect(launch).toHaveBeenCalledWith(expect.objectContaining({ contextHandoff }), expect.any(Object));
+  });
   it('passes the wrapper spec to the injected launcher and returns a pid handle', () => {
     const specDir = tmp();
     const launch = vi.fn(() => ({ wrapperPid: 4321 }));
