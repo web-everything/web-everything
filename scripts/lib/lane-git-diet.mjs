@@ -44,6 +44,7 @@ export const OPS_REF_READERS = Object.freeze([
   { file: 'scripts/operations/handoff-home.mjs', refs: 'ops/handoff', how: 'trackingRefspec(HANDOFF_BRANCH); runs in its own ~/.claude checkout, not a lane' },
   { file: 'scripts/ci/quarantine-skip.mjs', refs: 'ops/quarantine', how: '+refs/heads/${base}:refs/remotes/origin/${base} (CI job)' },
   // Delegators: they never name a tracking ref themselves; every read goes through readFromTransportBranch.
+  { file: 'scripts/ci/mq-result-reuse.mjs', refs: 'ops/quarantine', how: 'readFromTransportBranch (explicit trackingRefspec before ls-tree/show)' },
   { file: 'scripts/lib/verdict-ledger-io.mjs', refs: 'ops/review-requests', how: 'readFromTransportBranch' },
   { file: 'scripts/lib/card-number-ledger.mjs', refs: 'ops/card-numbers', how: 'readFromTransportBranch' },
   { file: 'scripts/lib/review-precedents-io.mjs', refs: 'ops/review-requests', how: 'readFromTransportBranch' },

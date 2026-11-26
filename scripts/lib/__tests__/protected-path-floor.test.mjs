@@ -35,6 +35,15 @@ function dataOnly(source) {
 }
 
 describe('shared protected-path floor', () => {
+  it.each(['scripts/ci/mq-result-reuse.mjs', 'scripts/ci-card-only.mjs', 'scripts/conveyor/soak/soak-scope.mjs'])(
+    'protects the independently pinned CI skip-verdict producer %s', path => {
+      const workflow = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../../.github/workflows/ci.yml'), 'utf8');
+      expect(workflow).toContain(`node ${path}`);
+      expect(matchesSome(path, shared.GUARD_FLOOR)).toBe(true);
+    });
+  it('retains the explicit checkout-only merge-queue reuse guard entry', () => {
+    expect(shared.GUARD_FLOOR).toContain('scripts/ci/mq-result-reuse.mjs');
+  });
   it('contains only data declarations, with no imports, settings resolution or runtime IO', () => {
     const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../protected-path-floor.mjs'), 'utf8');
     expect(dataOnly(source)).toBe(true);

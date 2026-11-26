@@ -248,10 +248,10 @@ describe('CI gate mirroring fails closed', () => {
     ]);
   });
   const real = yaml.safeLoad(workflow);
-  it.each(['Enforce bot-owned test timings', 'Record shard start', 'Measure shard resources'])(
+  it.each(['Enforce bot-owned test timings', 'Reuse the merge-queue result for this exact sha (main push only)', 'Record shard start', 'Measure shard resources'])(
     'refuses changed or missing %s commands rather than trusting workflow text', name => {
       const changed = yaml.safeLoad(workflow);
-      const steps = changed.jobs[name === 'Enforce bot-owned test timings' ? 'changes' : 'test-shard'].steps;
+      const steps = changed.jobs[name === 'Enforce bot-owned test timings' || name.startsWith('Reuse ') ? 'changes' : 'test-shard'].steps;
       const index = steps.findIndex(step => step.name === name);
       expect(index).toBeGreaterThanOrEqual(0);
       steps[index].run += '\necho unmirrored-command';
@@ -283,6 +283,19 @@ describe('CI gate mirroring fails closed', () => {
     expect(step).toBeDefined();
     step.with.script = step.with.script.replace('longest >= 1050', 'longest >= 99999');
     expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('update the urgent verification mirror');
+  });
+  it.each([
+    ['if', undefined], ['if', "github.event_name == 'push'"], ['if', "github.event_name == 'pull_request'"],
+    ['env', undefined], ['env', { GITHUB_TOKEN: 'unexpected' }], ['continue-on-error', undefined], ['continue-on-error', false],
+    ['env', { GITHUB_TOKEN: '${{ github.token }}' }],
+    ['env', { GITHUB_TOKEN: '${{ github.token }}', PUSH_BEFORE: '${{ github.sha }}' }],
+    ['timeout-minutes', undefined], ['timeout-minutes', 5],
+  ])('pins the reuse step execution context: %s=%j', (field, value) => {
+    const changed = yaml.safeLoad(workflow);
+    const step = changed.jobs.changes.steps.find(step => step.id === 'reuse');
+    if (value === undefined) delete step[field];
+    else step[field] = value;
+    expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('changes step execution context; update the urgent verification mirror');
   });
   it('pins the two-worker default and refuses a drift up to four', () => {
     expect(real.jobs['test-shard'].env.WE_VITEST_MAX_WORKERS).toBe("${{ vars.WE_VITEST_MAX_WORKERS || '2' }}");

@@ -53,10 +53,20 @@ const jobSetupRuns = {
   standards: setupRuns, 'test-shard': setupRuns, 'integration-part': setupRuns,
   'coverage-merge': ['npm ci'],
 };
+const fullTestReceipt = 'echo "All assigned tests ran without quarantine exclusions"';
+// Independently pin the invocation and receipt producer; never accept arbitrary new workflow shell text.
+const fullTestInvocation = command => `test_args=(${command})
+"\${test_args[@]}"
+case " \${test_args[*]} " in
+*" --exclude"*|*" --quarantined"*) ;;
+*) echo "full=true" >> "\${GITHUB_OUTPUT:-/dev/null}" ;;
+esac`;
 const mirroredRuns = {
   changes: ["FRESH_MAIN_SHA=\"\"\nif [ \"$EVENT_NAME\" = \"merge_group\" ]; then\n  BASE_SHA=\"$MG_BASE_SHA\"\nfi\nif [ \"$BASE_REF\" = \"main\" ]; then\n  if sh scripts/ci/fetch-main-history.sh; then\n    FRESH_MAIN_SHA=$(git rev-parse --verify --end-of-options 'refs/remotes/origin/main^{commit}') || FRESH_MAIN_SHA=\"\"\n  else\n    echo \"ci-card-only: main fetch failed; full suite\" >&2\n  fi\nfi\nnode scripts/ci-card-only.mjs --event=\"$EVENT_NAME\" --base=\"$BASE_SHA\" --base-ref=\"$BASE_REF\" --fresh-main-sha=\"$FRESH_MAIN_SHA\" --head=HEAD >> \"$GITHUB_OUTPUT\"",
     // PR ownership admission is checked by GitHub; local urgent runs have no PR event.
     "node scripts/ci/check-timings-bot-only.mjs",
+    // Main-only optimization: urgent verification always runs the full local suites.
+    "node scripts/ci/mq-result-reuse.mjs",
   ],
   'test-shard': [
     "echo \"Card-only change; no unit tests required by the changes classifier.\"",
@@ -66,7 +76,7 @@ list=$(node scripts/ci/shard-assign.mjs --suite=unit --group=covered --shard=\${
 files=()
 while IFS= read -r f; do [ -z "$f" ] || files+=("$f"); done <<< "$list"
 echo "unit shard \${{ matrix.shard }}/9: \${#files[@]} files"
-npm run test:coverage:shard -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-\${{ matrix.shard }}.json "\${files[@]}" $(node scripts/ci/quarantine-skip.mjs) # red-main quarantine (xx7ckd6): skip args from ops/quarantine, empty unless redMainMode=quarantine
+${fullTestInvocation('npm run test:coverage:shard -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}" $(node scripts/ci/quarantine-skip.mjs)')}
 `,
     `
 list=$(node scripts/ci/shard-assign.mjs --suite=unit --group=nocov --shard=1/1) || { echo "::error::shard-assign failed; refusing to run an unfiltered suite"; exit 1; }
@@ -74,7 +84,7 @@ list=$(node scripts/ci/shard-assign.mjs --suite=unit --group=nocov --shard=1/1) 
 files=()
 while IFS= read -r f; do [ -z "$f" ] || files+=("$f"); done <<< "$list"
 echo "unit no-coverage group: \${#files[@]} files"
-npm run test:unit -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-\${{ matrix.shard }}.json "\${files[@]}" $(node scripts/ci/quarantine-skip.mjs) # red-main quarantine (xx7ckd6): skip args from ops/quarantine, empty unless redMainMode=quarantine
+${fullTestInvocation('npm run test:unit -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}" $(node scripts/ci/quarantine-skip.mjs)')}
 `,
     // Non-failing measurement step (index 3): nproc, memory.peak, wall time. Never gates a shard.
     `
@@ -109,6 +119,7 @@ printf 'nproc: %s\\nmemory.peak: %s\\nwall time (seconds): %s\\n' "$cpu_count" "
 printf '{"nproc":%s,"memory.peak":"%s","wall_seconds":%s}\\n' "$cpu_count" "$memory_peak" "$wall_seconds" > shard-resources.json
 `,
     'echo "SHARD_START_SECONDS=$(date +%s)" >> "$GITHUB_ENV"',
+    fullTestReceipt,
   ],
   'coverage-merge': [
     `
@@ -135,7 +146,8 @@ else
 echo "run=true" >> "$GITHUB_OUTPUT"
 fi
 `,
-    "npm run test:integration:vitest -- --reporter=default --reporter=json --outputFile.json=coverage/timing-integration-${{ matrix.group }}.json $(node scripts/ci/quarantine-skip.mjs --job=\"integration\")",
+    fullTestInvocation('npm run test:integration:vitest -- --reporter=default --reporter=json --outputFile.json=coverage/timing-integration-${{ matrix.group }}.json $(node scripts/ci/quarantine-skip.mjs --job="integration")'),
+    fullTestReceipt,
   ],
   integration: [
     `
@@ -168,7 +180,7 @@ echo "::error::Host paths did not succeed."
 exit 1
 fi
 if [ "\${{ needs.changes.outputs.light }}" = "true" ]; then
-echo "Card-only PR: unit shards and coverage merge intentionally omitted."
+echo "Card-only PR or merge-queue reuse (CI-MAIN-REUSE-MQ): unit shards and coverage merge intentionally omitted."
 exit 0
 fi
 if [ "\${{ needs.test-shard.result }}" != "success" ]; then
@@ -277,14 +289,22 @@ function mirroredRunContext(job, text) {
     "${{ needs.changes.outputs.light != 'true' && (matrix.shard == 10) }}",
     "${{ always() && needs.changes.outputs.light != 'true' }}",
     fullUnit,
-  ][index]) : job === 'changes' && index === 1 ? "github.event_name == 'pull_request'" : job === 'integration-part' && (setup || index === 1) ? fullIntegration : undefined;
+    "${{ needs.changes.outputs.light != 'true' && (steps.covered.outputs.full == 'true' || steps.nocov.outputs.full == 'true') }}",
+  ][index]) : job === 'changes' && index === 1 ? "github.event_name == 'pull_request'"
+    : job === 'changes' && index === 2 ? "github.event_name == 'push' && github.ref == 'refs/heads/main'"
+      : job === 'integration-part' && (setup || index === 1) ? fullIntegration
+        : job === 'integration-part' && index === 2 ? "${{ steps.suite.outputs.full == 'true' }}" : undefined;
   return {
-    'working-directory': directory, if: condition, shell: undefined, 'continue-on-error': job === 'test-shard' && [3, 4].includes(index) ? true : undefined,
+    'working-directory': directory, if: condition, shell: undefined,
+    'continue-on-error': (job === 'test-shard' && [3, 4].includes(index)) || (job === 'changes' && index === 2) ? true : undefined,
+    ...(job === 'changes' && index === 2 ? { 'timeout-minutes': 1 } : {}),
     env: job === 'changes' && index === 1 ? {
       GITHUB_EVENT_NAME: '${{ github.event_name }}', GH_TOKEN: '${{ github.token }}',
       REPO: '${{ github.repository }}', PR_NUMBER: '${{ github.event.pull_request.number }}',
       HEAD_REF: '${{ github.event.pull_request.head.ref }}', HEAD_SHA: '${{ github.event.pull_request.head.sha }}',
       AUTHOR: '${{ github.event.pull_request.user.login }}', HEAD_REPO: '${{ github.event.pull_request.head.repo.full_name }}',
+    } : job === 'changes' && index === 2 ? {
+      GITHUB_TOKEN: '${{ github.token }}', PUSH_BEFORE: '${{ github.event.before }}',
     } : job === 'changes' ? {
       EVENT_NAME: '${{ github.event_name }}', BASE_SHA: '${{ github.event.pull_request.base.sha }}',
       MG_BASE_SHA: '${{ github.event.merge_group.base_sha }}', BASE_REF: '${{ github.event.pull_request.base.ref }}',
@@ -377,7 +397,7 @@ export function ciGatePlan(workflow) {
   const download = step('coverage-merge', 'Download shard coverage');
   if (!covered || merge !== `npm run coverage:merge -- coverage-shards --threshold=80 --expect=${covered}`
     || host !== 'node scripts/lint-host-paths.mjs'
-    || integration !== 'npm run test:integration:vitest -- --reporter=default --reporter=json --outputFile.json=coverage/timing-integration-${{ matrix.group }}.json $(node scripts/ci/quarantine-skip.mjs --job="integration")'
+    || runText(integration) !== runText(mirroredRuns['integration-part'][1])
     || upload.uses !== 'actions/upload-artifact@v4' || upload.with?.name !== 'coverage-shard-${{ matrix.shard }}'
     || upload.with?.path !== 'web-everything/coverage/coverage-final.json' || upload.with?.['if-no-files-found'] !== 'error'
     || !upload.if?.includes(`matrix.shard != ${plan.length}`)
@@ -391,7 +411,7 @@ export function ciGatePlan(workflow) {
   }
   const fetchMain = runText(step('test-shard', 'Fetch main history (blobless)').run);
   if (fetchMain !== 'sh scripts/ci/fetch-main-history.sh') throw new Error('unreadable-ci-gates: main history command');
-  return { requiredJobs, fetchMain: fetchMain.split(' '), installFui: [['npm', 'ci'], ['npm', 'run', 'build:tools']], install: ['npm', 'ci'], coverage: merge.split(' '), hostPaths: host.split(' '), integration: integration.split(' -- ')[0].split(' ') }; // CI-only reporter flags (per-group timing JSON) stay out of the one ungrouped local run
+  return { requiredJobs, fetchMain: fetchMain.split(' '), installFui: [['npm', 'ci'], ['npm', 'run', 'build:tools']], install: ['npm', 'ci'], coverage: merge.split(' '), hostPaths: host.split(' '), integration: ['npm', 'run', 'test:integration:vitest'] }; // CI-only reporters and receipts stay out of the one ungrouped local run
 }
 
 export function urgentMarker({ urgent, reason, sha, ledger, shards, expectedSteps, now, repo, readKey }) {
