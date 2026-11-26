@@ -157,8 +157,10 @@ export function resolveVerifySettings({ fileConfig, env = {} } = {}) {
       value = value != null && String(value).trim() !== '' ? Number(value) : undefined;
     }
     else if (key === 'alwaysRunTests') {
-      // Comma-separated list; an empty-but-set value switches the always-run set off.
-      value = value != null ? String(value).split(',').map(f => f.trim()).filter(Boolean) : undefined;
+      // Blank overrides inherit policy and provenance; an explicit validated file [] disables guards.
+      // Keep empty comma-list entries so malformed lists fail validation instead of dropping guards.
+      value = typeof value === 'string' && value.trim() !== ''
+        ? value.split(',').map(f => f.trim()) : undefined;
     }
     if (check(value)) {
       values[key] = value;
