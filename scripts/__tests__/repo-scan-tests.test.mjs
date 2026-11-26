@@ -151,6 +151,7 @@ describe('the verify gate wires the scanners in', () => {
 // it errs toward detecting; the answer to a detection is to mark the test (REPO_SCAN_TESTS) or defer it with a
 // reason (DEFERRED_SCAN_TESTS) — either way a human decides, which is the point.
 const SCANNER_SHAPES = [
+  /\bdiscoverModuleFiles\(/,
   /ls-files[^;]{0,200}cwd:\s*(ROOT|root|REPO_ROOT|repoRoot|REPO)\b/s,
   /readdirSync\([^)]*\b(ROOT|root|REPO_ROOT)\b[^)]*recursive/s,
   /(?:const walk = |function walk\()/,
@@ -160,6 +161,20 @@ const trackedTests = () => execFileSync('git', ['ls-files', '-co', '--exclude-st
   .split('\n').filter((f) => f && !f.includes('node_modules'));
 
 describe('guard: every repo-scanning test is marked or deferred with a reason', () => {
+  const discoveryTest = 'scripts/conveyor/soak/__tests__/breaks-index-discovery.test.mjs';
+  it('recognizes shared module discovery as a repo scanner without a hand-written walk', () => {
+    expect(SCANNER_SHAPES.some(re => re.test('const files = discoverModuleFiles(REAL_BREAKS_DIR);'))).toBe(true);
+  });
+  it('the soak discovery tag declares its registered completeness scope', () => {
+    const entry = REPO_SCAN_TESTS.find(e => e.test === discoveryTest);
+    expect(entry.scope).toBe('full');
+    expect(readFileSync(join(root, discoveryTest), 'utf8')).toContain(`${SCAN_TEST_TAG} scope=${entry.scope}`);
+  });
+  it('the soak discovery manifest entry is discoverable by its in-file mark', () => {
+    const tagged = trackedTests().filter(f => f === discoveryTest
+      && readFileSync(join(root, f), 'utf8').includes(`${SCAN_TEST_TAG} scope=`));
+    expect(tagged).toEqual([discoveryTest]);
+  });
   it('no detected scanner is unaccounted for', () => {
     const marked = new Set(REPO_SCAN_TESTS.map((e) => e.test));
     const unaccounted = trackedTests().filter((f) => existsSync(join(root, f))

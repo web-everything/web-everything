@@ -45,6 +45,23 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
   {
+    test: 'scripts/conveyor/health-smells/__tests__/index-discovery.test.mjs',
+    scope: 'full',
+    why: 'directory completeness requires the complete health-smell registry; selected only for its descriptor tree and discovery inputs',
+    matches: (f) => f.startsWith('scripts/conveyor/health-smells/') && f.endsWith('.mjs'),
+    inputs: ['scripts/conveyor/registry-discovery.mjs', 'scripts/conveyor/health-smells-shape.mjs',
+      'scripts/conveyor/health-smells/__tests__/index-discovery.test.mjs'],
+  },
+  {
+    test: 'scripts/conveyor/__tests__/health-responder-core.test.mjs',
+    scope: 'full',
+    why: 'descriptor coverage compares the complete discovered registry with the responder catalogue; selected only for registry or responder inputs',
+    matches: (f) => f.startsWith('scripts/conveyor/health-smells/') && f.endsWith('.mjs'),
+    inputs: ['scripts/conveyor/registry-discovery.mjs', 'scripts/conveyor/health-smells-shape.mjs',
+      'scripts/conveyor/health-responder-core.mjs', 'scripts/conveyor/__tests__/health-responder-core.test.mjs',
+      'scripts/conveyor/__tests__/fixtures/health-responder/replay.json'],
+  },
+  {
     test: 'scripts/conveyor/soak/__tests__/breaks-index-discovery.test.mjs',
     scope: 'full',
     why: 'directory completeness and production-registry collection require every break; selection is limited to the soak registry and its registration inputs',

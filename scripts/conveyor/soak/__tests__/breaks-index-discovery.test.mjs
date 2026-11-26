@@ -1,5 +1,5 @@
 /**
- * @repo-scanning-test
+ * @repo-scanning-test scope=full
  * @file breaks-index-discovery.test.mjs — proves `breaks/index.mjs` builds its registry from the DIRECTORY,
  * not a hand-maintained import list (the #3729-style conflict this refactor removes): a new module file is
  * picked up with zero index edits, non-module entries (index.mjs itself, tests, fixtures) are excluded,

@@ -1,4 +1,5 @@
 /**
+ * @repo-scanning-test scope=full
  * @file index-discovery.test.mjs — proves `health-smells/index.mjs` builds its registry from the DIRECTORY, not
  * a hand-maintained import list (the #3729-style conflict this refactor removes): a new module file is picked
  * up with zero index edits, non-module entries (index.mjs itself, __tests__/) are excluded, discovery order is

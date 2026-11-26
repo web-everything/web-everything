@@ -1,4 +1,5 @@
 // @vitest-environment node
+// @repo-scanning-test scope=full
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { decide, CATALOGUE, ACTION_ALLOWLIST, SHADOW_ACTUATORS, DEFAULT_CONFIG, familyKey } from '../health-responder-core.mjs';
