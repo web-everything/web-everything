@@ -10,8 +10,9 @@
  * that refused. Several exist purely to stop a later "helpful" fallback from reopening the bypass.
  */
 import { describe, it, expect } from 'vitest';
-import { dirname, resolve } from 'node:path';
-import { readFileSync } from 'node:fs';
+import { dirname, resolve, join } from 'node:path';
+import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { importGraph } from './import-graph.mjs';
 import {
@@ -28,6 +29,62 @@ const good = (over = {}) => ({
 });
 const ops = () => openPrOperation({ parkLabels: PARK_LABELS });
 const step = (decl, name) => decl.steps.find((s) => s.name === name).step;
+
+describe('T-OPENPR skip-push operation', () => {
+  function submit({ skipPush = true, auditOk = true, reviewAction = 'pass' } = {}) {
+    const cwd = mkdtempSync(join(tmpdir(), 'open-pr-published-'));
+    const sha = 'a'.repeat(40);
+    const calls = [];
+    try {
+      const decl = openPrOperation({ parkLabels: PARK_LABELS, deriveRef: () => 'lane/published-fixture' });
+      const input = { ...good(), ref: 'lane/published-fixture', bodyFile: join(cwd, 'body.md'), skipPush };
+      const plan = step(decl, 'plan').fn({ input });
+      const result = createPrLandRunner({ cwd, env: { HOME: cwd, TMPDIR: cwd },
+        git: () => { throw new Error('unexpected git read'); }, dupBornAs: () => [],
+        prepGate: () => ({ ok: true }), readPrepBody: () => 'Prepared fixture body',
+        canonicalAudit: request => { calls.push(['audit', request]); return { ok: auditOk, sha,
+          reason: 'canonical-audit-missing', message: 'run canonical audit' }; },
+        prePrReview: request => { calls.push(['review', request]); return { action: reviewAction, sha,
+          reason: 'pre-pr-review-missing', message: 'run pre-PR review' }; },
+        spawn: (_cmd, argv, options) => {
+          calls.push(['child', argv, options.cwd]);
+          return { status: 0, stdout: JSON.stringify(argv.includes('--check')
+            ? { reason: 'check-ok' } : { reason: 'opened', pr: 7 }) };
+        },
+      })({ argv: plan.argv });
+      return { decl, plan, result, calls, cwd, sha };
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  }
+
+  it('skip-push reuses matching published head without invoking git push', () => {
+    const { decl, plan, result, calls, cwd, sha } = submit();
+    expect(decl.input.skipPush).toMatchObject({ type: 'boolean', default: false });
+    expect(step(decl, 'plan').reads).toContain('input.skipPush');
+    expect(plan.argv).toContain('--skip-push');
+    expect(result).toMatchObject({ outcome: 'opened', pr: 7 });
+    const children = calls.filter(([kind]) => kind === 'child');
+    expect(children).toHaveLength(1);
+    expect(children[0][1]).toEqual(expect.arrayContaining(['--skip-push', `--sha=${sha}`]));
+    expect(children[0][2]).toBe(cwd);
+    expect(calls.filter(([kind]) => kind === 'review' || kind === 'audit')).toHaveLength(2);
+  });
+
+  it('skip push cannot skip canonical audit', () => {
+    const { result, calls } = submit({ auditOk: false });
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'canonical-audit-missing' });
+    expect(calls.find(([kind]) => kind === 'child')[1]).toContain('--check');
+  });
+
+  it('skip push cannot skip pre-PR review', () => {
+    const { result, calls } = submit({ reviewAction: 'refuse' });
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'pre-pr-review-missing' });
+    expect(calls.find(([kind]) => kind === 'child')[1]).toContain('--check');
+  });
+
+  it.each([false, undefined, 'false', 'true'])('omits skip-push unless explicitly true (%s)', skipPush => {
+    expect(planOpen(good({ skipPush })).argv).not.toContain('--skip-push');
+  });
+});
 
 describe('the declaration', () => {
   it('derives its command line, and takes the park labels from the HOME', () => {

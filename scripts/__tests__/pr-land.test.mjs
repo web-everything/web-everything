@@ -9,7 +9,7 @@ import { readFileSync, mkdtempSync, writeFileSync, rmSync, mkdirSync, renameSync
 import { resolve, join } from 'node:path';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, fileURLToPath } from 'node:url';
 import { drainScoredGit } from './fixtures/drain-scored-git.mjs';
 import * as prLand from '../pr-land.mjs';
 import { pushFailedDetail, mergeMethodFlag, buildCreateArgs, prCreateBodyGuard, liveBodyLandGuard, buildMergeArgs, buildRenumberHealArgs, buildRegenArgs, buildAddLabelArgs, classifyChecks, planPrLand, pollVerdict, isPostLandTreeDirty, postLandSkips, postLandReport, scopeHealChangedPaths, resolveProducerReviewLabel, resolveRosterReconcile, resolveParkLabel, withAuthorStamp, composePrBody, PARK_LABELS, decideHoldReadyStrip, isAcceptedAtHead, resolveDraft, isMainFixPr, decideReadyOnOpen, applyLabelWithRetry, unlabelledHandOffLabel, landTimeBodyGate } from '../pr-land.mjs';
@@ -19,6 +19,185 @@ import { buildAuthorActorMarker, parseAuthorActorId } from '../lib/review-indepe
 import { PANEL_LENSES } from '../lib/review-core.mjs';
 
 afterEach(() => vi.unstubAllEnvs());
+
+describe('T-OPENPR authoritative published head', () => {
+  function runPublished({ skipPush = true, remote = 'matching', existing = false, audit = true,
+    reviewHead = 'matching', sizeChange = '', lookup = 'ok', lockBusy = false, pushFails = false,
+    sha = 'a'.repeat(40), skipFlag = '--skip-push', check = false, dryRun = false } = {}) {
+    const dir = mkdtempSync(join(tmpdir(), 'pr-land-published-'));
+    const trace = join(dir, 'effects.jsonl');
+    const cli = fileURLToPath(new URL('../pr-land.mjs', import.meta.url));
+    const record = `import { appendFileSync } from 'node:fs';
+      const effect = value => appendFileSync(${JSON.stringify(trace)}, JSON.stringify(value) + '\\n');`;
+    const stubs = {
+      './operations/canonical-audit-gate.mjs': `${record} export const checkCanonicalAuditForOpen = () => {
+        effect(['audit']); return { ok: ${audit}, reason: 'canonical-audit-missing', message: 'run canonical audit' }; };`,
+      './lib/lane-verify.mjs': 'export const readVerifyMarker = () => null; export const verifyGateDecision = () => ({ ok: true });',
+      './lib/verify-ci-only.mjs': 'export const ciOnlyDecision = () => null;',
+      './lib/verify-lane-gate.mjs': 'export const initializeVerifierIdentity = () => ({}); export const verifySetting = () => 0;',
+      './lib/soak-precheck-at-open.mjs': `export const soakPrecheckEnabled = () => true;
+        export const soakPrecheckAtOpen = () => ({ ok: true, reason: 'fixture' });`,
+      './lib/pr-limit.mjs': `export const countOpenPrsForRepo = () => ({ count: 0, limit: 15 });
+        export const isBranchAllowedLive = () => false; export const isGlobalOffLive = () => false;`,
+      './conveyor/fix-procedure.mjs': `${record} export const pushRefusal = () => {
+        effect(['claim']); return globalThis.fixtureStage === 'claim-moved' ? { message: 'live fixer owns this branch' } : null;
+        }; export const repoKeyForCheckout = () => 'we'; export const callerIdentity = () => ({});`,
+      './conveyor/infra-blocked.mjs': 'export const originSlugOf = () => "fixture/project";',
+      './operations/build-pr-authorship.mjs': 'export const producerBuildContext = () => null; export const checkpointBuildPr = () => {};',
+      './lib/pr-size-admission.mjs': `${record} export const createSizeAdmissionRunner = () => async request => {
+        effect(['size-admission']); globalThis.fixtureStage = ${JSON.stringify(sizeChange)};
+        return { body: request.body, status: 'small' }; };`,
+      './lib/forge-land-provider.mjs': `${record}
+        export const createGhLandProvider = () => ({
+          listOpenByHead: () => { effect(['lookup']);
+            if (${JSON.stringify(lookup)} === 'throws') throw new Error('lookup unreadable');
+            if (${JSON.stringify(lookup)} === 'ambiguous') return [{ number: 7 }, { number: 8 }];
+            return ${existing} ? [{ number: 7 }] : []; },
+          create: p => { effect(['create', p]); globalThis.fixtureCreated = true; return 'https://example.invalid/pull/7'; },
+          viewPr: (pr, fields) => { effect(['view', pr, fields]); return {
+            headRefOid: ${JSON.stringify(reviewHead === 'matching' ? sha : 'b'.repeat(40))},
+            state: 'OPEN', headRefName: 'lane/published-fixture', baseRefName: 'main',
+            labels: [], comments: [], body: 'Prepared fixture description.' }; },
+          ensureLabel: (...args) => effect(['ensure-label', ...args]),
+          addLabel: (...args) => effect(['add-label', ...args]),
+          editBody: (...args) => effect(['edit-body', ...args]),
+          removeLabel: (...args) => effect(['remove-label', ...args]),
+        });`,
+    };
+    const loader = join(dir, 'loader.mjs');
+    const preload = join(dir, 'preload.mjs');
+    writeFileSync(loader, `const stubs = ${JSON.stringify(stubs)};
+      export async function resolve(specifier, context, next) {
+        if (context.parentURL === ${JSON.stringify(pathToFileURL(cli).href)} && stubs[specifier]) {
+          const original = new URL(specifier, context.parentURL).href;
+          return { url: 'data:text/javascript,' + encodeURIComponent('export * from ' + JSON.stringify(original) + ';' + stubs[specifier]), shortCircuit: true };
+        }
+        return next(specifier, context);
+      }`);
+    writeFileSync(preload, `import cp from 'node:child_process';
+      import { syncBuiltinESMExports, register } from 'node:module';
+      ${record}
+      Date.now = () => 1800000000000;
+      globalThis.fixtureStage = ''; globalThis.fixtureCreated = false;
+      cp.execFileSync = (cmd, args) => {
+        effect([cmd, args]);
+        if (cmd === 'node') return ''; // independently tested locus lint
+        if (cmd !== 'git') throw new Error('unexpected external call: ' + cmd);
+        if (args[0] === 'rev-parse') {
+          if (args.includes('--git-common-dir') || args.includes('--absolute-git-dir')) return ${JSON.stringify(dir)};
+          return globalThis.fixtureStage === 'local-moved' ? 'b'.repeat(40) : ${JSON.stringify(sha)};
+        }
+        if (args[0] === 'ls-remote') {
+          const mode = ${JSON.stringify(remote)};
+          if (mode === 'unreadable' || mode === 'timeout') throw new Error(mode === 'timeout' ? 'ETIMEDOUT' : 'remote unavailable');
+          if (mode === 'missing') return '';
+          if (mode === 'malformed') return 'broken refs/heads/lane/published-fixture';
+          if (mode === 'oversized') return 'x'.repeat(65537);
+          const oid = mode === 'mismatch' || globalThis.fixtureStage === 'remote-moved'
+            || (mode === 'moved-after-create' && globalThis.fixtureCreated) ? 'b'.repeat(40) : ${JSON.stringify(sha)};
+          const row = oid + '\\trefs/heads/lane/published-fixture';
+          return mode === 'ambiguous' ? row + '\\n' + row : mode === 'wrong-ref' ? oid + '\\trefs/heads/lane/other' : row;
+        }
+        if (args[0] === 'remote') return 'https://github.com/fixture/project.git';
+        if (args[0] === 'log') return 'fix: published fixture';
+        if (args[0] === 'diff') return args.includes('-z') ? 'M\\0README.md\\0' : 'README.md';
+        if (args[0] === 'push') { if (${pushFails}) throw new Error('push rejected'); return ''; }
+        if (args[0] === 'show') throw new Error('fixture has no manifest');
+        throw new Error('unexpected git: ' + args.join(' '));
+      };
+      cp.execSync = cp.spawnSync = cp.spawn = cp.exec = cp.execFile = () => { throw new Error('unexpected process'); };
+      syncBuiltinESMExports(); register(${JSON.stringify(pathToFileURL(loader).href)});`);
+    if (lockBusy) mkdirSync(join(dir, 'open-pr-submit.lock'));
+    try {
+      const child = spawnSync(process.execPath, ['--import', preload, cli, `--repo=${dir}`,
+        '--ref=lane/published-fixture', '--title=fix: published fixture', '--body=Prepared fixture description.',
+        '--park=review:pending', '--json', ...(skipPush ? [skipFlag] : []),
+        ...(check ? ['--check'] : []), ...(dryRun ? ['--dry-run'] : [])], {
+        cwd: dir, encoding: 'utf8', timeout: 30_000, maxBuffer: 2 * 1024 * 1024,
+        env: { PATH: process.env.PATH, HOME: dir, TMPDIR: dir, WE_COORDINATION_ROOT: dir,
+          WE_POLICY_CASCADE_LOG: '0', WE_REVIEW_LEDGER_MODE: 'off' },
+      });
+      expect(child.error, child.stderr).toBeUndefined();
+      expect(child.signal, child.stderr).toBeNull();
+      const effects = readFileSync(trace, 'utf8').trim().split('\n').map(JSON.parse);
+      return { status: child.status, result: JSON.parse(child.stdout.trim()), effects,
+        pushes: effects.filter(([cmd, args]) => cmd === 'git' && args[0] === 'push'),
+        writes: effects.filter(([cmd]) => ['create', 'add-label', 'edit-body', 'remove-label', 'ensure-label'].includes(cmd)) };
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+
+  it.each([false, true])('matching published head creates or reuses exactly once without push (existing=%s)', existing => {
+    const { status, result, pushes, writes, effects } = runPublished({ existing });
+    expect(status).toBe(0); expect(result).toMatchObject({ reason: 'parked', pr: 7 });
+    expect(pushes).toEqual([]);
+    expect(writes.filter(([cmd]) => cmd === 'create')).toHaveLength(existing ? 0 : 1);
+    expect(effects.filter(([cmd]) => cmd === 'audit').length).toBeGreaterThan(1);
+    expect(effects.some(([cmd, args]) => cmd === 'git' && args[0] === 'ls-remote')).toBe(true);
+  });
+  it('skip-push mismatched existing remote ref refuses before PR writes', () => {
+    const { status, result, pushes, writes } = runPublished({ remote: 'mismatch' });
+    expect(status).toBe(3); expect(result).toMatchObject({ reason: 'pr-head-mismatch' });
+    expect(result.detail).toContain('remote-ref-mismatch'); expect(pushes).toEqual([]); expect(writes).toEqual([]);
+  });
+  it('skip-push unreadable authoritative remote ref refuses before PR writes', () => {
+    const { status, result, pushes, writes } = runPublished({ remote: 'unreadable' });
+    expect(status).toBe(3); expect(result.detail).toContain('remote-ref-unreadable');
+    expect(pushes).toEqual([]); expect(writes).toEqual([]);
+  });
+  it('missing remote ref refuses without create', () => {
+    const { status, result, pushes, writes } = runPublished({ remote: 'missing' });
+    expect(status).toBe(3); expect(result.detail).toContain('remote-ref-missing');
+    expect(pushes).toEqual([]); expect(writes).toEqual([]);
+  });
+  it.each(['malformed', 'ambiguous', 'wrong-ref', 'oversized', 'timeout'])('refuses %s remote evidence without writes', remote => {
+    const { status, result, pushes, writes } = runPublished({ remote });
+    expect(status).toBe(3); expect(result.detail).toMatch(/remote-ref-/);
+    expect(result.detail).toMatch(/retry|rerun|human|inspect/i);
+    expect(pushes).toEqual([]); expect(writes).toEqual([]);
+  });
+  it('moved remote head refuses after create', () => {
+    const { status, result, pushes, writes } = runPublished({ remote: 'moved-after-create' });
+    expect(status).toBe(3); expect(result).toMatchObject({ reason: 'pr-head-mismatch', pr: 7, incomplete: true });
+    expect(result.detail).toContain('incomplete submission'); expect(pushes).toEqual([]);
+    expect(writes.map(([cmd]) => cmd)).toEqual(['create']);
+  });
+  it('default mode still pushes once', () => {
+    const { status, result, pushes } = runPublished({ skipPush: false });
+    expect(status).toBe(0); expect(result.reason).toBe('parked'); expect(pushes).toHaveLength(1);
+  });
+  it('failed default push stops before PR writes', () => {
+    const { status, result, pushes, writes } = runPublished({ skipPush: false, pushFails: true });
+    expect(status).toBe(3); expect(result.reason).toBe('push-failed'); expect(pushes).toHaveLength(1); expect(writes).toEqual([]);
+  });
+  it('skip push cannot skip canonical audit', () => {
+    const { status, result, pushes, writes } = runPublished({ audit: false });
+    expect(status).toBe(3); expect(result.reason).toBe('canonical-audit-missing'); expect(pushes).toEqual([]); expect(writes).toEqual([]);
+  });
+  it.each(['remote-moved', 'local-moved', 'claim-moved'])('rechecks %s evidence after size admission before PR writes', sizeChange => {
+    const { status, pushes, writes } = runPublished({ sizeChange });
+    expect(status).toBe(3); expect(pushes).toEqual([]); expect(writes).toEqual([]);
+  });
+  it.each(['throws', 'ambiguous'])('refuses %s PR lookup without falling through to create', lookup => {
+    const { status, pushes, writes } = runPublished({ lookup });
+    expect(status).toBe(3); expect(pushes).toEqual([]); expect(writes).toEqual([]);
+  });
+  it('refuses a mismatching reused PR head before PR writes', () => {
+    const { status, pushes, writes } = runPublished({ existing: true, reviewHead: 'different' });
+    expect(status).toBe(3); expect(pushes).toEqual([]); expect(writes).toEqual([]);
+  });
+  it('refuses a busy submission lock with inspect guidance', () => {
+    const { status, result, pushes, writes } = runPublished({ lockBusy: true });
+    expect(status).toBe(3); expect(result.detail).toMatch(/lock.*inspect/i); expect(pushes).toEqual([]); expect(writes).toEqual([]);
+  });
+  it.each([true, false])('check and dry-run still validate publication without writes (check=%s)', check => {
+    const { status, result, pushes, writes } = runPublished({ remote: 'mismatch', check, dryRun: !check });
+    expect(status).toBe(3); expect(result.detail).toContain('remote-ref-mismatch'); expect(pushes).toEqual([]); expect(writes).toEqual([]);
+  });
+  it.each(['--skip-push=false', '--skip-push=yes'])('refuses ambiguous flag %s', skipFlag => {
+    const { status, result, writes } = runPublished({ skipFlag });
+    expect(status).toBe(3); expect(result.reason).toBe('bad-ref'); expect(writes).toEqual([]);
+  });
+});
 
 describe('ready-on-open acquisition', () => {
   const headSha = 'a'.repeat(40);
