@@ -5,6 +5,7 @@ import { planReconcile } from '../../reconcile-core.mjs';
 import { buildStandDownComment } from '../../stand-down.mjs';
 import { buildOperatorAnswer, NO_CODE_REARM_RECEIPT } from '../../stand-down-answer-core.mjs';
 import { REARM_COMMENT_MARKER } from '../../rearm-review.mjs';
+import { runStandDownAnswer } from '../../stand-down-answer.mjs';
 
 export default {
   id: 'no-code-rearm-later-changes',
@@ -44,6 +45,33 @@ export default {
     }
     if (JSON.stringify(kinds(plan(['review:changes']))) !== JSON.stringify(['fix'])) violations.push('later changes verdict did not resume ordinary fix planning');
     if (JSON.stringify(kinds(plan(['review:changes'], 'b'.repeat(40)))) !== JSON.stringify(['fix'])) violations.push('changed head did not resume ordinary fix planning');
+    const headless = c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Legacy question' }));
+    const legacyThread = [verdict, comments[1], headless];
+    let posts = 0, refusal = null;
+    try {
+      runStandDownAnswer(['42', '--repo=no-code-rearm-fixture/example', '--reason=No code owed',
+        '--actor=chalbert', '--channel=chat', '--disposition=rearm-review', '--no-code-owed'], {
+        gh: args => {
+          if (args[1] === 'view') return JSON.stringify({ comments: legacyThread, headRefOid: head,
+            labels: [{ name: 'review:changes' }] });
+          posts++;
+          return '';
+        },
+      });
+    } catch (error) { refusal = error.message; }
+    if (posts !== 0 || !refusal?.includes('stand-down has no head')) violations.push('headless ceremony did not refuse before posting');
+    const legacyAnswer = comments[3];
+    for (const [cause, later, liveHead] of [
+      ['push', [], 'b'.repeat(40)], ['verdict', [verdict], head], ['claim', [comments[1]], head],
+    ]) {
+      comments.splice(0, comments.length, ...legacyThread, legacyAnswer, ...later);
+      for (const label of ['red-team:blocked', 'red-team:pending']) {
+        const result = plan(['review:changes', label], liveHead);
+        if (JSON.stringify(kinds(result)) !== JSON.stringify(['fix'])) violations.push(`headless ${cause}/${label}: ordinary fix did not resume`);
+        if (result.dispatch.some(d => d.operatorAnswer)) violations.push(`headless ${cause}/${label}: old ruling leaked into fixer payload`);
+        if (result.refusals.some(r => r.kind.startsWith('no-code-rearm'))) violations.push(`headless ${cause}/${label}: obsolete ruling still holds`);
+      }
+    }
     return { violations };
   },
   judge: report => report.violations,

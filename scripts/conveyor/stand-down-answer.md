@@ -81,6 +81,13 @@ job. The #3181 live ceremony and observation remain intentionally pending until 
 
 An explicit `--disposition=rearm-review --no-code-owed` ruling is executed mechanically: the conveyor takes a cross-checkout PR lock, reads the complete thread and fresh labels inside that exclusion, posts one durable receipt, and invokes the existing head-pinned rearm writer without launching a fixer. Only observed writer labels confirm success. A receipt spends the ruling even if the child crashes or cannot confirm. A later trusted changes verdict, fix-begin, or changed head retires that ruling and resumes ordinary planning; the old answer is never passed to a fixer.
 
+The no-code ceremony requires a readable head on the named stand-down, including replacement answers.
+For a legacy headless stand-down, record a new stand-down with the current head before answering it;
+the CLI refuses the unsupported answer before posting. Already-posted headless rulings remain held
+until superseded: later trusted verdicts or claims and removal of `review:changes` retire them.
+A changed head also retires them when the latest trusted claim (or the verdict if there is no claim)
+in the pre-answer window supplies the earlier head. That fallback never authorizes a rearm.
+
 If the original window still carries `review:changes`, a spent ruling requires an operator to inspect the failed handoff and post a replacement answer naming the same earlier stand-down. A held ruling has an explicit exit: clear the red-team hold, restore readable evidence, answer the newer unresolved stand-down, or post a replacement answer naming a stand-down with the current head. A lock with unknown ownership requires operator inspection; proven process death permits recovery, while a live holder has no expiry-based takeover. Planner branches that `continue` on a held state must document such an operator exit; superseded windows must fall through to ordinary planning.
 
 After inspecting a receipted failure, invoke the same `--disposition=rearm-review --no-code-owed`

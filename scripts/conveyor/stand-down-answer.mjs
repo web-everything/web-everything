@@ -11,7 +11,8 @@ function requireNoCodeHead(snapshot, target) {
   const live = String(snapshot.headRefOid ?? '').toLowerCase();
   const named = namedStandDownHead(target);
   if (named && !live.startsWith(named)) throw new Error('rearm-review --no-code-owed refused: head moved since the stand-down');
-  if (!/^[0-9a-f]{40}$/.test(live)) throw new Error('rearm-review --no-code-owed refused: live head is not a 40-hex SHA');
+  if (live.length !== 40 || !/^[0-9a-f]{40}$/.test(live)) throw new Error('rearm-review --no-code-owed refused: live head is not a 40-hex SHA');
+  if (!named) throw new Error('rearm-review --no-code-owed refused: stand-down has no head; record a new stand-down with the current head');
 }
 
 function failedNoCodeStandDownToRearm(snapshot, noCodeOwed) {

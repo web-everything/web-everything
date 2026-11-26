@@ -52,6 +52,27 @@ describe('no-code rearm predicate', () => {
     const unheaded = c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }));
     expect(predicate({ comments: [verdict, begin, unheaded, answer] })).toMatchObject({ state: 'held', why: 'stand-down has no head; a fresh answer is needed' });
   });
+  it.each([begin, verdict])('an untrusted later marker cannot retire a headless ruling: $id', marker => {
+    const headless = c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Legacy question' }));
+    expect(predicate({ comments: [verdict, begin, headless, answer,
+      { ...marker, author: { login: 'outsider' } }] }).state).toBe('held');
+  });
+  it('holds a headless ruling without trusted prior head evidence instead of inferring a push', () => {
+    const headless = c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Legacy question' }));
+    expect(predicate({ headRefOid: 'b'.repeat(40), comments: [
+      { ...verdict, author: { login: 'outsider' } }, { ...begin, author: { login: 'outsider' } },
+      headless, answer] }).state).toBe('held');
+  });
+  it.each([
+    ['verdict-only fallback', [verdict], 'b'.repeat(40), 'none'],
+    ['latest claim overrides an older verdict', [verdict, { ...begin, body: begin.body.replace(HEAD, 'b'.repeat(40)) }], 'b'.repeat(40), 'held'],
+    ['latest claim overrides an older claim', [begin, { ...begin, body: begin.body.replace(HEAD, 'b'.repeat(40)) }], 'b'.repeat(40), 'held'],
+    ['uppercase abbreviated claim on same head', [{ ...begin, body: begin.body.replace(HEAD, HEAD.slice(0, 9).toUpperCase()) }], HEAD, 'held'],
+    ['uppercase abbreviated claim after push', [{ ...begin, body: begin.body.replace(HEAD, HEAD.slice(0, 9).toUpperCase()) }], 'b'.repeat(40), 'none'],
+  ])('headless retirement uses trusted window evidence: %s', (_, before, headRefOid, state) => {
+    const headless = c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Legacy question' }));
+    expect(predicate({ comments: [...before, headless, answer], headRefOid }).state).toBe(state);
+  });
   it.each([REARM_COMMENT_MARKER, NO_CHANGE_COMMENT_MARKER])('legacy marker spends ruling: %s', marker => expect(predicate({ comments: [...comments, c('legacy', marker)] }).state).toBe('spent'));
   it('trusted receipt spends the answer even if the head moved', () => {
     const moved = c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?', head: 'b'.repeat(40) }));
@@ -89,6 +110,52 @@ describe('no-code rearm predicate', () => {
 });
 
 describe('no-code rearm planning', () => {
+  it('ceremony refuses a live head with a trailing newline before posting', () => {
+    let writes = 0;
+    expect(() => runStandDownAnswer(['42', '--repo=web-everything/web-everything', '--reason=No code owed',
+      '--actor=chalbert', '--channel=chat', '--disposition=rearm-review', '--no-code-owed'], {
+      gh: args => {
+        if (args[1] === 'view') return JSON.stringify({ comments: comments.slice(0, -1),
+          labels: [{ name: 'review:changes' }], headRefOid: HEAD + '\n' });
+        writes++;
+      },
+    })).toThrow(/live head is not a 40-hex SHA/);
+    expect(writes).toBe(0);
+  });
+  it.each([false, true])('ceremony refuses a headless stand-down before posting (replacement: %s)', replacement => {
+    const headless = { ...c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Legacy question' })),
+      createdAt: '2026-01-02T00:00:00Z' };
+    const ordinary = c('ordinary', core.buildOperatorAnswer({ standDownId: 'stop', actor: 'chalbert', channel: 'chat', reason: 'Inspect it' }), 'chalbert');
+    const thread = [verdict, begin, headless, ...(replacement ? [ordinary] : [])];
+    let writes = 0;
+    expect(() => runStandDownAnswer(['42', '--repo=web-everything/web-everything', '--reason=No code owed',
+      '--actor=chalbert', '--channel=chat', '--disposition=rearm-review', '--no-code-owed'], {
+      gh: args => {
+        if (args[1] === 'view') return JSON.stringify({ comments: thread, headRefOid: HEAD,
+          labels: [{ name: 'review:changes' }, { name: 'status:answered-waiting-fixer' }],
+          commits: [{ oid: HEAD, committedDate: '2026-01-01T00:00:00Z' }] });
+        writes++;
+      },
+    })).toThrow(/stand-down has no head/);
+    expect(writes).toBe(0);
+  });
+  it.each([
+    { cause: 'changed head', later: [], headRefOid: 'b'.repeat(40), labels: ['review:changes'] },
+    { cause: 'later verdict', later: [verdict], headRefOid: HEAD, labels: ['review:changes'] },
+    { cause: 'later claim', later: [begin], headRefOid: HEAD, labels: ['review:changes'] },
+    { cause: 'removed changes label', later: [], headRefOid: HEAD, labels: ['review:pending'] },
+  ])('retires a persisted headless ruling after $cause without passing it to a fixer', ({ later, headRefOid, labels }) => {
+    const headless = c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Legacy question' }));
+    const thread = [verdict, begin, headless, answer, ...later];
+    expect(predicate({ comments: thread, headRefOid, labels }).state).toBe('none');
+    const result = plan(thread, { headRefOid, labels });
+    expect(result.refusals.filter(r => r.kind.startsWith('no-code-rearm'))).toEqual([]);
+    expect(result.dispatch.some(d => d.kind === 'rearm-no-code')).toBe(false);
+    if (labels.includes('review:changes')) {
+      expect(result.dispatch.map(d => d.kind)).toEqual(['fix']);
+      expect(result.dispatch[0]).not.toHaveProperty('operatorAnswer');
+    }
+  });
   it.each(['red-team:blocked', 'red-team:pending'].flatMap(label => [
     { label, cause: 'changed head', thread: comments, headRefOid: 'b'.repeat(40) },
     { label, cause: 'later changes verdict', thread: [...comments, verdict], headRefOid: HEAD },
@@ -100,6 +167,7 @@ describe('no-code rearm planning', () => {
     expect(result.refusals.filter(r => r.kind.startsWith('no-code-rearm'))).toEqual([]);
     expect(result.dispatch.some(d => d.kind === 'rearm-no-code')).toBe(false);
     expect(result.dispatch.map(d => d.kind)).toEqual(['fix']);
+    expect(result.dispatch[0]).not.toHaveProperty('operatorAnswer');
   });
   it.each([7, 9, 39, 40])('ceremony and planner agree on an unchanged %i-character stand-down SHA', length => {
     const body = buildStandDownComment({ reason: 'needs-judgment', detail: 'Code owed?', head: HEAD.slice(0, length) });

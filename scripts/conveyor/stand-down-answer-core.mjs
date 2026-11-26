@@ -266,17 +266,21 @@ export function noCodeRearmPlan({ comments, labels, headRefOid } = {}) {
   if (!/^[\w=-]+$/.test(answerId) || /[\r\n]/.test(answerId)) return held('answer id unreadable');
   if (typeof headRefOid !== 'string' || headRefOid.length !== 40 || !/^[a-f0-9]{40}$/i.test(headRefOid)) return held('head unreadable');
   const ruledHead = standDownHead(comments[namedStandDownIndex(comments, answerAt, answer)].body);
-  if (!ruledHead) return held('stand-down has no head; a fresh answer is needed');
   if (!Array.isArray(labels) || !labels.every(l => typeof l === 'string')) return held('labels unreadable');
   if (!labels.includes('review:changes')) return result('none', 'review:changes is gone', answerId);
   // A ruling only owns its original window. Later work/verdicts and pushes retire it for
   // ordinary planning, while the executor still refuses every result except `ready`.
-  if (!headRefOid.toLowerCase().startsWith(ruledHead.toLowerCase())) return result('none', 'ruling superseded by a changed head', answerId);
+  // Legacy headless answers were admitted before the ceremony required a pinned head.
+  // Their latest trusted claim (or verdict) can retire them, never authorize a rearm.
+  const legacyWindow = ruledHead ? null : rearmWindow(comments.slice(0, answerAt));
+  const retirementHead = ruledHead ?? legacyWindow.claims?.at(-1) ?? legacyWindow.reviewedHead;
+  if (retirementHead && !headRefOid.toLowerCase().startsWith(retirementHead.toLowerCase())) return result('none', 'ruling superseded by a changed head', answerId);
   const after = comments.slice(answerAt + 1).filter(isTrustedMarkerAuthor);
   if (after.some(c => /^\s*🔒 conveyor fix-begin — fix claim held/.test(c.body)
     || /^\s*🔁\s+(?:human\s+)?review\s+[—-]\s+changes requested/i.test(c.body))) {
     return result('none', 'ruling superseded by a later fix claim or changes verdict', answerId);
   }
+  if (!ruledHead) return held('stand-down has no head; a fresh answer is needed');
   if (labels.some(l => ['red-team:blocked', 'red-team:pending'].includes(l))) return held('red-team hold stands');
   if (!noCodeRearmWindowHonours(comments.slice(0, answerAt), answer, headRefOid)) return held('answer does not clear the rearm window');
   if (comments.indexOf(latestUnresolvedStandDown(comments)) > answerAt) return held('unanswered stand-down after answer');
