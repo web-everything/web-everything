@@ -64,6 +64,8 @@ const pr = (extra = {}) => ({ number: 1, title: 'IO fixture', headRefOid: head,
   body: '<!-- authored-by-actor: author -->', createdAt: at, statusCheckRollup: [], commits: [], mergeable: 'MERGEABLE', ...extra });
 const options = (extra = {}) => {
   const opts = ({
+  env: {}, readFile: () => '{}', log: () => {},
+  cardReadable: () => false, shape: () => ({ humanRequired: false }),
   findSuspendedRuns: () => [],
   readExitRulings: () => ({ prs: new Set(), errors: [] }),
   checkoutState: () => ({ behind: 0 }),
@@ -509,7 +511,8 @@ it('shape child receives filenames unchanged as JSON stdin with bounded output a
     'with\u2028separator.md', '`backtick`.md', "quote'\".md", '$(shell).md', '--leading.md',
     '../parent.md', 'invisible\u200b.md', 'ｆullwidth.md', 'back\\slash.md'];
   exec.mockReturnValue('{"humanRequired":true}');
-  const facts = read({ gh: () => JSON.stringify([humanPr({ files: files.map(path => ({ path })), changedFiles: files.length })]) });
+  const facts = read({ shape: undefined,
+    gh: () => JSON.stringify([humanPr({ files: files.map(path => ({ path })), changedFiles: files.length })]) });
   expect(facts.humanRequired).toBe(true);
   expect(exec).toHaveBeenCalledTimes(1);
   const [bin, args, opts] = exec.mock.calls[0];
@@ -560,7 +563,7 @@ it('flags a ledger row that names the PR head but is malformed as unreadable evi
 
 // Evidence must never depend on how stale the caller's checkout is (R372).
 
-const goodPr = { number: 7, headSha: head, labels: [], evidenceErrors: [], minutesSinceUpdate: 5 };
+const goodPr = { mergeable: 'MERGEABLE', fixHoldLabel: 'hold:fix', number: 7, headSha: head, labels: [], evidenceErrors: [], minutesSinceUpdate: 5 };
 const freshFacts = { generatedAt: at, prs: [goodPr] };
 const staleOptions = extra => options({ gh: vi.fn(() => { throw new Error('stale checkout must not read locally'); }), ...extra });
 
@@ -1086,7 +1089,7 @@ it.each([[undefined], [null], ['UNKNOWN']])('an unknown or missing merge state i
   const row = read({ gh: () => JSON.stringify([pr({ mergeable, isDraft: false })]) });
   expect(row.mergeable).toBeNull();
   expect(row.evidenceErrors).toEqual([]);
-  expect(buildJudgeSweepBundle({ prs: [row] }).prs[0]).toMatchObject({ needsJudgment: false, nextOwner: 'nobody' });
+  expect(buildJudgeSweepBundle({ prs: [row] }).prs[0]).toMatchObject({ needsJudgment: false, nextOwner: 'operator' });
   expect(buildJudgeSweepBundle({ prs: [{ ...row, labels: ['review:human'],
     latestVerdict: { accepted: true }, redTeam: { state: 'clear' }, openReferrals: [], openSendBacks: [] }] }).prs[0])
     .toMatchObject({ needsJudgment: true, reason: 'clean-and-owed-approval' });

@@ -26,6 +26,9 @@ function existingJudgment(pr, thresholds = STALL_DEFAULTS) {
     && headAge > limits.needsHumanAgedHours * 60) return yes('needs-human-aged');
   if ((pr.isDraft === true || labels.includes('review-status:draft-withdrawn'))
     && headAge > limits.draftWithdrawnAgedHours * 60) return yes('draft-withdrawn-aged');
+  // Merge admission and operator acceptance end the repair episode, even if cap labels linger.
+  if (labels.includes('ready-to-merge')) return no('awaiting-merge');
+  if (labels.includes('review:accepted') && labels.includes('review:human')) return yes('awaiting-operator');
   const capHold = labels.some(l => /round-limit|cap-exhausted/.test(l));
   if (capHold || (Number.isInteger(pr.round) && Number.isInteger(pr.cap) && pr.round >= pr.cap)) return yes('at-cap');
   if (pr.redTeam?.latestOutcome === 'round-cap' && pr.redTeam.state === 'blocked'
@@ -34,8 +37,6 @@ function existingJudgment(pr, thresholds = STALL_DEFAULTS) {
   if (pr.fixerRunning) return no('fixer running');
   if (pr.inCi) return no('in CI');
   if (Number.isFinite(pr.minutesSinceFixLoop) && pr.minutesSinceFixLoop < 60) return no('fix-loop active (<60 min)');
-  if (labels.includes('ready-to-merge')) return no('awaiting-merge');
-  if (labels.includes('review:accepted') && labels.includes('review:human')) return yes('awaiting-operator');
   if (pr.fixerRunning === false && labels.some(l => ['status:answered-waiting-fixer', 'review:changes'].includes(l))
     && (pr.minutesSinceFixDispatch === null || (Number.isFinite(pr.minutesSinceFixDispatch)
       && pr.minutesSinceFixDispatch > limits.waitingFixerMinutes))) return yes('waiting-fixer-not-dispatched');

@@ -50,7 +50,7 @@ function fixture(overrides = {}) {
   const gh = vi.fn(() => JSON.stringify([pr()]));
   const readComments = vi.fn(() => []);
   const shape = vi.fn(() => ({ humanRequired: false }));
-  const options = { findSuspendedRuns: () => [], checkoutState: () => ({ behind: 0 }), gh, now: () => NOW, readLedgerRows: nearCapRows, readFixRows: () => [],
+  const options = { env: {}, readFile: () => '{}', log: () => {}, findSuspendedRuns: () => [], checkoutState: () => ({ behind: 0 }), gh, now: () => NOW, readLedgerRows: nearCapRows, readFixRows: () => [],
     readJobs: () => [], readComments, cache: memoryCache(), shape, baseCap: 5, cardReadable: () => false, ...overrides };
   const transport = options.gh;
   const readerOptions = { ...options, gh: args => {
@@ -72,10 +72,10 @@ describe('deterministic first-match judge classification', () => {
     ['finding-back-unfixed-more-than-once', { verdictHistory: [{ findings: [{ key: 'k' }] }, { findings: [{ key: 'k' }] }] }],
     ['clean-and-owed-approval', { labels: ['review:human'], latestVerdict: { accepted: true }, redTeam: { state: 'clear' } }],
     ['stalled>45min-no-owner', { minutesSinceUpdate: 46 }],
-    ['fixer running', { fixerRunning: true, round: 5 }],
-    ['fix-loop active (<60 min)', { minutesSinceFixLoop: 59, round: 5 }],
+    ['fixer running', { fixerRunning: true, round: 4 }],
+    ['fix-loop active (<60 min)', { minutesSinceFixLoop: 59, round: 4 }],
     ['waiting on review', { round: 4 }],
-    ['in CI', { inCi: true, round: 5 }],
+    ['in CI', { inCi: true, round: 4 }],
     ['in CI', { inCi: true }],
     ['waiting on review', {}],
   ])('%s', (reason, patch) => {
@@ -122,9 +122,9 @@ describe('deterministic first-match judge classification', () => {
       expect(needsJudgment(facts({ openReferrals }))).toEqual({ needsJudgment: false, reason: 'waiting on review' });
     }
   });
-  it('keeps at-cap PRs in CI out of judgment when evidence is readable and no referral awaits a ruling', () => {
+  it('requires judgment for at-cap PRs in CI even when evidence is readable and no referral awaits a ruling', () => {
     for (const patch of [{ round: 5 }, { labels: ['status:round-limit'] }]) {
-      expect(needsJudgment(facts({ ...patch, inCi: true }))).toEqual({ needsJudgment: false, reason: 'in CI' });
+      expect(needsJudgment(facts({ ...patch, inCi: true }))).toEqual({ needsJudgment: true, reason: 'at-cap' });
     }
   });
   it('builds one complete bundle with counts and no internal classifier inputs', () => {
@@ -955,4 +955,14 @@ describe('CONFLICT-OWNER-HARDEN cap routing', () => {
     expect(leaseStore.release).not.toHaveBeenCalled();
     expect(dispatch).not.toHaveBeenCalled();
   });
+});
+
+// Acceptance and merge admission end the repair episode; stale cap evidence must not reopen it.
+it.each(['ready-to-merge', 'operator-accepted'])('preserves %s ownership despite cap evidence', state => {
+  const labels = ['status:cap-exhausted', ...(state === 'ready-to-merge'
+    ? ['ready-to-merge'] : ['review:accepted', 'review:human'])];
+  const row = buildJudgeSweepBundle({ prs: [facts({ labels, round: 5 })] }).prs[0];
+  expect(row).toMatchObject(state === 'ready-to-merge'
+    ? { needsJudgment: false, reason: 'awaiting-merge', nextOwner: 'drain' }
+    : { needsJudgment: true, reason: 'awaiting-operator', nextOwner: 'judge' });
 });
