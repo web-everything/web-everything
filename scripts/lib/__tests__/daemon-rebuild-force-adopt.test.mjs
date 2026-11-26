@@ -122,6 +122,18 @@ function makeFixture() {
 
 const LOCK_OPTS = { waitMs: 2000, pollMs: 20 };
 
+// The setting is default-OFF with no env override and no production seam: the on path mocks the settings reader.
+const adoptFlag = vi.hoisted(() => ({ on: false }));
+vi.mock('../settings-files.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    readSettingsChecked: (o) => (adoptFlag.on && o?.namespace === 'rebuildAdoptNotWorse'
+      ? { value: { enabled: true }, taint: [], duplicates: [] } : actual.readSettingsChecked(o)),
+  };
+});
+afterEach(() => { adoptFlag.on = false; });
+
 beforeEach(() => {
   tempDirs.length = 0;
 });
@@ -135,7 +147,8 @@ afterEach(() => {
 
 const RULINGS = '## R508 — x\nOperator "Yes": adopt the build even though smoke failed for infra.\n';
 const QUOTE = 'adopt the build even though smoke failed for infra';
-const failing = () => vi.fn(async () => ({ verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'daemon-entries-boot', detail: 'boom', mayBeTransient: false }] } }));
+const TYPED_BOOT_FAILURE = { ok: false, name: 'daemon-entries-boot', detail: 'boom', mayBeTransient: false, entries: [{ entry: 'daemon.mjs', ok: false, kind: 'import failed', errorClass: 'TypeError: boom', rawError: 'TypeError: boom' }] };
+const failing = () => vi.fn(async () => ({ verdict: 'code', attempts: 1, smoke: { results: [TYPED_BOOT_FAILURE] } }));
 const headOf = (dir) => gitOk(dir, ['rev-parse', 'HEAD']).trim();
 const forceEnv = (env, base) => ({ ...env, WE_FORCE_ADOPT_HANDOFF: join(base, 'handoff.md'), WE_FORCE_ADOPT_CORONER: join(base, 'coroner.jsonl'), WE_DAEMON_EVENTS: join(base, 'events.jsonl') });
 
@@ -642,7 +655,8 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
     else if (kind === 'smoked') { successor = advanceMain(originDir, (dir) => writeFile(dir, 'scripts/lane-pool.mjs', '// pool\n')); extra = { runSmoke: passing() }; }
     else {
       successor = advanceMain(originDir, (dir) => writeFile(dir, 'scripts/lane-pool.mjs', '// pool\n'));
-      env = { ...env0 }; delete env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE; // the default: adopt a candidate failing only what last-good also fails
+      env = { ...env0 };
+      adoptFlag.on = true; // the on path (default-OFF, no env override, no production seam)
       extra = { runSmoke: failing() };
     }
     await tick(cloneDir, env, { ...extra, forceWatchProbe: healthy });
@@ -1164,9 +1178,9 @@ describe('R508 force-adopt: a force-adopted build stays unverified (never the in
   it('a build adopted as "no worse" over a failed smoke (harness-broken path, not a force) is likewise never the incremental-smoke baseline', async () => {
     const { base, originDir, cloneDir, env: env0 } = makeFixture();
     const env = forceEnv(env0, base);
-    delete env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE; // the default: adopt a candidate that fails only what last-good also fails
     const F = advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n'));
-    const failAll = vi.fn(async () => ({ verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'dispatch-dry-run', detail: 'F defect', mayBeTransient: false }] } }));
+    const failAll = vi.fn(async () => ({ verdict: 'code', attempts: 1, smoke: { results: [TYPED_BOOT_FAILURE] } }));
+    adoptFlag.on = true;
     const r = await tick(cloneDir, env, { runSmoke: failAll, forceWatchProbe: healthy });
     expect(r.reason).toBe('harness-broken-adopted-not-worse');
     expect(headOf(cloneDir)).toBe(F);

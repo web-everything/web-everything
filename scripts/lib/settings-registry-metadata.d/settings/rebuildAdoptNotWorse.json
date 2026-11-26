@@ -1,0 +1,6 @@
+{
+  "description": "Rebuild adopts a failed-smoke candidate when last-good fails the same check; default off (hold on last-good).",
+  "owner": "scripts/settings/rebuild-adopt-not-worse.json",
+  "changeVia": "pr",
+  "instant": false
+}
