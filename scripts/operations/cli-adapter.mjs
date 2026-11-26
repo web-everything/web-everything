@@ -64,7 +64,7 @@ import { assertNoForbiddenArgv, EFFORT_LEVELS, judgeSpawn } from '../lib/judge-s
 // `requireAllProperties` from `jury-core.mjs` here and broke all three of those tests with
 // `ERR_MODULE_NOT_FOUND: markdown-it` — a real, live-caught regression, not a hypothetical one; see
 // `codex-judge-spawn.mjs`'s own header for the full account. Do not re-introduce that edge.
-import { codexJudgeSpawn, requireAllProperties, resolveRaiseOnlyJudgeRoute, assertCodexFindings, CodexInvalidFindingsError } from '../lib/codex-judge-spawn.mjs';
+import { codexJudgeSpawn, requireAllProperties, resolveRaiseOnlyJudgeRoute, validateSeatAnswer, assertCodexFindings, CodexInvalidFindingsError } from '../lib/codex-judge-spawn.mjs';
 // #3383 probation — the ratified Codex model pin (`#x8wbivt`), a leaf constant with no jury/markdown-it edge
 // (same safety property `codex-judge-spawn.mjs`'s own header discusses for this file). Needed so the
 // advisory judge seat's `{provider, model}` identity is a STAMPABLE fact rather than whatever `codex exec`
@@ -1226,6 +1226,9 @@ export async function driveRun({
         }
       }
       const { value, telemetry } = unwrapJudgeOutcome(returned);
+      // All seat routes converge here: fresh providers, fallbacks, skip answers, batches and saved seats.
+      // Validate before committing anything the verdict reducer can consume; invalid means retry the seat.
+      validateSeatAnswer(value, current.pending.request.shape);
       current = advance(current, {
         registry,
         resume: { step: current.pending.step, value, ...(telemetry ? { telemetry } : {}) },

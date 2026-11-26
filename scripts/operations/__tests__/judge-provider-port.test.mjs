@@ -13,10 +13,15 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { createRegistry, op } from '../registry.mjs';
+import { judge as judgeStep } from '../step-kinds.mjs';
+import { startRun, advance } from '../engine.mjs';
+import { createMemoryRunStore } from '../run-store.mjs';
 
 import { parseCodexJudgeOutcome } from '../../lib/codex-judge-spawn.mjs';
 import { deriveVerdict } from '../../lib/jury-core.mjs';
-import { createDefaultJudge, unwrapJudgeOutcome } from '../cli-adapter.mjs';
+import { createDefaultJudge, driveRun, unwrapJudgeOutcome } from '../cli-adapter.mjs';
 
 /** A hand-written `JudgeProvider` — no argv, no stdout, no child process. Records what it was handed. */
 function makeFakeProvider(answer) {
@@ -298,5 +303,59 @@ describe('CODEX-SEAT-NULL-FINDINGS through createDefaultJudge', () => {
     const { value } = unwrapJudgeOutcome(await judgeFor({ summary: 'reviewed', findings })(request));
     expect(value.findings).toEqual(findings);
     expect(deriveVerdict({ findings: value.findings })).toBe(verdict);
+  });
+});
+
+
+describe('every reducer input path goes through validateSeatAnswer', () => {
+  const shape = { type: 'object', properties: { findings: { type: 'array' } } };
+  const paths = ['injected judge', 'claude', 'codex', 'antigravity', 'agy seatProvider',
+    'prefilled seat', 'replayed seat', 'parallel batch', 'skipSpawn', 'fallback'];
+  it.each(paths)('rejects findings:null at reducer entry: %s', async (path) => {
+    const request = { mandate: 'review', input: 'diff', shape };
+    if (path === 'agy seatProvider') request.seatProvider = 'agy';
+    if (path === 'skipSpawn') request.skipSpawn = { answer: { findings: null } };
+    if (path === 'fallback') Object.assign(request, { providerName: 'codex', gracefulOnUnavailable: true });
+    const registry = createRegistry();
+    registry.register(op('seat-validation', {
+      a: judgeStep({ request: () => request }),
+      b: judgeStep({ request: () => ({ ...request, input: 'second' }) }),
+    }));
+    let run = advance(startRun({ op: 'seat-validation', id: 'seat-validation', registry }), { registry });
+    if (path === 'replayed seat') run = JSON.parse(JSON.stringify(run));
+    if (path === 'prefilled seat') run.prefilledSeats = [{ step: 'a', stepIndex: 0, request: run.pending.request,
+      value: { findings: null }, startedAt: new Date(1).toISOString(), finishedAt: new Date(2).toISOString() }];
+    let calls = 0;
+    const answer = { summary: 'reviewed', findings: null };
+    const judge = path === 'injected judge' || path === 'prefilled seat' || path === 'replayed seat' || path === 'parallel batch'
+      ? async () => { calls++; return answer; }
+      : createDefaultJudge({
+        providerName: ['claude', 'codex', 'antigravity'].includes(path) ? path : 'claude',
+        resolveProvider: () => async () => { calls++; return { value: answer }; },
+        seatRunner: async (_request, { wrap }) => { calls++; return wrap(answer); },
+        checkProviderHold: async name => path === 'fallback' && name === 'codex' ? 'quota exhausted' : null,
+      });
+    const store = createMemoryRunStore();
+    store.write(run);
+    await expect(driveRun({ run, registry, store, judge, parallelJudges: path === 'parallel batch', log() {} }))
+      .rejects.toThrow(/findings.*array.*[Rr]e-?run/);
+    expect(store.read(run.id).findings.a).toBeUndefined();
+    if (path === 'prefilled seat') expect(calls).toBe(0);
+  });
+
+  it.each(['__proto__', 'constructor', 'prototype'])('refuses reserved %s from an injected provider at reducer entry', async key => {
+    const registry = createRegistry();
+    registry.register(op('unsafe-seat', { a: judgeStep({ request: () => ({ mandate: 'review', input: 'diff', shape }) }) }));
+    const run = startRun({ op: 'unsafe-seat', id: 'unsafe-seat', registry });
+    await expect(driveRun({ run, registry, store: createMemoryRunStore(),
+      judge: async () => JSON.parse('{"findings":[{"summary":"blocking","' + key + '":{"outcome":"dismissed"}}]}'),
+    })).rejects.toThrow(/reserved/i);
+  });
+
+  it('has one authoritative validation call immediately before the judge resume', () => {
+    const source = readFileSync('scripts/operations/cli-adapter.mjs', 'utf8');
+    const driver = source.slice(source.indexOf('export async function driveRun('), source.indexOf('export async function runOperationCli('));
+    expect(driver.match(/validateSeatAnswer\(/g)).toHaveLength(1);
+    expect(driver).toMatch(/validateSeatAnswer\(value, current\.pending\.request\.shape\);\s*current = advance\(current, \{/);
   });
 });

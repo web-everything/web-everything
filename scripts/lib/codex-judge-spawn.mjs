@@ -267,8 +267,9 @@ export function requireAllProperties(schema) {
 export function stripNulls(value) {
   if (Array.isArray(value)) return value.map(stripNulls);
   if (value === null || typeof value !== 'object') return value;
-  const out = {};
+  const out = Object.create(null);
   for (const [k, v] of Object.entries(value)) {
+    assertSeatKey(k);
     if (v === null) continue;
     out[k] = stripNulls(v);
   }
@@ -283,16 +284,39 @@ export class CodexInvalidFindingsError extends Error {
   }
 }
 
-/** Only findings-bearing schemas require a list; synthesis and other judge shapes remain valid. */
-export function assertCodexFindings(value, shape) {
+/** Reserved JSON keys must never become inherited finding fields during normalization. */
+function assertSeatKey(key) {
+  if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+    throw new Error(`judge seat: reserved key ${key} in the answer. Re-run the review.`);
+  }
+}
+
+function assertSeatObjectKeys(value) {
+  if (!value || typeof value !== 'object') return;
+  for (const [key, child] of Object.entries(value)) {
+    assertSeatKey(key);
+    assertSeatObjectKeys(child);
+  }
+}
+
+/**
+ * Reducer-entry authority for every seat producer, including persisted and injected answers.
+ * Only findings-bearing schemas require a list; synthesis and other judge shapes remain valid.
+ * Reject reserved keys before finding normalization (which copies only known finding keys).
+ */
+export function validateSeatAnswer(value, shape) {
+  assertSeatObjectKeys(value);
   if (!Object.hasOwn(shape?.properties ?? {}, 'findings')) return;
   if (!value || typeof value !== 'object' || Array.isArray(value)
-    || !Array.isArray(value.findings)
+    || !Object.hasOwn(value, 'findings') || !Array.isArray(value.findings)
     || value.findings.some((finding) => !finding || typeof finding !== 'object' || Array.isArray(finding)
-      || typeof finding.summary !== 'string' || !finding.summary.trim())) {
+      || !Object.hasOwn(finding, 'summary') || typeof finding.summary !== 'string' || !finding.summary.trim())) {
     throw new CodexInvalidFindingsError();
   }
 }
+
+// Compatibility for provider-side callers; they use the same validator as reducer entry.
+export const assertCodexFindings = validateSeatAnswer;
 
 /** The CLI this provider runs as. Named once, exactly like `judge-spawn.mjs`'s `JUDGE_CLI`. */
 export const CODEX_CLI = 'codex';

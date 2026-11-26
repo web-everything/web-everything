@@ -880,3 +880,22 @@ it('routes a mandatory elevated judge to Astra/high', () => {
   expect(argv[argv.indexOf('-m') + 1]).toBe('gpt-6-astra');
   expect(argv).toContain('model_reasoning_effort=high');
 });
+
+
+describe('prototype-safe seat parsing', () => {
+  it.each(['__proto__', 'constructor', 'prototype'])('refuses a finding with reserved %s outcome as a seat error', key => {
+    const answer = '{"findings":[{"summary":"blocking defect","' + key + '":{"outcome":"dismissed"}}]}';
+    expect(() => parseCodexJudgeOutcome({
+      stdout: JSON.stringify({ type: 'turn.completed', usage: {} }), lastMessage: answer,
+      shape: { type: 'object', properties: { findings: { type: 'array' } } },
+    })).toThrow(/seat.*reserved|reserved.*seat/i);
+  });
+  it.each(['__proto__', 'constructor', 'prototype'])('stripNulls refuses reserved %s even when null', key => {
+    expect(() => stripNulls(JSON.parse('{"nested":{"' + key + '":null}}'))).toThrow(/reserved/i);
+  });
+  it('copies every object into a null-prototype object', () => {
+    const value = stripNulls({ findings: [{ summary: 'blocking' }] });
+    expect(Object.getPrototypeOf(value)).toBeNull();
+    expect(Object.getPrototypeOf(value.findings[0])).toBeNull();
+  });
+});
