@@ -1062,7 +1062,7 @@ export async function runLiveSmoke({
           || isEnvTimeoutRow(r) || (r.mayBeTransient && isTransientDetail(r.detail)));
       const completedAt = clock();
       results.push({ name: check.name, ms: completedAt - startedAt, ...result, completedAt,
-        ...(budgetInterrupted ? { budgetInterrupted: true } : {}), mayBeTransient: check.mayBeTransient !== false });
+        budgetInterrupted: budgetInterrupted ? true : undefined, mayBeTransient: check.mayBeTransient !== false });
       // Both external probes have completed before the expensive tree checks begin. Budgets are a fresh
       // per-run object from resolveSmokeBudgets; explicit operator timeouts remain absolute.
       if (check.name === 'gh-pr-list' && env.WE_SMOKE_GH_LATENCY_SCALE !== '0') {
@@ -1240,7 +1240,13 @@ export async function runLiveSmokeWithRetry({
     }
     // ENVIRONMENT TIMEOUT (live 2026-09-26 22:37Z) — see {@link isEnvTimeoutFailureSet}. Retry ONCE with every
     // budget widened; still timing out → `'env-timeout'` (held, never a reject record, never an overlay suspect).
-    if (verdict === 'code' && isEnvTimeoutFailureSet(smoke.results, { minElapsedMs })) {
+    // Prior qualifying timeouts explain a retry consumed entirely by gate-observed refusals.
+    // Require a skip as well: transient noise alone is not new timeout evidence.
+    const failures = smoke.results.filter((r) => !r.ok);
+    const budgetOnlyRetry = envTimeout && failures.some((r) => r.budgetInterrupted === true)
+      && failures.every((r) => r.budgetInterrupted === true
+        || (r.mayBeTransient !== false && isTransientDetail(r.detail)));
+    if (verdict === 'code' && (isEnvTimeoutFailureSet(smoke.results, { minElapsedMs }) || budgetOnlyRetry)) {
       const rows = smoke.results.filter((r) => !r.ok).map((r) => ({ name: r.name, ms: r.ms, detail: r.detail }));
       if (!envTimeout) {
         const factor = envMs(env, SMOKE_ENV_TIMEOUT_BUDGET_FACTOR_ENV, DEFAULT_ENV_TIMEOUT_BUDGET_FACTOR);
@@ -1389,11 +1395,12 @@ export function isEnvTimeoutRow(row, { minElapsedMs = DEFAULT_ENV_TIMEOUT_MIN_EL
 }
 
 /** PURE: is this a failure set the environment explains — at least one {@link isEnvTimeoutRow}, and every other
- *  failure is ordinary transient noise from a check allowed to be transient? One code-shaped row ⇒ false. */
+ *  failure is allowed transient noise or a gate-flagged budget refusal? One code-shaped row ⇒ false. */
 export function isEnvTimeoutFailureSet(results, opts = {}) {
   const failures = (Array.isArray(results) ? results : []).filter((r) => !r.ok);
   if (!failures.some((r) => isEnvTimeoutRow(r, opts))) return false;
-  return failures.every((r) => isEnvTimeoutRow(r, opts) || (r.mayBeTransient !== false && isTransientDetail(r.detail)));
+  return failures.every((r) => r.budgetInterrupted === true || isEnvTimeoutRow(r, opts)
+    || (r.mayBeTransient !== false && isTransientDetail(r.detail)));
 }
 
 /** A COPY of `env` with every smoke budget, and lane-pool's own scan budget, multiplied by `factor`. The

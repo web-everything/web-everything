@@ -1,12 +1,14 @@
 /** @file scripts/lib/__tests__/daemon-rebuild-recovery.test.mjs — Persisted environment-timeout retry boundaries. */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { prepareRebuild } from '../daemon-rebuild/prepare.mjs';
-import { smokeAndAdopt } from '../daemon-rebuild/smoke.mjs';
-import { readRebuildState, writeRebuildState, readReadyCandidate } from '../daemon-rebuild/state.mjs';
+import { runLiveSmokeWithRetry, DISPATCH_DRY_RUN_SCRIPT } from '../daemon-live-smoke.mjs';
+import { CONSTELLATION_REPOS } from '../constellation-repos.mjs';
+import { smokeAndAdopt, budgetedRunChild } from '../daemon-rebuild/smoke.mjs';
+import { readRebuildState, writeRebuildState, readReadyCandidate, alertsFilePath } from '../daemon-rebuild/state.mjs';
 import { envTimeoutRetry, envTimeoutAppliesToPlan, recoveryDue, timeoutRetryAt, resolveRecovery, MAX_OVERLAY_OVERDUE_MS } from '../daemon-rebuild/recovery.mjs';
 import { rebuildClone } from '../daemon-rebuild/rebuild.mjs';
 import { rebuildCloneAsJob, REBUILD_JOB_KIND, RESULT_SUFFIX } from '../daemon-rebuild/rebuild-job.mjs';
@@ -296,5 +298,64 @@ describe('recovery setting retention bound', () => {
     expect(resolved.overlayOverdueMs).toBe(value);
     expect(recoveryDue({ state: {}, pending: [{ at: at(0) }], nowMs: value - 1, settings: resolved })).toBe(false);
     expect(recoveryDue({ state: {}, pending: [{ at: at(0) }], nowMs: value, settings: resolved })).toBe(true);
+  });
+});
+
+
+describe('SMOKE-ENVTIMEOUT-BUDGET recovery', () => {
+  it('env-timeout after budget exhaustion keeps last-good, writes no rejection, backs off, then retries', async () => {
+    const f = fixture(null);
+    f.env.WE_DAEMON_RECOVERY_ENV_TIMEOUT_BASE_MS = '600000';
+    f.env.WE_DAEMON_RECOVERY_ENV_TIMEOUT_MAX_MS = '2400000';
+    vi.spyOn(locks, 'withWriteLock').mockImplementation(async (_root, fn) => ({ ok: true, value: await fn() }));
+    vi.spyOn(candidate, 'materializeCandidate').mockReturnValue({ ok: true, path: f.root });
+    vi.spyOn(candidate, 'removeCandidate').mockImplementation(() => {});
+    const before = readRebuildState(f.root, f.env);
+    const runSmoke = vi.fn(async () => {
+      let t = 0;
+      return runLiveSmokeWithRetry({ root: f.root, env: { WE_SMOKE_LOAD_SCALE: '0', WE_SMOKE_BUSY_LOAD_RATIO: '1e9',
+        WE_SMOKE_RECONCILE_MS: '300000', WE_SMOKE_GH_ENV_PROBE: '0' }, clock: () => t,
+        refreshAuth: async ({ env }) => ({ env }), sleep: async () => {}, retries: 0,
+        runChild: budgetedRunChild({ deadline: 1700000, now: () => t, runChild: async (cmd, args, opts) => {
+          if (args[0] === 'scripts/conveyor/reconcile-pass.mjs' && args.includes(`--repo=${CONSTELLATION_REPOS.we.slug}`)) {
+            t += opts.timeoutMs;
+            throw new Error(`timed out after ${opts.timeoutMs}ms (process group killed)`);
+          }
+          if (args[2] === DISPATCH_DRY_RUN_SCRIPT) {
+            t += opts.timeoutMs;
+            throw new Error(`timed out after ${opts.timeoutMs}ms (process group killed)`);
+          }
+          if (cmd === 'node' && args[0] === '--input-type=module') return String(args[2]).includes('daemon-boot-smoke:entry-boot')
+            ? '{"ok":true}' : '[{"kind":"stub","ok":true}]';
+          return args[1] === 'list' ? '[]' : args[1] === 'acquire' ? '{"lane":1}' : '';
+        } }) });
+    });
+    const child = nowMs => rebuildClone({ root: f.root, env: f.env, run: f.run, log: { error() {} },
+      now: () => nowMs, readyOnly: true, asJob: false, mainOnly: true, versions: null, runSmoke,
+      dispatchSmoke: { settings: { dispatchSmoke: 'off' }, run() {}, match: () => false } });
+    expect((await child(1000)).reason).toBe('smoke-env-timeout');
+    const smokeResult = await runSmoke.mock.results[0].value;
+    expect(smokeResult).toMatchObject({ verdict: 'env-timeout', attempts: 2 });
+    expect(smokeResult.smoke.results.find(row => row.name === 'tree-stays-clean').budgetInterrupted).toBe(true);
+    const state = readRebuildState(f.root, f.env);
+    expect(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: f.root, encoding: 'utf8' }).trim()).toBe(f.head);
+    expect(state.adopted).toEqual(before.adopted);
+    expect(state.rejected).toEqual(before.rejected);
+    expect(state.held).toMatchObject({ reason: 'smoke-env-timeout', retryAt: at(601000) });
+    const alerts = readFileSync(alertsFilePath(f.root, f.env), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(alerts.some(row => row.kind === 'smoke-env-timeout')).toBe(true);
+    expect(alerts.some(row => row.kind === 'smoke-rejected')).toBe(false);
+    expect((await child(600999)).reason).toBe('smoke-env-timeout-backoff');
+    expect(runSmoke).toHaveBeenCalledTimes(1);
+    expect((await child(601000)).reason).toBe('smoke-env-timeout');
+    expect(runSmoke).toHaveBeenCalledTimes(2);
+  });
+
+  it('an existing sticky rejection for the same inputsKey still blocks the build', async () => {
+    const f = fixture(null);
+    const rejected = { inputsKey: f.plan.inputsKey, target: f.plan.finalSha, reason: 'real code failure' };
+    writeRebuildState(f.root, { rejected }, f.env);
+    expect(await f.prepare(1000)).toMatchObject({ terminal: true, result: { reason: 'still-rejected' } });
+    expect(readRebuildState(f.root, f.env).rejected).toEqual(rejected);
   });
 });
