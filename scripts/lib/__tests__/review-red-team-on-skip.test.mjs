@@ -20,7 +20,7 @@ import { publishRedTeamCheckFromLive, evaluateRedTeamCheckFact, clearLivePublica
 import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
 import { RESUME_MAX_ATTEMPTS, refusedReferralsAreRuled, reviewRunEvidence } from '../../conveyor/review-referral-hold.mjs';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -3187,4 +3187,122 @@ it('a recovered result check settles the next pass without a recovery seat', () 
   expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'red-team result already on head' });
   expect(o.publishCheck).toHaveBeenCalledTimes(1);
   expect(o.dispatch).not.toHaveBeenCalled();
+});
+
+
+import { appliedSwapFixture } from '../../conveyor/soak/fixtures/applied-swap-recovery.mjs';
+import * as recoveryLabels from '../review-red-team-on-skip.mjs';
+
+describe('applied swap recovery decisions and real job admission', () => {
+  const check = fn => { const f = appliedSwapFixture(); try { return fn(f); } finally { f.close(); } };
+  it('dead owner behind an applied record label swap redispatches fresh', () => check(f => {
+    expect(f.decide()).toMatchObject({ action: 'dispatch', mode: 'fresh', staleRecovery: true, why: 'dead owner recovery' });
+  }));
+  it.each([
+    ['alive matching birth', { isAlive: () => true, readPidStart: () => 'dead-birth' }],
+    ['unknown PID probe', { isAlive: () => { throw Error('unreadable'); } }],
+    ['foreign owner proven only by age', { host: 'other-host', isAlive: () => undefined }],
+    ['foreign namespace', { namespace: 'other-namespace', isAlive: () => false }],
+  ])('holds %s behind an applied swap', (_name, probe) => check(f => {
+    expect(f.decide({ recoveryOptions: { now: f.now, deadlineMs: 7200000, probe: { ...f.probe, ...probe } } }).action).toBe('skip');
+  }));
+  it('fresh label probe bypasses memoization, bounds IO and is called per decision', () => check(f => {
+    const run = vi.fn((args, options) => {
+      expect(args).toEqual(['pr', 'view', String(f.key.pr), '--repo', f.key.repo, '--json', 'labels']);
+      expect(options).toMatchObject({ noMemo: true, timeout: 30000, encoding: 'utf8', maxBuffer: 1024 * 1024 });
+      return JSON.stringify({ labels: [{ name: 'review:accepted' }] });
+    });
+    const readLiveLabels = recoveryLabels.createRecoveryLabelProbe({ env: f.key.env, run });
+    const readWitness = () => f.witness({ readLiveLabels });
+    expect(f.decide({ readWitness }).action).toBe('dispatch');
+    expect(f.decide({ readWitness }).action).toBe('dispatch');
+    expect(run).toHaveBeenCalledTimes(2);
+  }));
+  it('default dispatcher and abandon share the fresh label probe', () => check(f => {
+    vi.mocked(runGhSync).mockImplementation(() => JSON.stringify({ labels: [{ name: 'review:accepted' }] }));
+    const before = vi.mocked(runGhSync).mock.calls.length;
+    const readLiveLabels = recoveryLabels.createRecoveryLabelProbe({ env: f.key.env });
+    expect(f.decide({ readWitness: () => f.witness({ readLiveLabels }) }).action).toBe('dispatch');
+    expect(recoveryLabels.abandonStaleRedTeamRun(f.key, { probe: f.probe, setting: f.setting }).ok).toBe(true);
+    expect(vi.mocked(runGhSync).mock.calls.length - before).toBe(2);
+  }));
+  it('real recovery uses exactly five fresh bounded label reads across dispatch, abandon, payload witness, admission and readback', () => check(f => {
+    const before = f.runBytes();
+    const run = vi.fn((args, options) => {
+      expect(args).toEqual(['pr', 'view', String(f.key.pr), '--repo', f.key.repo, '--json', 'labels']);
+      expect(options).toMatchObject({ noMemo: true, timeout: 30000, encoding: 'utf8', maxBuffer: 1024 * 1024 });
+      return JSON.stringify({ labels: [{ name: 'review:accepted' }] });
+    });
+    const readLiveLabels = vi.fn(recoveryLabels.createRecoveryLabelProbe({ env: f.key.env, run }));
+    const readWitness = () => f.witness({ readLiveLabels });
+    expect(f.decide({ readWitness })).toMatchObject({ action: 'dispatch', mode: 'fresh', staleRecovery: true });
+    expect(readLiveLabels).toHaveBeenCalledTimes(1);
+    expect(f.abandon({ readWitness }).ok).toBe(true);
+    expect(readLiveLabels).toHaveBeenCalledTimes(2);
+    const io = f.makeJobIo({ readLiveLabels });
+    const readPayload = io.readRedTeamOnlyPayload;
+    const payloadSpy = vi.spyOn(io, 'readRedTeamOnlyPayload').mockImplementation(key => {
+      expect(readLiveLabels).toHaveBeenCalledTimes(2);
+      const payload = readPayload(key);
+      expect(readLiveLabels).toHaveBeenCalledTimes(3);
+      return payload;
+    });
+    const writeStatus = io.redTeamStatus;
+    const statusSpy = vi.spyOn(io, 'redTeamStatus').mockImplementation(input => {
+      if (input.status === 'queued') expect(readLiveLabels).toHaveBeenCalledTimes(3);
+      const result = writeStatus(input);
+      expect(readLiveLabels).toHaveBeenCalledTimes(5);
+      return result;
+    });
+    expect(f.attempt(io).redTeam.status).toBe('ran');
+    expect(payloadSpy).toHaveBeenCalledTimes(1);
+    expect(payloadSpy).toHaveBeenCalledWith({ repo: f.key.repo, pr: f.key.pr, head: f.key.head });
+    expect(statusSpy).toHaveBeenCalledWith(expect.objectContaining({ status: 'queued', redTeamMode: 'fresh' }));
+    expect(readLiveLabels).toHaveBeenCalledTimes(5);
+    expect(run).toHaveBeenCalledTimes(5);
+    expect(readLiveLabels.mock.calls.every(([key]) => key.repo === f.key.repo && key.pr === f.key.pr)).toBe(true);
+    expect(f.attempts.spawns).toBe(1);
+    expect(f.runBytes()).toBe(before);
+  }));
+  it('labels change after abandon: admission refuses, preserves writer, then next tick recovers', () => check(f => {
+    expect(f.abandon().ok).toBe(true);
+    const before = readFileSync(f.statusPath, 'utf8');
+    f.labels = ['review:accepted', 'review:pending'];
+    expect(f.attempt()).toMatchObject({ outcome: 'blocked-on-infra' });
+    expect(f.attempts.spawns).toBe(0); expect(readFileSync(f.statusPath, 'utf8')).toBe(before);
+    f.labels = ['review:accepted'];
+    expect(f.decide()).toMatchObject({ action: 'dispatch', mode: 'fresh' });
+    expect(f.attempt().redTeam.status).toBe('ran'); expect(f.attempts.spawns).toBe(1);
+  }));
+  it('a probe failure at real admission refuses without a spawn', () => check(f => {
+    expect(f.abandon().ok).toBe(true); const before = readFileSync(f.statusPath, 'utf8');
+    let reads = 0;
+    const io = f.makeJobIo({ readLiveLabels: () => {
+      if (++reads === 1) return ['review:accepted']; // Pre-admission payload witness succeeds.
+      throw Error('admission label probe failed');
+    } });
+    expect(f.attempt(io)).toMatchObject({ outcome: 'blocked-on-infra' });
+    expect(reads).toBe(2);
+    expect(f.attempts.spawns).toBe(0); expect(readFileSync(f.statusPath, 'utf8')).toBe(before);
+  }));
+  it('two overlapping attempts through real admission produce one spawn', () => check(f => {
+    expect(f.abandon().ok).toBe(true);
+    let second;
+    const first = f.attempt(f.makeJobIo(), () => { second = f.attempt(f.makeJobIo()); });
+    expect(first.redTeam.status).toBe('ran'); expect(second).toMatchObject({ outcome: 'blocked-on-infra' });
+    expect(f.attempts.spawns).toBe(1);
+  }));
+  it('real admission without the label probe refuses', () => check(f => {
+    expect(f.abandon().ok).toBe(true);
+    expect(f.attempt(f.makeJobIo({ readLiveLabels: null }))).toMatchObject({ outcome: 'blocked-on-infra' });
+    expect(f.attempts.spawns).toBe(0);
+  }));
+  it('real admission rolls back when labels change during queued readback', () => check(f => {
+    expect(f.abandon().ok).toBe(true); const before = readFileSync(f.statusPath, 'utf8');
+    let reads = 0;
+    const io = f.makeJobIo({ readLiveLabels: () => ++reads < 3 ? ['review:accepted'] : [] });
+    expect(f.attempt(io)).toMatchObject({ outcome: 'blocked-on-infra' });
+    expect(reads).toBe(3);
+    expect(f.attempts.spawns).toBe(0); expect(readFileSync(f.statusPath, 'utf8')).toBe(before);
+  }));
 });

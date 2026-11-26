@@ -1,3 +1,5 @@
+import { BODY_FILE_REFUSALS, isBodyFileRefusal } from '../lib/review-record-retry-evidence.mjs';
+export { BODY_FILE_REFUSALS, isBodyFileRefusal };
 import { redTeamCheckRunIsEvidence, redTeamCheckRunPayload, postRedTeamCheckRun as defaultPostRedTeamCheckRun } from '../lib/red-team-check-run.mjs';
 import { redTeamForHead } from '../lib/red-team-gate.mjs';
 import { assertReviewSessionPin } from '../lib/review-session-pin.mjs';
@@ -928,17 +930,6 @@ function childNeverStarted(e) {
   return !!e && e.status == null && !e.signal && SPAWN_NEVER_STARTED.has(e.code);
 }
 
-// These argument checks run in the CLI entry point before runReviewLabelCli can mutate anything.
-// Exported so a test can require one real-CLI no-write case per pattern: each one licenses a replay.
-// ANCHORED to the start of the CLI's own error text (optionally behind the sink's own UNKNOWN wrapper), so a
-// post-write `gh` stderr line that merely CONTAINS one of these phrases never licenses a replay.
-const BODY_FILE_ANCHOR = '^(?:review-set-label\\.mjs (?:failed|reported an error) and its outcome is UNKNOWN: )?';
-export const BODY_FILE_REFUSALS = Object.freeze([
-  new RegExp(`${BODY_FILE_ANCHOR}--body-file=[^\\r\\n]+ is unreadable \\(`),
-  new RegExp(`${BODY_FILE_ANCHOR}--body-file=[^\\r\\n]+ is empty — pass the verdict write-up`),
-  new RegExp(`${BODY_FILE_ANCHOR}--body-file must live under the repo root or a temp dir \\(got `),
-]);
-export const isBodyFileRefusal = text => typeof text === 'string' && BODY_FILE_REFUSALS.some(p => p.test(text));
 
 const PRE_WRITE_REFUSALS = Object.freeze([
   ...BODY_FILE_REFUSALS,

@@ -1932,3 +1932,87 @@ describe('recovery while a quiet review awaits human confirm', () => {
     expect(planRedTeamRecovery(result)).toMatchObject({ mode: 'skip', why: 'review-unfinished' });
   });
 });
+
+
+import { appliedSwapFixture } from '../../conveyor/soak/fixtures/applied-swap-recovery.mjs';
+
+describe('applied accept record label swap recovery witness', () => {
+  const check = fn => { const f = appliedSwapFixture(); try { fn(f); } finally { f.close(); } };
+  it('readRecoveryWitness exposes a decided accept whose only open effect is an applied non-idempotent label swap', () => check(f => {
+    const before = f.runBytes();
+    expect(f.witness()).toMatchObject({ newest: f.run, unfinishedReviewException: true, exceptionReason: 'applied-swap', scanComplete: true });
+    expect(f.reads).toBe(1);
+    expect(f.runBytes()).toBe(before);
+    expect(readDrainRedTeamEvidence({ ...f.key, now: f.now, readScorecards: () => [] })).toMatchObject({ ok: false, reason: 'review-unfinished' });
+  }));
+  it.each([
+    ['reject verdict', r => { r.verdict.verdict = 'changes'; }],
+    ['unknown verdict', r => { r.verdict.verdict = 'bogus'; }],
+    ['missing verdict', r => { r.verdict = null; }],
+    ['confirm not accept', r => { r.findings.confirm = 'changes'; }],
+    ['missing confirm', r => { delete r.findings.confirm; }],
+    ['empty addLabel', r => { r.effects[0].payload.addLabel = ''; }],
+    ['whitespace addLabel', r => { r.effects[0].payload.addLabel = ' '; }],
+    ['untrimmed addLabel', r => { r.effects[0].payload.addLabel = ' review:accepted '; }],
+    ['non-string addLabel', r => { r.effects[0].payload.addLabel = 42; }],
+    ['bad removeLabels', r => { r.effects[0].payload.removeLabels = 'review:pending'; }],
+    ['non-string removeLabels entry', r => { r.effects[0].payload.removeLabels = [42]; }],
+    ['empty removeLabels entry', r => { r.effects[0].payload.removeLabels = ['']; }],
+    ['addLabel also removed', r => { r.effects[0].payload.removeLabels = ['review:accepted']; }],
+    ['repo mismatch', r => { r.effects[0].payload.repo = 'other/repo'; }],
+    ['PR mismatch', r => { r.effects[0].payload.pr++; }],
+    ['head mismatch', r => { r.effects[0].payload.reviewedHead = 'c'.repeat(40); }],
+    ['to mismatch', r => { r.effects[0].payload.to = 'changes'; }],
+    ['second open effect', r => { r.effects[1].status = 'pending'; }],
+    ['resumed record', r => { r.resumeOf = { verdict: r.verdict }; }],
+    ['refused run', r => { r.outcome = 'refused'; }],
+    ['non-record pending', r => { r.pending.step = 'confirm'; }],
+    ['in-flight swap', r => { r.effects[0].status = 'in-flight'; }],
+    ['idempotent swap', r => { r.effects[0].idempotent = true; }],
+    ['retryable body-file refusal', r => { r.effects[0].unknownAttempts = 0; r.effects[0].error = '--body-file=gone is unreadable (ENOENT)'; }],
+    ['CI-held retry', r => { r.effects[0].status = 'failed'; r.effects[0].error = 'CI still pending on reviewed head'; }],
+  ])('holds %s without reading labels', (_name, change) => check(f => {
+    change(f.run); f.save();
+    expect(f.witness().ok).toBe(false);
+    expect(f.reads).toBe(0);
+  }));
+  it.each([
+    ['partially applied swap', ['review:accepted', 'review:pending']], ['missing added label', []],
+    ['non-array labels', { deferred: true }], ['non-string label name', [42]], ['null labels', null],
+    ['throttled labels', { throttled: true }],
+  ])('holds %s', (_name, labels) => check(f => { f.labels = labels; expect(f.witness().ok).toBe(false); expect(f.reads).toBe(1); }));
+  it.each(['label read failure', 'label read timeout', 'label read deferred'])('holds %s', reason => check(f => {
+    f.labelFailure = Object.assign(Error(reason), { code: reason.includes('timeout') ? 'ETIMEDOUT' : 'GH_DEFERRED' });
+    expect(f.witness().ok).toBe(false); expect(f.reads).toBe(1);
+  }));
+  it('holds without a label probe', () => check(f => { expect(f.witness({ readLiveLabels: undefined }).ok).toBe(false); }));
+  it('holds before the quietness horizon', () => check(f => {
+    f.save(f.run, f.horizon - 1); expect(f.witness().ok).toBe(false); expect(f.reads).toBe(0);
+  }));
+  it.each(['same-head rejection', 'other-head rejection', 'second decided unfinished run'])('holds a newer %s', kind => check(f => {
+    const other = structuredClone(f.run); other.id = 'review-pr-newer-blocker';
+    other.stepTimings[0].startedAt = new Date(f.now - 2 * f.horizon).toISOString();
+    if (kind !== 'second decided unfinished run') { other.verdict.verdict = 'changes'; other.pending = null; other.effects = []; }
+    if (kind === 'other-head rejection') other.findings.read.netBasis.rev = 'c'.repeat(40);
+    f.save(other); expect(f.witness()).not.toHaveProperty('unfinishedReviewException');
+    expect(f.decide().action).toBe('skip'); expect(f.reads).toBe(0);
+  }));
+  it('an early-exit scan never grants the applied-swap exception', () => check(f => {
+    const older = structuredClone(f.run); older.id = 'review-pr-old-blocker';
+    older.stepTimings[0].startedAt = new Date(f.now - 8 * f.horizon).toISOString();
+    f.save(older, 6 * f.horizon);
+    const w = f.witness({ list: () => [f.run.id, older.id], read: id => id === older.id ? older : f.run,
+      stat: path => ({ mtimeMs: path.includes(older.id) ? f.now - 6 * f.horizon : f.now - f.horizon }) });
+    expect(w.ok).toBe(false); expect(w.unfinishedReviewException).toBeUndefined(); expect(f.reads).toBe(0);
+  }));
+  it('holds a bounded scan with an unread boundary and names operator fallback', () => check(f => {
+    const older = structuredClone(f.run); older.id = 'review-pr-old-boundary'; f.save(older, 6 * f.horizon);
+    const warnings = [];
+    const w = f.witness({ scanSettings: { file: { runs: { scan: { maxParses: 1 } } }, env: {} }, warn: line => warnings.push(line) });
+    expect(w.ok).toBe(false); expect(f.reads).toBe(0); expect(warnings.join(' ')).toContain('HOLD and inspect omitted runs');
+  }));
+  it('holds a failed exhaustive scan without a label read', () => check(f => {
+    expect(() => f.witness({ list: () => [f.run.id, 'review-pr-unread'], read: () => { throw Error('EIO'); } })).toThrow();
+    expect(f.reads).toBe(0);
+  }));
+});

@@ -222,8 +222,20 @@ export const recoveryProbe = ({ alive = pidExistence, identity = pidIdentity } =
   };
 };
 
+/** Fresh decision-time labels; deferred, throttled and malformed responses throw and retain the hold. */
+export function createRecoveryLabelProbe({ env = process.env, run = runGhSync } = {}) {
+  return ({ repo, pr }) => {
+    const output = run(['pr', 'view', String(pr), '--repo', repo, '--json', 'labels'],
+      { env, encoding: 'utf8', noMemo: true, timeout: 30_000, maxBuffer: 1024 * 1024 });
+    const labels = JSON.parse(output)?.labels;
+    if (!Array.isArray(labels) || !labels.every(label => typeof label?.name === 'string')) throw Error('recovery labels unreadable; hold and retry next tick');
+    return labels.map(label => label.name);
+  };
+}
+
 /** Spend one abandonment before spawning. The marker binds raw bytes, rows and newest review, never a plan. */
-export function abandonStaleRedTeamRun(key, { readWitness = () => readRecoveryWitness(key), now = Date.now,
+export function abandonStaleRedTeamRun(key, { readLiveLabels = createRecoveryLabelProbe({ env: key.env }),
+  readWitness = () => readRecoveryWitness({ ...key, readLiveLabels }), now = Date.now,
   probe = recoveryProbe(), deadlineMs = staleRunDeadlineMs(key.env), writeJson = writeJsonAtomic,
   setting = resolveReviewRedTeamOnSkip({ env: key.env }).value } = {}) {
   const path = join(redTeamStatusDir(key.env), `${encodeURIComponent(key.repo)}-${Number(key.pr)}-${key.head}.json`);
@@ -913,8 +925,9 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
     : readBacklogOnlyNetFiles(key),
   exec = execFileSync, cwd = process.cwd(), mainRef = 'origin/main',
   proveMove = move => proveCardOnlyHeadMove({ ...move, exec, cwd, mainRef }),
+  readLiveLabels = createRecoveryLabelProbe({ env }),
   readWitness = readEvidence === readDrainRedTeamEvidence && readStatus === readRedTeamStatus
-    ? key => readRecoveryWitness({ ...key, env }) : null,
+    ? key => readRecoveryWitness({ ...key, env, readLiveLabels }) : null,
   headNeverReviewed = key => headNeverReviewedFromRuns({ ...key, env }),
   settlePending = settlePendingFor({ provider, env }),
   escalate = ({ repo, pr, head, why }) => {
@@ -925,7 +938,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
     if (error) throw Error(error);
     return result;
   },
-  abandon = key => abandonStaleRedTeamRun({ ...key, env }),
+  abandon = key => abandonStaleRedTeamRun({ ...key, env }, { readLiveLabels }),
   now = Date.now, lastDispatch: history = lastDispatch, preferLane, settle = settleRedTeamSkip, syncLabels = syncRedTeamStatusLabels,
   publishCheck = null,
   // #6606: the carried-check outbox and its republisher. Test runs need explicit IO for both, as for publishCheck.

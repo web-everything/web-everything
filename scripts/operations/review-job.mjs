@@ -94,7 +94,7 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, resolveCarryAcrossRebase } from '../lib/rebase-verdict-carry.mjs';
 import { isPublishableRedTeamResult, liveResultGateState, parseRedTeamComment, readRedTeamProbes, redTeamForHead, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../lib/red-team-gate.mjs';
 
-import { planRedTeamRecovery, recoveryProbe as defaultRecoveryProbe, staleRunDeadlineMs, normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from '../lib/review-red-team-on-skip.mjs';
+import { createRecoveryLabelProbe, planRedTeamRecovery, recoveryProbe as defaultRecoveryProbe, staleRunDeadlineMs, normalizeRedTeamResult, redTeamSkipNeedsSettlement, cardOnlyHeadMoveCandidate, cardOnlySkipSettlementCandidate } from '../lib/review-red-team-on-skip.mjs';
 import { failedRedTeamRetry, redTeamStatusWithoutRun, reviewOnlyRedTeamResult } from '../lib/red-team-run-result.mjs';
 import { classifyRedTeamSkip, isRealHead, safeErrorText, settleRedTeamSkip } from '../lib/red-team-skip-outcome.mjs';
 import { createRedTeamCarryIo } from '../lib/red-team-carry-io.mjs';
@@ -419,7 +419,9 @@ function fetchPinnedPrHead({ lanePath, repo, pr, head, headChangedError, env, ex
 /** The real effects, each one command. `root` is the checkout the arc runs from (the daemon's clone). */
 export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync, exec = execReadRaw, spawnNode = spawnSync, readConfig = spawnSync, spawnPack = spawnSync, readStatus = readRedTeamStatus, writeStatus = recordRedTeamStatus, readEvidence = readDrainRedTeamEvidence,
   readSeatRecords = () => createRedTeamIo({ root, env }).readRecords({ strict: true }),
-  readWitness = key => readRecoveryWitness({ ...key, env, readScorecards: readSeatRecords }), recoveryProbe = defaultRecoveryProbe(),
+  readLiveLabels = createRecoveryLabelProbe({ env, run: (args, options) => exec('gh', args, { ...options, cwd: root, env }) }),
+  readWitness = key => readRecoveryWitness({ ...key, env, readScorecards: readSeatRecords, readLiveLabels }), recoveryProbe = defaultRecoveryProbe(),
+  statusLabelProvider,
   queueBaseline = () => resolveLiveQueueBaseline({ checkoutRoot: root, env }),
   seatAvailable = provider => createRedTeamIo({ root, env }).cliAvailable(provider), spawnSpeculative = spawn,
   log = line => writeLineSync(2, `[${new Date().toISOString()}] ${line}`),
@@ -540,7 +542,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       }
       try {
         syncRedTeamStatusLabels({ repo: input.repo, pr: input.pr, head,
-          evidence: readEvidence(key), env, gh: settleGhFor(env), log: line => process.stderr.write(`${line}\n`) });
+          evidence: readEvidence(key), env, provider: statusLabelProvider, gh: settleGhFor(env), log: line => process.stderr.write(`${line}\n`) });
       } catch (e) { process.stderr.write(`review-job: red-team status label sync failed: ${e.message}\n`); }
       return { priorResult, ...(queued && input.redTeamMode ? { redTeamAdmission: { schema: 1, pid: process.pid, queued: stored,
         ...(input.retryCount === 1 ? { retrySpent: true } : {}),

@@ -25,17 +25,13 @@ import { isUnderTest } from '../lib/under-test.mjs';
 import { createActionStore } from '../operations/action-store.mjs';
 import { actionResource } from '../operations/action-record.mjs';
 import { isQuotaError } from '../lib/provider-quota-hold.mjs';
-import { isBodyFileRefusal } from '../operations/review-pr-io.mjs';
+import { BODY_FILE_REFUSALS, ciHeldRecordRetryCountersValid, reviewRecordRetryEvidence } from '../lib/review-record-retry-evidence.mjs';
 import { parseAdvisories, advisoryCoversHead, ADVISORY_OUTCOMES } from '../lib/advisory-labels.mjs';
 import { reverifyStaleReferrals } from './referral-reverify.mjs';
+export { ciHeldRecordRetryCountersValid };
 
 /** Maximum drives of a saved run before its resume budget is exhausted. Shared with the driver. */
 export const RESUME_MAX_ATTEMPTS = 3;
-
-/** Saved retry evidence must prove both counters; never coerce corrupt state into a fresh budget. */
-export function ciHeldRecordRetryCountersValid(evidence) {
-  return [evidence?.attempts, evidence?.resumeAttempts].every(n => Number.isSafeInteger(n) && n >= 0);
-}
 
 export const REFERRAL_HOLD_MARKER = 'review paused:';
 export const GH_LIST_COMMENT_CAP = 100;
@@ -59,23 +55,7 @@ export function reviewRunEvidence(run, { requireVerdict = false } = {}) {
   if (run?.op !== 'review-pr') return null;
   const read = run.findings?.read;
   const suspendedReferralEffect = !run.resumeOf && run.pending?.kind === 'effect' && run.pending.step === 'mandatoryReferrals';
-  let retryableRecordEffect = false;
-  let ciHeldRecordRetry;
-  try {
-    if (run.pending?.kind === 'effect' && run.pending.step === 'record' && Array.isArray(run.effects)) {
-      const outstanding = run.effects.filter(e => !['applied', 'declared'].includes(e?.status));
-      retryableRecordEffect = !run.resumeOf && outstanding.length > 0 && outstanding.every(e => e?.type === 'review.label-swap'
-        && e.status === 'pending' && e.unknownAttempts === 0 && isBodyFileRefusal(e.error));
-      if (outstanding.length > 0 && outstanding.every(e => e?.type === 'review.label-swap'
-        && e.status === 'failed' && (run.ciHeldRecord === true
-          || typeof e.error === 'string' && /CI still pending on reviewed head/.test(e.error)))) {
-        const resumeAttempts = Object.hasOwn(run, 'recordEffectResumeAttempts') ? run.recordEffectResumeAttempts : 0;
-        ciHeldRecordRetry = { attempts: outstanding.every(e => ciHeldRecordRetryCountersValid({
-          attempts: e.unknownAttempts, resumeAttempts,
-        })) ? Math.max(...outstanding.map(e => e.unknownAttempts)) : null, resumeAttempts };
-      }
-    }
-  } catch { /* Unreadable effects cannot prove a safe record retry. */ }
+  const { retryableRecordEffect, ciHeldRecordRetry } = reviewRecordRetryEvidence(run);
   const head = read?.netBasis?.rev ?? (suspendedReferralEffect ? run.input?.head : undefined);
   // A rewind drops the referral result. Use the saved pass until this pass finishes referralVerdict; an unrelated
   // advisory failure must not hide a successful persist behind the saved persistence failure (PR #5771).
@@ -174,7 +154,7 @@ const evidenceCache = new Map();
 export const REVIEW_EVIDENCE_CACHE_FILE = '.review-run-evidence.cache';
 /** A warm process with at most this many changed records parses them directly instead of the whole on-disk file. */
 export const EVIDENCE_DISK_MIN_MISSES = 32;
-const EVIDENCE_CODE = createHash('sha256').update(String(reviewRunEvidence)).update(String(ciHeldRecordRetryCountersValid))
+const EVIDENCE_CODE = createHash('sha256').update(String(reviewRunEvidence)).update(String(ciHeldRecordRetryCountersValid)).update(String(reviewRecordRetryEvidence)).update(BODY_FILE_REFUSALS.map(String).join())
   .update(String(isQuotaError)).digest('hex').slice(0, 16);
 function readEvidenceDiskCache(file) {
   try {

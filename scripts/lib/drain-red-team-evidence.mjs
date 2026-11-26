@@ -34,6 +34,7 @@ import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
 import { completedRedTeamSeat } from './red-team-run-result.mjs';
 import { latestAcceptRecord } from './accept-carry-forward.mjs';
 import { readRedTeamCarry } from './red-team-carry-machine.mjs';
+import { reviewRecordRetryEvidence } from './review-record-retry-evidence.mjs';
 
 export const redTeamStatusDir = (env = process.env) => join(dirname(sharedRunsDir(env)), 'red-team-status');
 /** How `redTeamEnqueueHold` names a hold that is only "result not sealed yet" (PR #6622); a test pins it to that text. */
@@ -303,6 +304,27 @@ const undecidedUnfinished = run => {
   // Any PRESENT verdict this reader does not recognise (an empty object, another key, an array, false, 0, '') counts as decided.
   return (!hasVerdict(run) || verdictOf(run) === 'needs-human') && !hasOpenEffect(run);
 };
+/** Only this exact accept effect may be checked against live labels. No writes or retries. */
+function appliedSwapCandidate(run, head) {
+  if (!run || verdictOf(run) !== 'accept' || run.findings?.confirm !== 'accept'
+    || run.resumeOf != null || run.outcome === 'refused'
+    || run.pending?.kind !== 'effect' || run.pending.step !== 'record'
+    || run.findings?.read?.netBasis?.rev !== head || !Array.isArray(run.effects)) return null;
+  const open = run.effects.filter(effect => !['applied', 'declared'].includes(effect?.status));
+  if (open.length !== 1) return null;
+  const effect = open[0], payload = effect?.payload;
+  if (effect?.type !== 'review.label-swap' || effect.status !== 'pending' || effect.idempotent !== false) return null;
+  const retry = reviewRecordRetryEvidence(run);
+  if (retry.retryableRecordEffect === true || retry.ciHeldRecordRetry !== undefined) return null;
+  const nonempty = value => typeof value === 'string' && value.trim().length > 0;
+  if (payload?.to !== 'accepted' || payload.repo !== run.input?.repo
+    || Number(payload.pr) !== Number(run.input?.pr) || payload.reviewedHead !== head
+    || !nonempty(payload.addLabel) || payload.addLabel !== payload.addLabel.trim()
+    || !Array.isArray(payload.removeLabels) || !payload.removeLabels.every(nonempty)
+    || payload.removeLabels.includes(payload.addLabel)) return null;
+  return payload;
+}
+
 // R622: how a record weighs on comment settlement (what the complete same-head read keeps of it):
 //  hard      a label effect still pending or in flight, a rejection still waiting on a step, or a present verdict this
 //            reader does not recognise (fails closed): blocks whatever else exists, whatever its start time.
@@ -428,7 +450,7 @@ const withSettleBounds = (failure, bounds) => Object.defineProperty(failure, 'se
 // unread record was written at least the mtime slack before that time and the newest run reviewed `newestHead`
 // (a carried head's source). Anything else holds as `scan-capped`.
 // One scan serves both tie orders, so a caller's fallback shares this scan's parse budget.
-function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak = 'id-asc', scanSettings, warn, now = Date.now() }) {
+function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak = 'id-asc', scanSettings, warn, now = Date.now(), exhaustiveAppliedSwap = false }) {
   if (!TIE_ORDERS.includes(tieBreak)) throw new TypeError('unknown run tieBreak');
   // A run with a read start outranks a start-less one; start-less runs are ordered by the checks below.
   const newerBy = order => (candidate, selected) => {
@@ -468,10 +490,10 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
   const budgetExhausted = Symbol('shared review parse budget exhausted');
   let hardHold = false;
   const runScan = (indexedIds, allCandidates = false) => {
-    const slots = Object.fromEntries(TIE_ORDERS.map(order => [order, { newer: newerBy(order), newest: null, exact: null, unfinished: null, unfinishedExact: null, since: -Infinity, active: -Infinity, undecided: true }]));
+    const slots = Object.fromEntries(TIE_ORDERS.map(order => [order, { newer: newerBy(order), newest: null, exact: null, unfinished: null, unfinishedExact: null, since: -Infinity, active: -Infinity, undecided: true, blockers: [] }]));
     const startless = []; // ids and mtimes only, never payloads
     const mtimes = new Map();
-    let count = 0, newestSettled = false, boundary = -Infinity;
+    let count = 0, newestSettled = false, boundary = -Infinity, exhaustive = false;
     // The read window is fixed in one order (equal mtimes by ascending id) for every caller: the tie
     // order only ranks matches in the slots. Otherwise equal mtimes straddling the cap would put
     // different records in the drain's and recovery's windows, and the two could disagree.
@@ -528,6 +550,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
           for (const slot of Object.values(slots)) {
             if (slot.newer(hit, slot.newest)) slot.newest = hit;
             if (run.findings?.read?.netBasis?.rev === head && slot.newer(hit, slot.exact)) slot.exact = hit;
+            if (unfinishedReview(run) && !undecidedUnfinished(run)) slot.blockers.push(id);
             if (unfinishedReview(run) && !supersededUnfinished(run, head)) {
               if (slot.newer(hit, slot.unfinished)) slot.unfinished = hit;
               if (run.findings?.read?.netBasis?.rev === head && slot.newer(hit, slot.unfinishedExact)) slot.unfinishedExact = hit;
@@ -546,15 +569,17 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
       const { exact, newest } = slots[tieBreak];
       boundary = nextAt;
       if (newest !== null && reviewStartedAt(newest) > nextAt + RUN_MTIME_SLACK_MS) newestSettled = true;
-      return (!indexedIds || allCandidates) && exact !== null && reviewStartedAt(exact) > nextAt + RUN_MTIME_SLACK_MS;
+      if (exhaustiveAppliedSwap && appliedSwapCandidate(exact?.run, head)) exhaustive = true;
+      return !exhaustive && (!indexedIds || allCandidates) && exact !== null && reviewStartedAt(exact) > nextAt + RUN_MTIME_SLACK_MS;
     }); } catch (error) {
       if (error !== budgetExhausted) throw error;
       end = RUN_SCAN_CAPPED;
     }
-    scan = { slots, startless, count, end, newestSettled, boundary };
+    scan = { slots, startless, count, end, newestSettled, boundary, exhaustive,
+      scanComplete: end === null && (!indexedIds || allCandidates) };
   };
   const failureFor = (order, exactHead, writtenAfter, newestHead) => {
-    const { newest, exact, unfinished, unfinishedExact, since, undecided, active } = scan.slots[order];
+    const { newest, exact, unfinished, unfinishedExact, since, undecided, active, blockers } = scan.slots[order];
     const selected = exact ?? newest;
     const selectedStart = selected ? reviewStartedAt(selected) : NaN;
     // A start-less run last written before the selected run started is older; any other cannot be ordered.
@@ -566,7 +591,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
       return withSettleBounds({ ok: false, reason: 'review-unfinished' },
         // Only the NEWEST run for this head may stand in: an older pending review never hides a newer same-head
         // verdict (a rejection above all), so that case keeps the plain hold (PR #6784).
-        { unfinishedHit: unfinishedExact && unfinishedExact === exact ? unfinishedExact : undefined, unfinishedStartedAt: since, unfinishedUndecided: undecided, unfinishedActiveAt: active, evaluatedAt: now, completeHeadRead, ...(scan.end?.ok === false ? { unreadBoundaryAt: scan.boundary } : {}) });
+        { scanComplete: scan.scanComplete, blockers, newest, unfinishedHit: unfinishedExact && unfinishedExact === exact ? unfinishedExact : undefined, unfinishedStartedAt: since, unfinishedUndecided: undecided, unfinishedActiveAt: active, evaluatedAt: now, completeHeadRead, ...(scan.end?.ok === false ? { unreadBoundaryAt: scan.boundary } : {}) });
     }
     if (scan.end?.ok !== false) return null;
     // Capped: usable only when no unread record can change this query's answer (see above).
@@ -632,7 +657,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
               runScan(ids);
               // A locator alone cannot prove a head has no review. Wrong-head/stale hints
               // and capped index reads must take the original bounded fallback.
-              if (!scan.slots[order].exact || scan.end?.ok === false) scan = null;
+              if (!scan.slots[order].exact || scan.end?.ok === false || (scan.exhaustive && !scan.scanComplete)) scan = null;
             } catch { scan = null; }
           }
           if (!scan) {
@@ -661,7 +686,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
 // Match resolveRunsDir's override precedence without migrating runs during a raw read.
 export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir = env.OPERATION_RUNS_DIR?.trim() || sharedRunsDir(env),
   list = listRunIds, read = readRun, stat = statSync, scanSettings = { env }, warn, now = Date.now(),
-  readScorecards = () => readStore({ path: resolveScorecardStorePath(env), strict: true }).records } = {}) {
+  readLiveLabels, readScorecards = () => readStore({ path: resolveScorecardStorePath(env), strict: true }).records } = {}) {
   const key = { repo, pr, head }, path = statusPath(key, env), bytes = optionalBytes(path);
   const parsed = bytes === null ? null : JSON.parse(bytes);
   // The writer file's mtime is the age of a record whose pid cannot be probed here (foreign host name). Unreadable stays unknown.
@@ -671,7 +696,7 @@ export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir
   const records = readScorecards();
   const seats = records.filter(r => r.dispatchKind === 'review-seat' && r.seat === 'red-team'
     && r.repo === repo && Number(r.pr) === Number(pr) && r.rev === head);
-  const lookup = reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak: 'id-desc', scanSettings, warn, now });
+  const lookup = reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak: 'id-desc', scanSettings, warn, now, exhaustiveAppliedSwap: true });
   // Preserve the existing policy-only carry surface; it never supplies a stale recovery payload.
   // The fallback reuses this scan (one parse budget and the same read window) but ranks equal
   // starts in the drain's ascending id order.
@@ -680,6 +705,7 @@ export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir
   let latest = lookup();
   let carryEvidence;
   let unfinishedReviewException = false;
+  let exceptionReason;
   if (latest.ok === false) {
     const bounds = latest.settleBounds;
     // A quiet undecided review can be waiting for this writer's result to finish its human
@@ -692,6 +718,21 @@ export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir
       && bounds.unfinishedHit?.run.findings?.read?.netBasis?.rev === head) {
       latest = bounds.unfinishedHit;
       unfinishedReviewException = true;
+    } else if (latest.reason === 'review-unfinished' && bounds?.scanComplete === true
+      && bounds.evaluatedAt - bounds.unfinishedActiveAt >= ABANDONED_REVIEW_AFTER_MS
+      && !Object.hasOwn(bounds, 'unreadBoundaryAt')
+      && ['queued', 'running'].includes(parsed?.status)
+      && bounds.unfinishedHit && bounds.newest?.id === bounds.unfinishedHit.id
+      && bounds.blockers?.length === 1 && bounds.blockers[0] === bounds.unfinishedHit.id
+      && typeof readLiveLabels === 'function' && appliedSwapCandidate(bounds.unfinishedHit.run, head)) {
+      const payload = appliedSwapCandidate(bounds.unfinishedHit.run, head);
+      let labels;
+      try { labels = readLiveLabels({ repo, pr }); } catch { return latest; }
+      if (!Array.isArray(labels) || !labels.every(name => typeof name === 'string')
+        || !labels.includes(payload.addLabel) || payload.removeLabels.some(name => labels.includes(name))) return latest;
+      latest = bounds.unfinishedHit;
+      unfinishedReviewException = true;
+      exceptionReason = 'applied-swap';
     } else {
       // A capped exact-head query cannot prove there is no exact-head run, but the drain's
       // carry paths may answer from the same scan. Its newest run stays null, which recovery
@@ -705,6 +746,7 @@ export function readRecoveryWitness({ repo, pr, head, env = process.env, runsDir
   const marker = optionalBytes(`${path}.stale-redispatch-1`);
   return { ...key, statusAt, rawWriter: { bytes, parsed, sha256: digest(bytes) }, seats, newest: newest?.run ?? null,
     ...(unfinishedReviewException ? { unfinishedReviewException: true } : {}),
+    ...(exceptionReason ? { exceptionReason, scanComplete: true } : {}),
     ...(newest ? {} : { carryEvidence: carryEvidence ?? readCarryEvidence() }),
     evidenceSha256: digest(JSON.stringify([seats, newest])),
     markers: { redispatch: marker === null ? null : JSON.parse(marker), retry: retryMarkerSpent(path) } };
