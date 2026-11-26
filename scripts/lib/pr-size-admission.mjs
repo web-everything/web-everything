@@ -73,6 +73,74 @@ export function createGitReader(cwd, exec = execFileSync) {
   };
 }
 
+/** Read-only sibling-history admission. Local lane refs are conservative ownership
+ * evidence; no network lookup or history mutation is needed. A lane base declares
+ * a stack, so only history above that base is judged. Bounds require operator
+ * inspection rather than turning incomplete evidence into an admission.
+ */
+export function checkSiblingBase({ git, base = 'main', sha = 'HEAD', ref = '' }) {
+  const read = (args, options = {}) => git(args, { timeout: 5000, maxBuffer: 8 * 1024 * 1024, ...options });
+  const pin = value => {
+    const text = value.trim();
+    if (!/^[a-f0-9]{40,64}$/.test(text)) throw new Error('invalid commit evidence');
+    return text;
+  };
+  const lines = (text, limit) => {
+    const rows = text.trim() ? text.trim().split('\n') : [];
+    if (rows.length > limit) throw new Error('history evidence exceeds inspection bound');
+    return rows;
+  };
+  try {
+    // Match size admission's preference for the canonical remote main over a
+    // stale local main. Explicit lane bases remain the declared stack boundary.
+    const remote = base === 'main' ? read(['for-each-ref', '--format=%(objectname)', 'refs/remotes/origin/main']).trim() : '';
+    const baseSha = pin(read(['rev-parse', '--verify', '--end-of-options', `${remote || base}^{commit}`]));
+    const head = pin(read(['rev-parse', '--verify', '--end-of-options', `${sha}^{commit}`]));
+    const refs = lines(read(['for-each-ref', '--format=%(objectname) %(refname)',
+      'refs/heads/lane/', 'refs/remotes/*/lane/*']), 256);
+    // Direct callers may omit ref; identify the checked-out lane rather than
+    // treating its own commits as inherited sibling history. Detached or
+    // unreadable HEAD requires an explicit ref instead of guessing ownership.
+    const ownRef = ref || read(['symbolic-ref', '--quiet', 'HEAD']).trim();
+    if (!ownRef || (!ref && !ownRef.startsWith('refs/heads/'))) throw new Error('current branch unavailable');
+    const own = ownRef.replace(/^refs\/heads\//, '');
+    const siblings = [];
+    const mainPatches = new Map();
+    const patchIds = input => new Set(lines(read(['patch-id', '--stable'], { input }), 2048).map(row => {
+      if (!/^[a-f0-9]{40,64} [a-f0-9]{40,64}$/.test(row)) throw new Error('invalid patch evidence');
+      return row.split(' ')[0];
+    }));
+    for (const row of refs) {
+      const match = /^([a-f0-9]{40,64}) refs\/(?:heads\/|remotes\/[^/]+\/)(lane\/[^\s]+)$/.exec(row);
+      if (!match) throw new Error('invalid lane evidence');
+      const [, tip, lane] = match;
+      if (lane === own) continue;
+      const shared = pin(read(['merge-base', head, tip]));
+      // A descendant lane does not own the current lane's history.
+      if (shared === head && tip !== head) continue;
+      const cherry = lines(read(['cherry', baseSha, shared]), 2048);
+      if (cherry.some(line => !/^[+-] [a-f0-9]{40,64}$/.test(line))) throw new Error('invalid cherry evidence');
+      if (!cherry.some(line => line.startsWith('+ '))) continue;
+      const fork = pin(read(['merge-base', baseSha, shared]));
+      // git cherry recognizes individual landed patches. An aggregate patch
+      // also recognizes several sibling commits landed as one squash commit.
+      if (!mainPatches.has(fork)) {
+        lines(read(['rev-list', '--max-count=2049', `${fork}..${baseSha}`]), 2048);
+        mainPatches.set(fork, patchIds(read(['log', '--no-merges', '--format=commit %H', '-p',
+          '--no-ext-diff', '--no-textconv', `${fork}..${baseSha}`, '--'])));
+      }
+      const aggregate = patchIds(read(['diff', '--no-ext-diff', '--no-textconv', fork, shared, '--']));
+      if (aggregate.size && [...aggregate].every(id => mainPatches.get(fork).has(id))) continue;
+      siblings.push(lane);
+    }
+    return siblings.length ? { ok: false, reason: 'sibling-base',
+      detail: `branch carries unlanded history shared with ${[...new Set(siblings)].join(', ')}` } : { ok: true };
+  } catch {
+    return { ok: false, reason: 'sibling-base-unreadable',
+      detail: 'sibling history evidence is unreadable or exceeds bounds; inspect the full local history and lane refs, repair the evidence or restack on main, then rerun --check' };
+  }
+}
+
 /** Attributes can override --text. Recover binary rows from immutable blobs, counting the
  * whole old and new files conservatively. Only a successful tree read proves a missing side.
  */

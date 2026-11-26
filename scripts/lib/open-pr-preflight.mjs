@@ -2,6 +2,8 @@
 const verify = 'run verify-lane';
 const audit = 'run node scripts/operations/run.mjs codex-audit --base=origin/main --head=<fullsha>; if WEAKENED needs a waiver request for sha X';
 export const HINTS = Object.freeze({
+  'sibling-base': 'restack only your commits: git rebase --onto main <last-inherited-sibling-commit> <your-lane>; or declare an intentional stack with --base=lane/<parent>; rerun --check',
+  'sibling-base-unreadable': 'inspect the full git history and lane refs, repair unreadable or oversized evidence, or restack on main; rerun --check',
   'canonical-audit-missing': audit, 'canonical-audit-weakened': audit,
   unverified: verify, untracked: verify, 'verify-unfinished': verify,
   'verify-red': verify, 'verify-corrupt': verify, 'red-ci-gated': verify,
