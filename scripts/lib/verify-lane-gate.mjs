@@ -1239,8 +1239,10 @@ export function alwaysRunPlan({ declared = [], fileExists, scanCommands = [], te
 /**
  * #99 — which planned guard files appear in vitest's executed-file inventory (its JSON report). Pure. A planned file
  * missing from the report was excluded or matched no test; an absent / unparseable report proves nothing, so every
- * file is missing (`reason: 'inventory-unavailable'`). A file counts as executed when it has a result entry, whatever
- * its outcome — a red guard is reported by the run's own exit code, not here.
+ * file is missing (`reason: 'inventory-unavailable'`). Supported Vitest 1.x JSON evidence requires a nonempty
+ * `assertionResults` array containing only known statuses, with at least one passed or failed assertion. Missing,
+ * malformed, unknown-status and entirely skipped/pending/todo inventories prove no execution. File status alone
+ * proves nothing; a failed assertion counts as executed, while the run's own exit code keeps verification red.
  * @param {{reportText: string|null|undefined, files: string[], cwd: string}} a
  * @returns {{executed: string[], missing: string[], reason: 'ok'|'inventory-unavailable'}}
  */
@@ -1249,9 +1251,9 @@ export function alwaysRunInventory({ reportText, files = [], cwd }) {
   try {
     const parsed = JSON.parse(String(reportText ?? ''));
     if (!parsed || !Array.isArray(parsed.testResults)) throw new Error('no testResults');
-    // A file whose every assertion was skipped / todo ran nothing: only an entry with a real result counts.
-    const ranSomething = (r) => !Array.isArray(r?.assertionResults) || !r.assertionResults.length
-      || r.assertionResults.some(a => a?.status !== 'skipped' && a?.status !== 'pending' && a?.status !== 'todo');
+    const ranSomething = (r) => Array.isArray(r?.assertionResults) && r.assertionResults.length > 0
+      && r.assertionResults.every(a => ['passed', 'failed', 'skipped', 'pending', 'todo'].includes(a?.status))
+      && r.assertionResults.some(a => a.status === 'passed' || a.status === 'failed');
     names = new Set(parsed.testResults.filter(ranSomething)
       .map(r => relative(cwd, String(r?.name ?? '')).split(sep).join('/').replace(/^\.\//, '')));
   } catch {

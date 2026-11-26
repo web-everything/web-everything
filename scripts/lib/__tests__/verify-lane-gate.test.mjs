@@ -1470,7 +1470,36 @@ describe('alwaysRunPlan (item 99)', () => {
 
 describe('alwaysRunInventory (item 99): a guard counts as run only if vitest executed it', () => {
   const cwd = '/repo';
-  const report = (...names) => JSON.stringify({ testResults: names.map(name => ({ name, status: 'passed' })) });
+  // Vitest 1.x JSON reporter shape: file status alone is not assertion-execution evidence.
+  const report = (...names) => JSON.stringify({ testResults: names.map(name => ({ name, status: 'passed', assertionResults: [{ status: 'passed' }] })) });
+  it('a verify report entry with zero assertions is missing execution and fails the guard', () => {
+    const reportText = JSON.stringify({ testResults: [{ name: '/repo/a.test.mjs', status: 'passed', assertionResults: [] }] });
+    expect(alwaysRunInventory({ reportText, files: ['a.test.mjs'], cwd }))
+      .toEqual({ executed: [], missing: ['a.test.mjs'], reason: 'ok' });
+  });
+  it.each([
+    ['omitted', {}],
+    ['null', { assertionResults: null }],
+    ['string', { assertionResults: 'passed' }],
+    ['object', { assertionResults: { status: 'passed' } }],
+    ['null assertion', { assertionResults: [null] }],
+    ['missing status', { assertionResults: [{}] }],
+    ['unknown status', { assertionResults: [{ status: 'running' }] }],
+    ['skipped', { assertionResults: [{ status: 'skipped' }] }],
+    ['pending', { assertionResults: [{ status: 'pending' }] }],
+    ['todo', { assertionResults: [{ status: 'todo' }] }],
+    ['passed plus malformed', { assertionResults: [{ status: 'passed' }, null] }],
+    ['passed plus unknown', { assertionResults: [{ status: 'passed' }, { status: 'running' }] }],
+  ])('an invalid or unexecuted assertion inventory (%s) cannot certify a guard', (_, entry) => {
+    const reportText = JSON.stringify({ testResults: [{ name: '/repo/a.test.mjs', status: 'passed', ...entry }] });
+    expect(alwaysRunInventory({ reportText, files: ['a.test.mjs'], cwd }))
+      .toEqual({ executed: [], missing: ['a.test.mjs'], reason: 'ok' });
+  });
+  it.each(['passed', 'failed'])('a supported %s assertion proves execution independently of the file status', status => {
+    const reportText = JSON.stringify({ testResults: [{ name: '/repo/a.test.mjs', status, assertionResults: [{ status }] }] });
+    expect(alwaysRunInventory({ reportText, files: ['a.test.mjs'], cwd }))
+      .toEqual({ executed: ['a.test.mjs'], missing: [], reason: 'ok' });
+  });
   it('one included + one excluded guard: the excluded one is reported missing even though the run exited 0', () => {
     expect(alwaysRunInventory({ reportText: report('/repo/a/guard.test.mjs'), files: ['a/guard.test.mjs', 'b/excluded.test.mjs'], cwd }))
       .toEqual({ executed: ['a/guard.test.mjs'], missing: ['b/excluded.test.mjs'], reason: 'ok' });
@@ -1479,7 +1508,7 @@ describe('alwaysRunInventory (item 99): a guard counts as run only if vitest exe
     expect(alwaysRunInventory({ reportText: report('/repo/a.test.mjs', '/repo/b.test.mjs'), files: ['a.test.mjs', './b.test.mjs'], cwd }).missing).toEqual([]);
   });
   it("a red guard is still executed (the run's own exit code carries the failure)", () => {
-    const reportText = JSON.stringify({ testResults: [{ name: '/repo/a.test.mjs', status: 'failed' }] });
+    const reportText = JSON.stringify({ testResults: [{ name: '/repo/a.test.mjs', status: 'failed', assertionResults: [{ status: 'failed' }] }] });
     expect(alwaysRunInventory({ reportText, files: ['a.test.mjs'], cwd }).missing).toEqual([]);
   });
   it.each([undefined, null, '', 'not json', '{}', '{"testResults":"x"}', '[]'])('an absent or unreadable report (%j) proves nothing: every guard is missing', (reportText) => {

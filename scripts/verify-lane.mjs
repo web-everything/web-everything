@@ -1313,10 +1313,12 @@ try {
     alwaysRun.executed = true;
     alwaysRun.ms = performance.now() - started;
     {
-      // `ran` is vitest's own executed-file inventory, red or green; a GREEN guard only counts when EVERY planned
-      // guard is in it.
+      // `ran` requires supported assertion-execution evidence, red or green; file presence/status alone cannot
+      // certify a guard. A GREEN guard only counts when EVERY planned guard has a passed or failed assertion.
       let reportText = null;
-      try { reportText = readFileSync(alwaysRunReport, 'utf8'); } catch { /* no report → nothing is proven */ }
+      try { reportText = readFileSync(alwaysRunReport, 'utf8'); } catch {
+        process.stderr.write('FAIL always-run guard: inventory-unavailable — could not read the Vitest assertion report; restore reporter output and rerun verify-lane.\n');
+      }
       // vitest names files under its own cwd, which is always the real path.
       const inventory = alwaysRunInventory({ reportText, files: alwaysRun.files, cwd: realpathSync(REPO) });
       alwaysRun.ran = inventory.executed;
@@ -1324,8 +1326,8 @@ try {
       if (inventory.missing.length && guard.exitCode === 0 && !guard.signal) {
         const why = inventory.reason === 'inventory-unavailable'
           ? 'vitest wrote no readable executed-file report, so no guard is proven to have run'
-          : 'vitest did not execute these declared guard files (excluded by its config, or matched no test)';
-        process.stderr.write(`FAIL always-run guard: ${why}: ${inventory.missing.join(', ')}\n`);
+          : 'vitest did not execute these declared guard files (excluded by its config, matched no test, or no valid executed assertion)';
+        process.stderr.write(`FAIL always-run guard: ${why}: ${inventory.missing.join(', ')}\nRestore an executable guard and rerun verify-lane; reporter changes require an explicit update to the supported assertion inventory contract.\n`);
         guard = { ...guard, exitCode: 1, failureDetails: { tests: inventory.missing.map(file => ({ file, name: null })), summary: `${why}: ${inventory.missing.join(', ')}`, truncated: false } };
         outcomes.guard = buildPhaseOutcome({ kind: 'scan', exitCode: 1, failureDetails: guard.failureDetails });
       }
