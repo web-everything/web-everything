@@ -256,6 +256,8 @@ export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|r
  * user fails the test.
  */
 export const LOCK_USERS = Object.freeze([
+  // The fast review pass owns both its singleton lease and the ordinary dispatch lease.
+  'scripts/lib/review-fast-pass-cli.mjs',
   // Remote discovery imports the remote-exec lock holder for its execution adapter.
   'scripts/readiness/remote-target.mjs',
   'scripts/operations/ruled-weakened-prune.mjs',
@@ -357,6 +359,8 @@ export const GUARD_FLOOR = Object.freeze([...new Set(['scripts/**/*file-locks*',
   'scripts/conveyor/soak/breaks/lane-acquire-waiter-takes-partial.mjs',
   // The missing-run push reservation is an exclusive-create (`wx`) hold: a race in it double-pushes a recovery.
   'scripts/conveyor/missing-run-push.mjs',
+  // Shared verification greens use exclusive creation and a no-clobber hard link for write-once publication.
+  'scripts/lib/verify-shared-marker.mjs',
   // The AGY usage reader writes its record through an exclusive-create (`wx`) temp file before the rename.
   'scripts/operations/agy-usage-reader.mjs',
   'scripts/*-lock.mjs', 'scripts/**/*-lock.mjs', 'scripts/**/with-lock*', 'skills-src/**/*-lock.mjs',

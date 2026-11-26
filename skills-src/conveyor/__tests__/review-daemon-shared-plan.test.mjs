@@ -2,19 +2,84 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { saveFastPlan, REVIEW_DISPATCH_LEASE_KEY } from '../../../scripts/lib/review-fast-pass-cli.mjs';
+import { acquireRunnerLease, releaseRunnerLeaseIfOwned } from '../runner-lock.mjs';
+import { dispatchReviewByMode } from '../../../scripts/operations/review-job.mjs';
 vi.mock('../../../scripts/lib/review-facts.mjs', async (original) => ({
   ...await original(), warmReviewFacts: async () => ({ skipped: 'test' }),
 }));
+vi.mock('../../../scripts/lib/review-fast-pass-cli.mjs', async original => ({
+  ...await original(), saveFastPlan: vi.fn(),
+}));
 import {
   runReviewTick, runReviewTickAllRepos, runConvertAdvisoryTick,
-  runConvertAdvisoryTickAllRepos, buildCliDaemonEffects, resolveReviewTickSharing,
+  runConvertAdvisoryTickAllRepos, buildCliDaemonEffects, resolveReviewTickSharing, runReviewDispatchPass,
 } from '../review-daemon.mjs';
 
 const repo = 'web-everything/web-everything';
 const empty = () => ({ dispatch: [], refusals: [] });
-const reviewOpts = { holdReconcile: () => [], statusCandidates: () => [] };
+const reviewOpts = { holdReconcile: () => [], statusCandidates: () => [], readMainSha: () => 'a'.repeat(40) };
 const authGateOverride = () => ({ paused: false, reason: null });
 afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
+
+it('ordinary maintenance runs while the dispatch mutex is held; capacity reads and spawn alone hold it', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'ordinary-mutex-'));
+  const key = REVIEW_DISPATCH_LEASE_KEY;
+  const maintenance = vi.fn(() => []), dispatch = vi.fn();
+  const readLiveReviewBudget = vi.fn(() => {
+    expect(acquireRunnerLease(root, 'competitor', { key }).ok).toBe(false);
+    throw Error('fixture capacity unreadable');
+  });
+  const run = () => runReviewDispatchPass({ owner: 'ordinary', lockRoot: root, repos: [repo], authGateOverride,
+    log: { error: () => {} }, reviewTickOpts: () => ({ ...reviewOpts,
+      holdReconcile: maintenance, readLiveReviewBudget, dispatch, acquirableLanes: () => [1],
+      dispatchState: { firstOwedAt: new Map(), lastDispatched: new Map() },
+      reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 77, headRefOid: 'a'.repeat(40) }] }),
+    }) });
+  try {
+    acquireRunnerLease(root, 'competitor', { key });
+    await run();
+    expect(maintenance).toHaveBeenCalledOnce();
+    expect(readLiveReviewBudget).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+    releaseRunnerLeaseIfOwned(root, 'competitor', { key });
+    const out = await run();
+    expect(out.failed).toContainEqual(expect.objectContaining({ error: 'fixture capacity unreadable' }));
+    expect(maintenance).toHaveBeenCalledTimes(2);
+    expect(readLiveReviewBudget).toHaveBeenCalledOnce();
+    expect(acquireRunnerLease(root, 'competitor', { key }).ok).toBe(true);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+it('ordinary dispatch stops the remaining candidates on lost ownership', () => {
+  const dispatch = vi.fn();
+  const out = runReviewTick({ ...reviewOpts, repo, dispatch, leaseHeld: () => false,
+    dispatchState: { firstOwedAt: new Map(), lastDispatched: new Map() },
+    reconcile: () => ({ dispatch: [1, 2].map(prNumber => ({ kind: 'review', prNumber })), refusals: [] }) });
+  expect(out.failed).toContainEqual({ prNumber: 1, error: 'dispatch lease lost' });
+  expect(dispatch).not.toHaveBeenCalled();
+});
+it.each(['ci', 'stack'])('ordinary pass forwards lease ownership through a slow %s read to the final spawn guard', async stage => {
+  const root = mkdtempSync(join(tmpdir(), 'ordinary-lease-loss-'));
+  const spawnJob = vi.fn(), head = 'a'.repeat(40);
+  const lose = () => releaseRunnerLeaseIfOwned(root, 'ordinary', { key: REVIEW_DISPATCH_LEASE_KEY });
+  try {
+    const out = await runReviewDispatchPass({ owner: 'ordinary', lockRoot: root, repos: [repo], authGateOverride,
+      log: { error: () => {} }, reviewTickOpts: () => ({ ...reviewOpts,
+        dispatchState: { firstOwedAt: new Map(), lastDispatched: new Map() },
+        reconcile: () => ({ dispatch: [77, 78].map(prNumber => ({ kind: 'review', prNumber, headRefOid: head })) }),
+        acquirableLanes: () => [1, 2], readLiveReviewBudget: () => ({ left: 2, reserve: 0 }),
+        dispatch: args => dispatchReviewByMode({ ...args, mode: 'job', root, dir: join(root, 'jobs'),
+          io: { liveHead: () => head }, checkStaleness: () => ({ fresh: true }),
+          readCompletion: () => null, resolveSettingsEnv: () => ({}),
+          stackCheck: () => { if (stage === 'stack') lose(); return { base: null }; },
+          ciGate: () => { if (stage === 'ci') lose(); return { allowed: true, headSha: head }; }, spawnJob,
+        }),
+      }) });
+    expect(spawnJob).not.toHaveBeenCalled();
+    expect(out.failed).toContainEqual(expect.objectContaining({ prNumber: 77, error: 'dispatch lease lost' }));
+    expect(out.failed).toContainEqual(expect.objectContaining({ prNumber: 78, error: 'dispatch lease lost' }));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 describe('review tick plan sharing', () => {
   it('snapshots the final replacement plan and withholds it when promotion replanning fails, leaving onPlan unchanged', () => {
@@ -30,10 +95,10 @@ describe('review tick plan sharing', () => {
     };
     const ok = run(() => replacement);
     expect(ok.out.operatorHolds).toEqual({ observedAt: 3, holds: [{ prNumber: 2, kind: 'cap-exhausted' }] });
-    expect(ok.onPlan).toHaveBeenCalledWith({ repo, plan: replacement, rawPrs: [{ ...rawPrs[0], isDraft: false }] });
+    expect(ok.onPlan).toHaveBeenCalledWith({ repo, plan: replacement, rawPrs: [{ ...rawPrs[0], isDraft: false }], mainSha: 'a'.repeat(40) });
     const failed = run(() => { throw Error('replan'); });
     expect(failed.out.operatorHolds).toBeNull();
-    expect(failed.onPlan).toHaveBeenCalledWith({ repo, plan: first, rawPrs: [{ ...rawPrs[0], isDraft: false }] });
+    expect(failed.onPlan).toHaveBeenCalledWith({ repo, plan: first, rawPrs: [{ ...rawPrs[0], isDraft: false }], mainSha: 'a'.repeat(40) });
   });
   it('reports the acted-on plan and raw listing without changing the return shape; callback errors are isolated', () => {
     const plan = empty();
@@ -41,7 +106,7 @@ describe('review tick plan sharing', () => {
     const baseline = runReviewTick(opts);
     const onPlan = vi.fn();
     expect(runReviewTick({ ...opts, onPlan })).toEqual(baseline);
-    expect(onPlan).toHaveBeenCalledWith({ repo, plan, rawPrs: null });
+    expect(onPlan).toHaveBeenCalledWith({ repo, plan, rawPrs: null, mainSha: 'a'.repeat(40) });
     expect(runReviewTick({ ...opts, onPlan: () => { throw Error('observer'); } })).toEqual(baseline);
   });
   it('reports the replacement plan and promoted snapshot, reading PRs once before the hold sweep', () => {
@@ -59,7 +124,7 @@ describe('review tick plan sharing', () => {
       promoteDrafts: () => ({ rows: [{ pr: 7, action: 'promoted' }] }),
     });
     expect(readPrs).toHaveBeenCalledTimes(1);
-    expect(onPlan).toHaveBeenCalledWith({ repo, plan: replacement, rawPrs: [{ ...rawPrs[0], isDraft: false }] });
+    expect(onPlan).toHaveBeenCalledWith({ repo, plan: replacement, rawPrs: [{ ...rawPrs[0], isDraft: false }], mainSha: 'a'.repeat(40) });
   });
   it('still sweeps independently when the shared PR read fails, and never reports a missing plan', () => {
     const holdReconcile = vi.fn(() => []);
@@ -70,6 +135,13 @@ describe('review tick plan sharing', () => {
     expect(holdReconcile).toHaveBeenCalledOnce();
     expect(out.reconcileError).toBeTruthy();
     expect(onPlan).not.toHaveBeenCalled();
+  });
+  it('persists no usable main SHA when main moves during planning', () => {
+    const onPlan = vi.fn();
+    runReviewTick({ ...reviewOpts, repo, reconcile: empty, onPlan,
+      readMainSha: vi.fn().mockReturnValueOnce('a'.repeat(40)).mockReturnValue('b'.repeat(40)),
+    });
+    expect(onPlan).toHaveBeenCalledWith({ repo, plan: empty(), rawPrs: null, mainSha: null });
   });
   it('convert uses cached entries and comments/labels with no reads; a missing entry follows the original path', async () => {
     const plan = { dispatch: [{ kind: 'convert-advisory', prNumber: 7 }] };
@@ -131,6 +203,7 @@ describe('review tick plan sharing', () => {
       runConvertAdvisories: (o) => runConvertAdvisoryTickAllRepos({ ...opts, repos, ...o }),
     });
     await effects.tickOnce();
+    expect(saveFastPlan).toHaveBeenCalledWith({ repo, plan: empty(), rawPrs: [], mainSha: 'a'.repeat(40) });
     expect(reconcile).toHaveBeenCalledTimes(reuse === '1' ? 3 : 6);
     expect(lines.filter((l) => l.includes('pass timings'))).toEqual([expect.stringMatching(/total \d+\.\d+s — reap .*facts .*review .*web-everything .*frontierui .*plateau-app .*convert .*prep .*reusePlan=.*source env.*repoConcurrency=3 \(source env\)/)]);
     await effects.tickOnce();
@@ -172,4 +245,17 @@ describe('review tick plan sharing', () => {
       expect(() => resolveReviewTickSharing(new Proxy({}, { get: () => { throw Error('env'); } }))).not.toThrow();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+});
+
+it('snapshot production passes the repository to both remote-main reads', () => {
+  const readMainSha = vi.fn(({ repo }) => repo === 'first/repo' ? 'a'.repeat(40) : 'b'.repeat(40));
+  const onPlan = vi.fn();
+  for (const repo of ['first/repo', 'second/repo']) runReviewTick({ ...reviewOpts, repo, readMainSha, onPlan, reconcile: empty });
+  expect(readMainSha.mock.calls.map(([args]) => args.repo)).toEqual(['first/repo', 'first/repo', 'second/repo', 'second/repo']);
+  expect(onPlan.mock.calls.map(([snapshot]) => snapshot.mainSha)).toEqual(['a'.repeat(40), 'b'.repeat(40)]);
+});
+it('failed remote-main reads leave no usable fast snapshot without breaking the ordinary tick', () => {
+  const onPlan = vi.fn();
+  expect(() => runReviewTick({ ...reviewOpts, repo, onPlan, reconcile: empty, readMainSha: () => { throw Error('remote unreadable'); } })).not.toThrow();
+  expect(onPlan).toHaveBeenCalledWith(expect.objectContaining({ mainSha: null }));
 });
