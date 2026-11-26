@@ -11,6 +11,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, existsSync, readdirSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { dirname } from 'node:path';
+import { runInNewContext } from 'node:vm';
 import { EventEmitter } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -775,6 +776,22 @@ it('classifies juror-timeout and writes the named seat to the ended record', () 
 
 
 describe('review loop process-group timeout', () => {
+  it('production preload lets a naturally completing child exit successfully before its deadline', () => {
+    const root = join(dir, 'natural-completion');
+    mkdirSync(join(root, 'scripts/operations'), { recursive: true });
+    writeFileSync(join(root, 'scripts/operations/review-loop-cli.mjs'), `
+      // Complete by draining the event loop, without an explicit process.exit().
+      setTimeout(() => console.log(JSON.stringify({ runId: 'natural-run', stopped: 'complete' })), 50);
+    `);
+    const io = createReviewJobIo({ root, env: { ...process.env },
+      readFile: () => '{"job":{"timeoutGraceMs":100}}', log: () => {} });
+    const timeoutMs = 2000;
+    const started = Date.now();
+    const result = io.runLoop({ pr: 10, repo: REPO, lanePath: root, timeoutMs });
+    expect(result).toMatchObject({ status: 0, signal: null, timedOut: false, supervisionFailed: false, groupTermination: null });
+    expect(Date.now() - started).toBeLessThan(timeoutMs);
+    expect(parseReviewLoopStdout(result.stdout)).toMatchObject({ runId: 'natural-run', stopped: 'complete' });
+  });
   it('generates a timeout fixture without unmanaged keep-alive timers', () => {
     const { root } = fixture(false);
     expect(findUnmanagedKeepAlives([{
@@ -799,13 +816,11 @@ with open(${JSON.stringify(childPid)}, 'w') as f:
     json.dump({'pid': os.getpid(), 'pgid': os.getpgrp()}, f)
 time.sleep(4)
 `)}], { stdio: 'ignore' });
-      process.on('SIGTERM', () => {
-        ${finishes ? `setTimeout(() => {
-          writeFileSync(${JSON.stringify(effect)}, JSON.stringify({ effect: 'applied' }));
-          console.log(JSON.stringify({ runId: 'grace-run', stopped: 'complete' }));
-          process.exit(0);
-        }, 100);` : ''}
-      });
+      (${reviewJob.installReviewLoopTerminationHandler.toString()})();
+      ${finishes ? `setTimeout(() => {
+        writeFileSync(${JSON.stringify(effect)}, JSON.stringify({ effect: 'applied' }));
+        console.log(JSON.stringify({ runId: 'grace-run', stopped: 'complete' }));
+      }, 800);` : ''}
       ${keepAliveScript()}
     `);
     return { root, effect, childPid, loopPid };
@@ -815,12 +830,14 @@ time.sleep(4)
     const logs = [];
     try {
       const io = createReviewJobIo({ root: paths.root,
-        env: { ...process.env, WE_REVIEW_JOB_TIMEOUT_GRACE_MS: '500' }, log: line => logs.push(line) });
+        env: { ...process.env }, readFile: () => '{"job":{"timeoutGraceMs":500}}', log: line => logs.push(line) });
+      const started = Date.now();
       const result = io.runLoop({ pr: 10, repo: REPO, lanePath: paths.root, timeoutMs: 700 });
+      expect(Date.now() - started).toBeLessThan(2500);
       expect(existsSync(paths.childPid), result.stderr || JSON.stringify(result)).toBe(true);
       const child = JSON.parse(readFileSync(paths.childPid, 'utf8'));
       const pid = Number(readFileSync(paths.loopPid, 'utf8'));
-      expect(() => process.kill(child.pid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
+      expect(() => process.kill(child.pid, 0), JSON.stringify(result)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
       expect(child.pgid).toBe(pid);
       expect(result).toMatchObject({ timedOut: true, groupTermination: 'group-killed' });
       expect(logs.join('\n')).toMatch(/group-term[\s\S]*group-kill/);
@@ -835,6 +852,31 @@ time.sleep(4)
       }
     }
   }
+  it('kills a synchronously blocked production loop and its descendant without an IPC reply', () => {
+    const paths = fixture(false);
+    const script = join(paths.root, 'scripts/operations/review-loop-cli.mjs');
+    writeFileSync(script, readFileSync(script, 'utf8')
+      + '\nAtomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20000);\n');
+    try {
+      const io = createReviewJobIo({ root: paths.root, env: { ...process.env },
+        readFile: () => '{"job":{"timeoutGraceMs":500}}', log: () => {} });
+      const started = Date.now();
+      const result = io.runLoop({ pr: 10, repo: REPO, lanePath: paths.root, timeoutMs: 700 });
+      expect(Date.now() - started).toBeLessThan(3000);
+      expect(result).toMatchObject({ timedOut: true, groupTermination: 'group-killed' });
+      const loopPid = Number(readFileSync(paths.loopPid, 'utf8'));
+      const child = JSON.parse(readFileSync(paths.childPid, 'utf8'));
+      expect(() => process.kill(loopPid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
+      expect(() => process.kill(child.pid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
+    } finally {
+      for (const file of [paths.childPid, paths.loopPid]) {
+        if (!existsSync(file)) continue;
+        const raw = readFileSync(file, 'utf8');
+        const pid = file === paths.childPid ? JSON.parse(raw).pid : Number(raw);
+        try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+    }
+  });
   it('timeout terminates the whole process group, so no grandchild outlives the job', () => {
     const { paths } = runFixture(false);
     expect(existsSync(paths.effect)).toBe(false);
@@ -853,10 +895,120 @@ describe('review timeout grace setting', () => {
     expect(setting.value.timeoutGraceMs).toBe(60_000);
     expect(setting.sources.timeoutGraceMs).toBe('standard');
   });
-  it('resolves grace through standard, platform, tool and environment with provenance', () => {
+  it('resolves grace through standard, platform and tool with provenance', () => {
     const resolve = (tool, env) => reviewJob.resolveLoopTimeoutGrace({ platform: { timeoutGraceMs: 2000 }, tool, env });
     expect(resolve({}, {})).toMatchObject({ value: { timeoutGraceMs: 2000 }, sources: { timeoutGraceMs: 'platform' } });
     expect(resolve({ timeoutGraceMs: 3000 }, {})).toMatchObject({ value: { timeoutGraceMs: 3000 }, sources: { timeoutGraceMs: 'tool' } });
-    expect(resolve({ timeoutGraceMs: 3000 }, { WE_REVIEW_JOB_TIMEOUT_GRACE_MS: '4000' })).toMatchObject({ value: { timeoutGraceMs: 4000 }, sources: { timeoutGraceMs: 'env' } });
+    expect(resolve({ timeoutGraceMs: 3000 }, { WE_REVIEW_JOB_TIMEOUT_GRACE_MS: '4000' })).toMatchObject({ value: { timeoutGraceMs: 3000 }, sources: { timeoutGraceMs: 'tool' } });
+  });
+});
+
+// Exercise the exact supervisor program sent to Node, with controlled OS evidence.
+function supervisionProbe({ overflow = false, identity = 'original', deny = false, terminate = false, unresponsive = false } = {}) {
+  const child = new EventEmitter();
+  child.pid = 123; child.connected = true; child.exitCode = null; child.signalCode = null;
+  child.send = vi.fn(message => {
+    if (!unresponsive) child.emit('message', { type: 'loop-identity', pid: 123, startTime: identity, nonce: message.nonce });
+  });
+  child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+  for (const stream of [child.stdout, child.stderr]) {
+    stream.destroy = vi.fn(); stream.resume = () => {};
+  }
+  const proc = new EventEmitter();
+  proc.execPath = process.execPath;
+  const kills = [];
+  let alive = true, killedAt;
+  proc.kill = (pid, signal) => {
+    kills.push([pid, signal]);
+    if (deny) throw Object.assign(Error('denied'), { code: 'EPERM' });
+    if (signal === 'SIGKILL') { alive = false; killedAt = elapsed; }
+  };
+  const timers = [];
+  let evidence, elapsed = 0, exitedAt;
+  proc.exit = () => { exitedAt = elapsed; proc.emit('exit'); };
+  const io = createReviewJobIo({ env: {}, readFile: () => '{"job":{"timeoutGraceMs":100}}', log: () => {},
+    spawnNode: (_file, args) => {
+      proc.argv = ['node', args[2]];
+      runInNewContext(args[1], { process: proc, Buffer,
+        require: name => name === 'node:child_process' ? {
+          spawn: () => child,
+        } : { writeFileSync: (fd, value) => { if (fd === 3) evidence = JSON.parse(value); } },
+        setTimeout: (fn, ms) => { const timer = { fn, ms: elapsed + ms }; timers.push(timer); return timer; },
+        clearTimeout: timer => { if (timer) timer.cancelled = true; },
+      });
+      child.emit('message', { type: 'loop-identity', pid: 123, startTime: 'original' });
+      if (overflow) child.stdout.emit('data', Buffer.alloc(33 * 1024 * 1024));
+      if (terminate) proc.emit('SIGTERM');
+      const advance = () => {
+        const timer = timers.filter(t => !t.cancelled && !t.ran).sort((a, b) => a.ms - b.ms)[0];
+        if (!timer || exitedAt !== undefined) return;
+        timer.ran = true; elapsed = timer.ms; timer.fn(); advance();
+      };
+      advance();
+      return { stdout: '{"stopped":"complete","verdict":{"verdict":"accept"}}', output: [null, '', '', JSON.stringify(evidence)] };
+    },
+  });
+  let result, error;
+  try { result = io.runLoop({ pr: 1, repo: REPO, lanePath: '.', timeoutMs: 200 }); } catch (e) { error = e; }
+  return { result, error, child, kills, exitedAt, timers, alive, killedAt };
+}
+
+describe('timeout audit regressions', () => {
+  it('kills an unresponsive loop group by the deadline even when identity IPC replies never arrive', () => {
+    const probe = supervisionProbe({ unresponsive: true });
+    expect(probe.child.send).toHaveBeenCalled();
+    expect(probe.kills).toContainEqual([-123, 'SIGKILL']);
+    expect(probe.alive).toBe(false);
+    expect(probe.killedAt).toBeLessThanOrEqual(10300);
+    expect(probe.exitedAt).toBeLessThanOrEqual(10300);
+    expect(probe.result).toMatchObject({ timedOut: true, supervisionFailed: true, groupTermination: 'group-killed' });
+  });
+  it('output overflow cannot auto-clear an earlier accept payload', () => {
+    const probe = supervisionProbe({ overflow: true });
+    expect(probe.result?.supervisionFailed).toBe(true);
+    const { io } = fakeIo({ runLoop: () => probe.result });
+    expect(runReviewJob({ pr: 10, repo: REPO }, io).outcome).toBe(BLOCKED_ON_INFRA);
+  });
+  it('hard deadline destroys retained pipes and returns without close', () => {
+    const probe = supervisionProbe();
+    expect(probe.child.stdout.destroy).toHaveBeenCalled();
+    expect(probe.child.stderr.destroy).toHaveBeenCalled();
+    expect(probe.result?.timedOut).toBe(true);
+    expect(probe.exitedAt).toBeLessThanOrEqual(10_300);
+  });
+  it('supervisor termination and exit kill the detached loop group', () => {
+    const probe = supervisionProbe({ terminate: true });
+    expect(probe.kills[0]).toEqual([-123, 'SIGKILL']);
+  });
+  it('group-kill-failed alerts and keeps both lane and job claimed', () => {
+    const logs = [];
+    const probe = supervisionProbe({ deny: true });
+    expect(probe.result?.groupTermination).toBe('group-kill-failed');
+    const { io, calls } = fakeIo({ runLoop: () => probe.result, log: line => logs.push(line) });
+    runReviewJob({ pr: 10, repo: REPO }, io);
+    expect(calls.some(c => ['release', 'unclaim'].includes(c[0]))).toBe(false);
+    expect(logs.join(' ')).toMatch(/ALERT.*retain/i);
+  });
+  it('grace rejects more than 300 seconds and ignores environment overrides', () => {
+    expect(reviewJob.resolveLoopTimeoutGrace({ platform: {}, tool: { timeoutGraceMs: 2147483647 }, env: {} }).value.timeoutGraceMs).toBe(60000);
+    expect(reviewJob.resolveLoopTimeoutGrace({ platform: {}, tool: { timeoutGraceMs: 100 }, env: { WE_REVIEW_JOB_TIMEOUT_GRACE_MS: '2147483647' } }).value.timeoutGraceMs).toBe(100);
+  });
+  it('delayed SIGKILL refuses a reused leader pid and start time', () => {
+    const probe = supervisionProbe({ identity: 'replacement' });
+    expect(probe.kills).not.toContainEqual([-123, 'SIGKILL']);
+    expect(probe.result?.groupTermination).toBe('group-kill-failed');
+  });
+  it('production termination handler lets the pending effect finish and record', () => {
+    const proc = new EventEmitter();
+    const remove = reviewJob.installReviewLoopTerminationHandler(proc);
+    proc.emit('SIGTERM');
+    expect(proc.listenerCount('SIGTERM')).toBe(1);
+    remove();
+    expect(proc.listenerCount('SIGTERM')).toBe(0);
+  });
+  it('timeout completion is bounded by timeout plus grace plus ten seconds', () => {
+    const probe = supervisionProbe();
+    expect(probe.exitedAt).toBeTypeOf('number');
+    expect(probe.exitedAt).toBeLessThanOrEqual(10300);
   });
 });

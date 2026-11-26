@@ -183,8 +183,8 @@ export const DEFAULT_LOOP_TIMEOUT_MS = 45 * 60 * 1000;
 export const LOOP_TIMEOUT_ENV = 'WE_REVIEW_JOB_TIMEOUT_MS';
 
 /** Allow an in-flight sink to finish and record its effect before killing descendants.
- * reviewJob.timeoutGraceMs: standard → platform → scripts/settings/review.json job → env.
- * Node timers must fit a signed 32-bit delay; overflow would otherwise become an immediate kill. */
+ * reviewJob.timeoutGraceMs: standard → platform → scripts/settings/review.json job. No environment override.
+ * Grace is bounded to five minutes; invalid settings fall back to the lower layer. */
 export function resolveLoopTimeoutGrace({ env = process.env, platform, tool, readFile = readFileSync, log } = {}) {
   if (tool === undefined) {
     try { tool = JSON.parse(readFile(new URL('../settings/review.json', import.meta.url), 'utf8')).job; }
@@ -192,70 +192,153 @@ export function resolveLoopTimeoutGrace({ env = process.env, platform, tool, rea
   }
   return cascadePolicy('reviewJob', tool, {
     standard: { timeoutGraceMs: 60_000 }, platform, env, log,
-    envValues: { timeoutGraceMs: env.WE_REVIEW_JOB_TIMEOUT_GRACE_MS === undefined ? undefined : Number(env.WE_REVIEW_JOB_TIMEOUT_GRACE_MS) },
-    valid: { timeoutGraceMs: n => Number.isSafeInteger(n) && n > 0 && n <= 2_147_483_647 },
+    envValues: {},
+    valid: { timeoutGraceMs: n => Number.isSafeInteger(n) && n > 0 && n <= 300_000 },
   });
 }
 
 /** Runs in a small supervisor so the job can retain its synchronous IO contract. The
  * supervisor stays outside the detached loop's group and owns BOTH timeout signals.
  * fd 3 is lifecycle evidence, separate from the loop's untrusted stdout/stderr. */
-function superviseReviewLoop() {
+export function installReviewLoopTerminationHandler(proc = process) {
+  // The supervisor owns the hard deadline. Keep the loop alive long enough for its
+  // current effect promise (or synchronous sink) to return and persist its outcome.
+  const deferTermination = () => {};
+  proc.on('SIGTERM', deferTermination);
+  if (proc.send) {
+    const identity = { pid: proc.pid, startTime: String(proc.hrtime.bigint()) };
+    proc.send({ type: 'loop-identity', ...identity });
+    proc.on('message', message => {
+      if (message?.type === 'verify-loop-identity') proc.send({ type: 'loop-identity', ...identity, nonce: message.nonce });
+    });
+    // Listening for identity requests must not keep a completed loop alive.
+    proc.channel.unref();
+  }
+  return () => proc.removeListener('SIGTERM', deferTermination);
+}
+
+function superviseReviewLoop(installTerminationHandler) {
   const { spawn } = require('node:child_process');
   const { writeFileSync } = require('node:fs');
   const [timeoutMs, graceMs, ...args] = JSON.parse(process.argv[1]);
-  const child = spawn(process.execPath, args, { detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
-  const result = { status: null, signal: null, timedOut: false, groupTermination: null, events: [] };
-  let exited = false, graceTimer, graceElapsed = false;
-  const finish = () => { writeFileSync(3, JSON.stringify(result)); process.exit(0); };
+  // Install before loading the production entry point, including during module evaluation.
+  const preload = `data:text/javascript,${encodeURIComponent(`(${installTerminationHandler.toString()})()` )}`;
+  const child = spawn(process.execPath, ['--import', preload, ...args], { detached: true, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+  const result = { status: null, signal: null, timedOut: false, supervisionFailed: false, groupTermination: null, events: [] };
+  let finished = false, closed = false, graceTimer, verificationTimer, graceElapsed = false;
+  // A startup token and challenge reply over the original IPC endpoint bind the
+  // PID to this leader's lifetime. A recycled numeric PID cannot inherit that pipe.
+  let originalIdentity = null, leaderExited = false, sequence = 0, pendingVerification = null;
+  child.on('exit', () => { leaderExited = true; });
+  child.on('message', message => {
+    if (message?.type !== 'loop-identity' || message.pid !== child.pid || typeof message.startTime !== 'string') return;
+    if (!originalIdentity && message.nonce === undefined) originalIdentity = message.startTime;
+    if (pendingVerification && message.nonce === pendingVerification.nonce) {
+      const callback = pendingVerification.callback;
+      clearTimeout(verificationTimer);
+      pendingVerification = null;
+      callback(message.startTime === originalIdentity && !leaderExited);
+    }
+  });
+  const fail = message => {
+    result.supervisionFailed = true;
+    result.groupTermination = 'group-kill-failed';
+    result.events.push(`ALERT ${message}; retain lane and job claim; operator must inspect group ${child.pid}`);
+  };
   const signalGroup = signal => {
     try { process.kill(-child.pid, signal); return true; }
     catch (error) {
       if (error.code === 'ESRCH') return false;
-      result.groupTermination = 'group-kill-failed';
-      result.events.push(`group signal ${signal} failed: ${error.code}; operator must inspect and terminate group ${child.pid}`);
+      fail(`group signal ${signal} failed: ${error.code}`);
       return false;
     }
   };
+  const originalChildStillLive = () => originalIdentity !== null && !leaderExited
+    && child.connected && child.exitCode === null && child.signalCode === null;
+  const finishPendingVerification = () => {
+    if (!pendingVerification) return;
+    const callback = pendingVerification.callback;
+    pendingVerification = null;
+    // A blocked JS thread cannot answer, but it still owns the original IPC
+    // endpoint and live child handle. A replacement PID cannot inherit either.
+    callback(originalChildStillLive());
+  };
+  const killVerifiedGroup = callback => {
+    const refuse = () => {
+      try { process.kill(-child.pid, 0); }
+      catch (error) { if (error.code === 'ESRCH') { result.groupTermination = 'group-already-gone'; callback(); return; } }
+      fail('group leader identity changed or unavailable'); callback();
+    };
+    if (!originalIdentity || leaderExited || !child.connected) { refuse(); return; }
+    const nonce = ++sequence;
+    pendingVerification = { nonce, callback: verified => {
+      if (!verified) { refuse(); return; }
+      const killed = signalGroup('SIGKILL');
+      if (result.groupTermination !== 'group-kill-failed') result.groupTermination = killed ? 'group-killed' : 'group-already-gone';
+      callback();
+    } };
+    verificationTimer = setTimeout(finishPendingVerification, 1000);
+    try { child.send({ type: 'verify-loop-identity', nonce }, error => {
+      if (error && pendingVerification?.nonce === nonce) { pendingVerification = null; refuse(); }
+    }); } catch { pendingVerification = null; refuse(); }
+  };
+  // exit handlers cannot await IPC. An open original endpoint plus an unreaped
+  // child handle still identifies this leader; never use a stale numeric PGID.
+  process.on('exit', () => {
+    if (!finished && originalChildStillLive()) signalGroup('SIGKILL');
+  });
+  for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => {
+    result.supervisionFailed = true;
+    killVerifiedGroup(finish);
+  });
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(timer); clearTimeout(graceTimer); clearTimeout(verificationTimer); clearTimeout(hardTimer);
+    child.stdout.destroy(); child.stderr.destroy();
+    writeFileSync(3, JSON.stringify(result)); process.exit(0);
+  };
+  const hardTimer = setTimeout(() => {
+    result.timedOut = true; result.supervisionFailed = true;
+    result.events.push('hard overall deadline; destroying retained output pipes');
+    finishPendingVerification();
+    if (!['group-killed', 'group-already-gone'].includes(result.groupTermination)) fail('hard deadline without confirmed group termination');
+    finish();
+  }, timeoutMs + graceMs + 10_000);
   const timer = setTimeout(() => {
-    result.timedOut = true;
+    result.timedOut = true; result.supervisionFailed = true;
     result.events.push(`group-term pgid=${child.pid} graceMs=${graceMs}`);
     signalGroup('SIGTERM');
-    // Do not clear this timer when the leader exits: descendants can still be alive.
     graceTimer = setTimeout(() => {
       graceElapsed = true;
       result.events.push(`group-kill pgid=${child.pid}`);
-      const killed = signalGroup('SIGKILL');
-      if (result.groupTermination !== 'group-kill-failed') result.groupTermination = killed ? 'group-killed' : 'group-already-gone';
-      if (exited || result.groupTermination === 'group-kill-failed') finish();
+      killVerifiedGroup(() => {
+        if (closed || result.groupTermination === 'group-kill-failed') finish();
+      });
     }, graceMs);
   }, timeoutMs);
-  // Bound each output stream below the synchronous caller's maxBuffer. Killing only
-  // the supervisor on buffer overflow would orphan the very group it owns.
   for (const [stream, fd] of [[child.stdout, 1], [child.stderr, 2]]) {
     let bytes = 0;
     stream.on('data', chunk => {
       bytes += chunk.length;
       if (bytes <= 32 * 1024 * 1024) writeFileSync(fd, chunk);
       else {
+        result.supervisionFailed = true;
         result.events.push('loop output exceeded 32 MiB; terminating process group');
-        signalGroup('SIGKILL');
-        stream.removeAllListeners('data');
-        stream.resume();
+        killVerifiedGroup(finish);
       }
     });
   }
   child.on('error', error => {
-    clearTimeout(timer); clearTimeout(graceTimer);
-    result.status = 1;
+    result.status = 1; result.supervisionFailed = true;
     result.events.push(`loop spawn failed: ${error.message}`);
     finish();
   });
   child.on('close', (status, signal) => {
-    exited = true;
+    closed = true;
     result.status = status; result.signal = signal;
-    if (!result.timedOut) { clearTimeout(timer); finish(); }
-    else if (graceElapsed) finish();
+    if (result.groupTermination === 'group-killed') setTimeout(finish, 100);
+    else if (!result.timedOut || graceElapsed) finish();
   });
 }
 
@@ -512,7 +595,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
   };
   const node = (args, { actorId, timeoutMs, extraEnv = null, groupGraceMs = null } = {}) => spawnNode(process.execPath,
     groupGraceMs === null ? [...heapCapArgs(basename(args[0], '.mjs')), ...args]
-      : ['-e', `(${superviseReviewLoop.toString()})()`, JSON.stringify([timeoutMs, groupGraceMs, ...heapCapArgs(basename(args[0], '.mjs')), ...args])], {
+      : ['-e', `(${superviseReviewLoop.toString()})(${installReviewLoopTerminationHandler.toString()})`, JSON.stringify([timeoutMs, groupGraceMs, ...heapCapArgs(basename(args[0], '.mjs')), ...args])], {
     cwd: root,
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
@@ -731,12 +814,12 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
         lifecycle = JSON.parse(String(r.output?.[3] ?? ''));
         if (typeof lifecycle.timedOut !== 'boolean' || !Array.isArray(lifecycle.events)) throw Error('invalid lifecycle');
       } catch {
-        throw Error(`review-loop supervisor returned incomplete lifecycle evidence; operator must inspect loop processes (${r.error?.message ?? r.signal ?? r.status})`);
+        throw Object.assign(Error(`review-loop supervisor returned incomplete lifecycle evidence; operator must inspect loop processes (${r.error?.message ?? r.signal ?? r.status})`), { retainClaim: true });
       }
       for (const event of lifecycle.events) log(`review-job ${event}`);
       return {
         status: lifecycle.status, signal: lifecycle.signal, stdout: String(r.stdout ?? ''), stderr: String(r.stderr ?? ''),
-        timedOut: lifecycle.timedOut, groupTermination: lifecycle.groupTermination,
+        supervisionFailed: lifecycle.supervisionFailed, timedOut: lifecycle.timedOut, groupTermination: lifecycle.groupTermination,
       };
     },
     releaseLane: (slug) => node(['scripts/lane-pool.mjs', 'release', '--all-pools', `--session=${slug}`], { timeoutMs: 5 * 60 * 1000 }),
@@ -1427,6 +1510,7 @@ function runReviewArc({
   } catch { tel = null; root = null; }
   const span = (name) => { try { return root ? root.child(name) : null; } catch { return null; } };
 
+  let retainClaim = false;
   let classified = null;
   let lanePath = null;
   try {
@@ -1664,9 +1748,10 @@ function runReviewArc({
     if (seatsBox.speculative) seatsBox.speculative.loopFinishedAt = io.now();
     timings.loopMs = io.now() - tL;
     const parsed = parseReviewLoopStdout(loop.stdout);
-    if (loop.timedOut) {
+    retainClaim = loop.groupTermination === 'group-kill-failed';
+    if (loop.timedOut || loop.supervisionFailed || loop.groupTermination) {
       classified = { outcome: BLOCKED_ON_INFRA, verdict: null, loopOutcome: null, runId: parsed?.runId ?? null,
-        label: `review-loop timed out after ${loopTimeoutMs}ms (${loop.groupTermination ?? 'group outcome unavailable; operator must inspect loop processes'})` };
+        label: `review-loop ${loop.timedOut ? 'timed out' : 'supervision failed'} after ${loopTimeoutMs}ms (${loop.groupTermination ?? 'group outcome unavailable; operator must inspect loop processes'})` };
     } else if (parsed) {
       // #3647 — classify what the loop PRINTED even on a non-zero exit: a finished review whose secondary
       // filing step failed is still that review's real outcome.
@@ -1687,8 +1772,9 @@ function runReviewArc({
     if (classified.outcome === BLOCKED_ON_INFRA && classified.label) io.log(`review-job ${slug}: loop error — ${classified.label}`);
     io.log(`review-job ${slug}: loop finished in ${timings.loopMs}ms — ${classified.outcome} (verdict ${classified.verdict ?? '-'}, loop ${classified.loopOutcome ?? '-'}, run ${classified.runId ?? '-'})`);
     // #4194 — hand the added seats what they need; they run in `runReviewJob` once this arc has fully finished.
-    return finishArc(parsed && !loop.timedOut ? { pr: planned.pr, repo: planned.repo, lanePath, loopPayload: parsed, slug } : null);
+    return finishArc(parsed && !loop.timedOut && !loop.supervisionFailed && !loop.groupTermination ? { pr: planned.pr, repo: planned.repo, lanePath, loopPayload: parsed, slug } : null);
   } catch (e) {
+    retainClaim ||= e?.retainClaim === true;
     classified = { outcome: BLOCKED_ON_INFRA, verdict: null, loopOutcome: null, runId: null, label: tail(e?.message ?? e, 500) };
     io.log(`review-job ${slug}: crashed — ${classified.label}`);
     return result({ ...classified, lanePath });
@@ -1706,8 +1792,9 @@ function runReviewArc({
         ...(done.label ? { label: String(done.label).slice(0, 500) } : {}),
       });
     } catch (e) { io.log(`review-job ${slug}: FAILED to write the done completion record — ${tail(e?.message ?? e, 200)}`); }
-    if (lanePath) { try { io.releaseLane(slug); } catch { /* reported by the lane pool's own reaper */ } }
-    try { io.unclaim(slug, pid); } catch { /* a stale record is pruned by pid next read */ }
+    if (retainClaim) io.log(`ALERT review-job ${slug}: retain lane and job claim; operator must terminate surviving loop processes`);
+    if (!retainClaim && lanePath) { try { io.releaseLane(slug); } catch { /* reported by the lane pool's own reaper */ } }
+    try { if (!retainClaim) io.unclaim(slug, pid); } catch { /* a stale record is pruned by pid next read */ }
     try { tel?.closeRoot({ outcome: done.outcome, label: done.label ?? null, attributes: { verdict: done.verdict ?? null, runId: done.runId ?? null } }); } catch { /* telemetry */ }
   }
 }
