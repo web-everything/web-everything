@@ -143,7 +143,7 @@ export function infraFailureCount({ logText, pr, sessions }) {
 }
 /** Control rows persist across the counting window: each head gets only one Claude re-arm.
  * Card 5947 (live #5045, 2026-10-13): ledger outcomes join caller evidence; aggregate-only callers discount the newest rows. */
-export function fixLoopDisposition({ rows, repo, pr, head, now = Date.now(), config = fixLoopConfig(), infraFailures = 0, build, infraRows = null }) {
+export function fixLoopDisposition({ rows, repo, pr, head, now = Date.now(), config = fixLoopConfig(), infraFailures = 0, build, infraRows = null, modelCount = 0 }) {
   if (!config.hold) return { action: 'dispatch' };
   const identity = row => row.repo === repo && row.pr === pr && row.head === head;
   const observed = (rows ?? []).filter(row => validRow(row) && identity(row) && Date.parse(row.at) <= new Date(now).getTime());
@@ -176,7 +176,7 @@ export function fixLoopDisposition({ rows, repo, pr, head, now = Date.now(), con
     return { action: 'hold', until };
   }
   if (!state.held) {
-    if (rawCount >= config.maxSessions + 1) return { action: 'rearm', reason: 'final attempt before raw per-head session ceiling' };
+    if (rawCount >= config.maxSessions + 1) return { action: 'rearm', reason: 'final attempt before raw per-head session ceiling', strongerModel: modelCount >= 2 };
     return { action: 'dispatch' };
   }
   if (build && counted.some(row => row.build !== build)) return { action: 'rearm', reason: 'fixer build-change' };

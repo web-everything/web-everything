@@ -354,3 +354,18 @@ it('resolves red-main discount through the cascade and fails closed on read fail
     { status: 'completed', conclusion: 'success', updatedAt: incidentWindows[0].end },
   ]).redMainWindows).toEqual(incidentWindows);
 });
+
+it('launcher failures alone reach the raw per-head ceiling and park', () => {
+  const rows = Array.from({ length: 5 }, (_, i) => row({ session: `launcher-${i}` }));
+  const outcomes = rows.map(r => ({ ...r, kind: 'outcome', outcome: 'failed', infra: true, reason: 'no-finding: none' }));
+  expect(fixLoopDisposition({ rows: [...rows, ...outcomes], repo: 'we', pr: 3990, head, now, config, modelCount: 0 }))
+    .toMatchObject({ action: 'park', reason: 'raw per-head repair session ceiling reached' });
+});
+it('raw ceiling reached by launcher rows alone does not set strongerModel', () => {
+  const rows = Array.from({ length: 4 }, (_, i) => row({ session: `launcher-${i}` }));
+  const outcomes = rows.map(r => ({ ...r, kind: 'outcome', outcome: 'failed', infra: true, reason: 'no-finding: none' }));
+  const decide = modelCount => fixLoopDisposition({ rows: [...rows, ...outcomes], repo: 'we', pr: 3990, head, now, config, modelCount });
+  expect(decide(0)).toMatchObject({ action: 'rearm', strongerModel: false });
+  expect(decide(1).strongerModel).toBe(false);
+  expect(decide(2).strongerModel).toBe(true);
+});

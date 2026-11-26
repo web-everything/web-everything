@@ -2225,7 +2225,7 @@ describe('fix dispatch staleness contract', () => {
 describe('routed Codex fallback', () => {
   it('routes repeated unproductive Codex repairs to Claude for this head only', () => {
     const planned = { repo: 'fui', pr: 7, isConflict: true, headRefOid: 'abc' };
-    const readRouted = vi.fn(() => ({ 'fui#7': [{ head: 'abc', outcome: 'failed' }, { head: 'abc', outcome: 'no-change' }] }));
+    const readRouted = vi.fn(() => ({ 'fui#7': [{ head: 'abc', outcome: 'failed', cause: 'model' }, { head: 'abc', outcome: 'no-change' }] }));
     const options = { launcherAvailable: true, readRouted };
     expect(routeFixExecutor(planned, options)).toMatchObject({ executor: 'claude' });
     expect(readRouted).toHaveBeenCalledWith({ repo: 'fui', pr: 7 });
@@ -3205,6 +3205,8 @@ describe('PUSH-GATE-S4 — a live hold read right before launch stops a fixer sp
       });
       const pass = runReconcileFixDispatch({
         root: '/repo', repo: 'we', dryRun: false, priorityShadow: null, tryResumeRound: null,
+        fixLoop: { readRows: () => [], append: () => {}, readRouted: () => ({}) },
+        fixConfig: { hold: true, maxSessions: 3, windowHours: 6 },
         reconcile: () => ({ dispatch: [{ kind: 'fix', prNumber: 7, headRefName: 'topic' }], refusals: [] }),
         readPushHoldOptions: { run }, checkStaleness: () => ({ fresh: true, behind: 0 }),
         listBuildClaims: () => [], listFixClaims: () => [], loadItems: () => [], findItemFn: () => null,
@@ -3287,5 +3289,83 @@ describe('candidate-side old smoke read isolation', () => {
         .toEqual({ code: 'hold-label', reason: 'review:human' });
       expect(run).toHaveBeenCalledTimes(1);
     } finally { vi.unstubAllEnvs(); }
+  });
+});
+
+describe('unknown-cause park recovery', () => {
+  const head = 'a'.repeat(40), now = Date.parse('2026-11-26T12:00:00Z');
+  const entry = { kind: 'fix', prNumber: 1764, headRefName: 'lane/3438-wire-reconcile-pass', headRefOid: head };
+  const config = { hold: true, maxSessions: 3, windowHours: 6 };
+  const run = (overrides = {}) => runReconcileFixDispatch({ root: '/repo', checkStaleness: FRESH, now, dryRun: false,
+    fetchItemlessDiffPaths: () => ['scripts/conveyor/reconcile-fix-dispatch.mjs'],
+    resolveCardScopeAtRef: () => item3438.scope,
+    reconcile: () => ({ dispatch: [entry], refusals: [] }), findItemFn: findItemStub, loadItems: () => [],
+    pickFreeLanes: () => [1], tryResume: () => ({ resumed: false }), tryResumeRound: null,
+    readPushHold: () => null, listBuildClaims: () => [], listFixClaims: () => [],
+    dispatch: () => ({ agentId: 'test' }), fixConfig: config, ...overrides });
+  it('a park row with fix-cause-unknown stops dispatch on that head and lapses on a new head', () => {
+    const park = { v: 1, kind: 'park', repo: 'we', pr: 1764, head, reason: 'fix-cause-unknown', at: new Date(now - 8 * 3600000).toISOString() };
+    const dispatch = vi.fn(() => ({ agentId: 'test' }));
+    const fixLoop = { readRows: () => [park], append: vi.fn(), readRouted: () => ({}) };
+    const held = run({ fixLoop, dispatch });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(held.reconcileRefusalDetails).toContainEqual(expect.objectContaining({ kind: 'fix-loop-parked' }));
+    const fresh = run({ fixLoop, dispatch, reconcile: () => ({ dispatch: [{ ...entry, headRefOid: 'b'.repeat(40) }], refusals: [] }) });
+    expect(fresh.dispatched, JSON.stringify(fresh)).toHaveLength(1);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+  });
+  it('comment without park row is completed to a park on the next pass', async () => {
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { readFixLoopRows, appendFixLoopRow } = await import('../fix-loop-ledger.mjs');
+    const { buildStandDownComment } = await import('../stand-down.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'recover-unknown-park-')), env = { WE_FIX_LOOP_LEDGER: join(dir, 'ledger.jsonl') };
+    const append = vi.fn(row => appendFixLoopRow(row, { env, now }));
+    const options = { reconcile: () => ({ dispatch: [], refusals: [{ kind: 'stood-down', prNumber: 1764 }] }),
+      readPrComments: () => [{ author: { login: 'web-everything' }, body: buildStandDownComment({ reason: 'fix-cause-unknown', head }) }],
+      fixLoop: { readRows: () => readFixLoopRows({ env }), append, readRouted: () => ({}) } };
+    try {
+      run(options); run(options);
+      expect(append).toHaveBeenCalledTimes(1);
+      expect(readFixLoopRows({ env })).toEqual([expect.objectContaining({ kind: 'park', head, repo: 'we', pr: 1764, reason: 'fix-cause-unknown' })]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each(['untrusted', 'quoted', 'missing-head'])('does not recover a %s unknown-cause marker', async variant => {
+    const { buildStandDownComment } = await import('../stand-down.mjs');
+    const body = buildStandDownComment({ reason: 'fix-cause-unknown', ...(variant === 'missing-head' ? {} : { head }) });
+    const append = vi.fn();
+    run({ reconcile: () => ({ dispatch: [], refusals: [{ kind: 'stood-down', prNumber: 1764 }] }),
+      readPrComments: () => [{ author: { login: variant === 'untrusted' ? 'stranger' : 'web-everything' }, body: variant === 'quoted' ? `quoted: ${body}` : body }],
+      fixLoop: { readRows: () => [], append, readRouted: () => ({}) } });
+    expect(append).not.toHaveBeenCalled();
+  });
+  it.each(['unknown', 'invalid', 'unreadable-ledger', 'unreadable-outcomes'])('fails closed on %s evidence without silently dispatching', variant => {
+    const dispatch = vi.fn();
+    const result = run({ dispatch, fixLoop: {
+      readRows: () => { if (variant === 'unreadable-ledger') throw Error('disk'); return []; }, append: vi.fn(),
+      readRouted: () => { if (variant === 'unreadable-outcomes') throw Error('disk');
+        return { 'we#1764': [{ head, outcome: 'failed', cause: variant }] }; },
+    } });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect([...result.refusals, ...result.reconcileRefusalDetails]).toContainEqual(expect.objectContaining({
+      kind: variant === 'unreadable-ledger' ? 'fix-loop-unreadable' : 'fix-loop-parked',
+    }));
+  });
+  it('a failed park write retains the stand-down and retries on the next pass', async () => {
+    const { buildStandDownComment } = await import('../stand-down.mjs');
+    let rows = [];
+    const append = vi.fn().mockImplementationOnce(() => { throw Error('disk'); }).mockImplementation(row => {
+      rows.push({ ...row, v: 1, at: new Date(now).toISOString() });
+    });
+    const dispatch = vi.fn(), options = { dispatch,
+      reconcile: () => ({ dispatch: [], refusals: [{ kind: 'stood-down', prNumber: 1764 }] }),
+      readPrComments: () => [{ author: { login: 'web-everything' }, body: buildStandDownComment({ reason: 'fix-cause-unknown', head }) }],
+      fixLoop: { readRows: () => rows, append, readRouted: () => ({}) } };
+    expect(run(options).reconcileRefusalDetails).toHaveLength(1);
+    expect(rows).toEqual([]);
+    run(options); run(options);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(append).toHaveBeenCalledTimes(2);
+    expect(rows).toHaveLength(1);
   });
 });
