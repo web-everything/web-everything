@@ -11,7 +11,7 @@ vi.mock('node:fs', async original => {
   const fake = {
     readFileSync: path => io.files.has(String(path)) ? io.files.get(String(path)) : missing(),
     readdirSync: () => [], existsSync: path => io.files.has(String(path)),
-    statSync: missing, lstatSync: missing, openSync: missing,
+    statSync: missing, lstatSync: missing, openSync: missing, opendirSync: missing,
     mkdirSync: () => {}, appendFileSync: () => {},
     writeFileSync: (path, value) => { io.files.set(String(path), value); },
     renameSync: (from, to) => { io.files.set(String(to), io.files.get(String(from))); io.files.delete(String(from)); },
@@ -20,6 +20,10 @@ vi.mock('node:fs', async original => {
   const wrapped = Object.fromEntries(Object.entries(fake).map(([name, fn]) =>
     [name, (...args) => io.active ? fn(...args) : real[name](...args)]));
   return { ...real, ...wrapped, default: { ...real.default, ...wrapped } };
+});
+vi.mock('node:os', async original => {
+  const real = await original();
+  return { ...real, homedir: () => io.active ? '/isolated-home' : real.homedir() };
 });
 vi.mock('node:child_process', async original => {
   const real = await original();
@@ -93,4 +97,23 @@ describe('tick — main-red alert publication gate', () => {
       probe, dir: '/isolated-health', now: Date.parse(NOW), config: expect.any(Object),
     });
   });
+});
+
+
+it('records returned metric collection warnings in the tick diagnostic path', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const cwd = mkdtempSync(join(tmpdir(), 'red-metrics-tick-'));
+  const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(cwd);
+  const clockSpy = vi.spyOn(Date, 'now').mockReturnValue(Date.parse(NOW));
+  try {
+    runMainRedAlert.mockResolvedValueOnce({ metricWarnings: ['Incomplete metric journal; recover source evidence.'] });
+    const summary = await tick(baseFlags, deps);
+    expect(summary.probeErrors.mainRedAlert).toMatch(/Incomplete metric journal.*recover source evidence/);
+  } finally {
+    clockSpy.mockRestore();
+    cwdSpy.mockRestore();
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });

@@ -121,3 +121,41 @@ describe('red metrics evidence', () => {
     expect(mainFailureSignature({})).toBeNull();
   });
 });
+
+
+describe('red metrics replay audit regressions', () => {
+  const event = (changes = {}) => ({ v: 1, key: 'event', repo: 'fixture/repo', head: 'a'.repeat(40),
+    seq: 1, runId: 1, kind: 'red', at: 1000, since: 0, signature: null,
+    queue: { waitMs: 100, admissionWaitMs: null, serviceMs: null }, ...changes });
+  const options = { from: 0, to: 10000, now: 10000 };
+
+  it.each([
+    ['ISO observation', { kind: 'unknown', at: '2026-11-26T00:00:00Z' }],
+    ['ISO origin', { since: '2026-11-25T00:00:00Z' }],
+    ['out-of-range observation', { at: 8640000000000001 }],
+    ['out-of-range origin', { at: 1e20, since: 1e20 }],
+  ])('rejects %s with an incomplete-evidence warning', async (_label, changes) => {
+    const { validMainRedMetric, reportMainRedMetrics } = await import('../main-ci-red-core.mjs');
+    expect(validMainRedMetric(event(changes))).toBe(false);
+    expect(reportMainRedMetrics([event(changes)], options).warnings.join(' ')).toMatch(/incomplete.*malformed/i);
+  });
+
+  it('refuses unrepresentable query timestamps without crashing daily replay', async () => {
+    const { reportMainRedMetrics } = await import('../main-ci-red-core.mjs');
+    const report = reportMainRedMetrics([event({ at: 1e20, since: 1e20 })], { from: 1e20, to: 1e20 + 1e6, now: 1e20 + 1e6 });
+    expect(report.warnings.join(' ')).toMatch(/incomplete range/i);
+  });
+
+  it('does not count future-only observations as coverage of the requested range', async () => {
+    const { reportMainRedMetrics } = await import('../main-ci-red-core.mjs');
+    const report = reportMainRedMetrics([event({ at: 20000 })], options);
+    expect(report.days).toEqual({});
+    expect(report.warnings.join(' ')).toMatch(/history does not cover.*recover/i);
+  });
+
+  it('warns when a queue observation survives without its red episode start', async () => {
+    const { reportMainRedMetrics } = await import('../main-ci-red-core.mjs');
+    const report = reportMainRedMetrics([event({ kind: 'queue', at: 0 })], options);
+    expect(report.warnings.join(' ')).toMatch(/queue.*no episode start.*recover/i);
+  });
+});

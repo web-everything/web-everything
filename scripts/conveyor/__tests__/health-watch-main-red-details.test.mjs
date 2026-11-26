@@ -25,7 +25,7 @@ describe('runMainRedAlert — current failure details within a red episode', () 
     createdAt: '2026-10-26T12:25:00.000Z' };
   const options = () => ({
     probe: { runs: [first] }, now: Date.parse('2026-10-26T12:30:00.000Z'),
-    dir: 'unused-injected-state', publish: vi.fn(), readState: () => ({}), writeState: vi.fn(),
+    dir: 'unused-injected-state', publish: vi.fn(), readState: () => ({}), writeState: vi.fn(), writeMetrics: async () => ({ warnings: [] }),
   });
   const seed = async () => {
     execFileSyncThrottled.mockReturnValue('[]');
@@ -73,7 +73,7 @@ describe('runMainRedAlert — bounded ready PR count', () => {
       probe: { runs: [{ headSha: 'a'.repeat(40), databaseId: 2,
         status: 'completed', conclusion: 'failure', createdAt: '2026-10-26T12:00:00.000Z' }] },
       now: Date.parse('2026-10-26T12:30:00.000Z'), dir: 'unused-injected-state',
-      publish, readState: () => ({}), writeState: vi.fn(),
+      publish, readState: () => ({}), writeState: vi.fn(), writeMetrics: async () => ({ warnings: [] }),
     });
     expect(publish).toHaveBeenCalledWith(expect.objectContaining({ kind: 'main-red', blockedReadyPrs: null }));
   });
@@ -88,7 +88,7 @@ describe('runMainRedAlert — bounded ready PR count', () => {
       probe: { runs: [{ headSha: 'a'.repeat(40), databaseId: 2,
         status: 'completed', conclusion: 'failure', createdAt: '2026-10-26T12:00:00.000Z' }] },
       now: Date.parse('2026-10-26T12:30:00.000Z'), dir: 'unused-injected-state',
-      publish, readState: () => ({}), writeState: vi.fn(),
+      publish, readState: () => ({}), writeState: vi.fn(), writeMetrics: async () => ({ warnings: [] }),
     });
     expect(publish).toHaveBeenCalledWith(expect.objectContaining({ kind: 'main-red', blockedReadyPrs: 1 }));
   });
@@ -107,7 +107,7 @@ describe('runMainRedAlert — bounded ready PR count', () => {
       probe: { runs: [{ headSha: 'a'.repeat(40), databaseId: 2,
         status: 'completed', conclusion: 'failure', createdAt: '2026-10-26T12:00:00.000Z' }] },
       now: Date.parse('2026-10-26T12:30:00.000Z'), dir: 'unused-injected-state',
-      publish, readState: () => ({}), writeState: vi.fn(),
+      publish, readState: () => ({}), writeState: vi.fn(), writeMetrics: async () => ({ warnings: [] }),
     });
     expect(publish).toHaveBeenCalledTimes(1);
     expect(publish).toHaveBeenCalledWith(expect.objectContaining({

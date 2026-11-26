@@ -147,9 +147,7 @@ function readAlertDetails({ state, config }) {
 
 export async function runMainRedAlert({ probe, dir, now = Date.now(), config = {},
   publish = publishAttention, readState = readAlertState, writeState = writeAlertState,
-  readDetails = readAlertDetails,
-  // Replacing state IO replaces the durable adapter as a whole; tests may inject a journal explicitly.
-  writeMetrics = writeState === writeAlertState ? appendMainRedMetrics : () => ({ warnings: [] }) } = {}) {
+  readDetails = readAlertDetails, writeMetrics = appendMainRedMetrics } = {}) {
   const prev = await readState(dir);
   const readOk = !!probe && !probe.error;
   const state = readOk ? mainRedState(probe.runs, { tip: probe.tip }) : { status: 'unknown' };
@@ -207,11 +205,14 @@ function planMainRedMetrics({ state, observed, runs, now, prev = {}, details }) 
   if (red && !prev.open) kind = 'red';
   if (red && !kind && sample !== prev.sample) kind = 'queue';
   if (kind) {
+    // Persist an observation ordinal: recurring samples are new evidence, while retries
+    // from the same saved state retain their key even when the polling clock advances.
+    next.eventSeq = (Number.isSafeInteger(prev.eventSeq) ? prev.eventSeq : 0) + 1;
     const event = { v: 1, repo: DEFAULT_REPO_SLUG, head: next.head ?? 'unknown', seq: next.seq,
       runId, kind, at: now, since: next.since ?? null, queue, signature,
       truncated: red && (state.windowTruncated === true || next.originUnknown === true) };
     event.key = createHash('sha256').update(JSON.stringify([event.repo, event.head, event.seq, kind,
-      runId, kind === 'queue' ? sample : null])).digest('hex');
+      runId, kind === 'queue' ? sample : null, next.eventSeq])).digest('hex');
     events.push(event);
   }
   if (observed === 'green') { next.open = false; next.previousGreenAt = now; }
@@ -240,7 +241,7 @@ function metricFiles(dir) {
  * Refuse at 10,000 files rather than deleting history. Operator archives before collection resumes.
  * Measurement failure is diagnostic only: it never grants dispatch/merge or changes alert authority.
  */
-export function appendMainRedMetrics(dir, events) {
+export function appendMainRedMetrics(dir, events, { writeFile = writeFileSync } = {}) {
   const warnings = [];
   try {
     if (!Array.isArray(events) || events.length > MAIN_RED_METRIC_LIMITS.events) throw new Error('event limit');
@@ -251,16 +252,24 @@ export function appendMainRedMetrics(dir, events) {
       const text = JSON.stringify(event);
       if (Buffer.byteLength(text) > MAIN_RED_METRIC_LIMITS.bytes) throw new Error('oversized event');
       const path = join(dir, 'main-red-metrics', `${event.key}.json`);
-      try {
+      const acknowledge = () => {
         const existing = statSync(path);
         if (existing.size > MAIN_RED_METRIC_LIMITS.bytes) throw new Error('oversized existing event');
         const saved = JSON.parse(readFileSync(path, 'utf8'));
-        if (!validMainRedMetric(saved) || saved.key !== event.key) throw new Error('malformed existing event');
-        continue; // first durable observation wins even if a retry's clock has advanced
-      } catch (error) { if (error.code !== 'ENOENT') throw error; }
+        // Only the polling timestamp may advance on a state-write retry. Every
+        // transition field, including origin and timing sample, must still agree.
+        const fields = ['v', 'key', 'repo', 'head', 'seq', 'runId', 'kind', 'since', 'signature', 'truncated'];
+        if (!validMainRedMetric(saved) || fields.some(key => saved[key] !== event[key])
+          || ['waitMs', 'admissionWaitMs', 'serviceMs'].some(key => saved.queue[key] !== event.queue[key]))
+          throw new Error('conflicting existing event');
+      };
+      try { acknowledge(); continue; } catch (error) { if (error.code !== 'ENOENT') throw error; }
       if (count >= MAIN_RED_METRIC_LIMITS.events) throw new Error('event limit');
-      try { writeFileSync(path, text, { flag: 'wx', mode: 0o600 }); count++; }
-      catch (error) { if (error.code !== 'EEXIST') throw error; }
+      try { writeFile(path, text, { flag: 'wx', mode: 0o600 }); count++; }
+      catch (error) {
+        if (error.code !== 'EEXIST') throw error;
+        acknowledge(); // The competing writer may have left partial or conflicting evidence.
+      }
     }
   } catch { warnings.push(metricRecovery); }
   return { warnings };

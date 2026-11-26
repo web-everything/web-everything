@@ -1422,7 +1422,10 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     }));
   }
   if (!flags['dry-run'] && !flags['no-gh'] && !fixtureTick && !Object.keys(flags).some(key => key.endsWith('-fixture'))) {
-    await attempt('mainRedAlert', () => runMainRedAlert({ probe: probes.mainCiRuns, dir, now, config }));
+    await attempt('mainRedAlert', async () => {
+      const result = await runMainRedAlert({ probe: probes.mainCiRuns, dir, now, config });
+      if (result?.metricWarnings?.length) throw new Error(result.metricWarnings.join(' '));
+    });
   }
   // #4066 `open-prs-over-limit` — fs/env only; pairs with the gh-cadenced `prs` read below.
   probes.prLimit = attempt('prLimit', () => probePrLimit());

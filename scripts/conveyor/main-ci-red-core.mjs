@@ -855,8 +855,9 @@ export function planStalledRecovery({ stall, failingRun, reruns = {}, settings =
  * Retention is read-only: older journal entries remain available for operator archival/replay.
  */
 export const MAIN_RED_METRIC_LIMITS = Object.freeze({ events: 10_000, bytes: 8192, days: 30 });
-const metricTime = (v) => typeof v === 'number' ? (Number.isFinite(v) && v >= 0 ? v : null)
-  : typeof v === 'string' && v.trim() ? ts(v) : null;
+const numericMetricTime = v => typeof v === 'number' && Number.isFinite(v) && v >= 0
+  && v <= 8640000000000000 ? v : null;
+const metricTime = v => numericMetricTime(typeof v === 'string' && v.trim() ? ts(v) : v);
 
 /** Total enqueue→start wait, admission→start wait, and start→completion service are independent.
  * A queued job or missing/reversed timestamp is unknown, never a zero-duration success.
@@ -887,9 +888,10 @@ export function validMainRedMetric(e) {
     && typeof e.key === 'string' && e.key.length <= 256 && /^[a-zA-Z0-9:_-]+$/.test(e.key)
     && typeof e.repo === 'string' && /^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(e.repo)
     && typeof e.head === 'string' && (e.head === 'unknown' || /^[a-f0-9]{7,64}$/i.test(e.head))
-    && Number.isSafeInteger(e.seq) && e.seq >= 0 && metricTime(e.at) !== null
+    && Number.isSafeInteger(e.seq) && e.seq >= 0 && numericMetricTime(e.at) !== null
+    && (e.since === null || numericMetricTime(e.since) !== null && e.since <= e.at)
     && (e.runId === null || Number.isSafeInteger(e.runId) && e.runId > 0)
-    && (e.kind !== 'red' || metricTime(e.since) !== null && e.since <= e.at)
+    && (e.kind !== 'red' || numericMetricTime(e.since) !== null && e.since <= e.at)
     && (e.signature === null || /^v1:[a-f0-9]{64}$/.test(e.signature))
     && e.queue && ['waitMs', 'admissionWaitMs', 'serviceMs'].every(k => e.queue[k] === null
       || typeof e.queue[k] === 'number' && Number.isFinite(e.queue[k]) && e.queue[k] >= 0);
@@ -919,14 +921,15 @@ export function reportMainRedMetrics(events, { from, to, now, warnings = [] } = 
     if (unique.has(e.key) && JSON.stringify(unique.get(e.key)) !== JSON.stringify(e)) warn('Incomplete conflicting duplicate event; recover source evidence.');
     else unique.set(e.key, e);
   }
-  const rows = [...unique.values()].sort((a, b) => a.at - b.at || a.seq - b.seq);
+  const rows = [...unique.values()].filter(e => e.at <= to).sort((a, b) => a.at - b.at || a.seq - b.seq);
   if (!rows.length || Math.min(...rows.map(e => e.kind === 'red' ? e.since : e.at)) > from)
     warn('Incomplete range: history does not cover the requested start; recover archived evidence.');
   const episodes = new Map(); const intervals = new Map(); const signatures = new Map(); const queues = new Set();
   for (const e of rows) {
-    if (e.at > to) continue;
     const episode = `${e.repo}:${e.seq}`;
     if (e.kind === 'unknown') warn('Unknown observation: red duration may include unobserved recovery; recover source evidence.');
+    if (e.kind === 'queue' && !episodes.has(episode))
+      warn('Incomplete range: queue observation has no episode start; recover archived evidence.');
     if (e.kind === 'red') episodes.set(episode, { repo: e.repo, start: e.since, end: null });
     if (e.kind === 'green') {
       const open = episodes.get(episode);

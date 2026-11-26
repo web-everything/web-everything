@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { mainRedState } from '../main-ci-red-core.mjs';
 import { diffFeed, parseFeedLine } from '../../operations/needs-you-feed.mjs';
 import {
@@ -205,6 +208,7 @@ describe('runMainRedAlert — feed deduplication after publish succeeds and stat
     });
     const args = {
       dir: 'unused-injected-state', readState, writeState, publish,
+      writeMetrics: async () => ({ warnings: [] }),
       probe: kind === 'main-status-unknown' ? null : kind === 'main-green'
         ? { runs: greenRuns(), tip: passingTip() } : { runs: redRuns() },
       readDetails: vi.fn(async () => scenario === 'changed alert details'
@@ -760,7 +764,8 @@ describe('planMainRedAlert — fail closed on unknown main status', () => {
 const wrapperInput = (overrides = {}) => ({
   probe: { runs: redRuns() }, dir: 'fake-health-state', now: START + 30 * MINUTE,
   config: {}, publish: vi.fn(), readDetails: vi.fn().mockResolvedValue(details()),
-  readState: vi.fn().mockResolvedValue({}), writeState: vi.fn(), ...overrides,
+  readState: vi.fn().mockResolvedValue({}), writeState: vi.fn(),
+  writeMetrics: vi.fn(async () => ({ warnings: [] })), ...overrides,
 });
 const expectPersisted = (writeState, next) => {
   expect(writeState).toHaveBeenCalledTimes(1);
@@ -1025,5 +1030,77 @@ describe('red metrics recurrence timing', () => {
       from: START + 40 * MINUTE, to: START + 60 * MINUTE, now: START + 60 * MINUTE,
     });
     expect(report.warnings.join(' ')).toMatch(/incomplete.*origin/i);
+  });
+});
+
+
+describe('red metrics audit regressions', () => {
+  const inJournal = async fn => {
+    const dir = mkdtempSync(join(tmpdir(), 'red-metrics-audit-'));
+    try { await fn(dir); } finally { rmSync(dir, { recursive: true, force: true }); }
+  };
+
+  it('persists generated and pending events when only state IO is injected', async () => {
+    const { readMainRedMetrics } = await import('../health-watch-main-red.mjs');
+    await inJournal(async dir => {
+      const pending = [{ ...plan({ now: START + MINUTE }).metrics[0], key: 'pending', kind: 'unknown', seq: 99 }];
+      const args = wrapperInput({ dir, readState: async () => ({ pendingMetrics: pending }) });
+      delete args.writeMetrics;
+      const result = await runMainRedAlert(args);
+      expect(result.metricWarnings).toEqual([]);
+      expect(readMainRedMetrics(dir).events.map(e => e.key)).toContain(pending[0].key);
+      expect(readMainRedMetrics(dir).events.map(e => e.key)).toContain(result.metrics[0].key);
+      expect(readMainRedMetrics(dir).events).toHaveLength(2);
+    });
+  });
+
+  it.each([
+    ['kind', { kind: 'unknown' }], ['sequence', { seq: 99 }],
+    ['origin', { since: START - MINUTE }],
+  ])('retains owed evidence when an existing key conflicts in %s', async (_field, conflict) => {
+    const { appendMainRedMetrics } = await import('../health-watch-main-red.mjs');
+    await inJournal(async dir => {
+      const event = plan().metrics[0];
+      expect(appendMainRedMetrics(dir, [{ ...event, ...conflict }]).warnings).toEqual([]);
+      const prev = { ...plan().next, pendingMetrics: [event] };
+      const args = wrapperInput({ dir, readState: async () => prev, writeMetrics: appendMainRedMetrics });
+      const result = await runMainRedAlert(args);
+      expect(result.metricWarnings.join(' ')).toMatch(/incomplete.*recover/i);
+      expect(result.next.pendingMetrics).toEqual([event]);
+    });
+  });
+
+  it.each(['', '{broken', 'conflict', 'identical'])('validates a concurrent EEXIST winner (%s) before acknowledgement', async winner => {
+    const { appendMainRedMetrics } = await import('../health-watch-main-red.mjs');
+    await inJournal(async dir => {
+      const event = plan().metrics[0];
+      const writeFile = vi.fn((path, text, options) => {
+        writeFileSync(path, winner === 'identical' ? text : winner === 'conflict'
+          ? JSON.stringify({ ...event, seq: 99 }) : winner, options);
+        throw Object.assign(new Error('competing writer'), { code: 'EEXIST' });
+      });
+      const receipt = appendMainRedMetrics(dir, [event], { writeFile });
+      expect(writeFile).toHaveBeenCalledTimes(1);
+      if (winner === 'identical') expect(receipt.warnings).toEqual([]);
+      else expect(receipt.warnings.join(' ')).toMatch(/incomplete.*recover/i);
+    });
+  });
+
+  it('preserves recurring queue observations and reports the latest unknown wait after replay', async () => {
+    const { appendMainRedMetrics, readMainRedReport, readMainRedMetrics } = await import('../health-watch-main-red.mjs');
+    await inJournal(async dir => {
+      let prev = {};
+      for (const [index, known] of [true, false, true, false].entries()) {
+        const runs = redRuns().map(r => ({ ...r, startedAt: known ? START + 2 * MINUTE : null }));
+        const result = plan({ prev: structuredClone(prev), runs, now: START + (30 + index) * MINUTE });
+        expect(appendMainRedMetrics(dir, result.metrics).warnings).toEqual([]);
+        prev = result.next;
+      }
+      expect(readMainRedMetrics(dir).events).toHaveLength(4);
+      const report = readMainRedReport(dir, { from: START, to: START + 40 * MINUTE, now: START + 40 * MINUTE });
+      expect(report.queue.waitMs).toEqual([]);
+      expect(report.queue.unknown).toBe(1);
+      expect(report.warnings.join(' ')).toMatch(/unknown queue wait/i);
+    });
   });
 });
