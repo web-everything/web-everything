@@ -21,6 +21,23 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const MULTI = 'scripts/__tests__/multi-repo-checks.test.mjs';
 
 describe('selectScanTests', () => {
+  it('scopes stand-down head scans to conveyor production sources and widens for rule changes', () => {
+    const test = 'scripts/conveyor/__tests__/stand-down.test.mjs';
+    const entry = REPO_SCAN_TESTS.find(e => e.test === test);
+    expect(entry).toBeDefined();
+    expect(entry.scope).toBe('files');
+    for (const path of ['scripts/conveyor/new.mjs', 'scripts/conveyor/nested/new.mjs']) {
+      expect(selectScanTests({ changedFiles: [path] }).scoped).toContain(entry);
+    }
+    for (const path of ['scripts/lib/new.mjs', 'skills-src/conveyor/new.mjs',
+      'scripts/conveyor/__tests__/new.test.mjs', 'scripts/conveyor/soak/new.mjs',
+      'scripts/conveyor/fixtures/new.mjs', 'scripts/conveyor/new.md']) {
+      expect(selectScanTests({ changedFiles: [path] }).scoped).not.toContain(entry);
+    }
+    for (const path of [test, 'scripts/conveyor/stand-down.mjs']) {
+      expect(selectScanTests({ changedFiles: [path] }).widened).toContain(entry);
+    }
+  });
   it('selects scoped push boundaries for scripts and widens for rule or allowlist edits', () => {
     const test = 'scripts/__tests__/push-gate-boundary.test.mjs';
     for (const ext of ['mjs', 'js', 'cjs', 'ts', 'mts', 'cts']) {

@@ -15,12 +15,14 @@
  *   nothing invokes is the #3095 defect arriving by a different door, and prose is exactly where that rot is
  *   invisible.
  */
+// @repo-scanning-test scope=files
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync, readdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import ts from 'typescript';
+import { scanScope, scopedScanFiles } from '../../lib/repo-scan-tests.mjs';
 import {
   standDownHead, standDownLapse, annotateLapsedStandDowns, resolveStandDownLapseOnNewHead,
   STAND_DOWN_MARKER, STAND_DOWN_REASONS, countStandDownComments, buildStandDownComment,
@@ -710,6 +712,7 @@ describe('out-of-diff timeout stand-down is a re-armable load-flake hold (#6469)
 
 it('every production stand-down poster includes the head trailer', () => {
   const root = resolve(HERE, '../../..');
+  const scope = scanScope();
   const missing = [];
   let callers = 0;
   function inspect(dir) {
@@ -721,6 +724,7 @@ it('every production stand-down poster includes the head trailer', () => {
         continue;
       }
       if (!entry.name.endsWith('.mjs')) continue;
+      if (!scopedScanFiles([path]).length) continue;
       const source = ts.createSourceFile(path, readFileSync(resolve(root, path), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
       function visit(node) {
         if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'buildStandDownComment') {
@@ -736,9 +740,9 @@ it('every production stand-down poster includes the head trailer', () => {
       visit(source);
     }
   }
-  inspect('scripts');
-  inspect('skills-src');
-  expect(callers).toBeGreaterThan(0);
+  inspect('scripts/conveyor');
+  // A changed conveyor file may contain no poster; the full inventory must contain callers.
+  if (scope === null) expect(callers).toBeGreaterThan(0);
   expect(missing).toEqual([]);
   const head = 'a'.repeat(40);
   expect(standDownHead(buildLoadFlakeHoldComment({ head, detail: 'No saved alternate' }))).toBe(head);
