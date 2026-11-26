@@ -16,7 +16,7 @@ import { join } from 'node:path';
 import {
   runGhSync, runGhCliPassthrough, classifyGhResource, primaryExhaustedResource, ghAuthIdentity, ghAuthProvenance, readBudgetBlock,
   writeBudgetBlock, parseBudgetProbe, budgetProbeArgs, ghThrottleLogPath, MAX_BUDGET_BLOCK_MS,
-} from '../gh-throttle.mjs';
+} from './gh-throttle.window-fixture.mjs';
 
 const NOW = Date.parse('2026-09-27T05:13:00Z');
 const RESET = '2026-09-27T05:19:56Z';
