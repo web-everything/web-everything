@@ -1,3 +1,4 @@
+import { createAdoptYieldProbe, safeAdoptYield } from '../../lib/daemon-rebuild/adopt-yield.mjs';
 /**
  * @file promote-draft-pr-dispatch.test.mjs — draft-first PRs (operator-approved 2026-09-27):
  *   `runReconcilePromoteDraftDispatch`, the mechanical pass that calls `gh pr ready` on every PR
@@ -720,6 +721,62 @@ Fix defect`);
       }), ...over };
     return { options, postComment, rearm, run: () => runReconcilePromoteDraftDispatch(options) };
   }
+  it.each(['callback', 'read'])('adoption probe %s error fails toward yielding with zero rearm effects', mode => {
+    const fail = () => { throw Error('probe unavailable'); };
+    const probe = mode === 'callback' ? fail
+      : createAdoptYieldProbe({ now: () => 0, readReady: fail });
+    expect(safeAdoptYield(probe)).toBe(true);
+    const acquireRearmLock = vi.fn();
+    const s = setup({ shouldYield: probe, acquireRearmLock });
+    expect(s.run().yieldedForAdoption).toBe(true);
+    for (const fn of [acquireRearmLock, s.postComment, s.rearm]) expect(fn).not.toHaveBeenCalled();
+  });
+  it('repeated throttled probes with no ready replacement permit dispatch across successive safe points and passes', () => {
+    const readReady = vi.fn(() => null);
+    const probe = createAdoptYieldProbe({ now: () => 0, bootHead: head, readReady });
+    expect(probe()).toBe(false);
+    const first = setup({ shouldYield: probe });
+    const second = setup({ shouldYield: probe });
+    expect(first.run().dispatched).toEqual([{ pr: 42, kind: 'rearm-no-code' }]);
+    expect(second.run().dispatched).toEqual([{ pr: 42, kind: 'rearm-no-code' }]);
+    expect(first.rearm).toHaveBeenCalledTimes(1);
+    expect(second.rearm).toHaveBeenCalledTimes(1);
+    expect(readReady).toHaveBeenCalledTimes(1);
+  });
+  it('throttled probes retain an observed adoption request', () => {
+    const readReady = vi.fn(() => ({ prevHead: head, adopt: { finalSha: 'b'.repeat(40) },
+      passedAt: '2026-11-26T18:00:00Z' }));
+    const probe = createAdoptYieldProbe({ now: () => 0, bootHead: head, readReady });
+    expect(probe()).toBe(true);
+    expect(probe()).toBe(true);
+    expect(readReady).toHaveBeenCalledTimes(1);
+  });
+  it.each(['thread', 'labels', 'claim', 'receipt'])('adoption appearing during %s read yields before the child', stage => {
+    let adopting = false;
+    const s = setup({ shouldYield: () => adopting });
+    const key = { thread: 'readThread', labels: 'readPrLabels', claim: 'readClaim', receipt: 'readThread' }[stage];
+    const read = s.options[key];
+    let reads = 0;
+    s.options[key] = (...args) => {
+      const result = read(...args);
+      if (++reads >= (stage === 'receipt' ? 2 : 1)) adopting = true;
+      return result;
+    };
+    const result = s.run();
+    expect(result.yieldedForAdoption).toBe(true);
+    expect(result.dispatched).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ pr: 42, kind: 'rearm-no-code-deferred-adoption' }));
+    expect(s.rearm).not.toHaveBeenCalled();
+  });
+  it('an admitted call whose planning overruns attempts exactly one of three rearm entries', () => {
+    let time = 0;
+    const acquireRearmLock = vi.fn(() => { throw Error('busy'); });
+    const s = setup({ now: () => time, deadlineAt: 10, acquireRearmLock,
+      reconcile: () => { time = 11; return { dispatch: [42, 43, 44].map(prNumber => ({ ...entry, prNumber })) }; },
+    });
+    expect(s.run()).toMatchObject({ handled: 1, deferred: [43, 44], nextRearmCursor: 'we#42' });
+    expect(acquireRearmLock).toHaveBeenCalledTimes(1);
+  });
   it('overlapping executors consume one answer only once', () => {
     const posted = [];
     let overlap, contender;
@@ -816,7 +873,7 @@ Fix defect`);
     expect(writer).toHaveBeenCalledTimes(1);
     expect(postComment).toHaveBeenCalledTimes(1);
   }, 120000);
-  it.each([false, true])('receipted replacement preserves consumed writer budgets: noCodeOwed=%s', noCodeOwed => {
+  it.each([false, true])('new round retires a receipted replacement and preserves consumed writer budgets: noCodeOwed=%s', noCodeOwed => {
     const ordinary = (id, standDownId) => c(id, buildOperatorAnswer({ standDownId, actor: 'chalbert',
       reason: 'Allow one retry', channel: 'chat', disposition: 'rearm-review' }));
     const exhausted = [verdict, begin, { ...stop, id: 'waiver-stop-1' }, ordinary('waiver-1', 'waiver-stop-1'),
@@ -840,10 +897,14 @@ Fix defect`);
     });
     const first = s.run();
     expect(first.dispatched).toEqual([]);
-    expect(first.refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-unconfirmed' }));
-    expect(writer).toHaveBeenCalledTimes(1);
-    expect(writer.mock.results[0].value.status).toBe(1);
-    expect(writer.mock.results[0].value.stdout).toContain('no change made');
+    expect(first.refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-stale' }));
+    expect(writer).not.toHaveBeenCalled();
+    expect(read().writes).toEqual(['receipt']);
+    // Independently retain the writer's budget proof even though the executor now retires earlier.
+    const denied = writer({ repoSlug: 'web-everything/web-everything', prNumber: 42,
+      expectHead: head, answerId: 'replacement' });
+    expect(denied.status).toBe(1);
+    expect(denied.stdout).toContain('no change made');
     expect(read().labels).toEqual(['review:changes']);
     expect(read().writes.filter(kind => kind === 'labels')).toEqual([]);
     const after = read();
@@ -853,7 +914,7 @@ Fix defect`);
     expect(postComment).toHaveBeenCalledTimes(1);
   }, 120000);
   it.each(['red-team:blocked', 'red-team:pending', 'changes verdict', 'stand-down'])(
-    'post-receipt %s permits exactly one extra review through the actual writer', lateEvidence => {
+    'post-receipt %s retires the ruling before the actual writer', lateEvidence => {
       const { read, write, writer, postComment } = actualWriterFixture();
       const s = setup({ readThread: () => read().comments, readPrLabels: () => read().labels, rearm: writer,
         postComment: args => {
@@ -864,16 +925,14 @@ Fix defect`);
           write(state);
         },
       });
-      // Pin the disclosed admission-to-writer window; the receipt still bounds the attempt.
-      expect(s.run().dispatched).toEqual([{ pr: 42, kind: 'rearm-no-code' }]);
-      expect(read().labels).toContain('review:pending');
-      expect(read().labels).not.toContain('review:changes');
-      expect(read().labels).not.toContain('review:accepted');
+      expect(s.run().refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-stale' }));
+      expect(read().labels).toContain('review:changes');
+      expect(read().labels).not.toContain('review:pending');
       const after = read();
       expect(s.run().dispatched).toEqual([]);
       expect(read()).toEqual(after);
-      expect(after.writes).toEqual(['receipt', 'labels', 'comment']);
-      expect(writer).toHaveBeenCalledTimes(1);
+      expect(after.writes).toEqual(['receipt']);
+      expect(writer).not.toHaveBeenCalled();
       expect(postComment).toHaveBeenCalledTimes(1);
     }, 120000);
   it.each(['live', 'unreadable'])('fresh %s fix claim refuses with zero writes', mode => {

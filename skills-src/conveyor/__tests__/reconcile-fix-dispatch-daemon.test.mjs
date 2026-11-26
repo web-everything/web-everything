@@ -3050,6 +3050,18 @@ describe('fix pass budgets', () => {
     ]);
   });
 
+  it('a failed rearm-cursor write logs a named fallback and the next tick resumes from memory', async () => {
+    const log = vi.fn(), write = vi.fn(() => { throw Error('disk unavailable'); });
+    const tick = vi.fn(() => ({ ...empty(), handled: 1, deferred: [43], nextRearmCursor: 'we#42' }));
+    const opts = fixture({ repos: ['a'], now: () => 0, budgetRotation: undefined,
+      cursorPersistence: { path: 'fixture', write, log }, promoteDraftTick: tick });
+    await runTickAllRepos(opts);
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/rearm-cursor-write-failed.*in-memory.*disk unavailable/));
+    tick.mockImplementation(() => ({ ...empty(), nextRearmCursor: null }));
+    await runTickAllRepos(opts);
+    expect(tick.mock.calls[1][0].rearmCursor).toBe('we#42');
+  });
   it('persists a separate scalar last-served rearm cursor and resumes it after restart without changing legacy or unrelated cursors', async () => {
     let saved;
     const cursors = { fix: { a: 17 }, notes: { a: '42:note' }, 'promote-draft': { a: 2 } };

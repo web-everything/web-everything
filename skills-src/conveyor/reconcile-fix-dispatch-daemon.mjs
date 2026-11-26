@@ -1059,11 +1059,13 @@ function writeFixPassCursors(path, content) {
 }
 
 /** Cursor persistence is best effort; injected writes receive the final path and JSON. */
-export async function saveFixPassCursors({ path, rotation, prCursors, write = writeFixPassCursors } = {}) {
+export async function saveFixPassCursors({ path, rotation, prCursors, write = writeFixPassCursors, log = console.error } = {}) {
   if (process.env.VITEST && path == null) return;
   try {
     await write(path ?? FIX_PASS_CURSORS_PATH, JSON.stringify({ version: 1, rotation, prCursors }) + '\n');
-  } catch { /* A persistence failure must not stop dispatch. */ }
+  } catch (e) {
+    log(`reconcile-fix-dispatch-daemon: rearm-cursor-write-failed — next tick resumes from in-memory cursors; restart may replay the lowest PR; operator must restore cursor persistence — ${String(e?.message ?? e).split('\n')[0]}`);
+  }
 }
 
 // Load once for the daemon defaults; injected state stays independent.

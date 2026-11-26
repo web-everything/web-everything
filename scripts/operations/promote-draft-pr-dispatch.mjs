@@ -581,17 +581,43 @@ export function runReconcilePromoteDraftDispatch({
         refusals.push({ pr: prNumber, kind: 'rearm-no-code-unreadable', why: String(e?.message ?? e).split('\n')[0] });
         continue;
       }
+      let ownReceiptId;
       try {
         const receipt = NO_CODE_REARM_RECEIPT(plan.answerId, entry.expectHead);
         const priorIds = new Set(comments.map(c => c.id));
         postComment({ repoSlug, prNumber, comment: receipt });
         const posted = readThread(prNumber, { repo: repoSlug, maxPages: 10 });
-        if (!Array.isArray(posted) || !posted.some(c => c.id != null && !priorIds.has(c.id)
-          && c.body === receipt && parseNoCodeRearmReceipt(c)?.answerId === plan.answerId)) {
+        const confirmed = Array.isArray(posted) && posted.find(c => c.id != null && !priorIds.has(c.id)
+          && c.body === receipt && parseNoCodeRearmReceipt(c)?.answerId === plan.answerId);
+        if (!confirmed) {
           throw Error('receipt author could not be confirmed; operator must inspect the posted receipt');
         }
+        ownReceiptId = confirmed.id;
       } catch (e) {
         refusals.push({ pr: prNumber, kind: 'rearm-no-code-receipt-failed', why: String(e?.message ?? e).split('\n')[0] });
+        continue;
+      }
+      // The confirmed receipt spends this attempt, but cannot hide evidence arriving behind it.
+      // Exclude only our own receipt from admission; any competing receipt still retires the ruling.
+      try {
+        const freshComments = readThread(prNumber, { repo: repoSlug, maxPages: 10 });
+        const freshLabels = validatePrLabels(readPrLabels({ repoSlug, prNumber })).map(l => typeof l === 'string' ? l : l.name);
+        if (!Array.isArray(freshComments)) throw Error('comments unreadable');
+        const freshPlan = noCodeRearmPlan({ comments: freshComments.filter(c => c.id !== ownReceiptId),
+          labels: freshLabels, headRefOid: entry.expectHead });
+        if (freshPlan.state !== 'ready' || freshPlan.answerId !== entry.answerId) {
+          refusals.push({ pr: prNumber, kind: 'rearm-no-code-stale', why: freshPlan.why });
+          continue;
+        }
+      } catch (e) {
+        refusals.push({ pr: prNumber, kind: 'rearm-no-code-unreadable', why: `${String(e?.message ?? e).split('\n')[0]}; operator must inspect the spent receipt before a fresh answer` });
+        continue;
+      }
+      yieldedForAdoption ||= safeAdoptYield(shouldYield);
+      if (yieldedForAdoption) {
+        deferred.push(prNumber);
+        refusals.push({ pr: prNumber, kind: 'rearm-no-code-deferred-adoption',
+          why: 'daemon adoption yield before writer; operator must inspect the spent receipt before a fresh answer' });
         continue;
       }
       let child, observed;
