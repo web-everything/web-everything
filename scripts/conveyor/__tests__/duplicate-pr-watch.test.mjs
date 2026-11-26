@@ -341,3 +341,22 @@ it('the callable CLI rejects an invalid verb without discovering PRs', async () 
     process.exitCode = savedExitCode;
   }
 });
+
+it('the real script entry (spawned once) runs the CLI and rejects an invalid verb', async () => {
+  const { spawnSync } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+  const { join, dirname } = await import('node:path');
+  const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'duplicate-pr-watch.mjs');
+  const r = spawnSync(process.execPath, [script, 'invalid', '--dry-run'], { encoding: 'utf8', timeout: 120000 });
+  expect(r.status).toBe(2);
+  expect(r.stderr).toContain('usage: duplicate-pr-watch.mjs sweep');
+  // Valid path through the real entry: sweep over an empty snapshot, no gh.
+  const { mkdtempSync, writeFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const dir = mkdtempSync(join(tmpdir(), 'dup-pr-watch-'));
+  const prsFile = join(dir, 'prs.json');
+  writeFileSync(prsFile, '[]');
+  const ok = spawnSync(process.execPath, [script, 'sweep', '--dry-run', `--prs-file=${prsFile}`], { encoding: 'utf8', timeout: 120000 });
+  expect(ok.status).toBe(0);
+  expect(JSON.parse(ok.stdout)).toEqual({ checked: true, flagged: 0, results: [] });
+}, 300000);
