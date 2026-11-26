@@ -37,6 +37,8 @@ import { join, dirname, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { searchCapabilities } from '../capability-search.mjs';
+import { rulingBranch, cardRulingKey, lookupRulingCard } from './ruling-card-branch.mjs';
+import { cardOnlyEligibility } from '../lib/card-batch-policy.mjs';
 import { localDateString } from '../lib/local-date.mjs';
 
 export { REPO_ROOT };
@@ -169,6 +171,55 @@ export function createCardBranchSink({ root = REPO_ROOT,
   };
 }
 
+/** Ruling-only publication: no shared batch sink, one immutable card, local preservation before push. */
+export function createRulingCardBranchSink({ root = REPO_ROOT,
+  git = (args, options) => execFileSync('git', args, { maxBuffer: 8 * 1024 * 1024, ...options }) } = {}) {
+  return async ({ rel, content, rulingKey }) => {
+    const branch = rulingBranch(rulingKey), ref = `refs/heads/${branch}`;
+    if (!cardOnlyEligibility([{ status: 'A', mode: '100644', path: rel }]).ok
+      || cardRulingKey(content) !== rulingKey) throw new Error('invalid keyed ruling card');
+    const abs = resolve(root, rel);
+    if (!lstatSync(abs).isFile() || lstatSync(abs).isSymbolicLink()
+      || realpathSync(dirname(abs)) !== join(realpathSync(root), 'backlog')) throw new Error('ruling card is not a regular backlog file');
+    const scratch = mkdtempSync(join(tmpdir(), 'ruling-card-index-'));
+    try {
+      const env = { ...process.env };
+      for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE',
+        'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES']) delete env[key];
+      env.GIT_INDEX_FILE = join(scratch, 'index');
+      env.GIT_TERMINAL_PROMPT = '0'; env.GIT_NO_REPLACE_OBJECTS = '1';
+      const run = (...args) => String(git(args, { cwd: root, env, encoding: 'utf8', timeout: 30000,
+        maxBuffer: 16 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] }));
+      const writeObject = (args, input) => String(git(args, { cwd: root, env, input, encoding: 'utf8', timeout: 30000,
+        maxBuffer: 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] })).trim();
+      const sha = value => { if (!/^[a-f0-9]{40}$/.test(value)) throw new Error('invalid ruling object ID'); return value; };
+      const found = lookupRulingCard({ root, rulingKey, git: run });
+      if (!found.ok) throw new Error(found.reason);
+      let commit;
+      if (found.card) {
+        if (found.card.rel !== rel || run('show', `${found.card.sha}:${rel}`) !== content)
+          throw new Error('ruling key already filed with different card bytes; consolidate, never copy');
+        commit = found.card.sha;
+      } else {
+        const baseline = sha(run('rev-parse', '--verify', 'origin/main^{commit}').trim());
+        run('read-tree', baseline);
+        const blob = sha(writeObject(['hash-object', '-w', '--stdin'], content));
+        if (run('ls-tree', baseline, '--', rel).trim()) throw new Error('ruling card already exists on main');
+        run('update-index', '--add', '--cacheinfo', '100644', blob, rel);
+        const tree = sha(run('write-tree').trim());
+        const identity = readGitIdentity(root, { env, run: (_command, args, options) => git(args, options) });
+        if (identityVerdict(identity, resolveGitIdentityPlaceholders({ env })).status !== 'ok')
+          throw new Error('author/committer identity could not be validated');
+        commit = sha(run('commit-tree', tree, '-p', baseline, '-m', 'backlog: preserve ruling card').trim());
+        // Compare-and-swap: a second owner can never replace a previously filed ruling card.
+        run('update-ref', ref, commit, '0'.repeat(40));
+      }
+      run('push', '--porcelain', '--no-follow-tags', 'origin', `${commit}:${ref}`);
+      return { branch, sha: commit, pushed: true, alreadyPresent: Boolean(found.card) };
+    } finally { rmSync(scratch, { recursive: true, force: true }); }
+  };
+}
+
 /** Scaffold facts plus the operator admission policy and origin/main preparation baseline. */
 export function createFileItemReader({ root = REPO_ROOT,
   today = () => localDateString(new Date(), 'America/Toronto'),
@@ -215,13 +266,18 @@ export function createFileItemReader({ root = REPO_ROOT,
  *   unset in production.
  */
 export function createFileItemSinks({ root = REPO_ROOT, write, queuePath,
-  cardBranch = createCardBranchSink({ root }) } = {}) {
+  cardBranch = createCardBranchSink({ root }), rulingCardBranch = createRulingCardBranchSink({ root }) } = {}) {
   // No explicit override → the ONE state-home queue every runner/daemon reads (see the file header).
   const resolvePath = queuePath || (() => resolveQueuePath());
 
   return {
     ...createScaffoldSinks({ root, write }),
-    [FILE_ITEM_CARD_BRANCH_EFFECT]: cardBranch,
+    [FILE_ITEM_CARD_BRANCH_EFFECT]: async payload => {
+      if (!payload.rulingKey) return cardBranch(payload);
+      const result = await rulingCardBranch(payload);
+      if (result?.pushed !== true) throw new Error(result?.warning ?? 'ruling branch publication failed; preserve the lane and retry');
+      return result;
+    },
     [FILE_ITEM_QUEUE_EFFECT]: async (payload) => {
       const path = resolvePath();
       const before = readQueueFile(path);

@@ -58,7 +58,7 @@ function runner(canonicalAudit) {
 
 // Keep both producers' default checker. Replace only filesystem/process effects in a child,
 // never the checker or evaluator; no real Git, credentials, network, or .git writes.
-function defaultProducer({ direct = false, dry = false, check = false, failMain = false, records = [] } = {}) {
+function defaultProducer({ direct = false, dry = false, check = false, failMain = false, card = false, records = [] } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'default-audit-gate-'));
   const trace = join(dir, 'effects.jsonl');
   const preload = join(dir, 'effects.mjs');
@@ -87,6 +87,7 @@ function defaultProducer({ direct = false, dry = false, check = false, failMain 
       }
       if (a[0] === 'fetch') throw new Error("couldn't find remote ref");
       if (a[0] === 'merge-base') return a.includes('--is-ancestor') ? '' : ${JSON.stringify(base)};
+      if (a[0] === 'diff' && a.includes('--raw') && ${card}) return ${JSON.stringify(':000000 100644 ' + '0'.repeat(40) + ' ' + 'd'.repeat(40) + ' A\0backlog/101-new.md\0')};
       if (a[0] === 'diff') return a.includes('--name-only') ? 'docs/guide.md\\n'
         : a.includes('--name-status') ? 'M\\tdocs/guide.md\\n'
         : 'diff --git a/docs/guide.md b/docs/guide.md\\n+documentation only\\n';
@@ -131,6 +132,24 @@ function defaultProducer({ direct = false, dry = false, check = false, failMain 
 }
 
 describe('default canonical checker integration', () => {
+  it.each([false, true].flatMap(direct => ['open', 'check', 'dry'].map(mode => [direct, mode])))('default checker admits card-only and pins sha, direct=%s mode=%s', (direct, mode) => {
+    const { result, effects } = defaultProducer({ direct, card: true, check: mode === 'check', dry: mode === 'dry' });
+    expect(result.reason).not.toBe('canonical-audit-missing');
+    expect(result.blockers?.some(b => b.gate === 'canonical-audit')).not.toBe(true);
+    if (!direct) {
+      expect(result.outcome).toBe(mode === 'check' ? 'checked' : 'opened');
+      expect(effects.find(([cmd]) => cmd === (mode === 'check' ? 'preflight' : 'publication'))[1]).toContain(`--sha=${sha}`);
+    } else if (mode === 'dry') {
+      expect(result.reason).toBe('dry-run');
+      expect(result.plan.find(line => line.startsWith('git push '))).toContain(`${sha}:refs/heads/lane/audit`);
+    } else if (mode === 'check') expect(result.sha).toBe(sha);
+    else {
+      const push = effects.find(([cmd, args]) => cmd === 'git' && args.includes('push'));
+      if (push) expect(push[1]).toContain(`${sha}:refs/heads/lane/audit`);
+    }
+    const raw = effects.find(([cmd, args]) => cmd === 'git' && args.includes('--raw'));
+    expect(raw[1].at(-1)).toBe(sha);
+  });
   it.each([false, true])('check calls the default Git fetch port before accepting audit evidence, direct=%s', direct => {
     const record = { head: sha, base, questionHash: QUESTION_HASH, at: '2026-11-17T00:00:00Z', verdict: 'NOT WEAKENED', findings: [] };
     const { result, effects } = defaultProducer({ direct, check: true, records: [record] });
@@ -232,7 +251,7 @@ describe('direct pr-land canonical gate seam', () => {
   });
   it('the direct CLI gates before its dry-run return and before publishing', () => {
     const source = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', 'pr-land.mjs'), 'utf8');
-    const gate = source.indexOf('  admitCanonicalAudit({ repo: REPO');
+    const gate = source.indexOf('  const auditAdmission = admitCanonicalAudit({ repo: REPO');
     expect(gate).toBeGreaterThan(0);
     expect(gate).toBeLessThan(source.indexOf('  if (DRY_RUN) {', gate));
     expect(gate).toBeLessThan(source.indexOf('  // 2. Publish', gate));

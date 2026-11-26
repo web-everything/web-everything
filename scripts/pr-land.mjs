@@ -969,7 +969,7 @@ async function runCli() {
 
   // 1. Resolve the SOURCE commit to publish (the lane clone's HEAD, or an explicit --sha). No local
   //    branch is created (that's guarded) — the lane model pushes `<source>:lane/<n>` straight to origin.
-  const refSha = tryGit(['rev-parse', SRC]);
+  let refSha = tryGit(['rev-parse', SRC]);
   // E3 (#3929) — record the producer's own hold in the verdict ledger, ALONGSIDE the label (strictly additive).
   // Fail-soft by construction: `recordParkVerdict` never throws, a miss is reported on stderr only, and nothing
   // here is read by any park / label / land decision. Written BEFORE the label call, like the drain's park.
@@ -983,9 +983,10 @@ async function runCli() {
   };
   if (!refSha) emit({ repo: REPO, merged: false, reason: 'no-such-src', detail: `source commit "${SRC}" not found — pass --sha=<commit> or run from a checkout whose HEAD carries the lane work` }, 3);
 
-  admitCanonicalAudit({ repo: REPO, ref: REF, sha: refSha, refreshMain: CHECK }, {
+  const auditAdmission = admitCanonicalAudit({ repo: REPO, ref: REF, sha: refSha, refreshMain: CHECK }, {
     refuse: DRY_RUN ? emit : result => collect('canonical-audit', result.reason, result.detail, refSha),
   });
+  if (auditAdmission.ok && auditAdmission.sha) refSha = auditAdmission.sha;
 
   // Derive a title when none was passed: `--fill` can't autofill for a lane/* head (it's remote-only, so
   // gh can't diff it locally). Use the source commit's subject — a meaningful, always-available title —
@@ -1032,7 +1033,7 @@ async function runCli() {
       plan: [
         `node scripts/lint-locus-prefix.mjs ${buildLocusLintArgs({ root: REPO, range: `${REMOTE}/${BASE}..${refSha}` }).join(' ')}   # #2331 producer locus-prefix re-check (fail fast on the #2170 review-append leak) — swept in --root, the clone holding the commits (#3342)`,
         `soak precheck (if no PR exists yet): ${soak.ok ? soak.skipped || soak.reason : `REFUSE: ${soak.message}`}`,
-        `git push ${REMOTE} ${SRC}:refs/heads/${REF}   # publish the lane clone's ${SRC} (${refSha.slice(0, 8)}) to the lane ref`,
+        `git push ${REMOTE} ${refSha}:refs/heads/${REF}   # publish the lane clone's ${SRC} (${refSha.slice(0, 8)}) to the lane ref`,
         prCreateBodyGuard(BODY).ok ? `gh ${createArgs.join(' ')}` : `REFUSE (if no PR exists yet): ${prCreateBodyGuard(BODY).reason}  # #2332 fail-fast — an existing PR for this head is exempt`,
         PLAN.waitForChecks ? 'poll: gh pr view <pr> mergeStateStatus + gh pr checks <pr> --required  (wait until green; abort on red)'
           : PLAN.mode === 'park' ? '(--park: skip check-wait — the PR is HELD for review, not landed by this run)'
@@ -1188,7 +1189,7 @@ async function runCli() {
   if (allBlockers.length) emit({ repo: REPO, merged: false, ref: REF, sha: refSha,
     reason: allBlockers[0].reason, blockers: allBlockers, info,
     detail: [formatBlockers(allBlockers), ...info].join('\n') }, 3);
-  if (CHECK) emit({ repo: REPO, merged: false, reason: 'check-ok', info,
+  if (CHECK) emit({ repo: REPO, merged: false, reason: 'check-ok', sha: refSha, info,
     detail: ['all pre-push gates passed', ...info].join('\n') }, 0);
 
   // 2. Publish the source commit to the lane ref on origin (guard-safe: lane/*). Never force, no local branch.

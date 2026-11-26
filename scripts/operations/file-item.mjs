@@ -58,6 +58,7 @@
  *
  * PURE. No fs, no clock, no process, no network. `./file-item-io.mjs` is the only place it touches the world.
  */
+import { rulingBranch } from '../lib/ruling-card-key.mjs';
 import { localDateString } from '../lib/local-date.mjs';
 import { OPERATOR_TASK_INPUT, OPERATOR_TASK_READS } from '../backlog/operator-task.mjs';
 import { op } from './registry.mjs';
@@ -73,6 +74,10 @@ import { validatePrepareCard } from '../conveyor/prepare-result.mjs';
  *  priority (P0..P4) for operator tasks is card #xqqmw6g, with the authority it needs. */
 export function planFileItem(read, input) {
   const verdict = planScaffold(read, input);
+  if (input.rulingKey) {
+    rulingBranch(input.rulingKey);
+    verdict.content = setFrontmatterField(verdict.content, 'rulingKey', JSON.stringify(input.rulingKey));
+  }
   const policy = read.operatorTask;
   if (!input.operatorTask) return verdict;
   // The digest supplies the complete authored body, replacing the scaffold's unfinished agreement.
@@ -215,6 +220,8 @@ export function fileItemOperation({ readScaffoldContext, searchDuplicates, now =
       workItem: { type: 'string', required: false, default: '' },
       size: { type: 'string', required: false, default: '' },
       slug: { type: 'string', required: false, default: '' },
+      // Ruling-only opt-out from shared batch publication; preserved on its own keyed branch.
+      rulingKey: { type: 'string', required: false, default: '' },
       digest: { type: 'string', required: false, default: '' },
       relatedTo: { type: 'string', required: false, default: '' },
       relatedReason: { type: 'string', required: false, default: '' },
@@ -266,7 +273,7 @@ export function fileItemOperation({ readScaffoldContext, searchDuplicates, now =
     // sees exactly what a `scaffold` caller would (num/id/rel/abs/kind/status/content/digestFilled).
     plan: compute({
       reads: [
-        'input.title', 'input.kind', 'input.type', 'input.workItem', 'input.size', 'input.slug',
+        'input.title', 'input.kind', 'input.type', 'input.workItem', 'input.size', 'input.slug', 'input.rulingKey',
         ...OPERATOR_TASK_READS, 'input.relatedTo', 'input.relatedReason', 'input.notDuplicateReason', 'input.digest', 'input.parent', 'input.blockedBy', 'input.scope', 'input.session', 'findings.read',
       ],
       fn: (view) => {
@@ -312,12 +319,13 @@ export function fileItemOperation({ readScaffoldContext, searchDuplicates, now =
     }),
 
     cardBranch: effectStep({
-      reads: ['verdict'],
+      reads: ['verdict', 'input.rulingKey'],
       effects: (view) => [{
         type: FILE_ITEM_CARD_BRANCH_EFFECT,
         // Replay checks the remote card bytes before appending; it cannot duplicate an applied card.
         idempotent: true,
-        payload: { rel: view.verdict.rel, content: view.verdict.content, batchDate: localDateString(now(), 'UTC') },
+        payload: { rel: view.verdict.rel, content: view.verdict.content, batchDate: localDateString(now(), 'UTC'),
+          ...(view.input.rulingKey ? { rulingKey: view.input.rulingKey } : {}) },
       }],
     }),
   });

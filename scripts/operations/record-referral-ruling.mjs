@@ -470,7 +470,10 @@ export function buildRulingCardInput(read, input, selected) {
   const first = selected[0] ?? {};
   // Built by the shared helper `retitle` also uses, so a partially-deduped card gets a title of the same shape.
   const title = rulingCardTitle({ file: first.file, line: first.line, claim: first.summary, more: selected.length - 1, tag: input.repo.split('/').pop(), pr: input.pr });
-  return { title,
+  const identities = selected.map(f => [f.runId, f.key]).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+  const rulingKey = identities.length && identities.every(([run, key]) => typeof run === 'string' && run && typeof key === 'string' && key)
+    ? `${identities[0][0]}:${createHash('sha256').update(JSON.stringify(identities)).digest('hex')}` : undefined;
+  return { title, ...(rulingKey ? { rulingKey } : {}),
     kind: 'story', size: '2', digest, scope,
     parent: '', queue: 'true', session: `card-ruling-${slug}` };
 }

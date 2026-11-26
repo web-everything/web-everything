@@ -106,6 +106,25 @@ describe('the declaration end to end', () => {
     return run;
   }
 
+  it('stamps the ruling key at write and passes the opt-out to publication, leaving ordinary filers unchanged', async () => {
+    const rulingKey = `referral-run:${'a'.repeat(64)}`;
+    for (const key of ['', rulingKey]) {
+      const registry = buildRegistry(), written = [], published = [];
+      let run = advanceWhileRunning(startRun({ op: FILE_ITEM_OP, id: key ? 'ruling-keyed' : 'ruling-ordinary', registry,
+        input: { title: 'Track the ruling finding', kind: 'story', size: '2', rulingKey: key } }), { registry });
+      run = await runToCompletion(run, { registry, store: createMemoryRunStore(), sinks: {
+        [SCAFFOLD_EFFECT]: async payload => { written.push(payload); return { written: true }; },
+        [FILE_ITEM_QUEUE_EFFECT]: async () => ({ queued: true }),
+        [FILE_ITEM_CARD_BRANCH_EFFECT]: async payload => { published.push(payload); return { pushed: true }; },
+      } });
+      expect(runStatus(run, { registry })).toBe('complete');
+      expect(written).toHaveLength(1); expect(published).toHaveLength(1);
+      if (key) { expect(matter(written[0].content).data.rulingKey).toBe(key); expect(published[0].rulingKey).toBe(key); }
+      else { expect(matter(written[0].content).data).not.toHaveProperty('rulingKey'); expect(published[0]).not.toHaveProperty('rulingKey'); }
+      expect(published[0].content).toBe(written[0].content);
+    }
+  });
+
   describe('duplicate admission before writing', () => {
     const input = { title: 'Prevent duplicate backlog cards', workItem: 'task', digest: 'Search before filing a card' };
     const hits = (backlog = []) => ({ backlog, scripts: [], skills: [] });

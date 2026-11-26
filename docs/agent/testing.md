@@ -4625,8 +4625,30 @@ to an older pass, plus carried and waived paths; malformed records require repai
 
 ## Canonical audit before opening PRs
 
-`open-pr` and direct `pr-land` require the canonical codex-audit JSONL evidence, including in dry runs
-and for docs-only changes. They resolve the local PR source to a full SHA and use the shared canonical
+A head whose net diff from the single merge-base with freshly fetched origin/main consists only of ADDED top-level `backlog/<id>-*.md` card files or raised-by files (status A, mode 100644) is admitted without a canonical audit; an edited or deleted card, any other path, a rename, a symlink, an empty diff, more than one merge-base, or any git or fetch error requires the audit as before.
+
+Eligible cards bypass missing, malformed and WEAKENED records before settings or records are read.
+Ineligible changes keep the existing veto and exact-head waiver behavior. The raw NUL-delimited diff
+must be complete, and the fetched commit must equal origin/main. Unknown evidence falls through to
+the audit path; its refusal names the canonical audit command for the resolved head.
+
+Ruling filings carry a stable `rulingKey` (referral run ID plus finding fingerprint) in frontmatter
+and use `lane/card-ruling-<key>` exclusively. The `file-item` rulingKey input opts out of shared batch
+publication and preserves only that card on its own branch before returning. Resume reads that branch
+locally, then origin, reusing its immutable card and PR; no filed card is deleted. A legacy keyed card
+found only on a shared batch branch stops with a report; unreadable lookup stops without filing.
+Lookup refuses more than 1,024 local or origin ruling/batch refs; inspect or consolidate legacy
+branches before retrying. Persisted filings without a ruling key require re-preparation from the referral identity, never a
+new guessed key. Exercise the crash between filing and opening with real Git objects and injected
+publication effects, asserting one card and one PR and no shared batch publication.
+Fresh checkout integration must use the real scaffold and private-index publication sinks: publication
+leaves the new card untracked in the lane's real index. Before detached checkout, reconcile only that
+regular, non-executable file whose unfiltered blob hash matches the published card, and require any
+existing index entry to match too. Stage the verified blob without replacing worktree bytes; conflicts,
+symlinks and unreadable evidence retain the filing and stop before verification or PR opening.
+
+`open-pr` and direct `pr-land` require the canonical codex-audit JSONL evidence for ineligible changes,
+including in dry runs and for docs-only changes. They resolve the local PR source to a full SHA and use the shared canonical
 evaluator and origin/main coverage check. The record file comes from the same settings the audit writer
 reads (`scripts/settings/prototype-load.json` beside these scripts), never the target checkout's, so
 sibling-repo PRs work. WEAKENED requires a `ruledWeakened` waiver matching ref, full SHA and findings

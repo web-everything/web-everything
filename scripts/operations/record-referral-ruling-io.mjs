@@ -1,3 +1,4 @@
+import { lookupRulingCard as lookupRulingBranch, rulingBranch } from './ruling-card-branch.mjs';
 import { assertJudgeReason } from './record-referral-ruling.mjs';
 import { assertRulingIdentity } from '../lib/operator-identity.mjs';
 import { JUDGE_ACTOR, JUDGE_ATTRIBUTION, readJudgeActorPolicy, readJudgeWriterPolicy, assertJudgeAuthority } from '../lib/marker-authorship.mjs';
@@ -320,9 +321,16 @@ const rulingDedupe = (input, options) => runCardDedupe(input, { ...options, read
   loadPolicy: () => ({ ...loadCardDedupePolicy({ root: REPO_ROOT, env: process.env }), dedupe: true }) });
 
 export async function landRulingCard(input, { repo, pr, dedupe = rulingDedupe,
-  landPreventionCard = defaultLandPreventionCard, ...landingOptions } = {}) {
+  landPreventionCard = defaultLandPreventionCard,
+  lookupRulingCard = (key, { lane = REPO_ROOT } = {}) => lookupRulingBranch({ root: lane, rulingKey: key }), ...landingOptions } = {}) {
+  let existing;
+  if (input.rulingKey) {
+    try { rulingBranch(input.rulingKey); existing = await lookupRulingCard(input.rulingKey, { lane: REPO_ROOT }); }
+    catch (error) { return { ok: false, step: 'ruling-lookup', reason: `${error.message}; nothing filed` }; }
+    if (existing?.ok !== true) return { ok: false, step: 'ruling-lookup', reason: existing?.reason ?? 'ruling-key lookup unavailable; nothing filed' };
+  }
   let plan;
-  try { plan = await dedupe(input, { lane: REPO_ROOT }); }
+  try { plan = existing?.card ? { action: 'file', matches: [] } : await dedupe(input, { lane: REPO_ROOT }); }
   catch (error) { return { ok: false, step: 'dedupe', reason: `duplicate-card check failed: ${String(error?.message ?? error).split('\n')[0]}; nothing filed` }; }
   if (plan?.action === 'mention' && plan.matches?.length) {
     const refs = plan.matches.map(({ card }) => {
@@ -340,10 +348,13 @@ export async function landRulingCard(input, { repo, pr, dedupe = rulingDedupe,
   if (plan?.matches?.length) {
     return { ok: false, step: 'dedupe', reason: 'findings already match existing open card(s) but not as one card; cite the right one with --card instead of filing a duplicate' };
   }
+  if (!input.rulingKey) return { ok: false, step: 'ruling-lookup',
+    reason: 'missing persisted rulingKey; re-prepare from the referral run ID and finding fingerprint; nothing filed' };
   const result = await landPreventionCard(input, { ...landingOptions,
+    lookupRulingCard: existing?.card ? () => existing : lookupRulingCard, rulingSourceRoot: REPO_ROOT,
     dedupe: () => null, batch: async () => ({ batched: false, disabled: true }) });
   if (result?.ok && result.rel && result.pr && !['batched', 'held', 'mentioned'].includes(result.step))
-    return { ok: true, reused: false, ref: `we:${result.rel}@pr${result.pr}`, pr: result.pr };
+    return { ok: true, reused: result.reused === true, ref: `we:${result.rel}@pr${result.pr}`, pr: result.pr };
   return { ok: false, step: result?.step ?? 'landing',
     reason: [result?.rel, result?.reason ?? 'card did not land on a single-card PR'].filter(Boolean).join(': ') };
 }

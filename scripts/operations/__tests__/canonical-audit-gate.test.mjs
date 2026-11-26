@@ -1,4 +1,8 @@
 import { describe, it, expect } from 'vitest';
+import * as admission from '../canonical-audit-gate.mjs';
+import { cardRepo } from './helpers/card-ruling-repo.mjs';
+import { symlinkSync, chmodSync } from 'node:fs';
+import { planAuditOwed } from '../../conveyor/audit-on-ready.mjs';
 import { checkCanonicalAuditForOpen } from '../canonical-audit-gate.mjs';
 import { QUESTION_HASH } from '../codex-audit.mjs';
 import { dirname, join, resolve } from 'node:path';
@@ -244,5 +248,118 @@ describe('canonical audit before opening a PR', () => {
   it('a short unresolved source fails closed before any evidence read', () => {
     const { result, reads } = fixture({ resolved: 'aaaaaaa' });
     expect(result.ok).toBe(false); expect(reads).toEqual([]);
+  });
+});
+
+
+describe('card-only admission with real git evidence', () => {
+  function probe(change, options = {}) {
+    const r = cardRepo();
+    try {
+      change(r);
+      const fullSha = r.git('rev-parse', 'HEAD').trim();
+      const reads = [];
+      const result = checkCanonicalAuditForOpen({ repo: r.root, sha: fullSha, fetchMain: options.fetchMain ?? r.fetchMain,
+        exec: (_cmd, args) => r.git(...args.slice(2)),
+        readFile: path => { reads.push(path); throw new Error('audit must be required for ineligible changes'); } });
+      return { result, reads, fullSha };
+    } finally { r.close(); }
+  }
+  it('cardOnlyAdmission never throws for unavailable inputs', () => {
+    expect(admission.cardOnlyAdmission(null)).toEqual({ ok: false });
+    expect(admission.cardOnlyAdmission({ get git() { throw new Error('unreadable'); } })).toEqual({ ok: false });
+  });
+  it.each(['missing', 'malformed', 'WEAKENED'])('eligible cards bypass %s records before any settings or record read', _kind => {
+    const { result, reads, fullSha } = probe(r => { r.put('backlog/101-new.md'); r.commit(); });
+    expect(result).toEqual({ ok: true, reason: null, message: '', exemption: 'card-only', record: null, sha: fullSha });
+    expect(reads).toEqual([]);
+  });
+  it('admits a card plus a raised-by file', () => {
+    expect(probe(r => { r.put('backlog/101-new.md'); r.put(`backlog/raised-by/100/1-${'a'.repeat(24)}.md`); r.commit(); }).result.ok).toBe(true);
+  });
+  it('admits a merge-from-main head by its net diff', () => {
+    expect(probe(r => {
+      r.git('checkout', '-b', 'card'); r.put('backlog/101-new.md'); r.commit();
+      r.git('checkout', 'main'); r.put('scripts/main-only.mjs'); const main = r.commit(); r.setMain(main);
+      r.git('checkout', 'card'); r.git('merge', '--no-edit', 'main');
+    }).result.ok).toBe(true);
+  });
+  it.each([
+    ['added .mjs', r => r.put('scripts/new.mjs')],
+    ['modified card', r => r.put('backlog/100-existing.md', 'changed')],
+    ['deleted card', r => r.git('rm', 'backlog/100-existing.md')],
+    ['docs file', r => r.put('docs/guide.md')],
+    ['mixed card+code', r => { r.put('backlog/101-new.md'); r.put('scripts/new.mjs'); }],
+    ['rename from scripts/ into backlog/', r => r.git('mv', 'scripts/existing.mjs', 'backlog/101-new.md')],
+    ['symlink (120000)', r => symlinkSync('../scripts/existing.mjs', join(r.root, 'backlog/101-new.md'))],
+    ['executable (100755)', r => { r.put('backlog/101-new.md'); chmodSync(join(r.root, 'backlog/101-new.md'), 0o755); }],
+    ['gitlink', r => {
+      r.git('init', 'backlog/101-new.md');
+      r.git('-C', 'backlog/101-new.md', 'commit', '--allow-empty', '-m', 'submodule');
+      r.git('add', 'backlog/101-new.md');
+      expect(r.git('diff', '--cached', '--raw')).toContain('160000');
+    }],
+    ['duplicate card ids', r => { r.put('backlog/101-a.md'); r.put('backlog/101-b.md'); }],
+    ['empty diff', () => {}],
+  ])('MUST STAY REFUSED: %s', (_name, change) => {
+    const { result } = probe(r => { change(r); r.commit(); });
+    expect(result).toMatchObject({ ok: false, reason: 'canonical-audit-missing' });
+  });
+  it('MUST STAY REFUSED: failed fetch', () => {
+    expect(probe(r => { r.put('backlog/101-new.md'); r.commit(); }, { fetchMain: () => { throw new Error('offline'); } }).result.ok).toBe(false);
+  });
+  it('MUST STAY REFUSED: zero merge-bases', () => {
+    expect(probe(r => { const tree = r.git('rev-parse', 'HEAD^{tree}').trim(); const sha = r.git('commit-tree', tree, '-m', 'unrelated').trim(); r.git('reset', '--hard', sha); }).result.ok).toBe(false);
+  });
+  it('MUST STAY REFUSED: criss-cross (2 merge-bases)', () => {
+    expect(probe(r => {
+      const tree = r.git('rev-parse', 'HEAD^{tree}').trim();
+      const commit = (message, parents) => r.git('commit-tree', tree, ...parents.flatMap(p => ['-p', p]), '-m', message).trim();
+      const a = commit('a', [r.baseline]), b = commit('b', [r.baseline]);
+      const main = commit('ab', [a, b]);
+      r.put('backlog/101-new.md'); r.git('add', 'backlog/101-new.md');
+      const headTree = r.git('write-tree').trim();
+      const head = r.git('commit-tree', headTree, '-p', b, '-p', a, '-m', 'ba with card').trim();
+      expect(r.git('merge-base', '--all', main, head).trim().split('\n')).toHaveLength(2);
+      r.setMain(main); r.git('reset', '--hard', head);
+    }).result.ok).toBe(false);
+  });
+  it.each(['malformed', 'truncated', 'extra row', 'trailing newline', 'unverified fetched sha', 'git error'])('MUST STAY REFUSED: %s raw evidence', kind => {
+    const r = cardRepo();
+    try {
+      r.put('backlog/101-new.md'); const fullSha = r.commit();
+      const raw = r.git('diff', '--raw', '-z', '--no-renames', r.baseline, fullSha);
+      const bad = { malformed: 'garbage\0', truncated: raw.slice(0, -1), 'extra row': raw + 'garbage\0', 'trailing newline': raw + '\n' };
+      const git = (...args) => {
+        if (kind === 'git error') throw new Error('unreadable');
+        if (kind === 'unverified fetched sha' && args.includes('FETCH_HEAD^{commit}')) return 'f'.repeat(40);
+        return args.includes('--raw') ? (bad[kind] ?? raw) : r.git(...args);
+      };
+      expect(admission.cardOnlyAdmission({ git, fullSha, fetchMain: r.fetchMain })).toEqual({ ok: false });
+    } finally { r.close(); }
+  });
+  it('cardOnlyAdmission issues only read-only git subcommands (merge-base --all, diff --raw -z --no-renames)', () => {
+    const r = cardRepo();
+    try {
+      r.put('backlog/101-new.md'); const fullSha = r.commit();
+      const seen = [];
+      const git = (...args) => { seen.push(args); return r.git(...args); };
+      expect(admission.cardOnlyAdmission({ git, fullSha, fetchMain: r.fetchMain })).toEqual({ ok: true });
+      const readOnly = new Set(['rev-parse', 'merge-base', 'diff']);
+      expect(seen.length).toBeGreaterThan(0);
+      for (const args of seen) expect(readOnly.has(args[0]), args.join(' ')).toBe(true);
+      const mb = seen.filter(a => a[0] === 'merge-base');
+      expect(mb).toHaveLength(1);
+      expect(mb[0]).toContain('--all');
+      const diff = seen.filter(a => a[0] === 'diff');
+      expect(diff).toHaveLength(1);
+      for (const flag of ['--raw', '-z', '--no-renames']) expect(diff[0]).toContain(flag);
+      expect(diff[0].some(a => /^--(output|stat|patch|binary)/.test(a))).toBe(false);
+    } finally { r.close(); }
+  });
+  it('audit-on-ready reports an exempt head as not owed', () => {
+    const check = () => probe(r => { r.put('backlog/101-new.md'); r.commit(); }).result;
+    expect(planAuditOwed({ repo: 'o/r', rawPrs: [{ number: 1, headRefOid: sha,
+      labels: ['review:human', 'advisory:accepted', 'red-team:clear'] }], check })).toEqual([]);
   });
 });
