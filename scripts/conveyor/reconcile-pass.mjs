@@ -58,7 +58,7 @@ import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
  */
 import { enrichPrsWithStandingRulingGrants } from './standing-ruling-io.mjs';
 import { enrichPrsWithOwedMainRule, resolveRefreshSettings } from '../lib/renamed-pr-refresh.mjs';
-import { excusePrMergeGateHolds, readMergeGateVerdict as defaultReadMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
+import { excusePrMergeGateHolds, annotateMergeGateAdmission as defaultAnnotateMergeGateAdmission, readMergeGateVerdict as defaultReadMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { readMainRedPriority } from '../lib/main-red-priority.mjs'; // card xu1nixv
 import { fetchPrCommits } from '../lib/pr-limit.mjs';
@@ -1769,6 +1769,7 @@ export function runReconcilePass({
   readOnly = false,
   readPrs = defaultReadPrs, readAgents = defaultReadAgents, enrich = enrichAgents,
   excuseMergeGateHolds = excusePrMergeGateHolds, readMergeGateVerdict = defaultReadMergeGateVerdict,
+  annotateMergeGateAdmission = defaultAnnotateMergeGateAdmission,
   readFreeze = readSharedFreeze, mergeGateSetting,
   enrichMainRed = enrichPrsWithMainRedFacts, enrichAlreadyLanded = enrichPrsWithAlreadyLandedFacts,
   // #4265 — the stacked-base conflict-fix cap's own `currentSha` (see {@link enrichPrsWithBaseRefFacts}'s own
@@ -1914,6 +1915,11 @@ export function runReconcilePass({
       readMergeGateVerdict, readFreeze, mergeGateSetting, env,
     });
   } catch { /* An unreadable verdict must retain the original red checks. */ }
+  try {
+    holdPrs = annotateMergeGateAdmission(holdPrs, {
+      repo: resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug, readMergeGateVerdict,
+    });
+  } catch { /* Unannotated rows fail closed at CI-heal admission. */ }
   const { prs: redPrs, mainRedWindows, mainLatestCheckRuns } = enrichMainRed(holdPrs, { repo: resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug, defaultBranch, requiredChecks });
   // live incident, PR #2752 (#4034/#2748) — attach `alreadyLandedInMain` to any PR carrying
   // `merge-status:conflicting` whose own content is already, file-by-file, present on `main`. Costs nothing

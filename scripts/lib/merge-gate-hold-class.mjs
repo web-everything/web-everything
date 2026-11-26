@@ -235,6 +235,37 @@ function parseWorkflowProtection(job, log, prNumber) {
 }
 
 const jobCache = new Map();
+/** Admission evidence is independent of excusal and never grants merge clearance. */
+export function annotateMergeGateAdmission(prs, { repo, readMergeGateVerdict: readVerdict = readMergeGateVerdict, ...readerOptions } = {}) {
+  return prs.map(pr => {
+    const row = latestFailingMergeGate(pr.statusCheckRollup);
+    if (!row) return pr;
+    const jobId = Number(/\/actions\/runs\/\d+\/job\/(\d+)/.exec(row.detailsUrl ?? row.details_url ?? '')?.[1] ?? row.id);
+    let classification = { class: 'unreadable', why: 'Missing or unreadable head-bound merge-gate evidence', jobId };
+    try {
+      if (Number.isSafeInteger(jobId) && jobId > 0 && typeof pr.headRefOid === 'string' && pr.headRefOid
+        && Number.isSafeInteger(pr.number) && pr.number > 0) {
+        const verdict = readVerdict({ ...readerOptions, repo, jobId, prNumber: pr.number });
+        const results = verdict?.results;
+        if (!verdict?.error && verdict?.num === pr.number && typeof verdict?.head_sha === 'string'
+          && verdict.head_sha.toLowerCase() === pr.headRefOid.toLowerCase() && verdict.ok === false
+          && Array.isArray(results) && results.length && results.every(r => r && statuses.has(r.status) && gates.has(r.id))) {
+          const holds = results.filter(blocking);
+          const review = r => (r.status === 'hold' && HUMAN_REVIEW_HOLD_GATES.includes(r.id))
+            || (verdict.workflowEditProtection === true && isRedTeamMissing(r));
+          if (holds.length) {
+            const real = holds.some(r => r.id !== 'red-main-freeze' && !review(r));
+            const cls = real ? 'real' : holds.some(r => r.id === 'red-main-freeze') ? 'main' : 'review';
+            classification = { class: cls, why: `Readable merge-gate holds: ${holds.map(r => r.id).join(', ')}`, jobId };
+          }
+        }
+      }
+    } catch { /* Keep unreadable evidence closed for admission. */ }
+    return { ...pr, statusCheckRollup: pr.statusCheckRollup.map(r => r === row
+      ? { ...r, mergeGateAdmission: classification } : r) };
+  });
+}
+
 /** Immutable job log + job head/completion metadata, cached by repository/job (never PR). */
 export function readMergeGateVerdict({ repo, jobId, prNumber, runGh = runGhSync, cache = jobCache } = {}) {
   try {
