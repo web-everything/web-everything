@@ -948,8 +948,7 @@ describe('remote client override', () => {
     const f = fixture();
     const clientPath = join(f.root, `unsafe\n\x1b\x7f${'x'.repeat(4096)}`, 'remote-exec.mjs');
     f.policy.settings.remote.clientPath = clientPath;
-    // Formatting needs no remote dispatch; exercise the hostless standard policy.
-    const displayPolicy = resolveAdmissionPolicy({platform:{remote:{clientPath}}});
+    const displayPolicy = f.policy;
     const formatted = formatAdmissionPolicy(displayPolicy);
     const displayPath = clientPath.replace(/[^\x20-\x7e]/g, '?').slice(0, 960);
     expect(formatted).toContain(`remote.clientPath=${displayPath} (platform)`);

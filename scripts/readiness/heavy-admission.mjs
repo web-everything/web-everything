@@ -554,7 +554,11 @@ export function formatAdmissionPolicy({ settings, sources, ignored = [], invalid
     settings[leaf] !== ADMISSION_POLICY_STANDARD[leaf] || (sources[leaf] ?? 'standard') !== 'standard');
   const values = ['cap', 'fastSlots', 'onTimeout', 'wholeSuite', 'fastScale.maxSlots', ...warnLeaves, 'priority.mode',
     ...Object.keys(ADMISSION_POLICY_STANDARD.remote)
-      .filter(key => (key !== 'clientPath' || settings.remote?.clientPath != null)
+      // As with default warning thresholds, omit the standard auto-unit map from the display.
+      // Explicit maps always retain their value and provenance; this leaves room for configured hosts.
+      .filter(key => (key !== 'slotUnitsByKind' || (sources['remote.slotUnitsByKind'] ?? 'standard') !== 'standard'
+          || JSON.stringify(settings.remote?.slotUnitsByKind) !== JSON.stringify(ADMISSION_POLICY_STANDARD.remote.slotUnitsByKind))
+        && (key !== 'clientPath' || settings.remote?.clientPath != null)
         && (key !== 'hosts' || (sources['remote.hosts'] ?? 'standard') !== 'standard' || (settings.remote?.hosts ?? DEFAULT_REMOTE_HOSTS).length !== 0))
       .map(key => key === 'elasticSlots' ? 'remote.elasticSlots.enabled' : key === 'bundle' ? 'remote.bundle.mainMaxAgeMin' : `remote.${key}`)]
     // The policy line shows at most 960 path characters so the whole line stays under 2,000.
