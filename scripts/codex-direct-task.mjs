@@ -111,7 +111,6 @@ import { resolveTranscriptCheckPolicy, transcriptCheckError } from './lib/codex-
 import { resolveBuildPolicy, appendBuildRequirements, renderCodexTaskRules } from './lib/build-policy.mjs';
 import { runBuildSelfReview, renderSelfReviewNotes, boundedSelfReviewDiff, assertNoLaneFilterDrivers } from './lib/build-self-review.mjs';
 import { pinDeveloperDir, laneGitConfigArgs, hardenLaneGitArgs, laneGitHardeningEnv, scrubGitRepoEnv } from './lib/lane-git-hardening.mjs';
-import { startLaneLeaseHeartbeat } from './lib/lane-lease-heartbeat.mjs';
 import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
 import { readProcStart } from './lib/daemon-jobs-runtime.mjs';
 import {
@@ -1771,9 +1770,11 @@ function repoRootFromCwd() {
 }
 
 /** RS-7179-1: keep the caller's lane lease(s) renewed for the whole run, stopped in `finally`. */
-export async function withLaneLeaseHeartbeat(cwds, fn, start = startLaneLeaseHeartbeat) {
+export async function withLaneLeaseHeartbeat(cwds, fn, start) {
   let stop = () => {};
-  try { stop = start({ cwds }) || stop; } catch (e) { console.error(`codex-direct-task: lane lease heartbeat did not start (${e?.message}); the run continues without lease renewal`); }
+  // Loaded lazily: a static import widens this module's import graph for every transitive importer
+  // (merge-ai-prs in-process CLI harness runs hang on the second main call when it is static).
+  try { stop = (start ?? (await import('./lib/lane-lease-heartbeat.mjs')).startLaneLeaseHeartbeat)({ cwds }) || stop; } catch (e) { console.error(`codex-direct-task: lane lease heartbeat did not start (${e?.message}); the run continues without lease renewal`); }
   try { return await fn(); } finally { try { stop(); } catch { /* best-effort */ } }
 }
 
