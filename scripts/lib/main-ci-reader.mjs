@@ -8,7 +8,9 @@ const firstLine = e => String(e?.stderr || e?.message || e).trim().split('\n').p
 
 export function settledAt(runs) {
   const times = (Array.isArray(runs) ? runs : []).filter(r => String(r?.status).toLowerCase() === 'completed' && classifyRun(r) !== 'ignore')
-    .map(r => Date.parse(r.updatedAt ?? '')).filter(Number.isFinite);
+    .map(r => typeof r.updatedAt === 'string' && r.updatedAt.trim() ? Date.parse(r.updatedAt) : NaN);
+  // One unreadable relevant completion invalidates the settle evidence; an older green cannot replace it.
+  if (times.some(t => !Number.isFinite(t))) return null;
   return times.length ? new Date(Math.max(...times)).toISOString() : null;
 }
 

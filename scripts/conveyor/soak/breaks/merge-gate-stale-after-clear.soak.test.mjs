@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import b from './merge-gate-stale-after-clear.mjs';
-it('all three stale-gate shapes POST once without bouncing', async () => {
+it('stale gate shapes POST once without bouncing and malformed main evidence holds', async () => {
   expect(b.fixPresent(process.cwd())).toBe(true);
   expect(b.judge(await b.run())).toEqual([]);
 });
@@ -16,7 +16,7 @@ it.each(['reverted', 'load-error'])('%s fails the break hard', async mode => {
     process.env.SOAK_TREE_ROOT = root;
     if (mode === 'reverted') {
       expect(b.fixPresent(root)).toBe(false);
-      expect(b.judge(await b.run())).toHaveLength(3);
+      expect(b.judge(await b.run())).toHaveLength(5);
     } else {
       expect(() => b.fixPresent(root)).toThrow(/probe failed/);
       await expect(b.run()).rejects.toThrow(/probe failed/);

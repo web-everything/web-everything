@@ -29,18 +29,24 @@ function fixture(fn) {
   const statePath = (r = repo, n = pr.number, id = run.id) => `${ledgerPath}.${r.replace('/', '~')}.${n}.${head}.${id}.rerun.json`;
   const writes = [], posts = [], bindings = [];
   let post = () => ({ status: 0 });
+  let jobs = () => ({ total_count: 1, jobs: [{ run_id: run.id, run_attempt: run.run_attempt,
+    check_run_url: `https://api.github.com/repos/${repo}/check-runs/${pr.statusCheckRollup[1]?.id ?? pr.statusCheckRollup[1]?.checkRunId}`,
+    status: 'completed', conclusion: 'failure',
+    completed_at: pr.statusCheckRollup[1]?.completedAt }] });
   const exec = vi.fn((cmd, args, options) => {
     expect(options.timeout).toBeGreaterThan(0); expect(options.maxBuffer).toBeGreaterThan(0);
     if (cmd !== 'gh') { writes.push(args); return { status: 0 }; }
     if (args[0] === 'pr') return { status: 0, stdout: JSON.stringify({ headRefOid: head }) };
     if (args.includes('POST')) { posts.push(args); return post(options); }
+    if (args[1]?.includes('/jobs?')) return { status: 0, stdout: JSON.stringify(jobs()) };
     bindings.push(args); return { status: 0, stdout: JSON.stringify(run) };
   });
   const options = { pr, headSha: head, requiredChecks, repo, ledgerPath, exec, readMain: green,
     readFreeze: () => ({ frozen: false, publishedAt: at(0) }), readComments: () => [comment()] };
   const go = extra => sendBackBlockedGate({ ...options, ...extra });
   const state = () => JSON.parse(readFileSync(statePath(), 'utf8'));
-  try { return fn({ pr, run, go, options, statePath, state, writes, posts, bindings, exec, ledgerPath, dir, setPost: fn => { post = fn; } }); }
+  try { return fn({ pr, run, go, options, statePath, state, writes, posts, bindings, exec, ledgerPath, dir,
+    setPost: fn => { post = fn; }, setJobs: fn => { jobs = fn; } }); }
   finally { vi.restoreAllMocks(); rmSync(dir, { recursive: true, force: true }); }
 }
 const held = (f, extra, reason) => { expect(f.go(extra)).toMatchObject({ sent: false, reason: expect.stringMatching(reason) }); expect(f.writes).toHaveLength(0); expect(f.posts).toHaveLength(0); };
@@ -150,22 +156,76 @@ it('head moving after reservation prevents the rerun POST', () => fixture(f => {
   held(f, { exec }, /live head changed/); expect(f.state()).toMatchObject({ count: 1, confirmed: false });
 }));
 it('head moving before the changes write prevents the writer', () => fixture(f => {
-  f.run.updated_at = at(8);
+  f.run.updated_at = f.pr.statusCheckRollup[1].completedAt = at(8);
   const exec = (c, a, o) => a[0] === 'pr' && existsSync(`${f.ledgerPath}.${head}.refused`)
     ? { status: 0, stdout: JSON.stringify({ headRefOid: 'b'.repeat(40) }) } : f.exec(c, a, o);
   held(f, { exec }, /live head changed/); expect(existsSync(`${f.ledgerPath}.${head}.refused`)).toBe(false);
 }));
 describe('Required-gate send-back R1–R3', () => {
-  it('T1 #7483 replay: gate older than main settle is re-run once via REST, never sent back', () => fixture(f => {
+  it('same-attempt gate completed before clearance reruns despite later workflow update', () => fixture(f => {
+    f.run.updated_at = at(10);
+    expect(f.go({ readComments: () => [comment(at(9))] }).reason).toContain('requested');
+    expect(f.posts).toEqual([['api', '-X', 'POST', `repos/${repo}/actions/runs/45635463327/rerun`]]);
+    expect(f.writes).toHaveLength(0);
+    expect(f.exec).toHaveBeenCalledWith('gh', ['api', `repos/${repo}/actions/runs/${f.run.id}/attempts/1/jobs?per_page=100`],
+      expect.objectContaining({ timeout: 60000, maxBuffer: 8 * 1024 * 1024 }));
+  }));
+  it.each([undefined, null, '', 'not-a-time', 123, {}])('mixed valid and invalid main completion timestamps hold without writes (%s)', updatedAt => fixture(f => {
+    const exec = (cmd, args, opts) => args[0] === 'run'
+      ? { status: 0, stdout: JSON.stringify([mainRun({ databaseId: 2, createdAt: at(8), updatedAt }), mainRun({ updatedAt: at(1) })]) }
+      : f.exec(cmd, args, opts);
+    held(f, { readMain: readMainCiRuns, exec }, /main.*unreadable|unreadable.*main/);
+  }));
+  it.each([undefined, null])('T3 missing or null frozen flag (%s) holds without writes', frozen => fixture(f => {
+    const freeze = { publishedAt: at(0) };
+    if (frozen === null) freeze.frozen = null;
+    held(f, { readFreeze: () => freeze }, /freeze/);
+  }));
+  it.each(['old-attempt', 'foreign-run', 'foreign-check', 'later-completion', 'missing-attempt', 'incomplete', 'oversized', 'empty', 'unreadable', 'duplicate', 'running', 'success'])('completion evidence from %s holds without writes', mode => fixture(f => {
+    f.run.run_attempt = 2;
+    const job = { run_id: f.run.id, run_attempt: 2, check_run_url: `https://api.github.com/repos/${repo}/check-runs/100`,
+      status: 'completed', conclusion: 'failure', completed_at: at(5) };
+    if (mode === 'old-attempt') job.run_attempt = 1;
+    if (mode === 'foreign-run') job.run_id++;
+    if (mode === 'foreign-check') job.check_run_url += '1';
+    if (mode === 'later-completion') job.completed_at = at(10);
+    if (mode === 'missing-attempt') delete job.run_attempt;
+    if (mode === 'running') job.status = 'in_progress';
+    if (mode === 'success') job.conclusion = 'success';
+    f.setJobs(() => mode === 'unreadable' ? null : mode === 'oversized' ? { total_count: 101,
+      jobs: [job, ...Array.from({ length: 100 }, (_, i) => ({ ...job, check_run_url: `https://api.github.com/repos/${repo}/check-runs/${i + 101}` }))] }
+      : { total_count: mode === 'incomplete' ? 101 : mode === 'empty' ? 0 : mode === 'duplicate' ? 2 : 1,
+      jobs: mode === 'empty' ? [] : mode === 'duplicate' ? [job, job] : [job] });
+    held(f, {}, /completion/);
+  }));
+  it.each(['nonzero', 'throw', 'invalid-json'])('attempt jobs read %s holds without writes', mode => fixture(f => {
+    const exec = (cmd, args, opts) => {
+      if (!args[1]?.includes('/jobs?')) return f.exec(cmd, args, opts);
+      if (mode === 'throw') throw Error('offline');
+      return mode === 'nonzero' ? { status: 1 } : { status: 0, stdout: '{' };
+    };
+    held(f, { exec }, /completion/);
+  }));
+  it('a complete 100-job attempt can bind the gate and rerun once', () => fixture(f => {
+    f.run.run_attempt = 2;
+    const job = { run_id: f.run.id, run_attempt: 2, status: 'completed', conclusion: 'failure', completed_at: at(5) };
+    f.setJobs(() => ({ total_count: 100, jobs: Array.from({ length: 100 }, (_, i) => ({ ...job,
+      check_run_url: `https://api.github.com/repos/${repo}/check-runs/${i + 100}` })) }));
+    expect(f.go().reason).toContain('requested'); expect(f.posts).toHaveLength(1); expect(f.writes).toHaveLength(0);
+    expect(f.exec).toHaveBeenCalledWith('gh', ['api', `repos/${repo}/actions/runs/${f.run.id}/attempts/2/jobs?per_page=100`],
+      expect.objectContaining({ timeout: 60000, maxBuffer: 8 * 1024 * 1024 }));
+  }));
+  it('T1 synthetic #7483 replay: gate older than main settle is re-run once via REST, never sent back', () => fixture(f => {
     f.run.updated_at = f.pr.statusCheckRollup[1].completedAt = '2026-11-25T14:35:06Z';
     f.go({ readComments: () => [comment('2026-11-25T14:00:00Z')], readMain: () => ({ ...green(), settledAt: '2026-11-25T15:07:20Z' }) }); expect(f.writes).toHaveLength(0);
     expect(f.posts).toEqual([['api', '-X', 'POST', `repos/${repo}/actions/runs/45635463327/rerun`]]);
     expect(f.writes).toHaveLength(0); f.go(); expect(f.posts).toHaveLength(1);
   }));
-  it('T2 #7452 replay: ledgered head, rendered clear-human, stale then in-progress then green', () => fixture(f => {
+  it('T2 synthetic #7452 replay: ledgered head, rendered clear-human, stale then in-progress then green', () => fixture(f => {
     f.pr.number = 7452; f.run.pull_requests = [{ number: 7452 }]; writeFileSync(f.ledgerPath, JSON.stringify({ [`${repo}#7452`]: { [head]: true } }));
     const readComments = () => [comment(at(9), buildVerdictComment({ to: 'clear-human', actor: 'nicolas', headSha: head }))];
     expect(f.go({ readComments }).reason).toContain('requested'); f.run.run_attempt++; f.run.status = 'in_progress';
+    expect(f.posts).toEqual([['api', '-X', 'POST', `repos/${repo}/actions/runs/${f.run.id}/rerun`]]);
     expect(f.go({ readComments }).reason).toContain('in progress'); f.run.status = 'completed'; f.run.conclusion = 'success';
     expect(f.go({ readComments }).sent).toBe(false); expect(f.posts).toHaveLength(1); expect(f.writes).toHaveLength(0);
   }));
@@ -202,6 +262,7 @@ describe('Required-gate send-back R1–R3', () => {
   it('T6 A+1 active waits, success holds, fresh red sends once, stale red reruns', () => {
     for (const [status, conclusion, time, count, sent] of [['in_progress', null, at(8), 1, false], ['completed', 'success', at(8), 1, false], ['completed', 'failure', at(8), 1, true], ['completed', 'failure', at(6), 2, false]]) fixture(f => {
       f.go(); Object.assign(f.run, { run_attempt: 2, status, conclusion, updated_at: time });
+      f.pr.statusCheckRollup[1].completedAt = time;
       expect(f.go().sent).toBe(sent); expect(f.posts).toHaveLength(count); expect(f.writes).toHaveLength(sent ? 1 : 0);
     });
   });
@@ -234,6 +295,14 @@ describe('Required-gate send-back R1–R3', () => {
     expect(exec.mock.calls[0][1]).toEqual(['run', 'list', '--repo', repo, '--workflow', 'ci.yml', '--branch', 'main', '--event', 'push', '--limit', '30', '--json', 'databaseId,conclusion,status,createdAt,updatedAt,headSha,event,attempt']);
     const pending = readMainCiRuns({ repo, exec: () => JSON.stringify([mainRun({ status: 'in_progress', attempt: 2 })]) }); expect(pending.error).toContain('being re-run');
   });
+  it.each(['cancelled', 'pending', 'foreign'])('shared reader ignores invalid timestamps on irrelevant %s runs', mode => fixture(f => {
+    const ignored = mainRun({ databaseId: 2, updatedAt: undefined,
+      ...(mode === 'cancelled' ? { conclusion: 'cancelled' } : mode === 'pending' ? { status: 'in_progress' } : { event: 'pull_request' }) });
+    const exec = (cmd, args, opts) => args[0] === 'run'
+      ? { status: 0, stdout: JSON.stringify([ignored, mainRun()]) } : f.exec(cmd, args, opts);
+    expect(f.go({ readMain: readMainCiRuns, exec }).reason).toContain('requested');
+    expect(f.posts).toHaveLength(1); expect(f.writes).toHaveLength(0);
+  }));
   it.each([undefined, 'bad', ''])('T12 invalid main/freeze timestamps %s hold', time => {
     fixture(f => held(f, { readMain: () => ({ ...green(), settledAt: time }) }, /main/));
     fixture(f => held(f, { readFreeze: () => ({ frozen: false, publishedAt: time }) }, /freeze/));
@@ -262,11 +331,11 @@ describe('Required-gate send-back R1–R3', () => {
   it('unreadable completion keeps skipped (flipped)', () => fixture(f => { f.run.updated_at = 'bad'; held(f, {}, /completion/); }));
   it('unreadable rollup completion keeps skipped (flipped)', () => fixture(f => { delete f.pr.statusCheckRollup[1].completedAt; held(f, {}, /completion/); }));
   it('equal clearing time is fresh; ledgered fresh-red head stays skipped', () => fixture(f => {
-    f.run.updated_at = at(7); expect(f.go().sent).toBe(true); f.writes.length = 0; held(f, {}, /already|ledger/);
+    f.run.updated_at = f.pr.statusCheckRollup[1].completedAt = at(7); expect(f.go().sent).toBe(true); f.writes.length = 0; held(f, {}, /already|ledger/);
   }));
   it.each(['🔁 review — changes requested', '🔁 human review — changes requested', '🔁 human review - changes requested'])('newest trusted bounce %s overrides acceptance; untrusted newer clearance has no authority', heading => fixture(f => {
     const readComments = () => [comment(at(4)), comment(at(9), heading), { ...comment(at(20)), author: { login: 'rando' } }];
-    f.run.updated_at = at(8); expect(f.go({ readComments }).sent).toBe(true); expect(f.posts).toHaveLength(0);
+    f.run.updated_at = f.pr.statusCheckRollup[1].completedAt = at(8); expect(f.go({ readComments }).sent).toBe(true); expect(f.posts).toHaveLength(0);
   }));
   it('unreadable/invalid rerun state holds; legacy markers are inert; distinct runs have distinct state', () => {
     for (const raw of ['bad', 'null', 'false', JSON.stringify({ count: 4, attempt: 1, at: at(0), confirmed: true }), JSON.stringify({ count: 1, attempt: 99, at: at(0), confirmed: true })]) fixture(f => { writeFileSync(f.statePath(), raw); held(f, {}, /state/); });
@@ -322,7 +391,7 @@ describe('restored HEAD coverage', () => {
     expect(f.go({ headSha: next, exec: movedExec }).sent).toBe(true); expect(JSON.parse(readFileSync(f.ledgerPath))[`${repo}#7483`]).toEqual({ [head]: true, [next]: true });
   }));
   it('BLOCKED skip pass sends fresh failure back and leaves the PR skipped', () => fixture(f => {
-    f.run.updated_at = at(8); const verdicts = [{ num: f.pr.number, repo: null, decision: 'skip', listedHeadSha: head, reason: 'merge state BLOCKED; required check "merge-gate" FAILURE' }];
+    f.run.updated_at = f.pr.statusCheckRollup[1].completedAt = at(8); const verdicts = [{ num: f.pr.number, repo: null, decision: 'skip', listedHeadSha: head, reason: 'merge state BLOCKED; required check "merge-gate" FAILURE' }];
     const result = sendBackBlockedGates({ ...f.options, verdicts, prsByRepo: new Map([[null, [f.pr]]]), localSlug: repo, cwdOf: () => process.cwd(), requiredChecksOf: () => requiredChecks });
     expect(f.writes).toHaveLength(1); expect(result[0]).toMatchObject({ sent: true, recorded: true }); expect(verdicts[0].decision).toBe('skip');
   }));
@@ -356,7 +425,7 @@ describe('restored HEAD coverage', () => {
     expect(f.posts).toEqual([['api', '-X', 'POST', `repos/${repo}/actions/runs/45545719563/rerun`]]); expect(f.writes).toHaveLength(0);
   }));
   it('equal verdict time is fresh; a malformed trusted bounce time holds', () => {
-    fixture(f => { f.run.updated_at = at(9); expect(f.go({ readComments: () => [comment(at(9))] }).sent).toBe(true); expect(f.posts).toHaveLength(0); });
+    fixture(f => { f.run.updated_at = f.pr.statusCheckRollup[1].completedAt = at(9); expect(f.go({ readComments: () => [comment(at(9))] }).sent).toBe(true); expect(f.posts).toHaveLength(0); });
     fixture(f => held(f, { readComments: () => [comment(), comment('bad', '🔁 review — changes requested')] }, /verdict/));
   });
   it('merge-gate first among required checks still sends mixed failures back', () => fixture(f => {

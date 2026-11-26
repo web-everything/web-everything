@@ -109,8 +109,22 @@ function gateDisposition({ pr, requiredChecks, repo, headSha, ledgerPath, ledger
   if (run.status !== 'completed') return hold('run status unreadable');
   if (run.conclusion === 'success') return hold('run succeeded');
   if (!['failure', 'timed_out', 'startup_failure', 'cancelled', 'action_required', 'stale'].includes(run.conclusion)) return hold('run conclusion unreadable');
-  const doneAt = time(run.updated_at), rowAt = time(gate?.completedAt ?? gate?.completed_at);
-  if (!Number.isFinite(doneAt) || !Number.isFinite(rowAt)) return hold('completion time unreadable');
+  const workflowUpdatedAt = time(run.updated_at), rowAt = time(gate?.completedAt ?? gate?.completed_at);
+  if (!Number.isFinite(workflowUpdatedAt) || !Number.isFinite(rowAt)) return hold('completion time unreadable');
+  // A run URL survives re-runs. Bind the check's completion to this attempt before using its time.
+  try {
+    const r = exec('gh', ['api', `repos/${repo}/actions/runs/${runId[2]}/attempts/${A}/jobs?per_page=100`],
+      { cwd, encoding: 'utf8', timeout: 60000, maxBuffer: 8 * 1024 * 1024 });
+    if (r?.status !== 0) throw Error('jobs unreadable');
+    const page = JSON.parse(r.stdout), checkId = Number(gate.id);
+    if (!Number.isSafeInteger(checkId) || checkId < 1 || !Array.isArray(page?.jobs)
+      || !Number.isInteger(page.total_count) || page.total_count !== page.jobs.length || page.total_count > 100) throw Error('jobs incomplete');
+    const matches = page.jobs.filter(j => j?.check_run_url === `https://api.github.com/repos/${repo}/check-runs/${checkId}`);
+    if (matches.length !== 1) throw Error('check absent or ambiguous');
+    const job = matches[0];
+    if (job.run_id !== run.id || job.run_attempt !== A || job.status !== 'completed' || !isFailedCheckRow(job)
+      || time(job.completed_at) !== rowAt) throw Error('attempt completion mismatch');
+  } catch { return hold('completion binding unreadable or mismatched; retry after checks refresh or operator must inspect attempt jobs'); }
   let latestAt = -Infinity, latest;
   try {
     const comments = readComments(pr.number, { repo });
@@ -125,7 +139,7 @@ function gateDisposition({ pr, requiredChecks, repo, headSha, ledgerPath, ledger
     if (!latest) throw Error('verdict absent');
   } catch { return hold('verdict unreadable'); }
   const clearAt = Math.max(CLEARING_HEADING.test(latest) ? latestAt : -Infinity, time(main.settledAt), time(freeze.publishedAt));
-  if (doneAt >= clearAt) return ledgered ? hold('head already ledgered; fresh red') : null;
+  if (rowAt >= clearAt) return ledgered ? hold('head already ledgered; fresh red') : null;
   const path = `${ledgerPath}.${repo.replace('/', '~')}.${pr.number}.${headSha.toLowerCase()}.${runId[2]}.rerun.json`;
   let state;
   try { state = JSON.parse(readFileSync(path, 'utf8')); } catch (e) { if (e.code !== 'ENOENT') return hold('re-run state unreadable; operator must repair'); }

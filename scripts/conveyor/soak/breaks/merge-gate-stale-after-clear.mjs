@@ -1,4 +1,4 @@
-/** #7483/#7452: stale gate reds must request fresh evidence without writing a verdict. */
+/** Synthetic #7483/#7452 shapes: stale gate reds request fresh evidence without writing a verdict. */
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -10,10 +10,11 @@ const { sendBackBlockedGate } = await import(process.argv[1]);
 const head = 'a'.repeat(40), repo = 'acme/widgets';
 const early = '2026-11-25T14:35:06Z', late = '2026-11-25T15:07:20Z';
 const pr = { number: 7483, headRefOid: head, rowsHead: head, rowsComplete: true, labels: ['ready-to-merge'],
-  statusCheckRollup: [{ name: 'merge-gate', status: 'completed', conclusion: 'failure', completedAt: early,
+  statusCheckRollup: [{ id: 100, name: 'merge-gate', status: 'completed', conclusion: 'failure', completedAt: early,
     detailsUrl: 'https://github.com/' + repo + '/actions/runs/45635463327' }] };
   const violations = [];
-  for (const shape of ['#7483', '#7452', 'freeze-lift']) {
+  for (const shape of ['#7483', '#7452', 'freeze-lift', 'later-workflow-update', 'malformed-main-time']) {
+    pr.number = shape === '#7452' ? 7452 : 7483;
     const dir = mkdtempSync(join(tmpdir(), 'soak-gate-clear-')), ledgerPath = join(dir, 'ledger');
     let posts = 0, writes = 0;
     try {
@@ -21,22 +22,32 @@ const pr = { number: 7483, headRefOid: head, rowsHead: head, rowsComplete: true,
       const exec = (cmd, args, options) => {
         if (cmd !== 'gh') { writes++; return { status: 0 }; }
         if (args[0] === 'pr') return { status: 0, stdout: JSON.stringify({ headRefOid: head }) };
+        if (args[0] === 'run') return { status: 0, stdout: JSON.stringify([
+          { databaseId: 2, status: 'completed', conclusion: 'success', event: 'push', createdAt: late, updatedAt: null },
+          { databaseId: 1, status: 'completed', conclusion: 'success', event: 'push', createdAt: early, updatedAt: early }
+        ]) };
         if (args.includes('POST')) {
           if (args.join(' ') === 'api -X POST repos/' + repo + '/actions/runs/45635463327/rerun'
             && options.env.WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS === '1') posts++;
           return { status: 0 };
         }
+        if (args[1].includes('/jobs?')) return { status: 0, stdout: JSON.stringify({ total_count: 1, jobs: [{
+          run_id: 45635463327, run_attempt: 1, check_run_url: 'https://api.github.com/repos/' + repo + '/check-runs/100',
+          status: 'completed', conclusion: 'failure', completed_at: early
+        }] }) };
         return { status: 0, stdout: JSON.stringify({ id: 45635463327, repository: { full_name: repo }, name: 'Merge gate',
           path: '.github/workflows/merge-gate.yml', event: 'pull_request_target', head_sha: head, pull_requests: [{ number: pr.number }], run_attempt: 1,
-          status: 'completed', conclusion: 'failure', updated_at: early }) };
+          status: 'completed', conclusion: 'failure', updated_at: shape === 'later-workflow-update' ? late : early }) };
       };
       const o = { pr, headSha: head, repo, ledgerPath, exec, requiredChecks: ['merge-gate'],
-        readMain: () => ({ runs: [{ status: 'completed', conclusion: 'success', createdAt: early }], settledAt: shape === '#7483' ? late : early }),
+        ...(shape === 'malformed-main-time' ? {} : { readMain: () => ({ runs: [{ status: 'completed', conclusion: 'success', createdAt: early }], settledAt: shape === '#7483' ? late : early }) }),
         readFreeze: () => ({ frozen: false, publishedAt: shape === 'freeze-lift' ? late : early }),
-        readComments: () => [{ id: 'C1', author: { login: 'web-everything' }, createdAt: shape === '#7452' ? late : early,
+        readComments: () => [{ id: 'C1', author: { login: 'web-everything' }, createdAt: ['#7452', 'later-workflow-update'].includes(shape) ? late : early,
           body: shape === '#7452' ? '✅ review — \`review:human\` cleared' : '✅ review — accepted' }] };
       const first = sendBackBlockedGate(o); sendBackBlockedGate(o);
-      if (first.sent || posts !== 1 || writes) violations.push(shape + ': stale gate bounced or REST rerun was not exactly once');
+      if (shape === 'malformed-main-time') {
+        if (first.sent || posts || writes || !/main.*unreadable/.test(first.reason)) violations.push(shape + ': unreadable main did not hold without writes');
+      } else if (first.sent || posts !== 1 || writes) violations.push(shape + ': stale gate bounced or REST rerun was not exactly once');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }
   console.log(JSON.stringify(violations));
