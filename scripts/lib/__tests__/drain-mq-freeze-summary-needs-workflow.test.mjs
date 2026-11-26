@@ -19,6 +19,10 @@ describe('P freeze summary workflow contract', () => {
       for (const [name, need] of Object.entries(proof.needs)) {
         const matrix = workflow.jobs[name].strategy?.matrix;
         const axes = matrix && Object.entries(matrix).filter(([key]) => !['include', 'exclude'].includes(key));
+        // A single plain axis, with no include/exclude rewriting the expanded member set.
+        if (matrix) { expect(axes).toHaveLength(1); expect(matrix.exclude).toBeUndefined();
+          // An include may only annotate existing members (e.g. a timeout), never add or rename one.
+          for (const item of matrix.include ?? []) expect(axes[0][1].map(String)).toContain(String(item[axes[0][0]])); }
         expect(need.members).toEqual(axes ? axes[0][1].map(String) : undefined);
       }
     }

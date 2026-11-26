@@ -927,6 +927,9 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         }
       } catch { blocked = true; /* unreadable gate log: the hold stays */ }
     }
+    // A failed P-map summary rides only on a fully proven pending freeze: any other outcome (unrecognized log,
+    // invalid gate URL, skipped block) must hold, never reach the main-red fallback.
+    if (gates.length === 1 && freezeSummarySet && !freezeOriginalSet && !freezePending) blocked = true;
     if (!freezeOriginalSet && blocked)
       return { logReason: 'pending freeze evidence unreadable or incomplete; operator must inspect failed jobs and enqueue manually' };
     const noLogInfra = failed.every(cancelledOnly) || freezeProven;

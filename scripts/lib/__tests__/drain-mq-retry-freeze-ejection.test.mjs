@@ -268,7 +268,7 @@ function pendingFixture(edit = () => {}) {
     if (endpoint.endsWith('/jobs/50')) return JSON.stringify(state.gateJob);
     if (endpoint.endsWith('/runs/1')) return JSON.stringify(state.gateRun);
     if (endpoint.includes('/workflows/ci.yml/runs?')) {
-      const items = endpoint.includes('created=<') ? [greenAtRemoval[1]] : state.main;
+      const items = endpoint.includes('created=<') ? [state.atRemoval ?? greenAtRemoval[1]] : state.main;
       return JSON.stringify({ total_count: items.length, workflow_runs: items });
     }
     if (endpoint.endsWith(`/runs/${N}/attempts/2`)) return JSON.stringify(state.named);
@@ -355,6 +355,19 @@ describe('pending freeze beside a summary failed only by cancelled needs (#7496)
   });
   it('holds an extra failed step', () => holdPending(s => s.summary.steps.push({ name: 'Install', conclusion: 'failure' })));
   it('holds a #7487-shaped soak-shard failure', () => holdPending(s => s.checks.push({ id: 999, name: 'soak-shard (1)', status: 'completed', conclusion: 'failure' })));
+  it.each(['unrecognized log', 'invalid gate URL'])('a failed P-map summary with %s holds and never falls to the main-red retry', value => {
+    const f = pendingFixture(s => {
+      s.atRemoval = { ...greenAtRemoval[1], conclusion: 'failure' };
+      // Under the 10-job cap, with a readable non-infra log, so only the main-red fallback could authorize.
+      s.checks = s.checks.filter(c => !/^cancelled-/.test(c.name));
+      s.overrides.set(`repos/${repo}/actions/jobs/139288907316/logs`, 'AssertionError: expected 1 to be 2\n');
+      if (value === 'unrecognized log') s.log = 'unrecognized gate output\n';
+      else s.checks[0].details_url = 'https://github.com/other/repo/actions/runs/45637335054/job/139286224799';
+    });
+    const result = f.guard();
+    expect(result.hold).toBe(true);
+    expect(f.log.mock.calls.flat().join('\n')).not.toContain('infra retry');
+  });
   it('on branch R a failed integration still holds, as today', () => holdPending(s => { s.log = FREEZE; }));
   it.each(['incomplete log', 'gate job', 'gate run', 'shared freeze', 'stale main', 'unfinished run', 'not CLEAN'])(
     'P guards: %s', value => holdPending(s => {
