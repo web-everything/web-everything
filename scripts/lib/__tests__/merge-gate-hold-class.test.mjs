@@ -284,7 +284,10 @@ it('reads a shared freeze at most once across a pass', () => {
 });
 it('keeps all PR rows unchanged when the injected excusal step throws', () => {
   // Rows stay red; the separate admission annotation still classes the review-only hold, so no ci-heal is planned.
-  expect(plan({ excuseMergeGateHolds: () => { throw Error('unavailable'); } }).dispatch.some(d => d.kind === 'ci-heal')).toBe(false);
+  const out = plan({ excuseMergeGateHolds: () => { throw Error('unavailable'); } });
+  expect(out.dispatch.some(d => d.kind === 'ci-heal')).toBe(false);
+  // The PR is still planned (not dropped) and the red check stays red: it is refused as a review-owned hold.
+  expect(out.refusals.some(r => r.prNumber === 4965 && r.kind === 'review-hold')).toBe(true);
 });
 it('uses a rollup detailsUrl job id and case-insensitive head binding', () => {
   const readVerdict = vi.fn(() => ({ ...verdict(), head_sha: sha.toUpperCase() }));
@@ -428,7 +431,9 @@ describe('fresh review CI merge-gate holds', () => {
     expect(gate({ readMergeGateVerdict: () => verdict(log) }))
       .toMatchObject({ allowed: false, affected: [{ name: 'merge-gate', reason: 'failure' }] });
     // Unreadable evidence is refused by admission (x-merge-gate-unreadable), never healed.
-    expect(plan({ readVerdict: () => verdict(log) }).dispatch.some(d => d.kind === 'ci-heal')).toBe(false);
+    const planned = plan({ readVerdict: () => verdict(log) });
+    expect(planned.dispatch.some(d => d.kind === 'ci-heal')).toBe(false);
+    expect(planned.refusals.some(r => r.prNumber === 4965 && r.kind === 'x-merge-gate-unreadable')).toBe(true);
     expect(defaultReadHeadCheckState({ repoSlug: repo, prNumber: 4965, sha,
       runGh: () => JSON.stringify(row), getRequiredChecks: () => ({ checks: ['merge-gate'] }),
       readPrLabels: () => [], readMergeGateVerdict: () => verdict(log), mergeGateSetting: { value: 'on' } }).state).toBe('red');
