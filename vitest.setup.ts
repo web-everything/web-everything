@@ -9,6 +9,15 @@ import { HERMETIC_ENV, isHermetic } from './scripts/lib/hermetic-tests.mjs';
 import { setupHermeticTestFile } from './scripts/lib/hermetic-tests-vitest.mjs';
 import { KEEPALIVE_ANCHOR_ENV, killKeepAlives } from './scripts/lib/test-keepalive.mjs';
 
+// Vitest 1.x compatibility for the combined count-and-arguments assertion.
+expect.extend({
+  toHaveBeenCalledExactlyOnceWith(received, ...args) {
+    const calls = received?.mock?.calls;
+    const pass = Array.isArray(calls) && calls.length === 1 && this.equals(calls[0], args);
+    return { pass, message: () => `expected exactly one call with ${this.utils.printExpected(args)}; received ${this.utils.printReceived(calls)}` };
+  },
+});
+
 // Host-store isolation: scripts/lib/operator-override-reader.mjs resolves the live operator-override store from
 // os.userInfo().homedir (account database, deliberately not $HOME). Point that at an empty path in every test
 // worker so no test reads the host's live overrides. Production code is untouched; a test passes `file`

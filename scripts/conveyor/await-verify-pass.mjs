@@ -57,6 +57,9 @@ import { readReviewHead, readReviewChecks } from '../lib/review-ci-gate-io.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { headCiVerdict } from './fix-push-ci.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
+import { latestFailingMergeGate, excuseMergeGateRows, loadMergeGateHoldSetting } from '../lib/merge-gate-hold-class.mjs';
+import { readMergeGateVerdictCache, validCachedVerdict } from './merge-gate-verdict-cache.mjs';
+import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { listSalvage, writeSalvage, clearSalvage, planSalvage, resolveSalvageTuning, salvageKey, stashCommit, salvageStoreDir } from './verified-push-salvage.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -455,11 +458,44 @@ async function previousCiPushGate({ io, record, nowMs, policy, persist }) {
       checks = await io.readPreviousChecks({ repo: record.repo, headSha: state.headSha });
     } catch { /* Incomplete evidence remains held until the bound. */ }
   }
+  const cached = state.headSha === lower(record.sha) ? { checks } : await cachedPreviousChecks({ io, record, checks, headSha: state.headSha });
   const decision = state.headSha === lower(record.sha) ? { action: 'push', reason: 'already-on-remote' }
-    : fixPushGate({ previousHeadChecks: checks, requiredChecks: required, firstHeldAt: state.firstHeldAt, now: nowMs, policy });
+    : fixPushGate({ previousHeadChecks: cached.checks, requiredChecks: required, firstHeldAt: state.firstHeldAt, now: nowMs, policy });
+  if (cached.note) decision.reason += `; ${cached.note}`;
   state = { ...state, lastReadAt: nowMs, ...(decision.action === 'push' ? { ready: decision } : {}) };
   if (!persist({ ...record, previousCi: state })) return { action: 'wait', reason: 'persist-failed' };
   return decision;
+}
+
+/** Local evidence only. A rejected snapshot retains the original failure and normal handoff. */
+async function cachedPreviousChecks({ io, record, checks, headSha }) {
+  const unchanged = { checks };
+  try {
+    if (checks?.rowsComplete !== true || lower(checks.rowsHead) !== lower(headSha)) return unchanged;
+    const row = latestFailingMergeGate(checks);
+    if (!row || row.app?.slug !== 'github-actions') return unchanged;
+    const setting = await io.mergeGateSetting?.();
+    if (setting?.value !== 'on') return unchanged;
+    const jobId = Number(/\/actions\/runs\/\d+\/job\/(\d+)/.exec(row.detailsUrl ?? row.details_url ?? '')?.[1] ?? row.id);
+    if (!Number.isSafeInteger(jobId) || jobId <= 0) return unchanged;
+    const start = io.monotonicNow?.() ?? performance.now();
+    try {
+      let read;
+      try { read = await io.readMergeGateVerdictCache({ repo: record.repo, pr: record.pr, jobId }); }
+      catch { read = { reason: 'unreadable' }; }
+      const validity = read?.entry ? validCachedVerdict(read.entry, {
+        repo: record.repo, pr: record.pr, jobId, headSha, now: (io.now ?? Date.now)(),
+      }) : { ok: false, reason: ['missing', 'stale', 'mismatch', 'unreadable'].includes(read?.reason) ? read.reason : 'unreadable' };
+      if (!validity.ok) return { checks, note: `merge-gate verdict unavailable (${validity.reason})` };
+      const e = read.entry;
+      const out = excuseMergeGateRows(checks, { prNumber: record.pr, headSha, labels: e.labels,
+        readVerdict: () => e.verdict, freeze: e.freeze, setting });
+      if (out.reviewHold) return { checks: out.rows, note: `merge-gate review-hold via cached verdict job ${jobId}` };
+      if (out.excused) return { checks: out.rows,
+        note: `merge-gate excused (${out.rows.find(r => r.mergeGateHoldExcused).mergeGateHoldExcused.kind}) via cached verdict job ${jobId}` };
+      return unchanged;
+    } finally { io.log?.(`merge-gate-verdict-cache: gate ${Math.max(0, Math.round((io.monotonicNow?.() ?? performance.now()) - start))} ms`); }
+  } catch { return unchanged; }
 }
 
 /** verify.infraFallbackToCi: standard ON; WE_VERIFY_INFRA_FALLBACK_TO_CI=0|false|off, else the tool layer's `verify.infraFallbackToCi`. */
@@ -619,7 +655,7 @@ export async function runAwaitVerifyPass({
       let marker = lane ? io.readMarker(record.lane) : null;
       let loadHigh = false;
       try { loadHigh = io.loadHigh?.() === true; } catch { /* Unknown load follows the normal red ladder. */ }
-      const loadMaxAttempts = recovery.value.loadRetry?.maxAttempts ?? 3;
+      const loadMaxAttempts = recovery.value?.loadRetry?.maxAttempts ?? 3;
       const loadInput = { loadHigh, loadMaxAttempts };
       let d = classifyAwaitVerdict({ record, marker, lane: record.pendingResume ? { head: record.sha } : lane, nowMs, ttlMs, limits, ...loadInput });
       if (pendingNoOp) {
@@ -1141,6 +1177,9 @@ export async function defaultAwaitVerifyIo({
     readPreviousHead: readReviewHead,
     readPreviousChecks: readReviewChecks,
     readPreviousRequired: getRequiredStatusChecks,
+    now: () => Date.now(),
+    mergeGateSetting: () => loadMergeGateHoldSetting({ env }),
+    readMergeGateVerdictCache: subject => readMergeGateVerdictCache(subject, { root: resolveCoordinationRoot({ env }) }),
     retryPolicy: () => loadVerifyRecoverySettings({ env }),
     infraFallbackToCi: () => { let tool; try { tool = readSettings()?.verify; } catch { /* absent tool layer */ } return resolveInfraFallbackToCi({ env, tool }); },
     loadHigh: () => {

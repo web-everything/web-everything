@@ -1,4 +1,20 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { runGhSync } from '../../lib/gh-throttle.mjs';
+import { readSharedFreeze } from '../../lib/red-main-freeze-shared.mjs';
+
+vi.mock('../../lib/gh-throttle.mjs', async importOriginal => ({ ...await importOriginal(),
+  runGhSync: vi.fn(() => { throw Error('unexpected GitHub evidence read'); }),
+}));
+vi.mock('../../lib/red-main-freeze-shared.mjs', async importOriginal => ({ ...await importOriginal(),
+  readSharedFreeze: vi.fn(() => { throw Error('unexpected freeze evidence read'); }),
+}));
+vi.mock('../../lib/settings-files.mjs', async importOriginal => ({ ...await importOriginal(),
+  readSettings: () => ({ verify: {}, fix: {} }), readDeclaredSettings: () => ({ settings: {}, errors: [] }),
+}));
+vi.mock('../../lib/policy-cascade.mjs', async importOriginal => ({ ...await importOriginal(), platformPreference: () => ({}) }));
 import { runAwaitVerifyPass, defaultAwaitVerifyIo } from '../await-verify-pass.mjs';
 import { main as markAwaitVerify } from '../await-verify.mjs';
 import ciBreak from '../soak/breaks/claude-fix-push-after-ci.mjs';
@@ -366,5 +382,193 @@ describe('Claude verify harness honors fix.pushAfterCi', () => {
 
   it('replays the supported Claude path as a daemon soak break', async () => {
     expect(ciBreak.judge(await ciBreak.run())).toEqual([]);
+  });
+});
+
+
+// All new cases use an isolated record, lane, clock, settings and IO. No host state is evidence.
+describe('cached verdict inputs to the previous-head push gate', () => {
+  let root;
+  beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'cached-push-')); vi.clearAllMocks(); });
+  afterEach(() => { rmSync(root, { recursive: true, force: true }); vi.restoreAllMocks(); });
+  const iso = t => new Date(t).toISOString();
+  const hold = (id, reason = 'review pending', status = 'hold') => ({ id, reason, status });
+  function fixture() {
+    let record = { v: 1, kind: 'fix', pr: 6085, repo: 'web-everything/web-everything', sha: SHA,
+      sessionId: 'fixture-session', who: 'fixture-fixer', lane: join(root, 'lanes', 'fixture-lane'),
+      ref: 'lane/fixture', requestedAt: iso(T0), attempt: 1 };
+    const checks = Object.assign([
+      { name: 'test', status: 'completed', conclusion: 'success' },
+      { name: 'merge-gate', status: 'completed', conclusion: 'failure', id: 777,
+        app: { slug: 'github-actions' }, details_url: 'https://github.com/o/r/actions/runs/12/job/777' },
+    ], { rowsComplete: true, rowsHead: PREVIOUS });
+    const entry = { v: 1, repo: record.repo, pr: record.pr, jobId: 777, headSha: PREVIOUS,
+      verdict: { num: record.pr, ok: false, job_name: 'merge-gate', head_sha: PREVIOUS,
+        completed_at: iso(T0 - 120_000), mainCiGreen: true, results: [hold('candidate-label')] },
+      verdictReadAt: iso(T0), labels: [], labelsHead: PREVIOUS, labelsReadAt: iso(T0),
+      freeze: { frozen: false, publishedAt: iso(T0 - 60_000) }, freezeReadAt: iso(T0) };
+    const state = { checks, entry, now: T0, resumes: [], pushes: [], logs: [], marker: 'running' };
+    const io = {
+      now: () => state.now, monotonicNow: () => 0, log: message => state.logs.push(message),
+      pushPolicy: () => ({ pushBeforeGate: true }),
+      fixTimingPolicy: () => ({ pushAfterCi: true, pushAfterCiMaxMin: 20 }), retryPolicy: () => ({}),
+      mergeGateSetting: () => ({ value: 'on', source: 'standard' }),
+      readMergeGateVerdictCache: vi.fn(() => ({ entry: state.entry })),
+      readPreviousHead: () => PREVIOUS,
+      readPreviousRequired: () => ({ checks: ['test', 'merge-gate'] }), readPreviousChecks: () => state.checks,
+      listRecords: () => [{ key: 'fixture-session', record }],
+      writeRecord: next => { record = next; return { ok: true }; }, clearRecord: () => ({ cleared: true }),
+      laneState: () => ({ head: SHA, dirty: false, treeHash: 'fixture-tree' }),
+      readMarker: () => ({ sha: SHA, status: state.marker, startedAt: iso(T0), treeHash: 'fixture-tree' }),
+      listSessions: () => [{ sessionId: 'fixture-session', state: 'done' }],
+      push: args => { state.pushes.push(args); return { ok: true }; },
+      resume: args => { state.resumes.push(args); return { resumed: true }; }, rerequest: () => ({ ok: true }),
+    };
+    return { io, state, record: () => record,
+      tick: (elapsed = 0) => runAwaitVerifyPass({ io, nowMs: T0 + elapsed, ttlMs: 3_600_000, loggedPolicyLine: { value: null } }) };
+  }
+  const gate = result => result.rows.find(row => row.action === 'push-ci-gate');
+  async function refused(h, why) {
+    const result = await h.tick();
+    expect(h.record().previousCi.ready.ciFailures).toContainEqual(expect.objectContaining({ name: 'merge-gate' }));
+    expect(h.state.pushes).toHaveLength(0);
+    expect(h.record().pendingResume?.kind).toBe('previous-ci');
+    if (why) expect(gate(result).reason).toContain('merge-gate verdict unavailable (' + why + ')');
+    return result;
+  }
+  it('a cached candidacy-only merge-gate hold is not a previous-head CI failure', async () => {
+    const h = fixture(); const result = await h.tick();
+    expect(h.record().previousCi.ready).toMatchObject({ action: 'push', reason: 'ci-complete; merge-gate excused (candidacy) via cached verdict job 777', ciFailures: [] });
+    expect(h.state.pushes).toHaveLength(1);
+    expect(h.state.resumes).toHaveLength(0);
+    expect(h.record().pendingResume).toBeUndefined();
+    expect(gate(result).reason).toBe(h.record().previousCi.ready.reason);
+    expect(h.state.logs).toContain('merge-gate-verdict-cache: gate 0 ms');
+  });
+  it('the push gate never reads GitHub for merge-gate evidence', async () => {
+    await fixture().tick();
+    const missing = fixture(); missing.io.readMergeGateVerdictCache = () => ({ reason: 'missing' });
+    await refused(missing, 'missing');
+    expect(runGhSync).not.toHaveBeenCalled(); expect(readSharedFreeze).not.toHaveBeenCalled();
+    expect(missing.record().previousCi.verdictRequest).toBeUndefined();
+  });
+  it('cleared manual freeze is excused as stale-freeze', async () => {
+    const h = fixture(); h.state.entry.verdict.results = [hold('red-main-freeze', 'main is RED (freeze: manual freeze: operator)')];
+    expect(gate(await h.tick()).reason).toBe('ci-complete; merge-gate excused (stale-freeze) via cached verdict job 777');
+    expect(h.record().previousCi.ready.ciFailures).toEqual([]);
+  });
+  it('candidacy-only with freeze.error is excused', async () => {
+    const h = fixture(); h.state.entry.freeze = { error: 'unreadable' }; await h.tick();
+    expect(h.record().previousCi.ready.ciFailures).toEqual([]);
+  });
+  it('a ready-to-merge candidate with review holds only is annotated and dropped', async () => {
+    const h = fixture(); h.state.entry.labels = ['ready-to-merge'];
+    h.state.entry.verdict.results.push(hold('review-acceptance'));
+    expect(gate(await h.tick()).reason).toBe('ci-complete; merge-gate review-hold via cached verdict job 777');
+    expect(h.record().previousCi.ready.ciFailures).toEqual([]);
+  });
+  it('workflow-protection verdict is a review-hold', async () => {
+    const h = fixture(); Object.assign(h.state.entry.verdict, { workflowEditProtection: true,
+      results: [hold('review-acceptance', 'human-only: the diff at abc123def touches .github/workflows/ci.yml')] });
+    expect(gate(await h.tick()).reason).toBe('ci-complete; merge-gate review-hold via cached verdict job 777');
+    expect(h.record().previousCi.ready.ciFailures).toEqual([]);
+  });
+  it.each([
+    ['a real codeql fail-closed hold', h => h.state.entry.verdict.results.push(hold('codeql', 'unreadable', 'fail-closed'))],
+    ['main-CI-red red-main-freeze', h => h.state.entry.verdict.results.push(hold('red-main-freeze', 'main is RED (freeze: CI failure)'))],
+    ['an active manual freeze', h => { h.state.entry.verdict.results.push(hold('red-main-freeze', 'main is RED (freeze: manual freeze: operator)')); h.state.entry.freeze.frozen = true; }],
+    ['a cleared manual freeze without a green diagnostic', h => { h.state.entry.verdict.results.push(hold('red-main-freeze', 'main is RED (freeze: manual freeze: operator)')); h.state.entry.verdict.mainCiGreen = false; }],
+    ['a manual freeze with freeze.error', h => { h.state.entry.verdict.results.push(hold('red-main-freeze', 'main is RED (freeze: manual freeze: operator)')); h.state.entry.freeze = { error: 'offline' }; }],
+    ['a candidate with a cleared manual freeze', h => { h.state.entry.labels = ['ready-to-merge']; h.state.entry.verdict.results.push(hold('red-main-freeze', 'main is RED (freeze: manual freeze: operator)')); }],
+    ['a candidate with candidate-label plus missing red-team', h => { h.state.entry.labels = ['ready-to-merge']; h.state.entry.verdict.results.push(hold('red-team', 'no red-team check run on head')); }],
+  ])('%s stays a CI failure', async (_name, change) => { const h = fixture(); change(h); await refused(h); });
+  it('unrelated required test failure remains alongside an excused merge-gate', async () => {
+    const h = fixture(); h.state.checks[0].conclusion = 'failure'; await h.tick();
+    expect(h.record().previousCi.ready.ciFailures.map(r => r.name)).toEqual(['test']);
+    expect(h.state.resumes[0].prompt).toContain('"name":"test"');
+  });
+  it.each(['labelsReadAt', 'freezeReadAt'])('%s expires during preceding checks at the injected decision clock', async field => {
+    const h = fixture(); h.io.readPreviousChecks = () => { h.state.now += 601_000; return h.state.checks; };
+    h.state.entry[field === 'labelsReadAt' ? 'freezeReadAt' : 'labelsReadAt'] = iso(T0 + 60_000);
+    await refused(h, 'stale');
+  });
+  it.each(['labelsReadAt', 'freezeReadAt'])('%s more than 60 s in the future refuses', async field => {
+    const h = fixture(); h.state.entry[field] = iso(T0 + 60_001); await refused(h, 'stale');
+  });
+  it.each([
+    ['headSha', e => { e.headSha = SHA; }], ['labelsHead', e => { e.labelsHead = SHA; }],
+    ['verdict.head_sha', e => { e.verdict.head_sha = SHA; }], ['jobId', e => { e.jobId = 776; }],
+    ['job_name', e => { e.verdict.job_name = 'other'; }], ['verdict.error', e => { e.verdict.error = 'offline'; }],
+    ['labels null', e => { e.labels = null; }], ['missing freeze', e => { delete e.freeze; }],
+  ])('%s mismatch leaves merge-gate in ciFailures', async (_name, change) => { const h = fixture(); change(h.state.entry); await refused(h, 'mismatch'); });
+  it.each(['missing', 'unreadable'])('%s cache falls back immediately without a request', async reason => {
+    const h = fixture(); h.io.readMergeGateVerdictCache = () => ({ reason });
+    await refused(h, reason); expect(h.record().previousCi.verdictRequest).toBeUndefined();
+  });
+  it('a throwing cache reader leaves merge-gate in ciFailures', async () => {
+    const h = fixture(); h.io.readMergeGateVerdictCache = () => { throw Error('EACCES'); }; await refused(h, 'unreadable');
+  });
+  it.each(['malformed JSON', 'oversized file'])('%s leaves merge-gate in ciFailures', async kind => {
+    const h = fixture(); const io = await defaultIo();
+    const dir = join(root, 'coordination', 'merge-gate-verdict-cache'); mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'we--6085--777.json'), kind === 'malformed JSON' ? '{' : ' '.repeat(256 * 1024 + 1));
+    h.io.readMergeGateVerdictCache = io.readMergeGateVerdictCache; await refused(h, 'unreadable');
+  });
+  it.each([undefined, 'other-app'])('app slug %s prevents cache consultation', async slug => {
+    const h = fixture(); h.state.checks[1].app = slug ? { slug } : undefined;
+    await refused(h); expect(h.io.readMergeGateVerdictCache).not.toHaveBeenCalled();
+  });
+  it('rowsComplete false leaves rows unchanged', async () => {
+    const h = fixture(); h.state.checks.rowsComplete = false; await refused(h);
+    expect(h.io.readMergeGateVerdictCache).not.toHaveBeenCalled();
+  });
+  it('rowsHead mismatch leaves rows unchanged', async () => {
+    const h = fixture(); h.state.checks.rowsHead = SHA; await refused(h);
+    expect(h.io.readMergeGateVerdictCache).not.toHaveBeenCalled();
+  });
+  it('setting off leaves rows unchanged with no producer', async () => {
+    const h = fixture(); h.io.mergeGateSetting = () => ({ value: 'off' }); await refused(h);
+    expect(h.io.readMergeGateVerdictCache).not.toHaveBeenCalled();
+  });
+  it.each(['unreadable', 'invalid'])('unreadable or invalid mergeGate setting leaves rows unchanged: %s', async kind => {
+    const h = fixture(); h.io.mergeGateSetting = () => { if (kind === 'unreadable') throw Error('unreadable'); return { value: 'invalid' }; };
+    await refused(h); expect(h.io.readMergeGateVerdictCache).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['label added within the window uses cached labels', 599_999, false],
+    ['label change past the window refuses', 600_001, true],
+    ['freeze re-activated within the window keeps the cached excuse', 599_999, false],
+    ['freeze evidence past the window refuses', 600_001, true],
+  ])('%s', async (name, age, reject) => {
+    const h = fixture(); h.state.now += age;
+    if (name.startsWith('freeze')) h.state.entry.verdict.results = [hold('red-main-freeze', 'main is RED (freeze: manual freeze: operator)')];
+    // Only the cached snapshot is available; live mutable evidence must never be requested.
+    if (reject) await refused(h, 'stale'); else { await h.tick(); expect(h.record().previousCi.ready.ciFailures).toEqual([]); }
+    expect(runGhSync).not.toHaveBeenCalled(); expect(readSharedFreeze).not.toHaveBeenCalled();
+  });
+  it('persisted ready survives cache expiry and label/freeze changes', async () => {
+    const h = fixture(); await h.tick(); const ready = structuredClone(h.record().previousCi.ready);
+    h.state.now += 700_000; h.state.entry.labels = ['ready-to-merge']; h.state.entry.freeze.frozen = true;
+    h.io.writeRecord({ ...h.record(), earlyPush: undefined }); await h.tick(30_000);
+    expect(h.record().previousCi.ready).toEqual(ready); expect(h.io.readMergeGateVerdictCache).toHaveBeenCalledTimes(1);
+  });
+  const defaultIo = () => defaultAwaitVerifyIo({ weRoot: root, poolRoot: join(root, 'lanes'),
+    env: { WE_COORDINATION_ROOT: join(root, 'coordination') }, exec: () => { throw Error('unexpected process'); },
+    dispatchIo: {}, stopSessionFn: () => {}, pushRefusalFn: () => null, readClaimFn: () => null,
+    pidAliveFn: () => false, realpath: path => path, listWrappedWorkers: () => [], requestWrappedResumeFn: () => ({ ok: false }) });
+  it('production io.now defaults to Date.now', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(T0); const io = await defaultIo(); expect(io.now()).toBe(T0);
+    vi.mocked(Date.now).mockReturnValue(T0 + 1); expect(io.now()).toBe(T0 + 1);
+  });
+  it('an injected io.now wins over the pass-start clock', async () => {
+    const h = fixture(); h.state.now = T0 + 600_001; await refused(h, 'stale');
+  });
+  it('every unavailable reason belongs to the closed reason set', async () => {
+    const allowed = ['missing', 'stale', 'mismatch', 'unreadable'];
+    for (const reason of allowed) {
+      const h = fixture(); h.io.readMergeGateVerdictCache = () => ({ reason });
+      const match = /merge-gate verdict unavailable \(([^)]+)\)/.exec(gate(await h.tick()).reason);
+      expect(match?.[1]).toBe(reason); expect(allowed).toContain(match?.[1]);
+    }
   });
 });

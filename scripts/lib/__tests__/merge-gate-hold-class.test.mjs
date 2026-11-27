@@ -743,3 +743,11 @@ describe('workflow-edit protection uses PR 7106 job-backed rollup evidence', () 
     expect(probe(() => {}, [workflowRow, red]).out.statusCheckRollup[1]).toEqual(red);
   });
 });
+
+
+it('readMergeGateVerdict returns job_name with the immutable job evidence', () => {
+  const completed_at = '2026-11-27T12:00:00Z';
+  const out = readMergeGateVerdict({ repo: 'fixture/repo', jobId: 777, prNumber: 4965, cache: new Map(),
+    runGh: args => args.at(-1).endsWith('/logs') ? candidacy : JSON.stringify({ name: 'merge-gate', head_sha: sha, completed_at }) });
+  expect(out).toEqual({ ...parsePrResultTable(candidacy, 4965), head_sha: sha, completed_at, job_name: 'merge-gate' });
+});
