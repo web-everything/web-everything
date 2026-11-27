@@ -35,8 +35,9 @@ const readOptions = cwd => ({ cwd, timeoutMs: 5_000, maxBuffer: 1024 * 1024,
   // gitRun overlays process.env: mask removed keys so they cannot be inherited again.
   env: { ...Object.fromEntries(Object.keys(process.env).map(key => [key, undefined])),
     ...laneGitHardeningEnv(templateFree(scrubGitRepoEnv(process.env))) } });
-const readOrigin = cwd => readGitOutput(gitRun('git', hardenLaneGitArgs(['remote', 'get-url', 'origin']), readOptions(cwd)));
-const readShallow = cwd => readGitOutput(gitRun('git', hardenLaneGitArgs(['rev-parse', '--is-shallow-repository']), readOptions(cwd)));
+// These fixed read argv need no rewriting; keep them literal for the push audit.
+const readOrigin = cwd => readGitOutput(gitRun('git', ['remote', 'get-url', 'origin'], readOptions(cwd)));
+const readShallow = cwd => readGitOutput(gitRun('git', ['rev-parse', '--is-shallow-repository'], readOptions(cwd)));
 
 function originMatches(dir, slug, read) {
   try {

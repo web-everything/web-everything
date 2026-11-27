@@ -351,6 +351,8 @@ describe('sibling clone provisioning', () => {
 });
 
 describe('main sibling provisioning lifecycle', () => {
+  // The in-process CLI loads the drain's full module graph, including on a cold transform cache.
+  const cliTimeoutMs = 30_000;
   async function startup({ dryRun = false, testMarker = null, mainCalls = 1, leaseRefused = false, failClone = false } = {}) {
     vi.doUnmock('../lib/git-run.mjs');
     vi.doMock('node:child_process', () => childProcessMock);
@@ -399,13 +401,13 @@ describe('main sibling provisioning lifecycle', () => {
     expect(provision).toHaveBeenCalledWith(expect.objectContaining({ dryRun: true }));
     expect(clone).not.toHaveBeenCalled();
     expect(result.stderr).toContain(`${testMarker}=1`);
-  });
+  }, cliTimeoutMs);
 
   it('forwards CLI dry-run to the real provisioner without invoking a clone runner', async () => {
     const { provision, clone } = await startup({ dryRun: true });
     expect(provision).toHaveBeenCalledWith(expect.objectContaining({ dryRun: true }));
     expect(clone).not.toHaveBeenCalled();
-  });
+  }, cliTimeoutMs);
 
   it.each([false, true])('provisions siblings only once across repeated main calls (clone failure: %s)', async failClone => {
     const { provision, clone, result } = await startup({ mainCalls: 2, failClone });
@@ -413,14 +415,14 @@ describe('main sibling provisioning lifecycle', () => {
     expect(provision).toHaveBeenCalledTimes(1);
     expect(provision).toHaveBeenCalledWith(expect.objectContaining({ dryRun: false }));
     expect(clone).toHaveBeenCalledTimes(2);
-  });
+  }, cliTimeoutMs);
 
   it('makes zero provisioning calls when the drain lease is refused', async () => {
     const { provision, clone, result } = await startup({ leaseRefused: true });
     expect(JSON.parse(result.stdout).skipped).toBe('drain-in-progress');
     expect(provision).not.toHaveBeenCalled();
     expect(clone).not.toHaveBeenCalled();
-  });
+  }, cliTimeoutMs);
 });
 
 
