@@ -18,11 +18,16 @@ async function exercise(root, kind, load) {
   const directory = mkdtempSync(join(os.tmpdir(), 'red-team-reserve-soak-'));
   // The operator reader deliberately ignores HOME. Redirect the account database seam in this
   // disposable child before importing it, as the Vitest sandbox does; never read the host store.
-  const userInfo = os.userInfo;
-  os.userInfo = (...args) => ({ ...userInfo(...args), homedir: directory });
+  os.userInfo = () => ({ uid: 1000, gid: 1000, username: 'fixture', shell: '/bin/sh', homedir: directory });
+  os.homedir = () => directory;
   syncBuiltinESMExports();
+  process.env.HOME = directory;
+  process.chdir(directory);
   try {
     mkdirSync(join(directory, '.claude'));
+    // The child does not run Vitest's setup: pin policy inputs instead of inheriting the operator's preferences.
+    process.env.WE_PLATFORM_PREFERENCES_FILE = join(directory, '.claude/platform-preferences.json');
+    writeFileSync(process.env.WE_PLATFORM_PREFERENCES_FILE, '{}');
     writeFileSync(join(directory, '.claude/operator-overrides.json'), JSON.stringify({
       'reviewConcurrency.maxLiveReviewRounds': 8, 'redTeam.queue.reservedSlots': 4,
     }));

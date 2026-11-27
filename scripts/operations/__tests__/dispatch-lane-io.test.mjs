@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, existsSync } 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { pinnedHookScript, pinnedStopHookScript } from '../../lib/pinned-hook-command.mjs';
+import { pinnedHookCommand, pinnedHookScript, pinnedStopHookScript } from '../../lib/pinned-hook-command.mjs';
 import { buildAgentArgv, defaultClaudeProvider, createTickReader, createDispatchSinks, reserveBuildLane, resolveDispatchSettingsEnv, DISPATCH_BASH_TIMEOUT_ENV } from '../dispatch-lane-io.mjs';
 import { spawnPreventionLandingJob } from '../../lib/prevention-landing-job.mjs';
 import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
@@ -31,7 +31,12 @@ describe('LEAN-DAEMON background sessions', () => {
         const settings = JSON.parse(argv[argv.indexOf('--settings') + 1]);
         expect(JSON.stringify(settings.hooks)).toContain('guard-bash.mjs');
         expect(JSON.stringify(settings.hooks)).toContain('guard-lane.mjs');
-        expect(JSON.stringify(settings)).not.toMatch(/MEMORY|check-memory|user-hooks/);
+        // The pinned write-time validator is required; personal memory loading/hooks remain forbidden.
+        const memoryGuard = pinnedHookCommand('scripts/check-memory.mjs', ['--pre']);
+        expect(settings.hooks.PreToolUse.flatMap(group => group.hooks)
+          .filter(hook => hook.command === memoryGuard)).toHaveLength(1);
+        expect(JSON.stringify(settings, (_key, value) => value === memoryGuard ? 'pinned-write-guard' : value))
+          .not.toMatch(/MEMORY|check-memory|user-hooks/);
       } finally { f.cleanup(); }
     }
   });
@@ -172,7 +177,8 @@ describe('LEAN-DAEMON audit regressions', () => {
       advisorFor: () => ({ enabled: false, reason: 'kind-not-in-trial' }),
       spawnEnv: { HOME: root, PATH: '/fixture/bin' },
     };
-    const argv = buildAgentArgv({ ...request, payload: { launchKind: kind, prompt: request.prompt } });
+    // Inspect a fresh launch's hooks; legacy resumes deliberately have no --settings.
+    const argv = buildAgentArgv({ ...request, resumeSessionId: null, payload: { launchKind: kind, prompt: request.prompt } });
     const hooks = JSON.parse(argv[argv.indexOf('--settings') + 1]).hooks;
     const commands = event => (hooks?.[event] ?? []).flatMap(group => group.hooks.map(hook => hook.command));
     const run = command => spawnSync('/bin/sh', ['-c', command], {

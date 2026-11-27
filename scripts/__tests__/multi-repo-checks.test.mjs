@@ -160,7 +160,7 @@ it('the orphan pagination soak resolves its repository and preserves incomplete-
   const file = 'scripts/conveyor/soak/breaks/orphan-guard-lists-past-200.mjs';
   expect(scanMultiRepo(read(file))).toEqual([]);
   const { default: scenario } = await import('../conveyor/soak/breaks/orphan-guard-lists-past-200.mjs');
-  const report = await scenario.run();
+  const report = await scenario.run({ root });
   expect(scenario.judge(report)).toEqual([]);
   expect(report.got).toEqual([201]);
 }, 30_000);
