@@ -130,6 +130,15 @@ describe('launchUncertain reports only provably-unlaunched refusals', () => {
         expect(run({ tryResume: () => result, tryResumeRound: () => result }, shape).launchUncertain).toEqual([7]);
       }
     });
+  it('null or undefined conflict-resume evidence refuses a fresh launch even with a free lane', () => {
+    for (const attempt of [null, undefined]) {
+      const dispatch = vi.fn(() => ({ pr: 7 }));
+      const result = run({ pickFreeLanes: () => [9], tryResume: () => attempt, dispatch }, conflict);
+      expect(result).toMatchObject({ launchUncertain: [7], dispatched: [],
+        refusals: [{ pr: 7, kind: 'dispatch-failed', why: expect.stringContaining('resume') }] });
+      expect(dispatch).not.toHaveBeenCalled();
+    }
+  });
   it('held after an uncertain resume lists the PR; held with no resume leaves it out', () => {
     const extra = { pickFreeLanes: () => [9], dispatch: () => ({ held: true }) };
     expect(run(extra).launchUncertain).toEqual([]);
@@ -158,6 +167,19 @@ describe('launchUncertain reports only provably-unlaunched refusals', () => {
     expect(run({ pickFreeLanes: () => [9], dispatch: planned => direct(planned, {
       spawnAgent: () => { throw Object.assign(new Error('refused'), { stderr: 'Workspace not trusted' }); },
     }) }).launchUncertain).toEqual([]);
+  });
+  it('trust-refusal stderr cannot erase timeout or kill uncertainty', () => {
+    for (const termination of [{ code: 'ETIMEDOUT' }, { signal: 'SIGTERM' }, { killed: true }]) {
+      const healTrust = vi.fn();
+      const result = run({ pickFreeLanes: () => [9], dispatch: planned => direct(planned, {
+        healTrust,
+        spawnAgent: () => { throw Object.assign(new Error('launch interrupted'), {
+          status: 1, stderr: 'Workspace not trusted', ...termination,
+        }); },
+      }) });
+      expect(result).toMatchObject({ launchUncertain: [7], dispatched: [], refusals: [{ kind: 'dispatch-failed' }] });
+      expect(healTrust).not.toHaveBeenCalled();
+    }
   });
   it('dispatchFix push-hold before launch leaves the PR out', () => {
     const result = run({ pickFreeLanes: () => [9], dispatch: planned => direct(planned, {

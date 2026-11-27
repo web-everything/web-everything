@@ -272,10 +272,14 @@ export async function defaultRedispatch({ slug, pr, reconcile }) {
   const dispatched = (result.dispatched ?? []).filter((d) => Number(d.pr ?? d.prNumber) === Number(pr));
   const refusals = only(result.refusals);
   const why = [...refusals, ...only(result.reconcileRefusalDetails)].map((r) => `${r.kind}: ${r.why ?? ''}`).join('; ');
-  return dispatched.length ? { ok: true } : {
-    ok: false, why: why || 'the dispatcher planned no fix for it',
-    launchNotStarted: dispatched.length === 0 && validUncertain(result.launchUncertain)
-      && !result.launchUncertain.includes(Number(pr)),
+  // A confirmed cold launch cannot account for an earlier unconfirmed resume.
+  // Missing or malformed evidence also leaves the reservation for inspection.
+  const launchAccounted = validUncertain(result.launchUncertain)
+    && !result.launchUncertain.includes(Number(pr));
+  return dispatched.length && launchAccounted ? { ok: true } : {
+    ok: false, why: why || (launchAccounted ? 'the dispatcher planned no fix for it'
+      : 'a launch remains unconfirmed; human inspection required'),
+    launchNotStarted: dispatched.length === 0 && launchAccounted,
   };
 }
 

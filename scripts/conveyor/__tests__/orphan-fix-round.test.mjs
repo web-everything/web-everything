@@ -145,6 +145,18 @@ describe('durable orphan redispatch attempts', () => {
     expect(options.escalate).toHaveBeenCalledOnce();
     expect(fixDispatch.runReconcileFixDispatch).toHaveBeenCalled();
   });
+  it('a successful cold dispatch cannot clear an earlier unconfirmed resume reservation', async () => {
+    const options = setup();
+    sandbox.dispatch = { dispatched: [{ pr: 4715 }], refusals: [], launchUncertain: [4715] };
+    const result = await runOrphanFixRoundPass(options);
+    expect(result.rows[0].result).toMatch(/^not-done:/);
+    expect(ledgers()).toMatchObject([{ pending: true, confirmed: 0 }]);
+    expect(options.postComment).not.toHaveBeenCalled();
+    expect(fixDispatch.runReconcileFixDispatch).toHaveBeenCalledOnce();
+    await runOrphanFixRoundPass(options);
+    expect(options.escalate).toHaveBeenCalledOnce();
+    expect(fixDispatch.runReconcileFixDispatch).toHaveBeenCalledOnce();
+  });
   it('planner-only refusal (reconcileRefusalDetails) stays retryable', async () => {
     sandbox.dispatch = noLane({ refusals: [{ pr: 9, kind: 'unrelated-secret' }],
       reconcileRefusalDetails: [{ prNumber: 4715, kind: 'planner-held' }, { prNumber: 9, kind: 'unrelated-secret' }] });
@@ -1155,7 +1167,7 @@ describe('runOrphanFixRoundPass — IO shell', () => {
     const dispatcher = vi.spyOn(fixDispatch, 'runReconcileFixDispatch').mockImplementation(options => {
       expect(options.reconcile({ repo: options.repo })).toEqual({
         dispatch: [{ kind: 'fix', prNumber: 4715 }], refusals: [{ prNumber: 4715 }] });
-      return { dispatched: [{ pr: 4715 }] };
+      return { dispatched: [{ pr: 4715 }], launchUncertain: [] };
     });
     try {
       const result = await runOrphanFixRoundPass(seams([VERDICT, BEGIN, RESTACK, END], { redispatch: defaultRedispatch, reconcile }));

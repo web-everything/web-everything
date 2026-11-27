@@ -1873,7 +1873,8 @@ export function dispatchFix(planned, {
     // Grants the REAL session dir (`grantDispatchTrust` collapses it to the scratch root under the default policy,
     // and trusts exactly that dir under `WE_DISPATCH_TRUST_ROOT=off`). With no cwd (the refusal came before one was
     // made) nothing was healed, so it is NOT relabelled transient — the raw error surfaces as before.
-    if (spawnCwd && isTrustRefusal(e)) {
+    // Trust stderr does not prove a prelaunch refusal if the CLI was interrupted.
+    if (spawnCwd && isTrustRefusal(e) && !e.signal && !e.killed && e.code !== 'ETIMEDOUT') {
       try { healTrust(spawnCwd); } catch { /* grantDispatchTrust never throws; belt-and-suspenders */ }
       throw Object.assign(new Error(`${DISPATCH_ENV_FAULT_PREFIX} workspace not trusted (claude --bg refused the scratch cwd) — `
         + 'the dispatch scratch cwd was re-granted; no agent started, retrying next pass'), { launchNotStarted: true });
@@ -2528,6 +2529,9 @@ export function runReconcileFixDispatch({
       let attempt;
       try {
         attempt = fixStep('resume', () => tryResume(entry, { root, repo: repoKey }), entry.pr);
+        // Preserve the old fail-closed access to attempt.resumed: absent evidence
+        // must refuse this entry before a cold launch can consume another lane.
+        if (attempt == null) throw new Error('conflict resume returned no result; human inspection required');
       } catch (e) {
         launchUncertain.add(Number(entry.pr));
         refusals.push({ pr: entry.pr, kind: 'dispatch-failed', why: describeDispatchFailure(e) });
