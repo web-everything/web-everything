@@ -7,11 +7,137 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { ciGreenOnSha } from '../../lib/lane-verify.mjs';
 
 const DEFAULT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const SOURCE = /\.(?:[cm]?[jt]sx?)$/;
 // Code folders: a named path here is followed even when missing (a deleted dependency).
 const CODE_ROOT = /^(?:scripts|src|tools|skills-src)\//;
+
+// WM2 suite policy. This is a versioned contract, not an environment override.
+// Changing the suite requires a new receipt name; older receipts remain historical evidence.
+export const SOAK_SUITE_POLICY = Object.freeze({
+  phase: 'postmerge', receipt: 'postmerge-soak-v1', maxAttempts: 2,
+  maxPages: 3, maxCalls: 24, requestMs: 10_000, deadlineMs: 60_000,
+});
+const FULL_SHARDS = '[1,2,3,4,5,6,7,8]';
+const fullSha = value => typeof value === 'string' && /^[0-9a-f]{40}$/.test(value);
+const positiveId = value => Number.isSafeInteger(value) && value > 0;
+const releaseHold = reason => ({ ok: false, reason, owner: 'repository-maintainers',
+  recovery: 'Keep release/adoption held; rerun the same main CI run once (at most two attempts). If exhausted or evidence exceeds bounds, repository maintainers must investigate and merge a corrective commit.' });
+
+/** @param {{event?:string, ref?:string}} input @returns {'premerge'|'postmerge'|'refuse'} */
+export function soakGatePhase({ event, ref } = {}) {
+  if (['pull_request', 'merge_group'].includes(event)) return 'premerge';
+  if (['push', 'workflow_dispatch'].includes(event) && ref === 'refs/heads/main') return SOAK_SUITE_POLICY.phase;
+  return 'refuse';
+}
+
+/** Validate the native Actions receipt producer; no API writes or personal credentials.
+ * @param {object} input @returns {{ok:boolean, reason:string, owner?:string, recovery?:string}}
+ */
+export function postmergeReceiptGate({ event, ref, sha, runId, attempt, scopeResult, run, shards, shardResult, aggregateResult } = {}) {
+  if (event !== 'push' || soakGatePhase({ event, ref }) !== 'postmerge' || !fullSha(sha)
+    || !positiveId(runId) || !positiveId(attempt) || attempt > SOAK_SUITE_POLICY.maxAttempts) return releaseHold('postmerge-producer-identity-or-attempt');
+  if (scopeResult !== 'success' || run !== 'true' || shards !== FULL_SHARDS
+    || shardResult !== 'success' || aggregateResult !== 'success') return releaseHold('postmerge-full-suite-incomplete');
+  return { ok: true, reason: SOAK_SUITE_POLICY.receipt };
+}
+
+/** Read-only release/adoption gate. Call inside the consumer's action lock immediately before effects.
+ * Native Actions owns the durable pending/completed journal: absent, crashed or skipped receipts HOLD.
+ * All IO, repository identity and time are explicit; no checkout, environment, git or host probes.
+ * @param {{repo:string, sha:string, now:()=>number, request:Function}} input
+ * @returns {Promise<object>} A named hold with recovery, or an exact SHA/run/attempt receipt.
+ */
+export async function postmergeReleaseGate({ repo, sha, now, request } = {}) {
+  try {
+    if (typeof repo !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(repo) || !fullSha(sha)
+      || typeof now !== 'function' || typeof request !== 'function') return releaseHold('postmerge-input-unreadable');
+    const [owner, repository] = repo.split('/');
+    const started = now();
+    let calls = 0;
+    const read = async (route, args = {}) => {
+      const time = now();
+      if (!Number.isFinite(started) || !Number.isFinite(time) || time < started || time - started >= SOAK_SUITE_POLICY.deadlineMs) throw new Error('postmerge-clock-or-deadline');
+      if (++calls > SOAK_SUITE_POLICY.maxCalls) throw new Error('postmerge-call-budget');
+      const controller = new AbortController();
+      let timer;
+      try {
+        const response = await Promise.race([
+          request(route, { owner, repo: repository, ...args, request: { timeout: SOAK_SUITE_POLICY.requestMs, signal: controller.signal } }),
+          new Promise((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error('postmerge-request-timeout')); }, SOAK_SUITE_POLICY.requestMs); }),
+        ]);
+        if (response?.status !== 200 || !response.data || typeof response.data !== 'object'
+          || JSON.stringify(response.data).length > 2 * 1024 * 1024) throw new Error('postmerge-response-unreadable-or-oversized');
+        const finished = now();
+        if (!Number.isFinite(finished) || finished < started || finished - started >= SOAK_SUITE_POLICY.deadlineMs) throw new Error('postmerge-clock-or-deadline');
+        return response.data;
+      } finally { clearTimeout(timer); }
+    };
+    const pages = async (route, field, args = {}) => {
+      const rows = [];
+      let total;
+      for (let page = 1; page <= SOAK_SUITE_POLICY.maxPages; page++) {
+        const data = await read(route, { ...args, per_page: 100, page });
+        if (!Number.isSafeInteger(data.total_count) || data.total_count < 0 || data.total_count > 100 * SOAK_SUITE_POLICY.maxPages
+          || (total !== undefined && total !== data.total_count) || !Array.isArray(data[field])) throw new Error('postmerge-pagination-unreadable-or-oversized');
+        total = data.total_count;
+        if (data[field].length !== Math.min(100, total - rows.length)) throw new Error('postmerge-pagination-incomplete');
+        rows.push(...data[field]);
+        if (rows.length === total) {
+          if (rows.some(row => !positiveId(row?.id)) || new Set(rows.map(row => row.id)).size !== rows.length) throw new Error('postmerge-record-identity-unreadable');
+          return rows;
+        }
+      }
+      throw new Error('postmerge-page-budget');
+    };
+    const snapshot = async () => {
+      const head = await read('GET /repos/{owner}/{repo}/git/ref/heads/main');
+      if (head.object?.sha !== sha) return releaseHold('postmerge-main-head-moved-or-unreadable');
+      const workflows = await pages('GET /repos/{owner}/{repo}/actions/workflows/ci.yml/runs', 'workflow_runs', { head_sha: sha, event: 'push' });
+      if (!workflows.length || workflows.some(w => !positiveId(w?.id) || !positiveId(w.check_suite_id)
+        || w.head_sha !== sha || w.event !== 'push' || w.head_branch !== 'main'
+        || w.repository?.full_name !== repo || w.head_repository?.full_name !== repo
+        || w.path !== '.github/workflows/ci.yml') || new Set(workflows.map(w => w.id)).size !== workflows.length) return releaseHold('postmerge-workflow-identity-unreadable');
+      const latest = workflows.reduce((a, b) => a.id > b.id ? a : b);
+      if (!positiveId(latest.run_attempt) || latest.run_attempt > SOAK_SUITE_POLICY.maxAttempts
+        || latest.status !== 'completed' || latest.conclusion !== 'success') return releaseHold('postmerge-workflow-incomplete-or-attempt-exhausted');
+      const checks = await pages('GET /repos/{owner}/{repo}/commits/{ref}/check-runs', 'check_runs', { ref: sha, filter: 'all' });
+      const verified = ciGreenOnSha({ headSha: sha, workflowRuns: [latest], checkRuns: checks,
+        required: ['test', 'smoke', 'daemon-soak', SOAK_SUITE_POLICY.receipt] });
+      if (!verified.ok) return releaseHold('postmerge-trusted-receipt-missing-or-unsuccessful');
+      const jobs = await pages('GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}/jobs', 'jobs',
+        { run_id: latest.id, attempt_number: latest.run_attempt });
+      if (jobs.some(job => job.head_sha !== sha || job.run_id !== latest.id || job.run_attempt !== latest.run_attempt
+        || job.status !== 'completed')) return releaseHold('postmerge-job-unbound-or-active');
+      const requiredJobs = [SOAK_SUITE_POLICY.receipt, ...Array.from({ length: 8 }, (_, i) => `soak-shard (${i + 1})`)];
+      const selected = [];
+      for (const name of requiredJobs) {
+        const matching = jobs.filter(job => job.name === name);
+        if (matching.length !== 1) return releaseHold('postmerge-full-suite-job-missing-or-ambiguous');
+        const job = matching[0];
+        if (job.head_sha !== sha || job.run_id !== latest.id || job.run_attempt !== latest.run_attempt
+          || job.status !== 'completed' || job.conclusion !== 'success') return releaseHold('postmerge-job-unbound-or-unsuccessful');
+        selected.push(job.id);
+      }
+      return { ok: true, sha, runId: latest.id, attempt: latest.run_attempt, suite: SOAK_SUITE_POLICY.receipt,
+        sources: verified.sources, jobs: selected };
+    };
+    const first = await snapshot();
+    if (!first.ok) return first;
+    const live = await snapshot();
+    if (!live.ok) return live;
+    if (JSON.stringify(first) !== JSON.stringify(live)) return releaseHold('postmerge-evidence-changed-during-admission');
+    const head = await read('GET /repos/{owner}/{repo}/git/ref/heads/main');
+    if (head.object?.sha !== sha) return releaseHold('postmerge-main-head-moved-at-action');
+    return live;
+  } catch (error) {
+    // External errors may contain credentials or control text; expose only our named reasons.
+    const reason = /^postmerge-[a-z-]+$/.test(error?.message) ? error.message : 'postmerge-request-failed';
+    return releaseHold(`postmerge-evidence-unreadable: ${reason}`);
+  }
+}
 
 // Decode JavaScript string escapes in one left-to-right pass, so an escaped backslash before
 // `u0064` is never read as a Unicode escape: `\u{…}`, `\uXXXX`, `\xXX`, legacy octal (CommonJS
@@ -307,7 +433,21 @@ async function selfTest() {
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  if (process.argv[2] === '--self-test') {
+  if (process.argv[2] === '--gate-phase') {
+    const phase = soakGatePhase({ event: process.env.GITHUB_EVENT_NAME, ref: process.env.GITHUB_REF });
+    process.stdout.write(`phase=${phase}\n`);
+    if (phase === 'refuse') { process.stderr.write('postmerge-phase-unknown: repository maintainers must investigate\n'); process.exitCode = 1; }
+    if (phase === 'postmerge' && !/^[12]$/.test(process.env.GITHUB_RUN_ATTEMPT ?? '')) {
+      process.stderr.write('postmerge-attempt-exhausted-or-unreadable: keep release held; repository maintainers must investigate and merge a corrective commit\n');
+      process.exitCode = 1;
+    }
+  } else if (process.argv[2] === '--postmerge-receipt') {
+    let result;
+    try { result = postmergeReceiptGate(JSON.parse(process.env.SOAK_RECEIPT_INPUT)); }
+    catch { result = releaseHold('postmerge-producer-input-unreadable'); }
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    if (!result.ok) process.exitCode = 1;
+  } else if (process.argv[2] === '--self-test') {
     await selfTest();
   } else {
     let run = true;

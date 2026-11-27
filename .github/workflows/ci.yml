@@ -47,7 +47,7 @@ on:
   # GitHub merge queue (merge-delivery strategy `github-merge-queue`): the required checks `test`, `smoke` and
   # `daemon-soak` re-run on each merge-group commit (main + the entries ahead + this PR). Check names unchanged so
   # the ruleset requires the same names. A merge_group can be light for a validated cards-only diff,
-  # and always runs the full soak (daemon-soak-scope: not a pull_request ⇒ run=true).
+  # and keeps the required daemon-soak name as a fast premerge gate. The full suite is postmerge.
   merge_group:
   workflow_dispatch:
   # Called only by ci-self.yml (manual dry run of a branch's own ci.yml). github.event_name stays the
@@ -641,9 +641,11 @@ jobs:
   # #4075 DAEMON SOAK HARNESS (card x0zg44l) — `npm run test:soak`: the REAL review + fix daemons, the real
   # rebuild/self-sync + live smoke gate, a real bare remote with main moving, fake GitHub + fake sessions, the
   # invariants (clone clean, <=1 main move behind, tick bounded, no onTick crash, owed work dispatched) checked
-  # after EVERY tick — plus one regression scenario per live daemon break (scripts/conveyor/soak/breaks/). Minutes,
-  # not seconds, so on a PR it runs ONLY when the PR touches daemon code (the path check below; a PR outside it
-  # passes this job in seconds), and ALWAYS on a push to main and on a manual dispatch. WHY on main (soak-main-red,
+  # after EVERY tick — plus one regression scenario per live daemon break (scripts/conveyor/soak/breaks/).
+  # SOAK-POSTMERGE / WM2: the full suite runs only on merged main (or a main diagnostic dispatch).
+  # PRs retain fast units; merge groups retain the scope safeguards, without the full daemon harness.
+  # Native Actions journals a pending postmerge-soak-v1 check; absence is also a release/adoption hold.
+  # Only its successful exact-SHA/run/attempt receipt can admit deploy.yml. WHY on main (soak-main-red,
   # 2026-09-26): it used to run on PRs only, so a soak regression that landed on main (the lane-pool verdict memo
   # that pinned a freed lane as "holds work", surfaced by the soak sharding) was invisible there — no red main,
   # no main-red window — and instead read as a red `daemon-soak` on EVERY unrelated daemon PR, each of which then
@@ -660,8 +662,8 @@ jobs:
   # 50-tick baseline PLUS all 18 break scenarios serially: 10-12min when daemon code changed — the slowest job in
   # CI (`test` runs 4-6min) — and growing by one scenario every time a new live daemon break gets a regression
   # test. Now three jobs:
-  #   job `daemon-soak-scope` — legacy paths OR derived soak import/literal-path closure, run ONCE (not per-shard) so the ~10s no-daemon-code skip
-  #                 stays exactly as cheap as it was in the single-job version.
+  #   job `daemon-soak-scope` — the existing diff detector remains available for persisted consumers;
+  #                 WM2's explicit phase selects fast premerge checks or the full postmerge harness.
   #   job `soak-shard`  — an 8-way matrix (`scripts/conveyor/soak/shard-files.mjs`): shard 1 is ALWAYS the 50-tick
   #                 baseline alone (it dwarfs any one break scenario, so a blind file-count split would strand it
   #                 next to a handful of breaks in one shard while the rest sit idle); shards 2-8 balance the
@@ -669,15 +671,16 @@ jobs:
   #                 new file) lands in a shard automatically, no shard-list to hand-maintain, so wall time stays
   #                 balanced as scenarios grow. A matrix job, so its own check names are
   #                 `soak-shard (1..8)`, NOT required (mirrors `test-shard`'s non-required matrix checks).
-  #   job `daemon-soak` — THE required aggregating check, name UNCHANGED: skips in ~10s when `daemon-soak-scope`
-  #                 found no daemon code touched (identical observable behavior to before the split), red if the
-  #                 scope job itself failed (fail closed), otherwise red unless EVERY shard succeeded. Full coverage is preserved — sharding only changes WHERE
-  #                 each scenario runs, never WHETHER it runs; every scenario still runs on every daemon PR.
+  #   job `daemon-soak` — required aggregate, name unchanged for branch protection and live required-check
+  #                 readers in review-ci-gate, ci-red-recovery-watch and main-red-recovery. No ruleset migration
+  #                 to a missing check: it reports fast premerge evidence and full postmerge evidence.
+  #   job `postmerge-soak-v1` — versioned release/adoption receipt, never a PR/merge-queue requirement.
   daemon-soak-scope:
     if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
+      phase: ${{ steps.phase.outputs.phase }}
       run: ${{ steps.scope.outputs.run }}
       shards: ${{ steps.scope.outputs.shards }}
     steps:
@@ -690,6 +693,10 @@ jobs:
 
       - name: Check soak scope safeguards (Node builtins only)
         run: node scripts/conveyor/soak/soak-scope.mjs --self-test
+
+      - name: Resolve WM2 suite gate phase
+        id: phase
+        run: node scripts/conveyor/soak/soak-scope.mjs --gate-phase >> "$GITHUB_OUTPUT"
 
       - name: Does this PR touch daemon code?
         id: scope
@@ -730,9 +737,8 @@ jobs:
   # failing must not hide a sibling shard's own result.
   soak-shard:
     needs: daemon-soak-scope
-    # R1068: shards run in the merge queue / on main / on dispatch, never on a pull_request push (~28k CI min/day).
-    # CI-SOAK-SCOPE-MQ: the matrix comes from the scope job. Shard 1 (the baseline) always runs; shards 2-8 run
-    # only when daemon code was touched (or the scope is unknown). Total stays 8, so it is not strategy.job-total.
+    # Premerge uses fast safeguards; the full eight-shard harness is postmerge only.
+    # Keep the matrix output and fixed denominator for persisted scope consumers.
     if: needs.daemon-soak-scope.result == 'success' && (needs.daemon-soak-scope.outputs.run == 'true' || needs.daemon-soak-scope.outputs.run == 'false') && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     # Measured 2026-10-14: time-balanced shards finish in ~8-14 min on main (shard 3: 13m24s and 13m48s on two
@@ -766,10 +772,28 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Validate soak phase before any suite can pass
+        env:
+          SOAK_PHASE: ${{ needs.daemon-soak-scope.outputs.phase }}
+        run: |
+          actual=$(node scripts/conveyor/soak/soak-scope.mjs --gate-phase)
+          if [ "$actual" != "phase=$SOAK_PHASE" ]; then
+            echo "::error::postmerge-phase-mismatch — release held; repository maintainers must investigate"
+            exit 1
+          fi
+
       - name: Install
+        if: needs.daemon-soak-scope.outputs.phase == 'postmerge'
         run: npm ci
 
+      - name: Premerge scope safeguards
+        if: needs.daemon-soak-scope.outputs.phase == 'premerge'
+        run: |
+          echo "postmerge-full-suite-deferred — fast premerge safeguards; release remains held for the merged-main receipt"
+          node scripts/conveyor/soak/soak-scope.mjs --self-test
+
       - name: Soak shard ${{ matrix.shard }}/8
+        if: needs.daemon-soak-scope.outputs.phase == 'postmerge'
         run: npm run test:soak:shard -- --shard=${{ matrix.shard }}/8 $(node scripts/ci/quarantine-skip.mjs --job="soak-shard (${{ matrix.shard }})")
 
       - name: Measure shard resources
@@ -836,6 +860,7 @@ jobs:
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             echo "soak deferred to merge queue (R1068)"
             echo "### daemon-soak: soak deferred to merge queue (R1068)" >> "$GITHUB_STEP_SUMMARY"
+            echo "postmerge-full-suite-deferred — queue runs fast safeguards; full suite belongs to the merged-main release hold"
             exit 0
           fi
           # Fail CLOSED on the scope job itself: a crashed `daemon-soak-scope` leaves `outputs.run` empty, and an
@@ -864,6 +889,28 @@ jobs:
             exit 1
           fi
           echo "All soak shards succeeded."
+
+  # The pending native check is the durable hold. A killed runner cannot publish a success;
+  # missing/failed/cancelled/timed-out evidence remains held, including emergency deploys.
+  postmerge-soak-v1:
+    needs: [daemon-soak-scope, soak-shard, daemon-soak]
+    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Complete exact-head postmerge receipt or retain release hold
+        env:
+          SOAK_RECEIPT_INPUT: >-
+            {"event":"${{ github.event_name }}","ref":"${{ github.ref }}","sha":"${{ github.sha }}",
+            "runId":${{ github.run_id }},"attempt":${{ github.run_attempt }},
+            "scopeResult":"${{ needs.daemon-soak-scope.result }}","run":"${{ needs.daemon-soak-scope.outputs.run }}",
+            "shards":"${{ needs.daemon-soak-scope.outputs.shards }}","shardResult":"${{ needs.soak-shard.result }}",
+            "aggregateResult":"${{ needs.daemon-soak.result }}"}
+        run: node scripts/conveyor/soak/soak-scope.mjs --postmerge-receipt
 
   # Deploy-smoke + deterministic interaction lane. Split OUT of `test` so the fast correctness
   # lane (coverage + gate) no longer waits on the ~25s docs build and the ~54s Playwright install +

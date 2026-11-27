@@ -45,6 +45,13 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
   {
+    test: 'scripts/ci/__tests__/ci-soak-merge-queue-only.test.mjs',
+    scope: 'files',
+    why: 'pins the postmerge receipt producer and both deployment hold guards using imported workflow source fixtures',
+    matches: (f) => ['.github/workflows/ci.yml', '.github/workflows/deploy.yml'].includes(f),
+    inputs: ['scripts/ci/__tests__/ci-soak-merge-queue-only.test.mjs'],
+  },
+  {
     test: 'scripts/operations/__tests__/audit-nonconvergence.test.mjs',
     scope: 'files',
     why: 'keeps the explicitly invoked diagnostic free of production consumers and mutating adapters',

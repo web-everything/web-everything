@@ -5,11 +5,12 @@
  * review finding: a crashed `daemon-soak-scope` leaves `outputs.run` empty, which must NOT read as "no daemon
  * code touched".
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { REPO_ROOT } from '../shard-files.mjs';
+import * as postmerge from '../soak-scope.mjs';
 
 const CI_YML = join(REPO_ROOT, '.github', 'workflows', 'ci.yml');
 
@@ -149,5 +150,202 @@ describe('daemon-soak runs on main pushes, not only on PRs', () => {
     const yml = readFileSync(CI_YML, 'utf8');
     expect(yml).toContain(`if [ "\${{ github.event_name }}" != "pull_request" ] && [ "\${{ github.event_name }}" != "merge_group" ]; then`);
     expect(yml).toContain(`echo "run=true" >> "$GITHUB_OUTPUT"; echo 'shards=[1,2,3,4,5,6,7,8]' >> "$GITHUB_OUTPUT"; exit 0`);
+  });
+});
+
+// All release evidence is injected. No git, GitHub, clock, cwd, lanes or host state is read.
+const mergedSha = 'a'.repeat(40);
+const nextSha = 'b'.repeat(40);
+const releaseRepo = 'fixture/project';
+const receiptName = 'postmerge-soak-v1';
+function releaseFixture() {
+  const workflow = { id: 100, check_suite_id: 200, run_attempt: 1,
+    head_sha: mergedSha, head_branch: 'main', event: 'push',
+    repository: { full_name: releaseRepo }, head_repository: { full_name: releaseRepo },
+    path: '.github/workflows/ci.yml', status: 'completed', conclusion: 'success' };
+  const checks = ['test', 'smoke', 'daemon-soak', receiptName].map((name, i) => ({
+    id: 300 + i, name, head_sha: mergedSha, app: { id: 15368 },
+    check_suite: { id: 200 }, status: 'completed', conclusion: 'success',
+    details_url: `https://github.com/${releaseRepo}/actions/runs/100/job/${400 + i}`,
+  }));
+  const jobs = [receiptName, ...Array.from({ length: 8 }, (_, i) => `soak-shard (${i + 1})`)]
+    .map((name, i) => ({ id: 400 + i, name, head_sha: mergedSha,
+      run_id: 100, run_attempt: 1, status: 'completed', conclusion: 'success' }));
+  const state = { head: mergedSha, workflows: [workflow], checks, jobs };
+  const calls = [];
+  const request = async (route, args) => {
+    calls.push({ route, args });
+    if (route.endsWith('/git/ref/heads/main')) return { status: 200, data: { object: { sha: state.head } } };
+    const key = route.endsWith('/check-runs') ? 'checks' : route.endsWith('/jobs') ? 'jobs' : 'workflows';
+    const field = { checks: 'check_runs', jobs: 'jobs', workflows: 'workflow_runs' }[key];
+    const rows = state[key];
+    return { status: 200, data: { total_count: rows.length, [field]: rows.slice((args.page - 1) * 100, args.page * 100) } };
+  };
+  return { state, calls, request, input: { repo: releaseRepo, sha: mergedSha, now: () => 1000, request } };
+}
+
+describe('SOAK-POSTMERGE release hold', () => {
+  it('merged head cannot release until its postmerge soak succeeds', async () => {
+    const f = releaseFixture();
+    f.state.checks.at(-1).status = 'queued';
+    f.state.checks.at(-1).conclusion = null;
+    expect((await postmerge.postmergeReleaseGate(f.input)).ok).toBe(false);
+    f.state.checks.at(-1).status = 'completed';
+    f.state.checks.at(-1).conclusion = 'success';
+    expect((await postmerge.postmergeReleaseGate(f.input)).ok).toBe(true);
+  });
+
+  it('selects full soak only for merged main or an explicit main diagnostic; PR and queue keep fast checks', () => {
+    for (const event of ['pull_request', 'merge_group']) {
+      expect(postmerge.soakGatePhase({ event, ref: 'refs/heads/main' })).toBe('premerge');
+    }
+    for (const event of ['push', 'workflow_dispatch']) {
+      expect(postmerge.soakGatePhase({ event, ref: 'refs/heads/main' })).toBe('postmerge');
+    }
+    expect(postmerge.soakGatePhase({ event: 'push', ref: 'refs/heads/other' })).toBe('refuse');
+    expect(postmerge.soakGatePhase({})).toBe('refuse');
+  });
+
+  it('the receipt producer requires the full suite, exact run and a bounded attempt', () => {
+    const input = { event: 'push', ref: 'refs/heads/main', sha: mergedSha, runId: 100, attempt: 1,
+      scopeResult: 'success', run: 'true', shards: '[1,2,3,4,5,6,7,8]', shardResult: 'success', aggregateResult: 'success' };
+    expect(postmerge.postmergeReceiptGate(input).ok).toBe(true);
+    for (const patch of [
+      { event: 'workflow_dispatch' }, { event: 'merge_group' }, { sha: 'short' }, { runId: null },
+      { attempt: 3 }, { attempt: 0 }, { shards: '[1]' }, { run: 'false' },
+      { scopeResult: 'failure' }, { shardResult: 'cancelled' }, { aggregateResult: 'skipped' },
+    ]) expect(postmerge.postmergeReceiptGate({ ...input, ...patch }).ok, JSON.stringify(patch)).toBe(false);
+  });
+
+  it.each(['failure', 'cancelled', 'timed_out', 'skipped', null])('%s soak keeps the release held with an owner and recovery', async conclusion => {
+    const f = releaseFixture();
+    f.state.jobs[1].conclusion = conclusion;
+    const result = await postmerge.postmergeReleaseGate(f.input);
+    expect(result).toMatchObject({ ok: false, owner: 'repository-maintainers' });
+    expect(result.reason).toBeTruthy();
+    expect(result.recovery).toContain('rerun');
+  });
+
+  it.each(['checks', 'jobs', 'workflows'])('missing %s is a hold, including a process crash before publication', async key => {
+    const f = releaseFixture();
+    f.state[key] = [];
+    expect((await postmerge.postmergeReleaseGate(f.input)).ok).toBe(false);
+  });
+
+  it.each([
+    ['forged App with the same name', f => { f.state.checks.at(-1).app.id = 7; }],
+    ['wrong workflow', f => { f.state.workflows[0].path = '.github/workflows/other.yml'; }],
+    ['old suite version', f => { f.state.checks.at(-1).name = 'postmerge-soak-v0'; }],
+    ['wrong head', f => { f.state.checks.at(-1).head_sha = nextSha; }],
+    ['replayed suite', f => { f.state.checks.at(-1).check_suite.id = 201; }],
+    ['PR workflow', f => { f.state.workflows[0].event = 'pull_request'; }],
+    ['fork producer', f => { f.state.workflows[0].head_repository.full_name = 'fork/project'; }],
+    ['replayed attempt', f => { f.state.jobs[0].run_attempt = 2; }],
+    ['unbound job', f => { delete f.state.jobs[0].run_id; }],
+    ['unbounded reruns', f => { f.state.workflows[0].run_attempt = 3; }],
+    ['invalid run id', f => { delete f.state.workflows[0].id; }],
+    ['duplicate check id', f => { f.state.checks.push({ ...f.state.checks.at(-1) }); }],
+    ['duplicate job', f => { f.state.jobs.push({ ...f.state.jobs[0] }); }],
+    ['active repair child', f => { f.state.jobs.push({ ...f.state.jobs[0], id: 499, name: 'repair', status: 'in_progress', conclusion: null }); }],
+    ['malformed extra evidence', f => { f.state.checks.push(null); }],
+  ])('%s cannot clear the hold', async (_name, change) => {
+    const f = releaseFixture();
+    change(f);
+    expect((await postmerge.postmergeReleaseGate(f.input)).ok).toBe(false);
+  });
+
+  it('a bounded second attempt succeeds only with fresh attempt-bound jobs', async () => {
+    const f = releaseFixture();
+    f.state.workflows[0].run_attempt = 2;
+    expect((await postmerge.postmergeReleaseGate(f.input)).ok).toBe(false);
+    f.state.jobs.forEach(job => { job.run_attempt = 2; });
+    expect((await postmerge.postmergeReleaseGate(f.input)).ok).toBe(true);
+  });
+
+  it('orders by authoritative ids even with absent, invalid or tied timestamps; a newer pending run holds', async () => {
+    const f = releaseFixture();
+    f.state.checks.forEach(check => { check.started_at = 'invalid'; });
+    expect((await postmerge.postmergeReleaseGate(f.input)).ok).toBe(true);
+    f.state.workflows.push({ ...f.state.workflows[0], id: 101, status: 'queued', conclusion: null });
+    expect((await postmerge.postmergeReleaseGate(f.input)).ok).toBe(false);
+  });
+
+  it('two fast merges retain the old receipt without releasing the untested head', async () => {
+    const f = releaseFixture();
+    f.state.head = nextSha;
+    expect((await postmerge.postmergeReleaseGate(f.input)).ok).toBe(false);
+    expect((await postmerge.postmergeReleaseGate({ ...f.input, sha: nextSha })).ok).toBe(false);
+    expect(f.state.checks.at(-1).head_sha).toBe(mergedSha);
+  });
+
+  it('re-reads evidence and main at the action boundary; an injected hold or head movement stops release', async () => {
+    for (const moved of [false, true]) {
+      const f = releaseFixture();
+      let heads = 0;
+      const request = async (route, args) => {
+        if (route.endsWith('/git/ref/heads/main') && ++heads === 2) {
+          if (moved) f.state.head = nextSha;
+          else f.state.checks.at(-1).conclusion = 'failure';
+        }
+        return f.request(route, args);
+      };
+      expect((await postmerge.postmergeReleaseGate({ ...f.input, request })).ok).toBe(false);
+    }
+  });
+
+  it('a main move during the final job read still refuses release', async () => {
+    const f = releaseFixture();
+    let jobs = 0;
+    const request = async (route, args) => {
+      const result = await f.request(route, args);
+      if (route.endsWith('/jobs') && ++jobs === 2) f.state.head = nextSha;
+      return result;
+    };
+    expect((await postmerge.postmergeReleaseGate({ ...f.input, request })).ok).toBe(false);
+  });
+
+  it('a hung reader times out to a named hold and aborts its request', async () => {
+    vi.useFakeTimers();
+    try {
+      const f = releaseFixture();
+      let signal;
+      const pending = postmerge.postmergeReleaseGate({ ...f.input, request: (_route, args) => {
+        signal = args.request.signal;
+        return new Promise(() => {});
+      } });
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(await pending).toMatchObject({ ok: false, reason: expect.stringContaining('postmerge-request-timeout') });
+      expect(signal.aborted).toBe(true);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('a request completing after the overall deadline cannot clear the hold', async () => {
+    const f = releaseFixture();
+    let elapsed = 0;
+    let jobs = 0;
+    const request = async (route, args) => {
+      const response = await f.request(route, args);
+      if (route.endsWith('/jobs') && ++jobs === 2) elapsed = 60_001;
+      return response;
+    };
+    expect((await postmerge.postmergeReleaseGate({ ...f.input, now: () => elapsed, request })).ok).toBe(false);
+  });
+
+  it.each(['throw', 'malformed', 'oversized', 'incomplete', 'clock'])('%s evidence holds visibly without any write or fallback', async kind => {
+    const f = releaseFixture();
+    const request = async (route, args) => {
+      if (kind === 'throw') throw new Error('injected read failure');
+      if (kind === 'malformed') return { status: 200, data: null };
+      if (kind === 'oversized') return { status: 200, data: { total_count: 301, workflow_runs: [] } };
+      if (kind === 'incomplete' && route.endsWith('/runs')) return { status: 200, data: { total_count: 2, workflow_runs: [] } };
+      return f.request(route, args);
+    };
+    const result = await postmerge.postmergeReleaseGate({ ...f.input, request,
+      now: kind === 'clock' ? () => NaN : f.input.now });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBeTruthy();
+    expect(result.recovery).toBeTruthy();
+    expect(f.calls.every(call => call.route.startsWith('GET '))).toBe(true);
+    expect(f.calls.length).toBeLessThanOrEqual(24);
   });
 });

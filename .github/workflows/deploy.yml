@@ -71,10 +71,12 @@ on:
 
 concurrency:
   group: deploy-worker
-  cancel-in-progress: true
+  # Keep the action lock through final evidence read, deployment and acknowledgement.
+  cancel-in-progress: false
 
 permissions:
   contents: read
+  actions: read
   checks: read
   statuses: read
 
@@ -129,6 +131,13 @@ jobs:
             *)                on_main=false ;;
           esac
 
+          # A receipt validator must never be loaded from an unmerged emergency target.
+          # The postmerge hold below is mandatory even when fast checks use break glass.
+          if [ "$on_main" != "true" ]; then
+            echo "::error::postmerge-target-unmerged — release held; repository maintainers must choose a merged main SHA"
+            exit 1
+          fi
+
           # B. Required checks — LATEST run per required name must be success.
           got=$(gh api --paginate "repos/${{ github.repository }}/commits/$DEPLOY_SHA/check-runs?filter=latest&per_page=100" \
                   | jq -s '[.[].check_runs[] | select(.name=="test" or .name=="smoke")
@@ -158,6 +167,21 @@ jobs:
           path: web-everything
           # THE POINT OF THIS CHANGE: build the commit CI verified, not the branch tip.
           ref: ${{ env.DEPLOY_SHA }}
+          persist-credentials: false
+
+      # Missing receipts are pending holds too, so a crash before CI even creates a check is safe.
+      # This guard has no break-glass exemption and uses only the scoped workflow token.
+      - name: Enforce postmerge release hold before building
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          retries: 0
+          script: |
+            const { postmergeReleaseGate } = await import(`${process.env.GITHUB_WORKSPACE}/web-everything/scripts/conveyor/soak/soak-scope.mjs`);
+            const result = await postmergeReleaseGate({ repo: `${context.repo.owner}/${context.repo.repo}`,
+              sha: process.env.DEPLOY_SHA, now: Date.now, request: github.request.bind(github) });
+            core.info(JSON.stringify(result));
+            if (!result.ok) core.setFailed(`Release held: ${result.reason}; owner=${result.owner}; ${result.recovery}`);
       - name: Mint FUI read token (GitHub App)
         id: fui-app-token
         if: vars.WE_APP_ID != ''
@@ -201,7 +225,20 @@ jobs:
         working-directory: web-everything
         run: node scripts/check-site-asset-size.mjs _site
 
+      - name: Recheck postmerge hold immediately before deployment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          retries: 0
+          script: |
+            const { postmergeReleaseGate } = await import(`${process.env.GITHUB_WORKSPACE}/web-everything/scripts/conveyor/soak/soak-scope.mjs`);
+            const result = await postmergeReleaseGate({ repo: `${context.repo.owner}/${context.repo.repo}`,
+              sha: process.env.DEPLOY_SHA, now: Date.now, request: github.request.bind(github) });
+            core.info(JSON.stringify(result));
+            if (!result.ok) core.setFailed(`Release held: ${result.reason}; owner=${result.owner}; ${result.recovery}`);
+
       - name: Deploy Worker + assets
+        # The immediately preceding step re-reads live evidence inside deploy-worker's lock.
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
