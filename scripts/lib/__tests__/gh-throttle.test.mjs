@@ -12,6 +12,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import * as fs from 'node:fs';
+import * as childProcess from 'node:child_process';
 import { join, basename } from 'node:path';
 import {
   DEFAULT_GH_CONCURRENCY_CAP, DEFAULT_ACQUIRE_TIMEOUT_MS, DEFAULT_RETRY_MAX_ATTEMPTS,
@@ -27,6 +29,15 @@ import {
   acquireGhWriteBudgetSync, classifyGhWrite, deriveGhCaller,
   runGhSync, execFileSyncThrottled, runGhCliPassthrough, stripGhDebug, scanGhApiFlags,
 } from './gh-throttle.window-fixture.mjs';
+
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, readFileSync: vi.fn(actual.readFileSync) };
+});
+vi.mock('node:child_process', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, execFileSync: vi.fn(actual.execFileSync), spawnSync: vi.fn(actual.spawnSync) };
+});
 
 function readJsonl(path) {
   return readFileSync(path, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
@@ -581,6 +592,30 @@ describe('acquireGhPointsSync — cross-process points budget over a real lock r
   });
 });
 
+// Keep timeout proofs independent of host policy files, credentials, processes and cwd.
+function writeTimeoutFixture() {
+  const lockRoot = mkdtempSync(join(tmpdir(), 'gh-write-timeout-'));
+  const read = fs.readFileSync.getMockImplementation();
+  const spies = [
+    vi.spyOn(fs, 'readFileSync').mockImplementation((path, ...args) => {
+      if (String(path).startsWith(lockRoot + '/')) return read(path, ...args);
+      throw Object.assign(new Error('fixture has no host files'), { code: 'ENOENT' });
+    }),
+    ...['execFileSync', 'spawnSync'].map(name => vi.spyOn(childProcess, name).mockImplementation(() => { throw new Error('unexpected host process'); })),
+    vi.spyOn(process, 'cwd').mockReturnValue(lockRoot),
+  ];
+  let clock = 0;
+  spies.push(vi.spyOn(Date, 'now').mockImplementation(() => clock));
+  const throttle = {
+    lockRoot, repo: lockRoot, env: { GH_TOKEN: 'fixture-token', WE_PLATFORM_PREFERENCES_FILE: join(lockRoot, 'absent.json') },
+    caller: 'fixture-caller', owner: 'fixture-owner', pid: 12345, cap: 2,
+    personalRoute: false, shimRouted: false, pointsToolFile: join(lockRoot, 'absent.json'),
+    now: () => clock, sleep: ms => { clock += ms; }, warn: vi.fn(),
+    budgetPerMin: 100, points: 1, writeBudgetPerMin: 1, pollMs: 10, pointsWindowMs: 60_000, acquireTimeoutMs: 50,
+  };
+  return { throttle, cleanup: () => { spies.reverse().forEach(spy => spy.mockRestore()); rmSync(lockRoot, { recursive: true, force: true }); } };
+}
+
 // ── #gh-write-burst — classifyGhWrite / deriveGhCaller / the write-only budget ──────────────────────────────
 describe('resolveGhWriteBudgetPerMin — env override, clamped sane', () => {
   it('defaults, ignores garbage, floors a fractional override, rejects < 1', () => {
@@ -770,7 +805,39 @@ describe('runGhSync — points budget + sidecar log wiring (#3670)', () => {
 });
 
 // ── #gh-write-burst — the write-only budget and caller attribution, wired through runGhSync/runGhCliPassthrough
+it.each(['sync', 'passthrough'])('%s explicitly ungated write timeout executes and logs the operator fallback', runner => {
+  const f = writeTimeoutFixture();
+  const exec = vi.fn(() => 'ok');
+  const spawn = vi.fn(() => ({ status: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }));
+  try {
+    f.throttle.env.WE_GH_THROTTLE_ON_SLOT_TIMEOUT = 'ungated';
+    const call = args => runner === 'sync'
+      ? runGhSync(args, { env: f.throttle.env, throttle: { ...f.throttle, exec } })
+      : runGhCliPassthrough(args, { throttle: f.throttle, spawn });
+    call(['pr', 'edit', '1']);
+    const result = call(['pr', 'edit', '2']);
+    expect(runner === 'sync' ? result : result.status).toBe(runner === 'sync' ? 'ok' : 0);
+    expect(runner === 'sync' ? exec : spawn).toHaveBeenCalledTimes(2);
+    expect(readJsonl(ghThrottleLogPath(f.throttle.lockRoot))).toContainEqual(expect.objectContaining({ outcome: 'slot_timeout', w: true, waitedMs: 50 }));
+  } finally { f.cleanup(); }
+});
+
 describe('runGhSync — write budget + caller attribution (#gh-write-burst)', () => {
+  it('a mutation whose write budget never clears inside acquireTimeoutMs is throttled and never executed', () => {
+    const f = writeTimeoutFixture();
+    const exec = vi.fn(() => 'ok');
+    try {
+      const options = { env: f.throttle.env, throttle: { ...f.throttle, exec } };
+      runGhSync(['pr', 'edit', '1'], options);
+      let error;
+      try { runGhSync(['pr', 'edit', '2'], options); } catch (e) { error = e; }
+      expect(exec).toHaveBeenCalledTimes(1);
+      expect(error).toMatchObject({ status: 1, ghThrottled: { waitedMs: 50 } });
+      expect(error.stderr).toContain('retry next tick');
+      expect(readJsonl(ghThrottleLogPath(f.throttle.lockRoot))).toContainEqual(expect.objectContaining({ outcome: 'slot_throttled', w: true }));
+    } finally { f.cleanup(); }
+  });
+
   it('logs caller and w:true on a mutation, w:false on a read — the classification calls.jsonl now carries', () => {
     const lockRoot = mkdtempSync(join(tmpdir(), 'gh-t-'));
     const exec = vi.fn(() => 'ok');
@@ -822,6 +889,20 @@ describe('runGhSync — write budget + caller attribution (#gh-write-burst)', ()
 });
 
 describe('runGhCliPassthrough — write budget + caller attribution (#gh-write-burst)', () => {
+  it('a mutation whose write budget times out returns throttled and never spawns', () => {
+    const f = writeTimeoutFixture();
+    const spawn = vi.fn(() => ({ status: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) }));
+    try {
+      const options = { throttle: f.throttle, spawn };
+      runGhCliPassthrough(['pr', 'edit', '1'], options);
+      const result = runGhCliPassthrough(['pr', 'edit', '2'], options);
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(result).toMatchObject({ status: 1, throttled: true, stdout: Buffer.alloc(0) });
+      expect(result.stderr.toString()).toContain('retry next tick');
+      expect(readJsonl(ghThrottleLogPath(f.throttle.lockRoot))).toContainEqual(expect.objectContaining({ outcome: 'slot_throttled', w: true, waitedMs: 50 }));
+    } finally { f.cleanup(); }
+  });
+
   it('logs caller and w:true for a mutation argv', () => {
     const lockRoot = mkdtempSync(join(tmpdir(), 'gh-t-'));
     const spawn = vi.fn(() => ({ status: 0, stdout: Buffer.from('{}'), stderr: Buffer.alloc(0), error: null }));
