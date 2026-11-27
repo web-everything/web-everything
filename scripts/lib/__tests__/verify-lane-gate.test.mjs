@@ -20,6 +20,7 @@ import { pathToFileURL } from 'node:url';
 import { alwaysRunPlan, alwaysRunInventory, verifyStandardsPolicy, STANDARDS_AUTO_PREFIXES, standardsRelevantPath, decideStandardsHalf, verifyPhaseAdmissionEnabled, verifyFastTargets, phaseAdmissionKind, verifyRelatedMode, buildPhaseOutcome, firstStandardsErrorId, verifyTestTimeoutFactor, scaledTimeoutFlags, buildVerifyPhases, formatVerifyPhases, explicitGateRefusal, resolveDefaultGate as resolveGate, resolvePushDefaultGate, matchRequestedDefaultGate, canScopeCheckStandards, composeGate, describeGate, laneRelevantChangeSince, computeWorkingTreeHash, stableTreeHash, FULL_GATE, MAX_RELATED_TARGETS, CARD_ONLY_SKIP_GATE, localDiffIsCardOnly } from '../verify-lane-gate.mjs';
 import { phaseAdmissionPlan, localPhaseReason } from '../verify-remote-routing.mjs';
 import { localChangedSet } from '../verify-lane-gate.mjs';
+import { selectionRequiredResult, selectionRefusalFromOutput } from '../verify-lane-gate.mjs';
 
 import { ciOnlyDecision, hostSaturation } from '../verify-ci-only.mjs';
 
@@ -957,6 +958,97 @@ describe('fix-3311 selection replay', () => {
   });
 });
 
+describe('selection-bound diagnostic evidence', () => {
+  const gate = { command: null, decision: { mode: 'blocked', reasons: ['recorded diff requires an explicit gate'] } };
+  it('unreadable prep identity stays refused with a named generic fallback', () => {
+    const result = selectionRequiredResult({ sha: 'a'.repeat(40), gate, repo: '/unused', runGit: () => { throw new Error('timed out'); } });
+    expect(result).toMatchObject({ ok: false, status: 'selection-required', exitCode: 3,
+      reason: 'local-selection-bound', redCause: 'refused', hint: { reason: 'prep-identity-unavailable' } });
+    expect(result.detail).toContain('supply --gate');
+    expect(result.hint.argv).toBeUndefined();
+  });
+  it('oversized prep evidence names the manual explicit-gate fallback', () => {
+    const root = mkdtempSync(join(tmpdir(), 'verify-prep-bound-'));
+    try {
+      writeFileSync(join(root, 'repos-create-prep-2026-11-26.md'), 'x'.repeat(128 * 1024 + 1));
+      const result = selectionRequiredResult({ gate, repo: root, prepDir: root,
+        runGit: args => args[0] === 'remote' ? 'https://github.com/plateauapp/plateau-app.git' : 'lane/repos-create' });
+      expect(result.hint).toEqual({ reason: 'prep-limit' });
+      expect(result.detail).toContain('supply --gate');
+      expect(result.ok).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('bounds the actual prep read and refuses evidence that grows past MAX_PREP_BYTES after stat', () => {
+    const root = mkdtempSync(join(tmpdir(), 'verify-prep-growth-'));
+    const path = join(root, 'repos-create-prep-2026-11-26.md');
+    const maxPrepBytes = 128 * 1024;
+    try {
+      writeFileSync(path, 'small enough to pass the initial stat');
+      const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+        import fs from 'node:fs';
+        import { syncBuiltinESMExports } from 'node:module';
+        const { selectionRequiredResult } = await import(process.argv[1]);
+        const [root, path, gateJson] = process.argv.slice(2);
+        const realReadSync = fs.readSync;
+        const reads = [];
+        fs.readSync = (fd, buffer, offset, length, position) => {
+          // This hook runs after fstat: grow the real open file before the real read.
+          fs.writeFileSync(path, 'x'.repeat(128 * 1024 + 64));
+          const bytesRead = realReadSync(fd, buffer, offset, length, position);
+          reads.push({ bufferBytes: buffer.length, offset, length, position, bytesRead });
+          return bytesRead;
+        };
+        syncBuiltinESMExports();
+        const result = selectionRequiredResult({ gate: JSON.parse(gateJson), repo: root, prepDir: root,
+          runGit: args => args[0] === 'remote' ? 'https://github.com/plateauapp/plateau-app.git' : 'lane/repos-create' });
+        console.log(JSON.stringify({ reads, result }));
+      `, pathToFileURL(resolve('scripts/lib/verify-lane-gate.mjs')).href, root, path, JSON.stringify(gate)],
+      { encoding: 'utf8', timeout: 10000, maxBuffer: 64 * 1024 });
+      expect(child.error).toBeUndefined();
+      expect(child.status, child.stderr).toBe(0);
+      const { reads, result } = JSON.parse(child.stdout);
+      expect(reads).toEqual([{ bufferBytes: maxPrepBytes + 1, offset: 0,
+        length: maxPrepBytes + 1, position: 0, bytesRead: maxPrepBytes + 1 }]);
+      expect(result).toMatchObject({ ok: false, status: 'selection-required', exitCode: 3,
+        hint: { reason: 'prep-limit' } });
+      expect(result.hint.argv).toBeUndefined();
+      expect(result.detail).toContain('supply --gate');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+  it('missing unreadable symlink and malformed prep evidence never suggests a gate', () => {
+    const root = mkdtempSync(join(tmpdir(), 'verify-prep-closed-'));
+    const runGit = args => args[0] === 'remote' ? 'https://github.com/plateauapp/plateau-app.git' : 'lane/repos-create';
+    const path = join(root, 'repos-create-prep-2026-11-26.md');
+    try {
+      for (const kind of ['missing', 'directory', 'symlink', 'malformed']) {
+        if (kind === 'directory') mkdirSync(path);
+        if (kind === 'symlink') symlinkSync(join(root, 'missing-target'), path);
+        if (kind === 'malformed') writeFileSync(path, '# no acceptance or scope');
+        const result = selectionRequiredResult({ gate, repo: root, prepDir: root, runGit });
+        expect(result.hint.argv, kind).toBeUndefined();
+        expect(result.hint.reason, kind).toBe({ missing: 'prep-missing', directory: 'prep-unreadable',
+          symlink: 'prep-unreadable', malformed: 'prep-invalid' }[kind]);
+        expect(result.detail, kind).toContain('supply --gate');
+        expect(result.exitCode, kind).toBe(3);
+        rmSync(path, { recursive: true, force: true });
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it.each([
+    { status: 0 }, { status: 3, stdout: '{bad json' }, { status: 3, signal: 'SIGTERM' },
+    { status: 3, error: new Error('timeout') },
+  ])('unknown or incomplete subprocess evidence cannot become a suggested gate: %j', raw => {
+    expect(selectionRefusalFromOutput(raw)).toBeNull();
+  });
+  it('contradictory stdout and stderr verdicts cannot supply a suggestion', () => {
+    const result = selectionRequiredResult({ gate, runGit: () => { throw new Error('no identity'); } });
+    expect(selectionRefusalFromOutput({ status: 3, stdout: JSON.stringify(result),
+      stderr: JSON.stringify({ ...result, sha: 'b'.repeat(40) }) })).toBeNull();
+  });
+});
+
 describe('explicitGateRefusal — an agent-supplied gate must be an affected-test shape', () => {
   it.each([
     'npx vitest related scripts/a.test.mjs scripts/b.mjs --run',
@@ -1378,7 +1470,36 @@ describe('alwaysRunPlan (item 99)', () => {
 
 describe('alwaysRunInventory (item 99): a guard counts as run only if vitest executed it', () => {
   const cwd = '/repo';
-  const report = (...names) => JSON.stringify({ testResults: names.map(name => ({ name, status: 'passed' })) });
+  // Vitest 1.x JSON reporter shape: file status alone is not assertion-execution evidence.
+  const report = (...names) => JSON.stringify({ testResults: names.map(name => ({ name, status: 'passed', assertionResults: [{ status: 'passed' }] })) });
+  it('a verify report entry with zero assertions is missing execution and fails the guard', () => {
+    const reportText = JSON.stringify({ testResults: [{ name: '/repo/a.test.mjs', status: 'passed', assertionResults: [] }] });
+    expect(alwaysRunInventory({ reportText, files: ['a.test.mjs'], cwd }))
+      .toEqual({ executed: [], missing: ['a.test.mjs'], reason: 'ok' });
+  });
+  it.each([
+    ['omitted', {}],
+    ['null', { assertionResults: null }],
+    ['string', { assertionResults: 'passed' }],
+    ['object', { assertionResults: { status: 'passed' } }],
+    ['null assertion', { assertionResults: [null] }],
+    ['missing status', { assertionResults: [{}] }],
+    ['unknown status', { assertionResults: [{ status: 'running' }] }],
+    ['skipped', { assertionResults: [{ status: 'skipped' }] }],
+    ['pending', { assertionResults: [{ status: 'pending' }] }],
+    ['todo', { assertionResults: [{ status: 'todo' }] }],
+    ['passed plus malformed', { assertionResults: [{ status: 'passed' }, null] }],
+    ['passed plus unknown', { assertionResults: [{ status: 'passed' }, { status: 'running' }] }],
+  ])('an invalid or unexecuted assertion inventory (%s) cannot certify a guard', (_, entry) => {
+    const reportText = JSON.stringify({ testResults: [{ name: '/repo/a.test.mjs', status: 'passed', ...entry }] });
+    expect(alwaysRunInventory({ reportText, files: ['a.test.mjs'], cwd }))
+      .toEqual({ executed: [], missing: ['a.test.mjs'], reason: 'ok' });
+  });
+  it.each(['passed', 'failed'])('a supported %s assertion proves execution independently of the file status', status => {
+    const reportText = JSON.stringify({ testResults: [{ name: '/repo/a.test.mjs', status, assertionResults: [{ status }] }] });
+    expect(alwaysRunInventory({ reportText, files: ['a.test.mjs'], cwd }))
+      .toEqual({ executed: ['a.test.mjs'], missing: [], reason: 'ok' });
+  });
   it('one included + one excluded guard: the excluded one is reported missing even though the run exited 0', () => {
     expect(alwaysRunInventory({ reportText: report('/repo/a/guard.test.mjs'), files: ['a/guard.test.mjs', 'b/excluded.test.mjs'], cwd }))
       .toEqual({ executed: ['a/guard.test.mjs'], missing: ['b/excluded.test.mjs'], reason: 'ok' });
@@ -1387,7 +1508,7 @@ describe('alwaysRunInventory (item 99): a guard counts as run only if vitest exe
     expect(alwaysRunInventory({ reportText: report('/repo/a.test.mjs', '/repo/b.test.mjs'), files: ['a.test.mjs', './b.test.mjs'], cwd }).missing).toEqual([]);
   });
   it("a red guard is still executed (the run's own exit code carries the failure)", () => {
-    const reportText = JSON.stringify({ testResults: [{ name: '/repo/a.test.mjs', status: 'failed' }] });
+    const reportText = JSON.stringify({ testResults: [{ name: '/repo/a.test.mjs', status: 'failed', assertionResults: [{ status: 'failed' }] }] });
     expect(alwaysRunInventory({ reportText, files: ['a.test.mjs'], cwd }).missing).toEqual([]);
   });
   it.each([undefined, null, '', 'not json', '{}', '{"testResults":"x"}', '[]'])('an absent or unreadable report (%j) proves nothing: every guard is missing', (reportText) => {

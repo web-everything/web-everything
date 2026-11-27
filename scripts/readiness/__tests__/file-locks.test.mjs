@@ -7,7 +7,7 @@
  *     • the ATOMIC fs primitives (acquireLockDir / reserve / heartbeat / release) against a real temp
  *       lock root, proving mkdir is the race gate and reserve applies the decision end-to-end.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, existsSync, utimesSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -17,6 +17,8 @@ import {
   reclaimDecision, wasReclaimed, planReservations,
   acquireLockDir, readLockEntry, heartbeat, heartbeatOwn, releaseLockDir, releaseLockDirIf, reserve, lockDirFor, draftSidecarFor, readClaimEvidence,
 } from '../file-locks.mjs';
+
+import { listFixDispatchClaimsStrict } from '../../conveyor/fix-claim-store.mjs';
 
 const T0 = Date.parse('2026-06-28T12:00:00.000Z');
 const iso = (ms) => new Date(ms).toISOString();
@@ -467,4 +469,86 @@ describe('claim sidecar audit regressions', () => {
       expect(() => readClaimEvidence(dir)).toThrow();
     },
   );
+});
+
+
+describe('strict raw claim evidence before sidecar folding', () => {
+  let root, dir, file, entry;
+  const hbName = owner => `hb.${createHash('sha256').update(owner).digest('hex').slice(0, 16)}`;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'claim-raw-first-'));
+    entry = makeLockEntry('fixture-owner', 'fixture-resource', iso(T0), null,
+      { repo: 'we', kind: 'fix', pr: 42 });
+    acquireLockDir(root, entry.path, entry);
+    dir = lockDirFor(root, entry.path);
+    file = join(dir, 'lock.json');
+    vi.spyOn(Date, 'now').mockReturnValue(T0 + LEASE_MS + 5000);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const retainAndRefuse = (root, file, raw) => {
+    expect(listFixDispatchClaimsStrict(root)).toEqual({ entries: [], unreadable: true });
+    expect(readFileSync(file, 'utf8')).toBe(raw);
+  };
+
+  it('newer sidecar cannot rehabilitate malformed raw lock timestamp', () => {
+    entry.heartbeatAt = '2026-06-28T12:00:00+00:00';
+    const raw = JSON.stringify(entry);
+    writeFileSync(file, raw);
+    writeFileSync(join(dir, hbName(entry.owner)), iso(T0 + LEASE_MS));
+    expect(() => readClaimEvidence(dir)).toThrow('Invalid raw lock timestamp');
+    retainAndRefuse(root, file, raw);
+  });
+
+  it.each([
+    ['noncanonical parseable', '2026-06-28T12:00:00+00:00'],
+    ['impossible', '2026-02-30T12:00:00Z'],
+    ['missing', undefined],
+    ['out-of-range', '+999999-01-01T00:00:00Z'],
+    ['non-string', 1],
+  ])('raw strict timestamp rejection precedes any sidecar read: %s', (_kind, at) => {
+    entry.heartbeatAt = at;
+    const raw = JSON.stringify(entry);
+    writeFileSync(file, raw);
+    writeFileSync(join(dir, hbName(entry.owner)), iso(T0 + LEASE_MS));
+    const readFile = vi.fn(readFileSync);
+    expect(() => readClaimEvidence(dir, { readFile })).toThrow('Invalid raw lock timestamp');
+    expect(readFile.mock.calls).toEqual([[file, 'utf8']]);
+    retainAndRefuse(root, file, raw);
+  });
+
+  it.each(['newer', 'older', 'malformed', 'wrong-owner'])(
+    'only valid owner heartbeat extends a valid raw lease: %s', kind => {
+      const at = kind === 'older' ? iso(T0 - 1000)
+        : kind === 'malformed' ? '2026-06-28T12:20:00+00:00' : iso(T0 + LEASE_MS);
+      writeFileSync(join(dir, hbName(kind === 'wrong-owner' ? 'other-owner' : entry.owner)), at);
+      const raw = readFileSync(file, 'utf8');
+      if (kind === 'malformed') {
+        expect(() => readClaimEvidence(dir)).toThrow('Invalid heartbeat evidence');
+        retainAndRefuse(root, file, raw);
+      } else {
+        const evidence = readClaimEvidence(dir).entry;
+        expect(evidence.heartbeatAt).toBe(kind === 'newer' ? at : entry.heartbeatAt);
+        expect(isLeaseExpired(evidence, T0 + LEASE_MS + 5000)).toBe(kind !== 'newer');
+        expect(listFixDispatchClaimsStrict(root)).toEqual({ entries: [evidence], unreadable: false });
+        expect(readFileSync(file, 'utf8')).toBe(raw);
+      }
+    },
+  );
+
+  it('unreadable raw evidence refuses before any sidecar read and retains the claim', () => {
+    const raw = readFileSync(file, 'utf8');
+    writeFileSync(join(dir, hbName(entry.owner)), iso(T0 + LEASE_MS));
+    const deny = () => { throw Object.assign(new Error('fixture read denied'), { code: 'EACCES' }); };
+    const readFile = vi.fn(deny);
+    expect(() => readClaimEvidence(dir, { readFile })).toThrow('fixture read denied');
+    expect(readFile.mock.calls).toEqual([[file, 'utf8']]);
+    // An absent raw record also refuses in the real scanner, even with a fresh sidecar.
+    rmSync(file);
+    expect(listFixDispatchClaimsStrict(root)).toEqual({ entries: [], unreadable: true });
+    expect(existsSync(dir)).toBe(true);
+    writeFileSync(file, raw);
+  });
 });

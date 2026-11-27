@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { describe, it, expect, vi } from 'vitest';
 import { createRequire } from 'node:module';
-import { createMemoryStorage } from '../core.mjs';
+import { createMemoryStorage, createEventLog, parseGithubEvent } from '../core.mjs';
 
 // Only the platform superclass is replaced. The constructor, migration and SQL
 // adapter below are imported from production, without extracting or copying them.
@@ -74,6 +74,48 @@ function assertPrune(adapter, { rows, limits, kept, highest }) {
 }
 
 describe.skipIf(!DatabaseSync)(`production adapter on real in-memory SQLite${sqliteUnavailable ? ` (${sqliteUnavailable})` : ''}`, () => {
+  it('SD4 receipt survives row pruning and reopening; SQLite failure rolls back row and receipt', () => {
+    const fixture = sqliteFixture();
+    try {
+      const object = new PrEventLog({ storage: fixture.storage }, { OCC_DEDUPE: 'shadow' });
+      const record = parseGithubEvent('check_run', { action: 'completed', repository: { full_name: 'o/r' },
+        check_run: { id: 7, head_sha: 'a', pull_requests: [{ number: 1 }] } }, { deliveryId: 'A', receivedAt: 1 });
+      object.append(record, 1);
+      fixture.db.exec('DELETE FROM events');
+      const reopened = new PrEventLog({ storage: fixture.storage }, { OCC_DEDUPE: 'shadow' });
+      expect(reopened.append(record, 2)).toEqual({ seq: 2, duplicate: false });
+      expect(reopened.read(1).events[0]).toMatchObject({ occ: 'gh/check_run/7/completed', occDuplicate: true });
+      fixture.db.exec("CREATE TRIGGER fail_receipt BEFORE INSERT ON receipts BEGIN SELECT RAISE(ABORT, 'receipt failure'); END");
+      const another = { ...record, id: 'B', occ: 'gh/check_run/8/completed', native: { id: 8, type: 'check_run' } };
+      expect(() => reopened.append(another, 3)).toThrow('receipt failure');
+      expect(reopened.read(0).head).toBe(2);
+      expect(reopened.storageAdapter.hasReceipt(another.occ)).toBe(false);
+      expect(reopened.storageAdapter.hasDelivery('B')).toBe(false);
+      fixture.db.exec('DROP TRIGGER fail_receipt');
+      expect(reopened.append(another, 4)).toEqual({ seq: 3, duplicate: false });
+      expect(reopened.read(2).events[0].occDuplicate).toBe(false);
+    } finally { fixture.db.close(); }
+  });
+
+  it('SD4 SQL receipt overflow uses sequence order and age; shadow mode is validated at the worker boundary', () => {
+    const fixture = sqliteFixture();
+    try {
+      expect(() => new PrEventLog({ storage: fixture.storage }, { OCC_DEDUPE: 'on' })).toThrow();
+      const adapter = fixture.adapter();
+      adapter.putReceipt('a', 100, 1); adapter.putReceipt('b', 90, 2); adapter.putReceipt('c', 110, 3);
+      expect(adapter.pruneReceipts(0, 2)).toBe(1);
+      expect(adapter.hasReceipt('a')).toBe(false);
+      expect(adapter.hasReceipt('b')).toBe(true);
+      expect(adapter.pruneReceipts(100, 2)).toBe(1);
+      expect(adapter.hasReceipt('b')).toBe(false);
+      expect(adapter.hasReceipt('c')).toBe(true);
+      const log = createEventLog(adapter, { occDedupe: 'off' });
+      log.append({ id: 'off', type: 'check_run', occ: 'new', native: { id: 1, type: 'check_run' } }, 1);
+      expect(adapter.hasReceipt('new')).toBe(false);
+      expect(log.read(0).events[0]).not.toHaveProperty('occ');
+    } finally { fixture.db.close(); }
+  });
+
   it('replay alone expires the default key and row windows through the production appendRuntime method', () => {
     const fixture = sqliteFixture();
     try {

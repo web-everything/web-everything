@@ -328,6 +328,119 @@ ${enable}`.replaceAll('/srv', srv).replaceAll('/etc/login.defs', join(dir, 'logi
         expect(events.indexOf('egress-installed')).toBeLessThan(events.lastIndexOf('check'));
       } else expect(readFileSync(sudoers, 'utf8')).toBe(oldSudoers);
     });
+  function freshInstall({missingUID = false} = {}) {
+    const dir = fixture(), srv = join(dir, 'srv'), pool = join(srv, 'forge-exec');
+    const log = join(dir, 'log'), sudoers = join(dir, 'sudoers'), passwd = join(dir, 'passwd');
+    mkdirSync(pool, {recursive: true});
+    writeFileSync(passwd, 'root:x:0:0::/root:/bin/bash\nops:x:1000:1000::/srv/ops:/bin/bash\nforge-exec:x:1001:1001::/:/usr/sbin/nologin\n');
+    writeFileSync(join(dir, 'login.defs'), 'SYS_UID_MIN 100\nSYS_UID_MAX 999\n');
+    const fake = (name, body) => writeFileSync(join(dir, name), '#!/bin/bash\n' + body + '\n', {mode: 0o755});
+    fake('getent', 'cat "$PASSWD"');
+    fake('id', `name=\${!#}; awk -F: -v name="$name" -v flag="$1" '
+$1 == name { if (flag == "-u") print $3; else if (flag == "-g") print $4; found=1 }
+END { exit !found }' "$PASSWD"`);
+    fake('useradd', `echo "account:$*" >> "$LOG"
+uid= home=
+while (($#)); do
+  case "$1" in
+    --uid) uid=$2; shift 2;;
+    --home-dir) home=$2; shift 2;;
+    *) name=$1; shift;;
+  esac
+done
+printf '%s:x:%s:%s::%s:/bin/bash\\n' "$name" "$uid" "$uid" "$home" >> "$PASSWD"`);
+    fake('systemctl', '[[ "$1" != show ]] || echo not-found');
+    for (const name of ['nft', 'chown', 'visudo']) fake(name, 'exit 0');
+    for (const name of ['apt-get', 'gh', 'git', 'pgrep', 'ps', 'launchctl']) fake(name, 'echo "unexpected host command: $0" >&2; exit 91');
+    writeFileSync(join(dir, 'forge-egress.sh'), 'echo "apply:$FORGE_EGRESS_UIDS" >> "$LOG"\nprintf "%s" "$FORGE_EGRESS_UIDS" > "$TABLE_UIDS"\n');
+    const runnerURL = new URL('../forge-exec-run.mjs', import.meta.url).href;
+    writeFileSync(join(dir, 'self-check.mjs'), `import {readFileSync} from 'node:fs';
+import {createRunner} from ${JSON.stringify(runnerURL)};
+const uids = readFileSync(process.env.TABLE_UIDS, 'utf8').trim().split(/\\s+/).map(Number)
+  .filter(uid => !process.env.MISSING_UID || uid !== 992);
+const stdout = 'table inet forge_exec_egress { set registry4 { type ipv4_addr } set registry6 { type ipv6_addr } chain slot_egress { oifname "lo" accept ip daddr @registry4 tcp dport 443 accept ip6 daddr @registry6 tcp dport 443 accept reject with icmpx 3 } chain output { type filter hook output priority 0; policy accept; meta skuid { ' + uids.join(', ') + ' } jump slot_egress } }';
+const runner = createRunner({testRoot: process.env.FIXTURE_ROOT, clock: () => 1800000000000,
+  testEgressProbe: () => ({code: 0, stdout})});
+try { for (const uid of process.argv.slice(2)) await runner.egressReady(Number(uid)); }
+catch (error) { console.error(error.code + ': ' + error.message); process.exitCode = 1; }
+`);
+    fake('node', `if [[ "$1" == egress-self-check ]]; then
+  shift
+  exec "$REAL_NODE" "$FIXTURE_ROOT/self-check.mjs" "$@"
+fi
+exec "$REAL_NODE" "$@"`);
+    const prefix = setup.slice(setup.indexOf('set -euo pipefail'), setup.indexOf('# Only ops may create run containers.'));
+    const directories = setup.match(/python3 - <<'DIRECTORIES'\n([\s\S]*?)\nDIRECTORIES/)[1];
+    const identities = `import os, pwd, grp, types
+original_fstat = os.fstat
+os.fstat = lambda fd: types.SimpleNamespace(st_uid=0, st_mode=original_fstat(fd).st_mode)
+os.fchown = lambda *args: None
+os.getgrouplist = lambda name, gid: [gid]
+def identity(name):
+    with open(os.environ['PASSWD']) as stream:
+        rows = [line.strip().split(':') for line in stream]
+    row = next(row for row in rows if row[0] == name)
+    return types.SimpleNamespace(pw_uid=int(row[2]), pw_gid=int(row[3]), gr_gid=int(row[3]), gr_mem=[])
+pwd.getpwnam = identity
+grp.getgrnam = identity
+`;
+    const prepare = setup.slice(setup.indexOf('sudoers_pending=$(mktemp'), setup.indexOf('if ! command -v rsync'));
+    const enable = setup.slice(setup.lastIndexOf('systemctl enable --now forge-exec-egress.timer'))
+      .replace('/usr/local/libexec/forge-egress.sh apply', 'bash "$(dirname -- "$0")/forge-egress.sh" apply')
+      .replace('/usr/local/libexec/forge-exec-run.mjs egress-self-check', 'node egress-self-check');
+    const script = `${prefix}
+python3 - <<'DIRECTORIES'
+${identities}${directories}
+DIRECTORIES
+${prepare}
+${enable}`.replaceAll('/srv', srv).replaceAll('/etc/login.defs', join(dir, 'login.defs'))
+      .replaceAll('/etc/sudoers.d/.forge-exec.XXXXXXXX', join(dir, '.sudoers.XXXXXXXX'))
+      .replaceAll('/etc/sudoers.d/forge-exec', sudoers);
+    writeFileSync(join(dir, 'forge-setup.sh'), script);
+    const runSetup = () => spawnSync('/bin/bash', [join(dir, 'forge-setup.sh')], {
+      cwd: dir, encoding: 'utf8', timeout: 10000, maxBuffer: 65536,
+      env: {PATH: dir + ':/usr/bin:/bin:/usr/local/bin', HOME: dir, TMPDIR: dir, FORGE_HOST: 'fresh-fixture',
+        REAL_NODE: process.execPath, FIXTURE_ROOT: dir, LOG: log, PASSWD: passwd,
+        TABLE_UIDS: join(dir, 'table-uids'), ...(missingUID ? {MISSING_UID: '1'} : {})},
+    });
+    return {runSetup, pool, log, sudoers};
+  }
+  const freshSlots = Array.from({length: 8}, (_, i) => 'slot-' + (i + 1));
+  const freshApply = 'apply:999 998 997 996 995 994 993 992';
+  it('first install 0 -> 8: real parser accepts the numeric listing, then slots publish', () => {
+    const {runSetup, pool, log, sudoers} = freshInstall();
+    const result = runSetup();
+    expect(result.status, result.stderr).toBe(0);
+    expect(readdirSync(pool).filter(name => name.startsWith('slot-')).sort()).toEqual(freshSlots);
+    expect(readdirSync(pool).some(name => name.startsWith('.disabled-slot-'))).toBe(false);
+    for (let k = 1; k <= 8; k++) expect(readFileSync(sudoers, 'utf8')).toContain('forge-exec-' + k);
+    expect(readFileSync(log, 'utf8').trim().split('\n').filter(line => line.startsWith('apply:')))
+      .toEqual([freshApply, freshApply]);
+  });
+  it('rerun on the installed 8-slot host is idempotent', () => {
+    const {runSetup, pool, log, sudoers} = freshInstall();
+    const first = runSetup();
+    expect(first.status, first.stderr).toBe(0);
+    const before = readFileSync(sudoers, 'utf8');
+    writeFileSync(log, '');
+    const second = runSetup();
+    expect(second.status, second.stderr).toBe(0);
+    const events = readFileSync(log, 'utf8').trim().split('\n');
+    expect(events.filter(line => line.startsWith('account:'))).toEqual([]);
+    expect(events.filter(line => line.startsWith('apply:'))).toEqual([freshApply, freshApply]);
+    expect(readdirSync(pool).filter(name => name.startsWith('slot-')).sort()).toEqual(freshSlots);
+    expect(readdirSync(pool).some(name => name.startsWith('.disabled-slot-'))).toBe(false);
+    expect(readFileSync(sudoers, 'utf8')).toBe(before);
+  });
+  it('listing missing UID 992 keeps the pool unpublished', () => {
+    const {runSetup, pool, sudoers} = freshInstall({missingUID: true});
+    const result = runSetup();
+    expect(result.status, result.stderr).toBe(1);
+    expect(result.stderr).toContain('do not cover slot UID 992');
+    expect(result.stderr).toContain('egress-uid-uncovered');
+    expect(readdirSync(pool).filter(name => name.startsWith('slot-'))).toEqual([]);
+    expect(existsSync(sudoers)).toBe(false);
+  });
   it('setup passes its effective count into both sweep and egress units', () => {
     expect(setup).toContain('Environment=FORGE_EXEC_SLOTS=$FORGE_EXEC_SLOTS');
     expect(setup).toContain(`printf 'Environment=FORGE_EXEC_SLOTS=%s\\n' "$FORGE_EXEC_SLOTS" >> /etc/systemd/system/forge-exec-sweep.service`);
