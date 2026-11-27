@@ -24,7 +24,8 @@ import { execFileSync } from 'node:child_process';
 import {
   existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync,
 } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { isBuiltin } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 import { defineJobKind, kindRegistry } from '../daemon-jobs.mjs';
@@ -47,6 +48,128 @@ export const DEPS_AS_JOB_ENV = 'WE_DAEMON_DEPS_AS_JOB';
 export const DEFAULT_DEPS_JOB_RETRY_MS = 5 * 60_000;
 const COMPLETE_MARKER = '.snapshot-complete';
 
+const SYNTAX_LIMITS = Object.freeze({ maxFiles: 128, maxBytes: 4 * 1024 * 1024, maxMs: 10_000 });
+const NON_CLAIMS = Object.freeze([
+  'invoked-function loads', 'eval', 'aliased createRequire', 'computed specifiers',
+]);
+
+/**
+ * Bounded syntax evidence, never a proof of the runtime import closure. Follow import/re-export
+ * declarations and top-level require/import targets regardless of indentation, refusing nonliteral
+ * specifiers as UNKNOWN. Keep the previous conservative non-indented heuristic, including quoted eval
+ * loads: runtime non-claims must never exempt a previously rejected load. No source is executed.
+ * All IO, paths, time and the TypeScript syntax API are supplied by the caller; this module
+ * must load without installed packages. Incomplete evidence throws with a repair/retry action.
+ * This opt-in inspection reports syntax evidence only and never executes the inspected source.
+ */
+export function inspectDepsImports(entry, { root: repoRoot, read, now, syntax: ts, ...limits } = {}) {
+  const { maxFiles, maxBytes, maxMs } = { ...SYNTAX_LIMITS, ...limits };
+  const refuse = (reason) => {
+    throw new Error(`Incomplete dependency syntax evidence: ${reason}; repair the input or inspection budget and retry; runtime assurance requires a separate isolated import trace.`.replace(/[\x00-\x1f\x7f-\x9f]/g, ' '));
+  };
+  if (typeof repoRoot !== 'string' || !isAbsolute(repoRoot) || typeof read !== 'function' || typeof now !== 'function' || typeof ts?.createSourceFile !== 'function') refuse('required-input-missing');
+  if (![maxFiles, maxBytes, maxMs].every((n) => Number.isSafeInteger(n) && n > 0)) refuse('invalid-budget');
+  const started = now();
+  let last = started;
+  const checkTime = () => {
+    const tick = now();
+    if (!Number.isFinite(started) || !Number.isFinite(tick) || tick < last) refuse('invalid-clock');
+    last = tick;
+    if (tick - started >= maxMs) refuse('time-budget');
+  };
+  const localPath = (absolute) => {
+    const path = relative(repoRoot, absolute);
+    if (!path || path === '..' || path.startsWith('../') || isAbsolute(path)) refuse(`outside-root: ${absolute}`);
+    return path;
+  };
+  const classifyAbsolute = (absolute, name) => {
+    const path = relative(repoRoot, absolute);
+    // Installed packages and external sources are dependencies, even when their
+    // specifier is a path or URL. Report them without reading outside the closure.
+    if (path === '..' || path.startsWith('../') || isAbsolute(path)
+      || resolve(absolute).split(/[\\/]/).includes('node_modules')) return { package: name };
+    return { local: localPath(absolute) };
+  };
+  const classify = (name, path) => {
+    if (isBuiltin(name)) return { builtin: true };
+    if (name.startsWith('./') || name.startsWith('../')) return { local: localPath(resolve(repoRoot, dirname(path), name)) };
+    if (isAbsolute(name)) return classifyAbsolute(name, name);
+    if (name.startsWith('file:')) {
+      let absolute;
+      try { absolute = fileURLToPath(name); } catch (error) { refuse(`invalid-file-url: ${error.message}`); }
+      return classifyAbsolute(absolute, name);
+    }
+    if (!name || /^[a-zA-Z][\w+.-]*:/.test(name)) refuse(`unsupported-specifier: ${name}`);
+    return { package: name };
+  };
+  const seen = new Set();
+  const packages = [];
+  let bytes = 0;
+  function walk(path, chain) {
+    checkTime();
+    if (seen.has(path)) return;
+    if (seen.size >= maxFiles) refuse('file-budget');
+    seen.add(path);
+    let text;
+    try { text = read(path, maxBytes - bytes); } catch (error) { refuse(`read-failed: ${path}: ${error.message}`); }
+    checkTime();
+    if (typeof text !== 'string') refuse(`read-failed: ${path}: missing source text`);
+    bytes += Buffer.byteLength(text, 'utf8');
+    if (bytes > maxBytes) refuse('byte-budget');
+    const source = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+    if (source.parseDiagnostics.length) refuse(`malformed-module: ${path}`);
+    const lines = text.split('\n');
+    const startupPackages = new Set();
+    const startupLocals = new Set();
+    const calls = [{ node: source, inFunction: false }];
+    while (calls.length) {
+      checkTime();
+      const { node, inFunction } = calls.pop();
+      if (ts.isCallExpression(node) && (node.expression.kind === ts.SyntaxKind.ImportKeyword
+        || (ts.isIdentifier(node.expression) && node.expression.text === 'require')
+        || (ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'require')
+        || (ts.isElementAccessExpression(node.expression) && ts.isStringLiteral(node.expression.argumentExpression)
+          && node.expression.argumentExpression.text === 'require'))) {
+        const line = lines[source.getLineAndCharacterOfPosition(node.getStart(source)).line];
+        const argument = node.arguments[0];
+        if (!inFunction || /^\S/.test(line)) {
+          if (!argument || !ts.isStringLiteral(argument)) refuse(`unknown-specifier: ${path}`);
+          const target = classify(argument.text, path);
+          if (target.local) startupLocals.add(target.local);
+          if (target.package) startupPackages.add(target.package);
+        }
+      }
+      const childInFunction = inFunction || ts.isFunctionLike(node);
+      ts.forEachChild(node, (child) => { calls.push({ node: child, inFunction: childInFunction }); });
+    }
+    for (const line of lines) {
+      checkTime();
+      if (!/^\S/.test(line) || /^\/\//.test(line)) continue;
+      for (const match of line.matchAll(/\b(?:require|import)\s*\(\s*(['"])([^'"]+)\1/g)) {
+        checkTime();
+        const target = classify(match[2], path);
+        if (target.local) startupLocals.add(target.local);
+        if (target.package) startupPackages.add(target.package);
+      }
+    }
+    for (const name of startupPackages) packages.push([...chain, path, name].join(' -> '));
+    for (const target of startupLocals) walk(target, [...chain, path]);
+    for (const statement of source.statements) {
+      checkTime();
+      if (!ts.isImportDeclaration(statement) && !ts.isExportDeclaration(statement)) continue;
+      const specifier = statement.moduleSpecifier;
+      if (!specifier) continue;
+      if (!ts.isStringLiteral(specifier)) refuse(`unreadable-import: ${path}`);
+      const target = classify(specifier.text, path);
+      if (target.local) walk(target.local, [...chain, path]);
+      else if (target.package) packages.push([...chain, path, target.package].join(' -> '));
+    }
+  }
+  walk(localPath(resolve(repoRoot, entry)), []);
+  checkTime();
+  return { packages, visited: [...seen], nonClaims: NON_CLAIMS, assurance: 'bounded syntax only; runtime import closure unproven' };
+}
+
 /**
  * The ONE argv the install job runs `npm` with. `--ignore-scripts` is load-bearing: the daemon runs unattended with
  * the operator's gh/git credentials, so a lockfile change that lands on main (possibly merged by the drain itself)
@@ -67,7 +190,10 @@ export const DEPS_JOB_KIND = defineJobKind({
   entry: 'scripts/lib/daemon-rebuild/deps-job.mjs',
   codeMode: 'readonly-tree',
   serial: true,
-  // The child needs no packages itself (node built-ins + this repo's scripts only): it BUILDS the store.
+  // The child builds the store without installed packages. deps-job-no-packages.test.mjs checks its
+  // bounded static import/re-export graph via inspectDepsImports, plus a conservative load-line heuristic. This is syntax
+  // evidence only: invoked-function loads, eval and aliased createRequire are outside its proof.
+  // Stronger runtime-import assurance needs a separately reviewed, isolated import trace.
   nodeModules: false,
   maxAttempts: 2,
 });
