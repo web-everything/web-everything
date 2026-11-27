@@ -3671,6 +3671,13 @@ export function planReconcile({
         const admission = admitCiHeal({ reason: 'required', failingRequired: failing.required,
           rollup: pr.statusCheckRollup, mainState });
         if (!admission.admitted) {
+          if (pr?.codeqlFailure && (admission.reason === 'main-red' || admission.reason === 'x-merge-gate-unreadable')) {
+            if (admission.reason === 'x-merge-gate-unreadable') notes.push({
+              kind: admission.reason, prNumber, text: `PR #${prNumber}: ${admission.why}`,
+            });
+            planCodeqlHeal(owedMainRuleFact);
+            continue;
+          }
           refuse(admission.reason, { ...withPhase, why: admission.why });
           if (admission.reason === 'x-merge-gate-unreadable') notes.push({
             kind: admission.reason, prNumber, text: `PR #${prNumber}: ${admission.why}`,

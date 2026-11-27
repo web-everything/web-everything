@@ -105,3 +105,37 @@ describe('CI-heal admission at the planner push sites', () => {
       'real', ['real']);
   });
 });
+
+describe('CodeQL repair stays reachable under required-check admission (red-team 7531)', () => {
+  const codeql = { checkRunId: '456', headSha: HEAD, alerts: [{ rule: 'js/xss', path: 'src/a.mjs', line: 3, message: 'x' }] };
+  const opts = { requiredChecks: ['test', 'merge-gate'], mainRedWindows: openWindow };
+  const rollup = (g = gate('main')) => [check('test', 'SUCCESS'), g, check('CodeQL')];
+  const codeqlRow = plan => expect(plan.dispatch).toContainEqual(expect.objectContaining({ kind: 'ci-heal', reason: 'codeql', codeql }));
+  it('main-only merge-gate hold with main red still plans the CodeQL repair', () => {
+    const plan = run(pr({ codeqlFailure: codeql, statusCheckRollup: rollup() }), opts);
+    heal(plan, 'real', ['real']);
+    codeqlRow(plan);
+    expect(plan.refusals).not.toContainEqual(expect.objectContaining({ prNumber: 7483, kind: 'main-red' }));
+  });
+  it('unreadable merge-gate still plans the CodeQL repair and surfaces the unreadable note', () => {
+    const plan = run(pr({ codeqlFailure: codeql, statusCheckRollup: rollup(gate('unreadable')) }), opts);
+    heal(plan, 'real', ['real']);
+    codeqlRow(plan);
+    expect(plan.notes).toContainEqual(expect.objectContaining({ kind: 'x-merge-gate-unreadable', prNumber: 7483 }));
+    expect(plan.refusals).not.toContainEqual(expect.objectContaining({ prNumber: 7483, kind: 'x-merge-gate-unreadable' }));
+  });
+  it('a CodeQL FAILURE row without codeqlFailure evidence stays main-red', () => {
+    const plan = run(pr({ statusCheckRollup: rollup() }), opts);
+    noHeal(plan);
+    refusal(plan, 'main-red');
+    const unreadable = run(pr({ statusCheckRollup: rollup(gate('unreadable')) }), opts);
+    noHeal(unreadable);
+    refusal(unreadable, 'x-merge-gate-unreadable');
+  });
+  it('a non-required failing check without alert evidence does not dispatch', () => {
+    const plan = run(pr({ statusCheckRollup: [check('test', 'SUCCESS'), gate('main'), check('lint')] }), opts);
+    noHeal(plan);
+    expect(plan.dispatch.filter(row => row.kind === 'ci-heal' || row.reason === 'codeql')).toEqual([]);
+    refusal(plan, 'main-red');
+  });
+});
