@@ -31,7 +31,7 @@ import { readSettings } from './settings-files.mjs';
 import { readLockEntry, heartbeat } from '../readiness/file-locks.mjs';
 // Keep fix-run's static graph independent of the dispatch wrappers: use the light claim store.
 import { fixDispatchClaimRoot, fixDispatchResource } from '../conveyor/fix-claim-store.mjs';
-import { postRequiresReviewMark } from './fix-review-floor.mjs';
+import { postRequiresReviewMark } from './fix-review-mark.mjs'; // leaf — fix-review-floor would close an import cycle via ai-routing
 import { isUnderTest } from './under-test.mjs';
 
 const platformPreferences = () => {

@@ -5,14 +5,10 @@
  * Ruling 7: Read-to-spawn serialization and drain acceptance carry are follow-ups, outside this guarantee.
  */
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
-import { execFileSyncThrottled } from './gh-throttle.mjs';
-import { ghRepoSlug } from './constellation-repos.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
-export const REQUIRES_REVIEW_MARK = '<!-- dispatch requires-review: true -->';
-export const renderRequiresReviewMark = ({ kind, rung }) => [
-  'conveyor requires-review — a critical repair was routed to this PR', '',
-  `This ${kind} repair (rung \`${rung ?? 'default'}\`) was routed **requiresReview**: every later review dispatched on this PR uses the Opus reviewer.`,
-  REQUIRES_REVIEW_MARK].join('\n');
+import { REQUIRES_REVIEW_MARK } from './fix-review-mark.mjs';
+// The mark renderer/poster is a leaf (fix-review-mark.mjs) so fix-slot-borrow never imports the thread reader (import cycle).
+export { REQUIRES_REVIEW_MARK, renderRequiresReviewMark, postRequiresReviewMark } from './fix-review-mark.mjs';
 export function threadRequiresReview(comments) {
   if (!Array.isArray(comments)) return true;
   return comments.some(c => isTrustedMarkerAuthor(c) && typeof c?.body === 'string'
@@ -23,7 +19,3 @@ export function reviewCareFloor(readThread, { repo, pr }) {
   try { return threadRequiresReview(readThread({ repo, pr })); } catch { return true; }
 }
 export const completeThreadReader = exec => ({ repo, pr }) => readCompletePrComments(Number(pr), { repo, ...(exec ? { exec } : {}) });
-export function postRequiresReviewMark({ repo, pr, kind, rung, exec = execFileSyncThrottled }) {
-  exec('gh', ['pr', 'comment', String(pr), '--repo', ghRepoSlug(repo), '--body', renderRequiresReviewMark({ kind, rung })],
-    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 1024 * 1024 });
-}
