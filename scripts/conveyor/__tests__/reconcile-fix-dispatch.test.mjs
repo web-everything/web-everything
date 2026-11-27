@@ -1681,10 +1681,17 @@ describe('runReconcileFixDispatch — read reconcile-pass, plan, assign a lane, 
         unsupportedPath,
         reconcile: () => ({ dispatch: [], refusals: [] }),
         checkStaleness: FRESH,
-      fetchItemlessDiffPaths: () => [],
+        fetchItemlessDiffPaths: () => [],
+        loadItems: () => [], pickFreeLanes: () => [],
+        listBuildClaims: () => [], listFixClaims: () => [],
+        prStack: null, prStackSettings: {}, priorityShadow: null,
+        fixSettings: { ...FIX_SETTINGS_DEFAULTS },
+        readMainRedPriorityRecord: () => null,
+        now: 1000, clock: () => 1000, stepNow: () => 1000, stepLog: () => {},
       });
       expect(result).toEqual({
         handled: 0, deferred: [], nextCursor: null,
+        launchUncertain: [],
         dispatched: [], refusals: [], scopeRanks: [], reconcileRefusals: 0, reconcileRefusalDetails: [],
       });
     } finally { rmSync(dir, { recursive: true, force: true }); }
