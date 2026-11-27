@@ -334,7 +334,9 @@ export function createAgentActivityReader({
   // if it were still running (dispatch-lane-io.mjs#defaultListAgents; PR #2715 review). Same as runner-activity-io.
   listAgents = () => defaultListAgents({ exec }),
   listJobs,
-  root = REPO_ROOT,
+  // Resolve the dispatch-owned default at read time: import-time callers can
+  // construct this reader before dispatch-lane-io has initialized REPO_ROOT.
+  root,
   projectsDir = claudeProjectsDir(),
   completionsDir = resolveCompletionsDir(),
   codexHome = resolveCodexHome(),

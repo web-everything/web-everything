@@ -59,13 +59,16 @@ export function enrichRows(rawRows, { isAlive = pidAlive, stat = statSync } = {}
  */
 export function createLiveWorkCollector({
   now = Date.now,
-  readActivity = createAgentActivityReader(),
+  readActivity,
   collectQueue = collectHeavyQueue,
   isAlive = pidAlive,
   stat = statSync,
   prToCard = {},
 } = {}) {
   return () => {
+    // The default collector is constructed during module loading, which can reach
+    // this module before agent-activity-io has initialized through a dispatch cycle.
+    readActivity ??= createAgentActivityReader();
     const { rows: rawRows } = readActivity({ all: true });
     const heavyQueue = assessHeavyQueue(collectQueue());
     const rows = enrichRows(rawRows, { isAlive, stat });
