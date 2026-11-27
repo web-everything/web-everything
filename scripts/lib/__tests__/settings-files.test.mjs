@@ -495,8 +495,11 @@ describe('the real layout (we:scripts/settings/ + legacy dispatch-settings.json)
     // settings-registry.test.mjs covers feature-file values, shared ownership and fail-closed checked reads.
     // The generated-doc merge resolver and its soak break only LIST the settings files as regeneration inputs
     // (a digest of paths); neither reads a setting value from the legacy file.
+    // The no-code answer soak test only NAMES the legacy path inside its fs shim, to hand back an empty `{}` for it;
+    // it reads no setting value from the file either.
     const declarationInventories = ['scripts/lib/settings-registry.mjs', 'scripts/lib/daemon-rebuild/advisory-merge.mjs',
-      'scripts/conveyor/soak/breaks/settings-registry-doc-conflict-regenerated.mjs'];
+      'scripts/conveyor/soak/breaks/settings-registry-doc-conflict-regenerated.mjs',
+      'scripts/conveyor/soak/breaks/nocode-answer-resumed-fixer-reviews.soak.test.mjs'];
     const root = join(SETTINGS_DIR, '..', '..');
     const stripComments = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
     const direct = [];
