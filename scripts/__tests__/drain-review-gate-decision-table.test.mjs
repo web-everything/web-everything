@@ -1,8 +1,10 @@
-import { describe, it, expect, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { describe, it, expect, vi, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
+import { readFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { decideDrainReviewGate, buildDrainVerdicts } from '../merge-ai-prs.mjs';
+import { decideDrainReviewGate, buildDrainVerdicts, drainPinnedCwd } from '../merge-ai-prs.mjs';
+import drainSource from '../merge-ai-prs.mjs?raw';
 
 // #6021 — decision table for decideDrainReviewGate: every review label × workflow / non-workflow change list,
 // with the intended drain action pinned, plus the "is this listing trusted?" cases the hold depends on.
@@ -163,6 +165,130 @@ describe('decideDrainReviewGate — production wiring', () => {
   it('both drain call sites pass the listing evidence through workflowReadOptions', () => {
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
     expect(src).toMatch(/const workflowReadOptions = \(v\) => \(\{ files: v\.listedFiles, filesComplete: v\.listedFilesComplete,\s*listedHeadSha: v\.listedHeadSha,/);
+    expect(src.match(/\.\.\.workflowReadOptions\(v\)/g)).toHaveLength(2);
+  });
+});
+
+describe('decideDrainReviewGate — cross-repo listing with a rename (FUI-DRAIN-CHANGED-FILES)', () => {
+  const XREPO = 'frontier-ui/frontierui';
+  let root, SIB, localCwd, elsewhere, cwdSpy;
+  beforeAll(() => {
+    root = mkdtempSync(join(tmpdir(), 'drain-pinned-cwd-'));
+    SIB = join(root, 'frontierui');
+    localCwd = join(root, 'web-everything');
+    elsewhere = join(root, 'elsewhere');
+    for (const dir of [SIB, localCwd, elsewhere, join(root, 'scripts')]) mkdirSync(dir);
+    // Import the code under test as data, then inject it into a temporary repo; no checkout reads in this suite.
+    writeFileSync(join(root, 'scripts/merge-ai-prs.mjs'), drainSource);
+  });
+  beforeEach(() => {
+    cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(localCwd);
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-11-27T12:00:00Z'));
+  });
+  afterEach(() => { cwdSpy.mockRestore(); vi.useRealTimers(); });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  const untrusted = { repo: XREPO, local: false, cwd: undefined, files: PLAIN, filesComplete: false, listedHeadSha: HEAD };
+  const trustedWf = { repo: XREPO, local: false, cwd: undefined, files: WORKFLOW, filesComplete: true, listedHeadSha: HEAD };
+  const pinnedRead = (calls) => calls.find(([cmd, args]) => cmd === 'git' && args[0] === 'diff');
+  const fetchCall = (calls) => calls.find(([cmd, args]) => cmd === 'git' && args[0] === 'fetch');
+  const recording = (calls, opts = {}) => (cmd, args, o) => { calls.push([cmd, args, o]); return execFor(opts)(cmd, args); };
+
+  // Initial read of an untrusted listing (Ruling 4a).
+  it('C1 verified sibling + known base: pinned read in that clone at the head, plain diff merges', () => {
+    const calls = [];
+    const result = gate(LABELS.accepted, { ...untrusted, pinnedCwd: SIB, defaultBranch: 'main', exec: recording(calls) });
+    const read = pinnedRead(calls);
+    expect(read?.[2]?.cwd).toBe(SIB);
+    expect(read[1].join(' ')).toContain(HEAD);
+    expect(read[1]).toContain('--no-renames');
+    expect(result.action).toBe('merge');
+  });
+  it('C2 the pinned read shows a workflow path → park for a human, never merge', () => {
+    expect(gate(LABELS.accepted, { ...untrusted, pinnedCwd: SIB, defaultBranch: 'main', exec: execFor({ diff: WORKFLOW }) }))
+      .toMatchObject({ action: 'park', workflowEditHold: true });
+  });
+  it('C3 a failed pinned read in the sibling clone defers, never merges', () => {
+    const exec = vi.fn((cmd, args) => { if (cmd === 'git') throw new Error('bad object'); return execFor()(cmd, args); });
+    expect(gate(LABELS.accepted, { ...untrusted, pinnedCwd: SIB, defaultBranch: 'main', exec }))
+      .toMatchObject({ action: 'defer', reason: expect.stringContaining('workflow-edit change list unreadable') });
+  });
+  it('C4 a non-main base is fetched and diffed as given', () => {
+    const calls = [];
+    gate(LABELS.accepted, { ...untrusted, pinnedCwd: SIB, defaultBranch: 'develop', exec: recording(calls) });
+    expect(fetchCall(calls)?.[1]).toContain('+refs/heads/develop:refs/remotes/origin/develop');
+    expect(fetchCall(calls)?.[2]?.cwd).toBe(SIB);
+  });
+  it('C5 the acceptance head wins over a different listed head', () => {
+    const calls = [];
+    gate(LABELS.accepted, { ...untrusted, listedHeadSha: OTHER, pinnedCwd: SIB, defaultBranch: 'main', exec: recording(calls) });
+    expect(pinnedRead(calls)[1].join(' ')).toContain(HEAD);
+    expect(pinnedRead(calls)[1].join(' ')).not.toContain(OTHER);
+  });
+  it('C6 no head to pin to (no acceptance, no listed head) → defer, no git call, never merge', () => {
+    const calls = [];
+    const result = gate(LABELS.none, { ...untrusted, listedHeadSha: null, pinnedCwd: SIB, defaultBranch: 'main', exec: recording(calls) });
+    expect(calls.some(([cmd]) => cmd === 'git')).toBe(false);
+    expect(result).toMatchObject({ action: 'defer', applyLabel: null });
+  });
+  it.each([
+    ['C7a no pinnedCwd (bare cwd only)', () => ({ cwd: localCwd })],
+    ['C7b pinnedCwd but unknown base', () => ({ pinnedCwd: SIB, defaultBranch: null })],
+    ['C7c pinnedCwd empty', () => ({ pinnedCwd: '', defaultBranch: 'main' })],
+  ])('%s → no git read, defer with the no-file-count reason', (_name, extra) => {
+    const calls = [];
+    const result = gate(LABELS.accepted, { ...untrusted, ...extra(), exec: recording(calls) });
+    expect(pinnedRead(calls)).toBeUndefined();
+    expect(result).toMatchObject({ action: 'defer', applyLabel: null, reason: expect.stringContaining('no file count') });
+  });
+  it('C8 policy off: no pinned read and no workflow hold (existing exception kept)', () => {
+    const calls = [];
+    const result = gate(LABELS.accepted, { ...untrusted, pinnedCwd: SIB, defaultBranch: 'main', workflowEditSetting: 'off', exec: recording(calls) });
+    expect(pinnedRead(calls)).toBeUndefined();
+    expect(result.action).toBe('merge');
+  });
+
+  // Recheck of a trusted listing that shows a workflow path (Ruling 4b): only a good, non-empty net diff replaces it.
+  it('R1 net diff plain and non-empty → the listing hold clears in the sibling clone', () => {
+    const calls = [];
+    const result = gate(LABELS.accepted, { ...trustedWf, pinnedCwd: SIB, defaultBranch: 'main', exec: recording(calls, { diff: PLAIN }) });
+    expect(pinnedRead(calls)?.[2]?.cwd).toBe(SIB);
+    expect(result.action).toBe('merge');
+  });
+  it.each([
+    ['R2 net diff shows the workflow path', { exec: execFor({ diff: WORKFLOW }) }],
+    ['R3 net diff empty', { exec: execFor({ diff: [] }) }],
+    ['R4 net diff read fails', { exec: vi.fn((cmd, args) => { if (cmd === 'git') throw new Error('bad object'); return execFor()(cmd, args); }) }],
+  ])('%s → the listing hold stands: park, never merge', (_name, extra) => {
+    expect(gate(LABELS.accepted, { ...trustedWf, pinnedCwd: SIB, defaultBranch: 'main', ...extra }))
+      .toMatchObject({ action: 'park', workflowEditHold: true });
+  });
+  it('R5 unknown base: no recheck, the listing hold stands', () => {
+    const calls = [];
+    expect(gate(LABELS.accepted, { ...trustedWf, pinnedCwd: SIB, defaultBranch: null, exec: recording(calls, { diff: PLAIN }) }))
+      .toMatchObject({ action: 'park', workflowEditHold: true });
+    expect(pinnedRead(calls)).toBeUndefined();
+  });
+
+  it('L1 local repo behaviour is unchanged: pinnedCwd is ignored when local', () => {
+    const calls = [];
+    gate(LABELS.accepted, { files: PLAIN, filesComplete: false, listedHeadSha: HEAD, local: true, cwd: localCwd, pinnedCwd: elsewhere, exec: recording(calls) });
+    expect(pinnedRead(calls)?.[2]?.cwd).toBe(localCwd);
+  });
+
+  // Production wiring (Acceptance 2): the drain passes only the verified sibling, through both gate call sites.
+  it('W1 drainPinnedCwd: local → none (sibling not asked); absent / origin-mismatch / provision-failed (null) → none; present → its dir', () => {
+    const sib = vi.fn(() => SIB);
+    expect(drainPinnedCwd('web-everything/web-everything', { isLocalRepo: () => true, siblingCloneDir: sib })).toBeUndefined();
+    expect(sib).not.toHaveBeenCalled();
+    expect(drainPinnedCwd(XREPO, { isLocalRepo: () => false, siblingCloneDir: () => null })).toBeUndefined();
+    expect(drainPinnedCwd(XREPO, { isLocalRepo: () => false, siblingCloneDir: () => '' })).toBeUndefined();
+    expect(drainPinnedCwd(XREPO, { isLocalRepo: () => false, siblingCloneDir: () => SIB })).toBe(SIB);
+  });
+  it('W2 workflowReadOptions carries pinnedCwd from drainPinnedCwd, and both gate call sites still spread it', () => {
+    const src = readFileSync(join(root, 'scripts/merge-ai-prs.mjs'), 'utf8');
+    const body = src.match(/const workflowReadOptions = \(v\) => \(\{[\s\S]*?\}\);/)?.[0] ?? '';
+    expect(body).toContain('pinnedCwd: drainPinnedCwd(v.repo, { isLocalRepo, siblingCloneDir })');
     expect(src.match(/\.\.\.workflowReadOptions\(v\)/g)).toHaveLength(2);
   });
 });

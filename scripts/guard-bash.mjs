@@ -4689,8 +4689,9 @@ export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLi
     // `shellTokens` yields `{text, quoted, op}` records, not strings — test `.text`, or every token
     // stringifies to `[object Object]` and the rule denies nothing at all.
     const bodyish = (seg) => shellTokens(seg).some((t) => BODY_FLAG.test(t.text));
-    if (atCommand(/^gh\s+pr\s+edit\b/) && bodyish(s))
-      return 'a raw `gh pr edit --body`/`-b`/`-F` drops the `authored-by-actor` stamp pr-land wrote at open, which disarms the self-clear refusal in review-independence.mjs (this is how #1162 landed on its own author\'s clearance). Use `node scripts/pr-body-edit.mjs --pr=<n> --body-file=<f>`, which carries the stamp across. Sanctioned override: prefix `PR_BODY_STAMP_OK=1`.';
+    const GH_GLOBAL = String.raw`(?:\s+(?:-R\s*\S+|--(?:repo|hostname)(?:=\S+|\s+\S+)))*`;
+    if (atCommand(new RegExp(String.raw`^gh${GH_GLOBAL}\s+pr\s+edit\b`)) && bodyish(s))
+      return 'a raw `gh pr edit --body`/`-b`/`-F` drops the `authored-by-actor` stamp pr-land wrote at open, which disarms the self-clear refusal in review-independence.mjs (this is how #1162 landed on its own author\'s clearance). To add a section use `node scripts/pr-body-edit.mjs --pr=<n> --append-file=<f> [--section=<name>]`; to replace the body use `node scripts/pr-body-edit.mjs --pr=<n> --body-file=<f>`, which carries the stamp across. Sanctioned override: prefix `PR_BODY_STAMP_OK=1`.';
     // The REST route to the same field. `gh api` writes it with `-f body=…`/`--field`/`--raw-field`, and the
     // graphql form names the mutation instead of a path.
     if (atCommand(/^gh\s+api\b/)
