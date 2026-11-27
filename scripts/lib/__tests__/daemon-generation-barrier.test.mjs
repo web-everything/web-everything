@@ -1,18 +1,20 @@
 import { describe, expect, it } from 'vitest';
 import { spawn } from 'node:child_process';
-import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import ts from 'typescript';
 import { keepAliveScript } from '../test-keepalive.mjs';
+import * as barrier from '../daemon-generation-barrier.mjs';
 import {
-  awaitGroupDeath, decidePromotion, mayHandOver, settleDecision, scanNewSessionSpawns, MERGE_CAPABLE_SPAWN_ALLOWLIST,
+  awaitGroupDeath, decidePromotion, mayHandOver, settleDecision,
 } from '../daemon-generation-barrier.mjs';
 
-const here = dirname(fileURLToPath(import.meta.url));
-const root = join(here, '..', '..'); // scripts/
 const realSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const errCode = (code) => Object.assign(new Error(code), { code });
+
+it('exports only the group probe and evidence-gated handover API', () => {
+  expect(Object.keys(barrier).sort()).toEqual([
+    'DEFAULT_GH_REQUEST_TIMEOUT_MS', 'GROUP_DEATH_TIMEOUT_MS', 'GROUP_PROBE_MS', 'HANDOVER_EXIT_CODE',
+    'awaitGroupDeath', 'decidePromotion', 'mayHandOver', 'settleDecision',
+  ]);
+});
 
 // Host capability, measured with raw kill(-pgid, 0) and NOT with the code under test: a container whose pid 1 never
 // reaps leaves an exited orphan as a zombie, so a real group never reads ESRCH there (the Forge exec container).
@@ -118,29 +120,39 @@ describe('awaitGroupDeath', () => {
 });
 
 describe('decidePromotion', () => {
-  const good = { exitCode: 77, groupDeath: 'dead', recordWritten: true, inFlight: 0, nowMs: 1000, expectedDigest: 'd1', candidate: { pid: 9, alive: true, ready: true, codeDigest: 'd1' } };
+  const good = { exitCode: 77, groupDeath: 'dead', escapeEvidence: 'confirmed', recordWritten: true, inFlight: 0, nowMs: 1000, expectedDigest: 'd1', candidate: { pid: 9, alive: true, ready: true, codeDigest: 'd1' } };
+  const clean = { ...good, nowMs: 0, expectedDigest: 'd', candidate: { pid: 4242, alive: true, ready: true, codeDigest: 'd' } };
   it('promotes a clean handover with no wait', () => {
     expect(decidePromotion(good)).toMatchObject({ promote: true, waitMs: 0, reconcileFirst: false });
   });
+  it.each([undefined, null, 'unknown', 'Confirmed', true, 'confirmed '])('refuses without confirmed escape evidence (%s)', (escapeEvidence) => {
+    expect(decidePromotion({ ...clean, escapeEvidence })).toEqual({ promote: false, reason: 'escape-unconfirmed' });
+  });
+  it('promotes a clean handover only with confirmed escape evidence', () => {
+    expect(decidePromotion(clean)).toEqual({ promote: true, to: clean.candidate, waitMs: 0, reconcileFirst: false });
+  });
+  it('checks group death before escape evidence', () => {
+    expect(decidePromotion({ ...good, groupDeath: 'alive', escapeEvidence: undefined })).toEqual({ promote: false, reason: 'group-alive' });
+  });
   it.each([
-    ['group alive', { groupDeath: 'alive' }],
-    ['group unknown (EPERM)', { groupDeath: 'unknown' }],
-    ['group missing', { groupDeath: undefined }],
-    ['record not written', { recordWritten: false }],
-    ['record missing', { recordWritten: undefined }],
-    ['candidate dead', { candidate: { ...good.candidate, alive: false } }],
-    ['candidate not ready', { candidate: { ...good.candidate, ready: false } }],
-    ['candidate missing', { candidate: undefined }],
-    ['digest mismatch', { candidate: { ...good.candidate, codeDigest: 'zz' } }],
-    ['expected digest missing', { expectedDigest: undefined }],
-    ['in-flight unknown', { inFlight: undefined }],
-    ['in-flight negative', { inFlight: -1 }],
-    ['exit code unknown', { exitCode: undefined }],
-    ['exit code NaN', { exitCode: NaN }],
-    ['candidate pid 0', { candidate: { ...good.candidate, pid: 0 } }],
-    ['candidate pid negative', { candidate: { ...good.candidate, pid: -5 } }],
-  ])('refuses on %s', (_n, patch) => {
-    expect(decidePromotion({ ...good, ...patch })).toMatchObject({ promote: false });
+    ['group alive', { groupDeath: 'alive' }, 'group-alive'],
+    ['group unknown (EPERM)', { groupDeath: 'unknown' }, 'group-death-unknown'],
+    ['group missing', { groupDeath: undefined }, 'group-death-unknown'],
+    ['record not written', { recordWritten: false }, 'record-not-written'],
+    ['record missing', { recordWritten: undefined }, 'record-not-written'],
+    ['candidate dead', { candidate: { ...good.candidate, alive: false } }, 'candidate-dead'],
+    ['candidate not ready', { candidate: { ...good.candidate, ready: false } }, 'candidate-not-ready'],
+    ['candidate missing', { candidate: undefined }, 'candidate-dead'],
+    ['digest mismatch', { candidate: { ...good.candidate, codeDigest: 'zz' } }, 'digest-mismatch'],
+    ['expected digest missing', { expectedDigest: undefined }, 'digest-mismatch'],
+    ['in-flight unknown', { inFlight: undefined }, 'in-flight-unknown'],
+    ['in-flight negative', { inFlight: -1 }, 'in-flight-unknown'],
+    ['exit code unknown', { exitCode: undefined }, 'exit-code-unknown'],
+    ['exit code NaN', { exitCode: NaN }, 'exit-code-unknown'],
+    ['candidate pid 0', { candidate: { ...good.candidate, pid: 0 } }, 'candidate-dead'],
+    ['candidate pid negative', { candidate: { ...good.candidate, pid: -5 } }, 'candidate-dead'],
+  ])('refuses on %s', (_n, patch, reason) => {
+    expect(decidePromotion({ ...good, ...patch })).toEqual({ promote: false, reason });
   });
   it('an unclean blue (exit != 77, or in flight) promotes only with a settle wait and reconcile-first', () => {
     for (const patch of [{ exitCode: 1 }, { exitCode: 137 }, { inFlight: 2 }]) {
@@ -186,191 +198,4 @@ describe('mayHandOver', () => {
     ['paused field missing', { paused: undefined }],
     ['currentChild field missing', { currentChild: undefined }],
   ])('refuses with %s', (_n, patch) => expect(mayHandOver({ ...ok, ...patch }).ok).toBe(false));
-});
-
-describe('new-session spawn allowlist', () => {
-  it.each([
-    'const opts = Object.fromEntries([["detached", true], ["stdio", "inherit"]]); spawn(process.execPath, ["-e", workerSource], opts)',
-    'spawn(process.execPath, [], Object.fromEntries(entries))',
-    'spawn(process.execPath, [], Object.assign({}, supplied))',
-    'spawn(process.execPath, [], JSON.parse(serialized))',
-    'spawn(process.execPath, [], makeOptions())',
-    'spawn(process.execPath, [], { ...supplied, stdio: "inherit" })',
-    'spawn(process.execPath, [], { [key]: true })',
-    'spawn(process.execPath, [], { __proto__: supplied })',
-    'spawn(process.execPath, opts)',
-    'spawnSync(process.execPath, [], opts)',
-    'fork(workerPath, [], opts)',
-    'execFile(process.execPath, [], opts, callback)',
-    'execFileSync(process.execPath, [], opts)',
-    'exec(command, opts, callback)',
-    'execSync(command, opts)',
-    'childProcess.spawn(process.execPath, [], opts)',
-    'import { spawn as launch } from "node:child_process"; launch(process.execPath, [], opts)',
-    'const launch = spawn; launch(process.execPath, [], opts)',
-    'let launch; launch = spawn; launch(process.execPath, [], opts)',
-    'const launch = spawn.bind(null); launch(process.execPath, [], opts)',
-    'const { spawn: launch } = require("node:child_process"); launch(process.execPath, [], opts)',
-    'import * as cp from "node:child_process"; cp[method](process.execPath, [], opts)',
-    'import { spawn as launch } from "node:child_process"; function run(launch = null) {} launch(process.execPath, [], opts)',
-    'spawn.call(null, process.execPath, [], opts)',
-    'spawn.apply(null, callArgs)',
-    'spawn(...callArgs)',
-  ])('requires inspectable options before handover: %s', (source) => {
-    expect(scanNewSessionSpawns(source).length).toBeGreaterThan(0);
-  });
-  it('does not exempt constructed options even for an allowlisted command', () => {
-    expect(scanNewSessionSpawns('spawn("osascript", [], options)', { file: 'branch-sync.mjs' }).length).toBeGreaterThan(0);
-  });
-  it.each([
-    'spawn(process.execPath)',
-    'spawn(process.execPath, ["worker.mjs"])',
-    'spawn(process.execPath, args, { stdio: "inherit", env, cwd })',
-    'spawn(process.execPath, { stdio: "inherit" })',
-    'execFile(process.execPath, args, { timeout: 1000 }, callback)',
-    'exec(command, { timeout: 1000 }, callback)',
-  ])('accepts inspectable inherited-group options: %s', (source) => {
-    expect(scanNewSessionSpawns(source)).toEqual([]);
-  });
-  it('declares exactly the three known non-merging-or-disclosed spawns', () => {
-    expect(MERGE_CAPABLE_SPAWN_ALLOWLIST.map((e) => e.name)).toEqual(['osascript', 'deps-job', 'drain-followup-job']);
-  });
-  it.each([
-    ["spawn('gh', a, { detached: true })"],
-    ["spawn('gh', a, { detached })"],
-    ["spawn('gh', a, { stdio, detached })"],
-    ["spawn('gh', a, { ['detached']: true })"],
-    ["spawn('gh', a, { 'detached' : opts.d })"],
-    ["spawn('setsid', ['gh'])"],
-    ["subprocess.Popen(x, start_new_session=True)"],
-    ["// osascript\nspawn('gh', a, { detached: true })"],
-    ["spawn('gh', a, { detached: true }) // osascript"],
-    ["/* deps-job */ spawn('gh', a, { detached: true })"],
-    ["// lane/* base\nspawn('gh', a, { detached: true });\n/* real comment */"],
-    ["const glob = 'lane/*';\nspawn('gh', a, { detached: true });\n/* real comment */"],
-    ['const glob = `lane/*`;\nspawn("gh", a, { detached: true });\n/* real comment */'],
-    ["opts.detached = true; spawn('gh', a, opts)"],
-    ["opts['detached'] = true; spawn('gh', a, opts)"],
-    ["opts[`detached`] = true; spawn('gh', a, opts)"],
-    ["opts['de' + 'tached'] = true; spawn('gh', a, opts)"],
-    ["opts.detached ||= true; spawn('gh', a, opts)"],
-    ["opts.detached++; spawn('gh', a, opts)"],
-    ["++opts['detached']; spawn('gh', a, opts)"],
-    ["[opts.detached] = [true]; spawn('gh', a, opts)"],
-    ["({ value: opts.detached } = source); spawn('gh', a, opts)"],
-    ["Object.defineProperty(opts, 'detached', { value: true }); spawn('gh', a, opts)"],
-    ["Reflect.set(opts, 'detached', true); spawn('gh', a, opts)"],
-    ["spawn('gh', a, { get detached() { return true; } })"],
-    ["spawn('gh', a, { ['de' + 'tached']: true })"],
-    ["spawn('gh', a, { ['de\\u0074ached']: true })"],
-    ["spawn('launch' + 'ctl', ['submit', '-l', 'job', '--', 'gh'])"],
-    ['spawn(`launch${"ctl"}`, ["submit"])'],
-    ['spawn("sh", ["-c", `launchctl submit -l job -- ${command}`])'],
-    ['spawn("sh", ["-c", `${prefix} launchctl submit -- ${command}`])'],
-    ['spawn("sh", ["-c", `${prefix} launchctl submit -- gh`])'],
-    ["spawn('launchctl', ['submit', '-l', 'job', '--', 'gh', 'pr', 'merge'])"],
-    ["spawn('/bin/sh', ['-c', 'launchctl submit -l job -- gh pr merge'])"],
-    ["setpgid(0, 0)"],
-    ["setpgrp()"],
-    ["// lane/* base\r\nspawn('gh', a, { detached: true });\r\n/* real comment */"],
-    ["// lane/* base\u2028spawn('gh', a, { detached: true });\u2029/* real comment */"],
-    ['const url = "https://example.test/lane/*";\nspawn("gh", a, { detached: true });\n/* real comment */'],
-    ['const glob = /lane\\/\\*/;\nspawn("gh", a, { detached: true });\n/* real comment */'],
-    ['const glob = `lane/* ${spawn("gh", a, { detached: true })}`;\n/* real comment */'],
-    ['spawn(process.execPath, ["-e", "spawn(\'gh\', a, { detached: true })"])'],
-    ['const childSource = "opts[\'detached\'] = true; spawn(\'gh\', a, opts)"'],
-  ])('flags %s', (src) => expect(scanNewSessionSpawns(src)).toHaveLength(1));
-  it.each(['osascript', 'deps-job'])('rejects a detached spawn adjacent to %s', (command) => {
-    const file = command === 'osascript' ? 'branch-sync.mjs' : 'deps-job.mjs';
-    const src = `spawn('${command}', a, { detached: true });\nspawn('gh', a, { detached: true });`;
-    expect(scanNewSessionSpawns(src, { file })).toEqual([{ line: 2, text: 'detached: true' }]);
-    expect(scanNewSessionSpawns(`const kind = '${command}';\nlog(kind);\nspawn('gh', a, { detached: true });`, { file })).toHaveLength(1);
-    expect(scanNewSessionSpawns(src.replace('\n', ' '), { file })).toHaveLength(1);
-  });
-  it('never borrows an exemption from another argument or a containing spawn', () => {
-    const file = 'branch-sync.mjs';
-    expect(scanNewSessionSpawns("spawn('gh', ['osascript'], { detached: true })", { file })).toHaveLength(1);
-    expect(scanNewSessionSpawns("spawn('osascript', [spawn('gh', a, { detached: true })], { detached: true })", { file })).toHaveLength(1);
-    expect(scanNewSessionSpawns("spawn('osascript', a, { detached: opts.detached = true })", { file })).toHaveLength(1);
-    expect(scanNewSessionSpawns("spawn('osascript', a, { detached: launchctl() })", { file })).toHaveLength(1);
-  });
-  it('refuses exemptions without the declared file and exact command', () => {
-    const src = "spawn('osascript', a, { detached: true })";
-    expect(scanNewSessionSpawns(src)).toHaveLength(1);
-    expect(scanNewSessionSpawns(src, { file: 'other.mjs' })).toHaveLength(1);
-    expect(scanNewSessionSpawns("spawn('gh', ['deps-job'], { detached: true })", { file: 'deps-job.mjs' })).toHaveLength(1);
-  });
-  it.each([undefined, null, 'spawn("gh", a, { detached: true'])('fails closed on unreadable source %s', (source) => {
-    expect(scanNewSessionSpawns(source)).toHaveLength(1);
-  });
-  it('exempts only an allowlisted spawn on its own code line, and prose is not a spawn', () => {
-    expect(scanNewSessionSpawns("spawn('osascript', a, { detached: true })", { file: 'branch-sync.mjs' })).toHaveLength(0);
-    expect(scanNewSessionSpawns("branch || 'detached HEAD'; const detached = x == null;")).toHaveLength(0);
-    // the follow-up allowlist entry applies to its own file only
-    const src = 'spawn(process.execPath, [entryPath], { cwd, env, detached: true })';
-    expect(scanNewSessionSpawns(src, { file: 'daemon-jobs-runtime.mjs' })).toHaveLength(0);
-    expect(scanNewSessionSpawns(src, { file: 'other.mjs' })).toHaveLength(1);
-    expect(scanNewSessionSpawns(`${src}; spawn('gh', a, { detached: true })`, { file: 'daemon-jobs-runtime.mjs' })).toHaveLength(1);
-    expect(scanNewSessionSpawns("spawn(process.execPath, [entryPath, 'gh'], { detached: true })", { file: 'daemon-jobs-runtime.mjs' })).toHaveLength(1);
-  });
-  it('detects canary detached spawns throughout every real scanned file', () => {
-    const files = ['merge-ai-prs.mjs', 'lib/enqueue-on-event.mjs', 'lib/drain-followup-job.mjs', 'lib/daemon-jobs-runtime.mjs'];
-    for (const file of files) {
-      const source = readFileSync(join(root, file), 'utf8');
-      const tree = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
-      expect(tree.parseDiagnostics, file).toEqual([]);
-      const positions = [];
-      const collect = (node) => {
-        if (ts.isBlock(node) || ts.isSourceFile(node)) positions.push(...node.statements.map((s) => s.getStart(tree)));
-        ts.forEachChild(node, collect);
-      };
-      collect(tree);
-      const sorted = [...new Set(positions)].sort((a, b) => a - b);
-      const stride = Math.max(1, Math.floor(sorted.length / 16));
-      for (const position of sorted.filter((_p, i) => i % stride === 0)) {
-        const canary = "spawn('gh', ['pr', 'merge'], { detached: true });\n";
-        const injected = source.slice(0, position) + canary + source.slice(position);
-        const line = tree.getLineAndCharacterOfPosition(position).line + 1;
-        expect(scanNewSessionSpawns(injected, { file: file.split('/').pop() }), `${file}:${line}`)
-          .toContainEqual({ line, text: 'detached: true' });
-      }
-    }
-  });
-  it.each([0, 2])('requires additional evidence for opaque forwarding in the real source inventory (prefix lines: %i)', (prefixLines) => {
-    const files = ['merge-ai-prs.mjs', 'lib/enqueue-on-event.mjs', 'lib/drain-followup-job.mjs', 'lib/daemon-jobs-runtime.mjs'];
-    // the sibling repo's daemon.mjs is out of reach for a hermetic test: its scan is the live PGID probe (acceptance 6)
-    // These are REFUSALS, not allowlist entries. The old empty-result expectation incorrectly certified
-    // opaque bags; S1.4 cannot enable exit handover until these sites have inspectable options/evidence.
-    const unresolved = [
-      'exec(cmd, args, { cwd, ...opts })',
-      'exec(cmd, args, { cwd, ...opts })',
-      "exec('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []),\n    '--json', 'headRefOid'], opts)",
-      "exec('gh', GH_ARGV.readPrReviews(slug, pr), opts)",
-      'execFileSync(cmd, args, { ...opts, timeout: 60_000 })',
-      'execFileSync(cmd, args, { ...opts, timeout: 60_000 })',
-      'execFileSync(file, args, { ...opts, cwd })',
-      'execFileSync(cmd, args, { cwd: escCwd, ...opts })',
-    ];
-    for (const f of files) {
-      const original = readFileSync(join(root, f), 'utf8');
-      // A hashbang is valid only at the start of the source. Shift the body without moving it.
-      const prefixOffset = original.startsWith('#!') ? original.indexOf('\n') + 1 : 0;
-      const source = original.slice(0, prefixOffset) + '\n'.repeat(prefixLines) + original.slice(prefixOffset);
-      const tree = ts.createSourceFile(f, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
-      expect(tree.parseDiagnostics, `${f}: line-shift fixture must remain valid JavaScript`).toEqual([]);
-      // Locate each audited call independently of the scanner, preserving duplicate occurrences.
-      // Unrelated line shifts must not change the inventory, but missing/new calls must still fail.
-      let offset = 0;
-      const expected = f === 'merge-ai-prs.mjs' ? unresolved.map((text) => {
-        const position = source.indexOf(text, offset);
-        expect(position, `${f}: missing audited call ${text}`).toBeGreaterThanOrEqual(0);
-        offset = position + text.length;
-        return {
-          line: source.slice(0, position).split('\n').length,
-          text: `Uninspectable process options; inspect before permitting handover: ${text}`,
-        };
-      }) : [];
-      expect(scanNewSessionSpawns(source, { file: f.split('/').pop() }), f).toEqual(expected);
-    }
-  });
 });

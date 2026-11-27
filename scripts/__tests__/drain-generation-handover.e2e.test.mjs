@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawn, spawnSync } from 'node:child_process';
-import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, watch, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
-import { awaitGroupDeath, decidePromotion, scanNewSessionSpawns } from '../lib/daemon-generation-barrier.mjs';
+import { awaitGroupDeath, decidePromotion } from '../lib/daemon-generation-barrier.mjs';
 import { acquireDrainLease, releaseDrainLease, localRepoSlug } from '../readiness/drain-lock.mjs';
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -26,13 +26,13 @@ async function startBlue(sink) {
 }
 
 const candidate = { pid: 4321, alive: true, ready: true, codeDigest: 'd1' };
-const decide = (groupDeath) => decidePromotion({ exitCode: 77, groupDeath, recordWritten: true, inFlight: 0, nowMs: 0, expectedDigest: 'd1', candidate });
+const decide = (groupDeath, escapeEvidence) => decidePromotion({ exitCode: 77, groupDeath, escapeEvidence, recordWritten: true, inFlight: 0, nowMs: 0, expectedDigest: 'd1', candidate });
 
 /** Green acts only after `go`, which exists only if the barrier said so. `awaitDeath` is injectable for the mutation proof. */
 async function runHandover(sink, awaitDeath) {
   const pgid = await startBlue(sink);
   const groupDeath = await awaitDeath({ pgid, identity: 'spawn-nonce', probeIdentity: () => null, killGroup: (p, s) => process.kill(-p, s), sleep, probeMs: 20, timeoutMs: 15000 });
-  const verdict = decide(groupDeath);
+  const verdict = decide(groupDeath, 'confirmed'); // Test stand-in for S3's approved evidence producer.
   if (verdict.promote) appendFileSync(sink, 'green-merge\n');
   return { groupDeath, verdict, lines: readFileSync(sink, 'utf8').trim().split('\n') };
 }
@@ -54,7 +54,7 @@ const canReap = await (async () => {
 })();
 
 describe('generation handover (ordered exit)', () => {
-  it('refuses constructed options even when a detached worker outlives a clean blue group', async () => {
+  it('refuses a clean blue whose detached worker outlives its group without escape evidence', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'gen-constructed-'));
     const sink = join(dir, 'effects'), ready = join(dir, 'ready'), release = join(dir, 'release');
     writeFileSync(sink, '');
@@ -78,9 +78,8 @@ describe('generation handover (ordered exit)', () => {
       setInterval(() => { if (fs.existsSync(${JSON.stringify(ready)})) process.exit(77); }, 10);
       setTimeout(() => process.exit(2), 10000);
     `;
-    const violations = scanNewSessionSpawns(source);
-    // Execute the rejected source only as a negative fixture: ESRCH alone cannot certify this program.
-    const leader = spawn(process.execPath, ['-e', source], { detached: true, stdio: 'ignore' });
+    // All child IO and cwd belong to this fixture; no checkout, host config or external commands are used.
+    const leader = spawn(process.execPath, ['-e', source], { cwd: dir, env: { HOME: dir, TMPDIR: dir }, detached: true, stdio: 'ignore' });
     killers.push(leader.pid);
     expect(await new Promise((resolve, reject) => { leader.once('exit', resolve); leader.once('error', reject); })).toBe(77);
     const workerPid = Number(readFileSync(ready, 'utf8'));
@@ -89,13 +88,17 @@ describe('generation handover (ordered exit)', () => {
     const groupDeath = await awaitGroupDeath({ pgid: leader.pid, identity: 'blue-spawn', probeIdentity: () => null,
       killGroup: (pgid, signal) => process.kill(-pgid, signal), sleep, probeMs: 20, timeoutMs: 2000 });
     expect(groupDeath).toBe('dead');
-    expect(decide(groupDeath).promote).toBe(true); // proves why the source scan is a mandatory prerequisite
-    if (violations.length === 0 && decide(groupDeath).promote) appendFileSync(sink, 'green-first-effect\n');
+    expect(() => process.kill(workerPid, 0)).not.toThrow(); // ESRCH did not include the escaped worker.
+    const verdict = decide(groupDeath);
+    const appended = new Promise((resolve, reject) => {
+      const watcher = watch(sink, () => { clearTimeout(timer); watcher.close(); resolve(); });
+      const timer = setTimeout(() => { watcher.close(); reject(new Error('detached-worker-effect-timeout')); }, 3000);
+      watcher.once('error', (error) => { clearTimeout(timer); watcher.close(); reject(error); });
+    });
     writeFileSync(release, 'go');
-    const deadline = Date.now() + 3000;
-    while (!readFileSync(sink, 'utf8').includes('blue-late-effect') && Date.now() < deadline) await sleep(10);
+    await appended;
     expect(readFileSync(sink, 'utf8')).toBe('blue-late-effect\n');
-    expect(violations.length).toBeGreaterThan(0);
+    expect(verdict).toEqual({ promote: false, reason: 'escape-unconfirmed' });
   }, 20_000);
 
   it.runIf(process.platform === 'darwin')('requires the real ordering proof to run on the Darwin drain host', () => {
