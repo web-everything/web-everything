@@ -57,7 +57,7 @@
  */
 
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
-import { readdirSync, readFileSync, existsSync, mkdirSync, lstatSync, fstatSync, openSync, writeSync, closeSync, constants as fsConstants } from 'node:fs';
+import { readdirSync, readFileSync, existsSync, mkdirSync, fstatSync, openSync, writeSync, closeSync, constants as fsConstants } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -591,26 +591,42 @@ export function errorDebugLogPath(env = process.env) {
   return env.REVIEW_LOOP_CLI_DEBUG_LOG || join(env.HOME || '.', '.claude', 'review-loop-cli-debug.log');
 }
 // @test-only-export-ok: inject descriptor operations without mocking the worker's guarded node:fs module.
-export function writeErrorDebugLog(site, error, env = process.env, io = { openSync, fstatSync, closeSync }) {
+export function writeErrorDebugLog(site, error, env = process.env, io = {}) {
+  const ops = { mkdirSync, openSync, fstatSync, writeSync, closeSync,
+    getuid: () => typeof process.getuid === 'function' ? process.getuid() : null,
+    now: () => new Date().toISOString(), ...io };
+  let fd = null;
+  let reason = 'debug-log-open-refused';
+  let result;
   try {
     const path = errorDebugLogPath(env);
-    mkdirSync(dirname(path), { recursive: true });
-    // Fail closed: never append raw text to a symlink, a non-regular file, a file we do not own, or one that
-    // is group/world accessible. A missing file is created 0600 atomically (open mode), never chmod'd after.
-    let st = null;
-    try { st = lstatSync(path); } catch { st = null; }
-    if (st && (!st.isFile() || st.isSymbolicLink() || (st.mode & 0o077) !== 0
-      || (typeof process.getuid === 'function' && st.uid !== process.getuid()))) return;
-    const fd = io.openSync(path, fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW, 0o600);
-    try {
-      // The path may have been replaced (or created) since lstat. Check the opened file before writing secrets.
-      const opened = io.fstatSync(fd);
-      if (!opened.isFile() || (opened.mode & 0o077) !== 0
-        || (typeof process.getuid === 'function' && opened.uid !== process.getuid())) return;
-      writeSync(fd, `${new Date().toISOString()} ${site} ${String(error?.stack ?? error?.message ?? error)}\n`); // error-class-allowed
+    ops.mkdirSync(dirname(path), { recursive: true });
+    if (!Number.isInteger(fsConstants.O_NOFOLLOW) || fsConstants.O_NOFOLLOW === 0) throw new Error('no no-follow open');
+    // One atomic open, then validate THAT descriptor immediately before writing. NONBLOCK also refuses a
+    // substituted FIFO without waiting for a reader. No path pre-check can authorize a later open.
+    fd = ops.openSync(path, fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT
+      | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK, 0o600);
+    if (!Number.isInteger(fd) || fd < 0) throw new Error('invalid debug descriptor');
+    reason = 'debug-log-metadata-refused';
+    const opened = ops.fstatSync(fd);
+    const uid = ops.getuid();
+    if (opened?.isFile() !== true || !Number.isInteger(opened.mode) || (opened.mode & 0o077) !== 0
+      || !Number.isInteger(uid) || uid < 0 || opened.uid !== uid) throw new Error('unsafe debug descriptor');
+    reason = 'debug-log-write-refused';
+    const detail = String(error?.stack ?? error?.message ?? error); // error-class-allowed
+    const record = `${ops.now()} ${site} ${detail}\n`
+      + (error?.stdout != null ? `stdout: ${String(error.stdout)}\n` : '')
+      + (error?.stderr != null ? `stderr: ${String(error.stderr)}\n` : '');
+    const written = ops.writeSync(fd, record);
+    result = written === Buffer.byteLength(record) ? { ok: true } : { ok: false, reason };
+  } catch { result = { ok: false, reason }; }
+  finally {
+    if (Number.isInteger(fd) && fd >= 0) {
+      try { ops.closeSync(fd); }
+      catch { result = { ok: false, reason: 'debug-log-close-refused' }; }
     }
-    finally { io.closeSync(fd); }
-  } catch { /* debug log is best effort; skipping it never changes the printed class */ }
+  }
+  return result;
 }
 /** `<site>:<class>` — the only form of an error that may reach output. */
 export function describeErrorClass(site, error, { log = writeErrorDebugLog } = {}) {
@@ -622,11 +638,39 @@ function refusalClass(site, lines) {
   return describeErrorClass(site, new Error((lines ?? []).join(' / ')));
 }
 
+/** Keep the original class even when the private diagnostic cannot be saved. Never echo logging errors. */
+function reviewErrorDiagnostic(site, error, { log = writeErrorDebugLog, correlationId = randomUUID } = {}) {
+  const errorClass = classifyErrorClass(error);
+  const id = correlationId();
+  let debugLog = 'debug-log-write-refused';
+  try {
+    const saved = log(`${site} correlation-id=${id}`, error);
+    const reasons = ['debug-log-open-refused', 'debug-log-metadata-refused', 'debug-log-write-refused', 'debug-log-close-refused'];
+    debugLog = saved?.ok === true ? 'written'
+      : reasons.includes(saved?.reason) ? saved.reason : 'debug-log-status-refused';
+  } catch { /* The original class remains authoritative; the fallback below is operator-visible. */ }
+  return { error: `${site}:${errorClass}`, correlationId: id, debugLog };
+}
+
+function diagnosticLines(diagnostic) {
+  return [`error: ${diagnostic.error}`, `correlation-id: ${diagnostic.correlationId}`,
+    ...(diagnostic.debugLog === 'written' ? []
+      : [`${diagnostic.debugLog}; inspect private debug logging before retrying.`])];
+}
+
+/** Error records may themselves contain raw sink text. Render only the classified diagnostic on failure. */
+function renderReviewOutcome({ outcome, json = false, declaration = null }) {
+  if (!outcome.reviewError) return renderOutcome({ outcome, json, declaration });
+  const payload = { runId: outcome.run.id, op: outcome.run.op, stopped: outcome.stopped, ...outcome.reviewError };
+  return { code: 1, lines: json ? [JSON.stringify(payload, null, 2)] : diagnosticLines(outcome.reviewError) };
+}
+
 /** Executable boundary: report replay refusals and other thrown errors with a nonzero CLI result. */
 export async function runReviewLoopCliOnce(options) {
   try { return await runReviewLoopOnce(options); }
   catch (error) {
-    return { code: 1, lines: [`error: ${describeErrorClass('error-class', error)}`], run: null, stopped: 'refused' };
+    const diagnostic = reviewErrorDiagnostic('error-class', error, options?.diagnostics);
+    return { code: 1, lines: diagnosticLines(diagnostic), run: null, stopped: 'refused' };
   }
 }
 
@@ -674,6 +718,7 @@ export async function runReviewLoopOnce({
   advisorySettings = resolvePostAcceptAdvisorySettings, recordAdvisoryShadow = recordPostAcceptAdvisoryShadow,
   recordAdvisoryLoops = recordPostAcceptAdvisoryLoops, recordAdvisoryRating = recordPostAcceptAdvisoryRating,
   advisoryLog = line => console.error(line),
+  diagnostics, clock = Date.now,
 } = {}) {
   const parsed = parseOperationArgv(declaration, argv);
   const requiresCleanReferrals = acceptPolicy.value.unattendedAcceptRequiresCleanReferrals;
@@ -702,8 +747,14 @@ export async function runReviewLoopOnce({
     // is reported on the outcome (`acceptHeld`), so a filing branch never claims an accept that did not happen.
     const acceptHeld = o.resume?.value === 'accept' ? acceptHold(o.run, { filed: true }) : null;
     const resume = acceptHeld ? null : o.resume;
-    return driveRun({ ...o, resume, autoConfirm: guardedConfirm, parallelJudges, seatLanes })
+    return driveRun({ ...o, resume, autoConfirm: guardedConfirm, parallelJudges, seatLanes, clock })
       .then(async (out) => {
+        if (out.error != null) {
+          // Classify at the producer before telemetry, rendering, or either filing/accept continuation.
+          const stopped = ['effect-halted', 'effect-refused', 'step-refused', 'juror-timeout'].includes(out.stopped)
+            ? out.stopped : 'refused';
+          return { ...out, stopped, reviewError: reviewErrorDiagnostic('drive-run', out.error, diagnostics) };
+        }
         if (out?.run) {
           try {
             const resolved = advisorySettings({ log: advisoryLog });
@@ -934,7 +985,8 @@ export async function runReviewLoopOnce({
     const outcome = { run, stopped: 'effect-halted', applied: [], error: new Error(
       `effect ${unresolvedAdvisory.key} (${unresolvedAdvisory.type}) has an UNKNOWN outcome; `
       + 'it is not idempotent and cannot be replayed. Resolve the saved effect outcome by hand first.') };
-    return { ...renderOutcome({ outcome, json: parsed.control.json, declaration }), run, stopped: outcome.stopped };
+    outcome.reviewError = reviewErrorDiagnostic('drive-run', outcome.error, diagnostics);
+    return { ...renderReviewOutcome({ outcome, json: parsed.control.json, declaration }), run, stopped: outcome.stopped };
   }
 
   // THE ONE LINE THIS FILE ADDS TO THE DRIVE CALL: an UNATTENDED policy, and `attemptedBy: 'agent'` so a
@@ -947,14 +999,15 @@ export async function runReviewLoopOnce({
   if (outcome.stopped === 'juror-timeout') {
     const seat = outcome.run.seatTimeouts.findLast(s => s.step === outcome.run.pending?.step);
     const { lens, provider, model, head, timeoutMs, wallMs } = seat;
-    const payload = { stopped: 'juror-timeout', runId: outcome.run.id, lens, provider, model, head, timeoutMs, wallMs };
+    const payload = { stopped: 'juror-timeout', runId: outcome.run.id, lens, provider, model, head, timeoutMs, wallMs,
+      ...outcome.reviewError };
     return { code: 1, lines: [JSON.stringify(payload, null, 2)], run: outcome.run, ...payload };
   }
 
   if (outcome.stopped === 'confirm') {
     const hold = acceptHold(outcome.run);
     if (hold) {
-      const rendered = renderOutcome({ outcome, json: parsed.control.json, declaration });
+      const rendered = renderReviewOutcome({ outcome, json: parsed.control.json, declaration });
       return { ...rendered, lines: parsed.control.json ? rendered.lines
         : [...rendered.lines, `Unattended accept parked: ${hold}.`], run: outcome.run, stopped: outcome.stopped };
     }
@@ -1004,7 +1057,7 @@ export async function runReviewLoopOnce({
     }
 
     if (filingError) {
-      const rendered = renderOutcome({ outcome, json: parsed.control.json, declaration });
+      const rendered = renderReviewOutcome({ outcome, json: parsed.control.json, declaration });
       if (parsed.control.json) {
         const payload = { ...JSON.parse(rendered.lines[0]), preventionFilingError: filingError };
         return { code: 1, lines: [JSON.stringify(payload, null, 2)], run: outcome.run, stopped: outcome.stopped };
@@ -1036,7 +1089,7 @@ export async function runReviewLoopOnce({
     const acceptedOutcome = await drive({
       run: outcome.run, registry, store, sinks, judge: activeJudge, resume: acceptResume, autoConfirm, attemptedBy: 'agent',
     });
-    const rendered = renderOutcome({ outcome: acceptedOutcome, json: parsed.control.json, declaration });
+    const rendered = renderReviewOutcome({ outcome: acceptedOutcome, json: parsed.control.json, declaration });
     if (parsed.control.json) {
       const payload = {
         ...JSON.parse(rendered.lines[0]),
@@ -1099,7 +1152,7 @@ export async function runReviewLoopOnce({
       filingError = describeErrorClass('filing-failed', e);
     }
     if (filingError) {
-      const rendered = renderOutcome({ outcome, json: parsed.control.json, declaration });
+      const rendered = renderReviewOutcome({ outcome, json: parsed.control.json, declaration });
       if (parsed.control.json) {
         const payload = { ...JSON.parse(rendered.lines[0]), roundCardsFilingError: filingError };
         return { code: 1, lines: [JSON.stringify(payload, null, 2)], run: outcome.run, stopped: outcome.stopped };
@@ -1128,7 +1181,7 @@ export async function runReviewLoopOnce({
       run: accepting, registry, store, sinks, judge: activeJudge, resume: { step: outcome.run.pending.step, value: 'accept' },
       autoConfirm, attemptedBy: 'agent',
     });
-    const rendered = renderOutcome({ outcome: acceptedOutcome, json: parsed.control.json, declaration });
+    const rendered = renderReviewOutcome({ outcome: acceptedOutcome, json: parsed.control.json, declaration });
     const summaryLine = `round-cards: ${repo}#${pr} round ${decision.round ?? '?'} (${decision.rule}${decision.k ? `, K=${decision.k}` : ''}): `
       + `${acceptedOutcome.acceptHeld ? 'NOT accepted' : 'accepted'}; ${decision.cards.length} finding(s) carded → ${where}`
       + `${alreadyFiled ? ' (already filed)' : ''}`;
@@ -1246,7 +1299,7 @@ export async function runReviewLoopOnce({
       };
       return { code: filingError ? 1 : baseCode, lines: [JSON.stringify(payload, null, 2)], run: outcome.run, stopped: outcome.stopped };
     }
-    const rendered = renderOutcome({ outcome, json: false, declaration });
+    const rendered = renderReviewOutcome({ outcome, json: false, declaration });
     return {
       code: filingError ? 1 : rendered.code,
       lines: [
@@ -1262,7 +1315,7 @@ export async function runReviewLoopOnce({
     };
   }
 
-  const rendered = renderOutcome({ outcome, json: parsed.control.json, declaration });
+  const rendered = renderReviewOutcome({ outcome, json: parsed.control.json, declaration });
   // THE LOOP STATUS, NAMED IN WORDS, on a stop this file did not special-case (a bounce that landed, a stop
   // exhausted at the cap, an ordinary human-addressed park). `--json` already carries `run.verdict.loop`
   // inside the printed `verdict` field (via `outcomePayload`, which `renderOutcome` calls); this adds nothing

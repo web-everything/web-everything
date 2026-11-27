@@ -80,6 +80,21 @@ describe('R1086 measured host saturation', () => {
   it('refuses an unsaturated host with measured idle and an operator fallback', () => {
     expect(decide({ saturation: () => host(80) })).toMatchObject({ ok: false, reason: 'ci-only-not-saturated', detail: expect.stringMatching(/CPU idle 80%.*retry local verification/) });
   });
+  it('ci-only-not-saturated refusal names the exact local verify route', () => {
+    const route = 'run: node scripts/verify-lane.mjs request, then repeat node scripts/verify-lane.mjs check --wait=150000 until green, then re-run open-pr without --verify';
+    for (const saturation of [
+      () => host(80),
+      () => { throw Error('x'); },
+      () => ({ saturated: false, reason: 'x'.repeat(400) }),
+    ]) {
+      const result = decide({ saturation });
+      expect(result).toMatchObject({ ok: false, reason: 'ci-only-not-saturated' });
+      expect(result.detail).toContain('node scripts/verify-lane.mjs request');
+      expect(result.detail).toContain('node scripts/verify-lane.mjs check --wait=150000');
+      expect(result.detail).toContain(route);
+      expect(result.detail.length).toBeLessThanOrEqual(300);
+    }
+  });
   it.each(['park', 'label-on-green', 'open-only'])('ordinary %s keeps ci-only-not-saturated when saturated=false', mode => {
     expect(decide({ mode, saturation: () => ({ saturated: false, reason: 'idle host' }) }))
       .toMatchObject({ ok: false, reason: 'ci-only-not-saturated' });

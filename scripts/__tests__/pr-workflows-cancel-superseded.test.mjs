@@ -1,13 +1,15 @@
 // PR workflows must cancel superseded runs without changing main's CI policy.
+// @repo-scanning-test scope=files
 import { describe, it, expect } from 'vitest';
 import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import yaml from 'js-yaml';
+import { scanRoot, scopedScanFiles } from '../lib/repo-scan-tests.mjs';
 
-const workflowsDir = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '.github', 'workflows');
+const root = scanRoot(join(dirname(fileURLToPath(import.meta.url)), '..', '..'));
 const selectWorkflowFiles = (names) => names.filter((name) => /\.ya?ml$/.test(name)).sort();
-const workflowFiles = selectWorkflowFiles(readdirSync(workflowsDir));
+const workflowFiles = selectWorkflowFiles(readdirSync(join(root, '.github', 'workflows')));
 
 // Pin the existing merge-gate exception: unwatched label events and non-PR/manual
 // runs intentionally get unique keys. No other run-specific group is exempt.
@@ -332,9 +334,28 @@ describe('PR concurrency checker self-tests', () => {
 });
 
 describe('PR workflows cancel superseded runs', () => {
+  it('no workflow uses runs-on self-hosted hetzner', () => {
+    const files = scopedScanFiles(workflowFiles.map((name) => `.github/workflows/${name}`));
+    for (const file of files) {
+      const workflow = yaml.safeLoad(readFileSync(join(root, file), 'utf8'));
+      expect(workflow?.jobs, `${file}: missing jobs`).toBeTruthy();
+      for (const [name, job] of Object.entries(workflow.jobs)) {
+        // Reusable-workflow calls have no runner of their own.
+        if (job.uses) continue;
+        const runner = job['runs-on'];
+        const labels = typeof runner === 'object' && !Array.isArray(runner)
+          ? runner?.labels : runner;
+        expect(labels, `${file}: ${name} missing runner labels`).toBeTruthy();
+        const values = Array.isArray(labels) ? labels : [labels];
+        expect(values.includes('self-hosted') && values.includes('hetzner'),
+          `${file}: ${name} targets retired Hetzner runners`).toBe(false);
+      }
+    }
+  });
+
   it('uses prefix-free literal concurrency prefixes across all real PR workflows', () => {
     expectDistinctPrPrefixes(workflowFiles.map((name) => [
-      name, readFileSync(join(workflowsDir, name), 'utf8'),
+      name, readFileSync(join(root, '.github', 'workflows', name), 'utf8'),
     ]));
   });
 
@@ -343,7 +364,7 @@ describe('PR workflows cancel superseded runs', () => {
   });
 
   it.each(workflowFiles)('%s has PR-specific concurrency and cancels superseded PR runs', (name) => {
-    const text = readFileSync(join(workflowsDir, name), 'utf8');
+    const text = readFileSync(join(root, '.github', 'workflows', name), 'utf8');
     expect(prConcurrencyViolations(text), name).toEqual([]);
   });
 });

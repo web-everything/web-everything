@@ -13,11 +13,19 @@ hyphens, with no trailing newline. User@host forms and leading hyphens are rejec
 Roots must be exactly `/srv/forge-exec`; other paths, including `/` and traversal,
 are rejected. An invalid explicit list disables remote dispatch, runs locally,
 and logs `location=local reason=invalid-remote-hosts` with its settings source.
-Custom targets are probed in order with noninteractive SSH, a five-second
-connection timeout, and a ten-second execution deadline that kills the child.
-A missing executable is `runner-missing`; other SSH failures
-are `ssh-unreachable`. No healthy target means local admission with
-`location=local reason=no-healthy-remote`, without remote dispatch.
+Custom targets first pass the routing gate and caller write-confinement check.
+Local gate decisions preserve their reason without reading host state or probing.
+Each target is then checked in list order: breaker, runner probe, telemetry health.
+An open breaker skips the probe (`backoff-<trigger>`); an unreachable backoff is
+re-probed so the locked health check can lift it. Probes use noninteractive SSH,
+a five-second connection timeout and a ten-second execution deadline that kills
+the child. Skips name `runner-missing`, `ssh-unreachable`, or the health refusal.
+Hook errors use `breaker-unreadable` or `remote-health-unreadable`; malformed
+results use `breaker-result-invalid` or `admit-result-invalid`, and an open breaker
+without a reason uses `breaker-open`. The first target passing all three wins.
+No healthy target means local admission with `location=local reason=no-healthy-remote`
+and ordered skip details in the fallback record; there is no fallback to Forge
+unless Forge is explicitly in the list.
 Discovery does not cache results. Execution keeps the existing ops sudo and SSH
 credential handling; configure aliases through the operator's existing SSH setup.
 
