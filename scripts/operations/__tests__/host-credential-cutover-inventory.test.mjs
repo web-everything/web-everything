@@ -317,6 +317,35 @@ describe('evidence and cohort', () => {
     const out = await subject.inventory({ ...options, fs: io });
     expect(out.exitCode).toBe(1); expect(await fs.readFile(target, 'utf8')).toBe('original');
   });
+  it('ancestor replacement at evidence open refuses admission without creating outside evidence', async () => {
+    for (const sink of ['inventory.json', 'result.txt']) {
+      for (const ancestor of ['state', 'state/credential-cutover', 'state/credential-cutover/runs', 'run']) {
+        const root = join(temp, `${sink}-${ancestor.replaceAll('/', '-')}`);
+        const outside = join(root, 'outside');
+        await fs.mkdir(outside, { recursive: true });
+        let swapped = false;
+        const io = { ...options.fs, open: async (path, ...args) => {
+          if (!swapped && path.endsWith(`/${sink}`)) {
+            const directory = dirname(path);
+            const checked = ancestor === 'run' ? directory : join(root, ancestor);
+            const suffix = directory.slice(checked.length + 1);
+            await fs.mkdir(join(outside, suffix), { recursive: true });
+            await fs.rename(checked, `${checked}-original`);
+            await fs.symlink(outside, checked);
+            swapped = true;
+          }
+          return options.fs.open(path, ...args);
+        } };
+        const out = await subject.admissionCheck({ ...options, root, fs: io });
+        expect(swapped).toBe(true);
+        expect(out.allowed).toBe(false);
+        expect(out.exitCode).toBe(1);
+        expect(out.reasons).toContain('COHORT');
+        expect(lines.stdout.join('')).toContain('reason=COHORT action=RERUN');
+        expect((await fs.readdir(outside, { recursive: true })).filter(p => /(?:inventory\.json|result\.txt)$/.test(p))).toEqual([]);
+      }
+    }
+  });
   it('concurrent aggregates produce exactly one exclusive decision', async () => {
     const { record } = await collect();
     const results = await Promise.all([subject.aggregate({ ...options, runId: record.runId }), subject.aggregate({ ...options, runId: record.runId })]);
@@ -378,6 +407,24 @@ describe('read completeness, pagination and authority', () => {
         ? response([], 200, { link: cases[i](Number(url.searchParams.get('page') || 1)) }) : undefined, 20, 'MALFORMED');
     }
     expect(calls.length).toBeLessThan(600);
+  });
+  it('skipped ruleset pages refuse live admission instead of omitting a page-two bypass', async () => {
+    options.run = runner(({ url }) => {
+      if (url.pathname === `/orgs/${O}/rulesets`) {
+        const page = url.searchParams.get('page') ?? '1';
+        if (page === '1') return response([{ id: 7 }], 200, {
+          link: `<https://api.github.com/orgs/${O}/rulesets?per_page=100&page=3>; rel="next"`,
+        });
+        return response(page === '2' ? [{ id: 8 }] : []);
+      }
+      if (url.pathname === `/orgs/${O}/rulesets/8`) return actorResponse('Integration', 22);
+    });
+    const out = await subject.admissionCheck(options);
+    expect(out.allowed).toBe(false);
+    expect(out.result).toBe('INCOMPLETE');
+    expect(out.reasons).toContain('MALFORMED');
+    expect(lines.stdout.join('')).toContain('reason=MALFORMED action=OPERATOR-REVIEW');
+    expect(calls.some(c => new URL(c.argv.at(-1), 'https://api.github.com').searchParams.get('page') === '3')).toBe(false);
   });
   for (const variant of ['sample-repos', 'skip-detail']) test(variant, 'page-two repo bypass cannot be omitted', async () => {
     const { out } = await checkDecision(({ url }) => {

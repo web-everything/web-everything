@@ -30,6 +30,11 @@ const MAX_OUTPUT = 4 * 1024 * 1024;
 const MAX_EVIDENCE = 32 * 1024 * 1024;
 const MAX_CALLS = 50000;
 const MAX_SOURCES = 50000;
+// Darwin's sys/fcntl.h: unlike O_NOFOLLOW, this rejects symlinks in EVERY
+// pathname component atomically. Node does not expose the constant. This
+// Homebrew-pinned operator tool must refuse persistence on other substrates
+// rather than fall back to a check-then-open walk (operator: rerun on macOS).
+const NOFOLLOW_ANY = process.platform === 'darwin' ? 0x20000000 : null;
 const DAY = 86400000;
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const roots = () => ['user', 'memberships', ...ORGS.flatMap(o =>
@@ -227,10 +232,12 @@ export async function emit(c, kind, value, path) {
     text = JSON.stringify(value) + '\n';
   }
   if (path) {
+    if (NOFOLLOW_ANY === null) refuse('COHORT');
     await containment(c, false);
     const directory = dirname(path), st = await c.fs.lstat(directory);
     if (st.isSymbolicLink() || !st.isDirectory() || await c.fs.realpath(directory) !== directory) refuse('COHORT');
-    const h = await c.fs.open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    // O_NOFOLLOW_ANY also covers the leaf; Darwin rejects combining the two flags.
+    const h = await c.fs.open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | NOFOLLOW_ANY, 0o600);
     try { await h.writeFile(text, 'utf8'); } finally { await h.close(); }
   } else await c.stdout(text);
   return value;
@@ -303,19 +310,20 @@ function pageKey(path) {
   const u = new URL(path, 'https://api.github.com');
   if (!u.searchParams.has('page')) u.searchParams.set('page', '1'); u.searchParams.sort(); return u.href;
 }
-function nextPage(link, initial, visited) {
+function nextPage(link, current, visited) {
   if (link === undefined) return null;
   const links = link.split(',').map(p => /^\s*<([^>]+)>;\s*rel="(next|prev|first|last)"\s*$/.exec(p));
   if (links.some(p => !p) || links.filter(p => p[2] === 'next').length > 1) refuse('MALFORMED');
   const next = links.find(p => p[2] === 'next'); if (!next) return null;
   let u; try { u = new URL(next[1]); } catch { refuse('MALFORMED'); }
-  const original = new URL(initial, 'https://api.github.com');
+  const original = new URL(current, 'https://api.github.com');
   if (u.origin !== original.origin || u.username || u.password || u.hash || u.pathname !== original.pathname) refuse('MALFORMED');
   const query = u => [...u.searchParams].filter(([k]) => k !== 'page').sort();
   if (JSON.stringify(query(u)) !== JSON.stringify(query(original)) || !/^[1-9][0-9]{0,5}$/.test(u.searchParams.get('page') ?? '')
     || new Set([...u.searchParams.keys()]).size !== [...u.searchParams.keys()].length) refuse('MALFORMED');
   const path = `${u.pathname}${u.search}`;
-  if (visited.has(pageKey(path))) refuse('MALFORMED'); return path;
+  if (Number(u.searchParams.get('page')) !== Number(original.searchParams.get('page') ?? '1') + 1
+    || visited.has(pageKey(path))) refuse('MALFORMED'); return path;
 }
 async function pages(c, path, budget, installations = false) {
   const u = new URL(path, 'https://api.github.com'); u.searchParams.set('per_page', '100');
@@ -328,7 +336,7 @@ async function pages(c, path, budget, installations = false) {
       if (total !== undefined && total !== count) refuse('COHORT'); total = count; chunk = chunk.installations;
     }
     if (list(chunk).length > 100) refuse('MALFORMED'); items.push(...chunk);
-    current = nextPage(out.headers.link, initial, visited);
+    current = nextPage(out.headers.link, current, visited);
     if (!current) return installations ? { total_count: total, installations: items } : items;
   }
   refuse('MALFORMED');
