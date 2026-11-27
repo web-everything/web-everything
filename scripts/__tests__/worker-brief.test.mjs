@@ -16,6 +16,7 @@ import { main as freeScopeMain } from '../operations/free-scope-cli.mjs';
 import { heartbeatScope, partitionRegistry, registerScope } from '../operations/free-scope.mjs';
 import * as workerBrief from '../worker-brief.mjs';
 import { routeMode } from '../lib/brief-header.mjs';
+import { fenceUntrusted } from '../lib/mandate-fence.mjs';
 
 describe('BRIEF-TEMPLATE-HARDEN', () => {
   const fixture = async (check) => {
@@ -77,6 +78,37 @@ describe('BRIEF-TEMPLATE-HARDEN', () => {
         expect(result.effects.redTeamBrief).not.toHaveBeenCalled();
       }
     }
+  }));
+
+  it('debug and debug-to-merge live-proof requirements remain instructions outside the data fence', () => fixture(({ base, prep, cfg }) => {
+    for (const mode of ['debug', 'debug-to-merge']) {
+      cfg.routes['daemon-tooling'] = mode;
+      for (const step of [undefined, 'HARDEN-FIXTURE']) {
+        const text = renderWorkerBrief({ ...base, step, kind: 'daemon-tooling', prepPath: prep });
+        // Remove exactly one complete shared fence, leaving any leaked context visible.
+        const instructions = text.replace(fenceUntrusted('material', cfg.modes[mode]), '');
+        expect(instructions).not.toContain(cfg.modes[mode]);
+        expect(instructions).toContain('No PR before live proof of the fix on the blocked case (with ET times).');
+        expect(instructions).toContain('If live proof is impossible, say why and stop before opening a PR.');
+        if (mode === 'debug-to-merge') {
+          expect(instructions).toContain('Prove the fix live on the prototype until the blocked PR merges, THEN open the fix PR.');
+        } else {
+          expect(instructions).toContain('Diagnose on the live system first; load the smallest fix on the daemon and prove it live before opening a PR.');
+        }
+        expect(text).toContain(`<material>\n${cfg.modes[mode]}\n</material>`);
+      }
+    }
+  }));
+
+  it('header and body share the route selected by an omitted blocker step slot', () => fixture(({ base, prep, cfg }) => {
+    cfg.modes.debug = 'Complete debug context: blocked case must move live before any PR.';
+    const text = renderWorkerBrief({ ...base, step: 'BLOCKER-FIX', kind: 'daemon-tooling', prepPath: prep });
+    expect(text).toContain('Mode: debug\n');
+    expect(text).toContain('Slot: plan:BLOCKER-FIX\n');
+    expect(text).toContain(`<material>\n${cfg.modes.debug}\n</material>`);
+    expect(text.split(cfg.modes.debug)).toHaveLength(2);
+    expect(text.replace(fenceUntrusted('material', cfg.modes.debug), '')).not.toContain(cfg.modes.debug);
+    expect(text).not.toContain(cfg.modes.fast);
   }));
 
   it('invalid header options refuse full and single-step rendering', () => fixture(async ({ header, invoke }) => {
