@@ -571,8 +571,8 @@ describe('verify-lane — slot heartbeat while the gate runs (verify-admission, 
     // Before: no refresh, so heartbeatAt stayed at acquire time and the lease expired under a long gate.
     const samples = join(dir, 'samples.json');
     const gateScript = join(dir, 'sample.mjs');
-    const admissionModule = resolve(process.cwd(), 'scripts/readiness/heavy-admission.mjs');
-    const locksModule = resolve(process.cwd(), 'scripts/readiness/file-locks.mjs');
+    const admissionModule = resolve(TEST_REPO_ROOT, 'scripts/readiness/heavy-admission.mjs');
+    const locksModule = resolve(TEST_REPO_ROOT, 'scripts/readiness/file-locks.mjs');
     writeFileSync(gateScript, `import { writeFileSync } from 'node:fs';
 import { admissionLockRoot, slotPath } from ${JSON.stringify(admissionModule)};
 import { readLockEntry } from ${JSON.stringify(locksModule)};
@@ -613,7 +613,7 @@ describe('verify-lane — card-only diff skips the local gate (skipLocalForCardO
   it('a green records the ledger and the next round selects only the delta since it', () => {
     const ledgerDir = mkdtempSync(join(tmpdir(), 'green-ledger-'));
     try {
-      const env = { ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_GREEN_LEDGER_DIR: ledgerDir, WE_VERIFY_SELECTION: 'since-last-green' };
+      const env = { ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_GREEN_LEDGER_DIR: ledgerDir, WE_VERIFY_ALWAYS_RUN_TESTS: '', WE_VERIFY_SELECTION: 'since-last-green' };
       git('update-ref', 'refs/remotes/origin/main', 'HEAD');
       // A REAL default-gate green (code diff, so no card-only skip): a stub `vitest` on the checkout's own
       // node_modules/.bin stands in for the test runner, and `.gitignore` keeps the tree clean (the ledger needs that).
@@ -643,7 +643,7 @@ describe('verify-lane — card-only diff skips the local gate (skipLocalForCardO
   it('a card-only skip writes the marker but records nothing in the green ledger', () => {
     const ledgerDir = mkdtempSync(join(tmpdir(), 'green-ledger-'));
     try {
-      const env = { ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_GREEN_LEDGER_DIR: ledgerDir, WE_VERIFY_SELECTION: 'since-last-green' };
+      const env = { ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_GREEN_LEDGER_DIR: ledgerDir, WE_VERIFY_ALWAYS_RUN_TESTS: '', WE_VERIFY_SELECTION: 'since-last-green' };
       git('update-ref', 'refs/remotes/origin/main', 'HEAD');
       commitFile('backlog/zz3-card.md');
       const first = spawnSync('node', [VERIFY_LANE, 'verify', '--json'], { cwd: dir, encoding: 'utf8', env });
@@ -1832,7 +1832,7 @@ describe('local timeout-only retry under admission', () => {
     if (scan) { mkdirSync(join(dir, 'scripts/lib/__tests__'), { recursive: true }); writeFileSync(join(dir, scanTest), '// scanner\n'); }
     for (const file of files) writeFileSync(join(dir, file), live ? `
 import './source.mjs';
-import { it } from ${JSON.stringify(resolve(process.cwd(), 'node_modules/vitest/dist/index.js'))};
+import { it } from ${JSON.stringify(resolve(TEST_REPO_ROOT, 'node_modules/vitest/dist/index.js'))};
 import { existsSync, writeFileSync } from 'node:fs';
 it('first attempt times out', async () => {
   const attempt = ${JSON.stringify(file + '.attempt')};
@@ -1848,18 +1848,18 @@ it('first attempt times out', async () => {
     mkdirSync(join(dir, 'tmp'));
     if (live) writeFileSync(join(dir, 'vitest.config.mjs'), 'export default { test: { environment: "node", include: ["*.test.mjs"] } };\n');
     writeFileSync(join(dir, 'package.json'), JSON.stringify({ type: 'module', scripts: { 'test:unit': 'node scripts/readiness/heavy-admission.mjs run -- vitest run', 'check:standards': 'true' } }));
-    const admissionModule = resolve(process.cwd(), 'scripts/readiness/heavy-admission.mjs');
+    const admissionModule = resolve(TEST_REPO_ROOT, 'scripts/readiness/heavy-admission.mjs');
     // Stub commands exit immediately too; drain their pipe writes before exiting.
     const fake = `#!/usr/bin/env node
 import { appendFileSync, writeFileSync } from 'node:fs';
 import { admissionLockRoot, heldSlots } from ${JSON.stringify(admissionModule)};
-import { writeAllSync } from ${JSON.stringify(resolve(process.cwd(), 'scripts/lib/write-all-sync.mjs'))};
+import { writeAllSync } from ${JSON.stringify(resolve(TEST_REPO_ROOT, 'scripts/lib/write-all-sync.mjs'))};
 const args = process.argv.slice(2);
 const held = heldSlots({ lockRoot: admissionLockRoot(process.cwd()), cap: 1, fastSlots: 1 });
 appendFileSync('calls.jsonl', JSON.stringify({ args, held, inherited: process.env.WE_HEAVY_ADMISSION_HELD, nonce: process.env.WE_VERIFY_MARKER_NONCE ?? null, scanFiles: process.env.VERIFY_SCAN_FILES ?? null, scanRoot: process.env.VERIFY_SCAN_ROOT ?? null }) + '\\n');
 if (${live} && args[0] === 'vitest') {
   const { spawnSync } = await import('node:child_process');
-  const result = spawnSync(process.execPath, [${JSON.stringify(resolve(process.cwd(), 'node_modules/vitest/vitest.mjs'))}, ...args.slice(1), ...(!args.includes('--maxWorkers=1') ? ['--maxWorkers=1', '--minWorkers=1'] : [])], { stdio: 'inherit' });
+  const result = spawnSync(process.execPath, [${JSON.stringify(resolve(TEST_REPO_ROOT, 'node_modules/vitest/vitest.mjs'))}, ...args.slice(1), ...(!args.includes('--maxWorkers=1') ? ['--maxWorkers=1', '--minWorkers=1'] : [])], { stdio: 'inherit' });
   process.exit(result.status ?? 2);
 }
 if (args[0] === 'vitest' && args.includes('--reporter=json') && args.includes('--maxWorkers=1')) {
@@ -1917,7 +1917,8 @@ process.exit(${standardsExit});
     execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'baseline'], { cwd: dir });
     execFileSync('git', ['branch', 'origin/main'], { cwd: dir });
     writeFileSync(join(dir, edited ? files[0] : 'source.mjs'), '// changed\n');
-    const env = { ...gateScrubbedEnv(), WE_VERIFY_RETRY_FAILED: '0', WE_COORDINATION_ROOT: join(dir, 'coordination'), PATH: `${join(dir, 'bin')}:${process.env.PATH}`, LANE_POOL_ROOT: join(dir, 'pool'), WE_PLATFORM_PREFERENCES: preferences, WE_HEAVY_ADMISSION_CAP: '1', WE_VERIFY_PHASE_ADMISSION: phaseAdmission, WE_VERIFY_STANDARDS: 'always', TMPDIR: join(dir, 'tmp'), ...(guard ? { WE_VERIFY_ALWAYS_RUN_TESTS: guardExcluded ? 'guard.test.mjs,excluded.test.mjs' : 'guard.test.mjs' } : {}) };
+    // These synthetic repos declare only the guards created above; production policy is tested separately.
+    const env = { ...gateScrubbedEnv(), WE_VERIFY_RETRY_FAILED: '0', WE_COORDINATION_ROOT: join(dir, 'coordination'), PATH: `${join(dir, 'bin')}:${process.env.PATH}`, LANE_POOL_ROOT: join(dir, 'pool'), WE_PLATFORM_PREFERENCES: preferences, WE_HEAVY_ADMISSION_CAP: '1', WE_VERIFY_PHASE_ADMISSION: phaseAdmission, WE_VERIFY_STANDARDS: 'always', TMPDIR: join(dir, 'tmp'), WE_VERIFY_ALWAYS_RUN_TESTS: guard ? (guardExcluded ? 'guard.test.mjs,excluded.test.mjs' : 'guard.test.mjs') : '' };
     function invoke(args = [], extraEnv = {}) {
       const result = spawnSync('node', [VERIFY_LANE, ...args, '--json'], { cwd: dir, env: { ...env, ...extraEnv }, encoding: 'utf8' });
       expect(result.error, result.stderr).toBeUndefined();
@@ -1998,8 +1999,8 @@ process.exit(${standardsExit});
   });
 
   function idleFallbackEnv({ timeout = false, standardsExit = 0, scripts = { 'test:unit': 'true' } } = {}) {
-    const saturationUrl = pathToFileURL(resolve(process.cwd(), 'scripts/lib/verify-ci-only.mjs')).href;
-    const admissionUrl = pathToFileURL(resolve(process.cwd(), 'scripts/readiness/heavy-admission.mjs')).href;
+    const saturationUrl = pathToFileURL(resolve(TEST_REPO_ROOT, 'scripts/lib/verify-ci-only.mjs')).href;
+    const admissionUrl = pathToFileURL(resolve(TEST_REPO_ROOT, 'scripts/readiness/heavy-admission.mjs')).href;
     const loader = join(dir, 'fallback-loader.mjs');
     writeFileSync(loader, `
 export async function load(url, context, nextLoad) {
