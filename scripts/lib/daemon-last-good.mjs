@@ -194,7 +194,7 @@ export function decideLastGood({
  */
 export function lastGoodForClone({
   root, headSha, dirty = false, env = process.env, now = Date.now(), readState = readRebuildStateFile,
-  readHeartbeat = readBuildHeartbeatFile, ownerAlive = leaseOwnerAlive,
+  readHeartbeat = readBuildHeartbeatFile, ownerAlive = heartbeatOwnerAlive,
 }) {
   let heartbeat = null;
   try { heartbeat = readHeartbeat(root, env); } catch { /* Unreadable heartbeat leaves today's rule unchanged. */ }
@@ -249,7 +249,14 @@ export function decideRebuildGrace({
   return { grace: true, reason: 'rebuild-in-progress', target: b.target ?? null, buildAgeMs, sinceAdoptMs };
 }
 
-/** Same-host lease owner liveness (`daemon-rebuild.mjs#buildLeaseIsLive`'s rule, re-stated — import cycle). */
+/** Heartbeat admission requires a successful same-host probe. Unknown liveness falls back to the existing
+ * holding sources; an expired lease without one still refuses until rebuild/adoption or operator repair. */
+function heartbeatOwnerAlive(building) {
+  if (building?.host !== hostname() || !Number.isSafeInteger(building.pid) || building.pid <= 0) return false;
+  try { process.kill(building.pid, 0); return true; } catch { return false; }
+}
+
+/** Legacy rebuild-grace owner check; its existing semantics are independent of heartbeat admission. */
 function leaseOwnerAlive(building) {
   if (building.host && building.host !== hostname()) return true;
   if (!Number.isInteger(building.pid)) return false;

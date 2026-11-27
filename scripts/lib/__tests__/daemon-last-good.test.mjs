@@ -99,6 +99,24 @@ describe('BUILD-LEASE-SMOKE-AWARE reader', () => {
   };
   const heartbeatFile = (token) => join(env.WE_DAEMON_STATE_DIR, `${cloneKey(root)}.build-heartbeat.${token}.json`);
 
+  it('default heartbeat owner probe refuses EIO and every other process-check error', () => {
+    const o = fixture();
+    o.state.building.host = o.heartbeat.host = hostname();
+    const probe = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    const read = () => lastGoodForClone({
+      root, env, headSha: o.headSha, now,
+      readState: () => o.state, readHeartbeat: () => o.heartbeat,
+    });
+    try {
+      expect(read()).toMatchObject({ onLastGood: true, holdingBy: 'heartbeat' });
+      for (const code of ['EIO', 'EPERM', 'ESRCH', undefined]) {
+        probe.mockImplementation(() => { throw Object.assign(new Error('probe failed'), { code }); });
+        expect(read()).toMatchObject({ onLastGood: false, holdingBy: null });
+      }
+      expect(probe).toHaveBeenCalledWith(o.state.building.pid, 0);
+    } finally { probe.mockRestore(); }
+  });
+
   it.each([
     ['T1', '2026-11-27T20:20:16Z', '2026-11-27T20:46:06Z', '2026-11-27T21:21:54.737Z'],
     ['T2', '2026-11-27T17:52:00Z', '2026-11-27T19:39:41Z', '2026-11-27T20:15:53Z'],
