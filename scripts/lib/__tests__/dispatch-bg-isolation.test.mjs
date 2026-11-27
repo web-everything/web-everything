@@ -4,9 +4,10 @@
  *   throws. Every fs call is injected — no real filesystem touched, mirroring `gh-app-shim.test.mjs`'s own
  *   in-memory-store convention for `ensureSettingsFileEnv`/`ensureSettingsFilePermissions`.
  */
+import * as dispatchIsolation from '../dispatch-bg-isolation.mjs';
 import { pinnedHookScript } from '../pinned-hook-command.mjs';
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, mkdirSync, readdirSync, copyFileSync, symlinkSync, realpathSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, mkdirSync, readdirSync, copyFileSync, symlinkSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -108,6 +109,104 @@ describe('hasWorktreeIsolationOff', () => {
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 
 describe('xl5reby dispatched worker effective settings include the repo guard hooks', () => {
+  function broadcastFixture(run) {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'dispatch broadcast-')));
+    const REPO = join(root, 'repo');
+    const cwd = join(root, 'scratch');
+    const command = 'node scripts/broadcast-inject.mjs';
+    const group = { hooks: [{ type: 'command', command }] };
+    mkdirSync(join(REPO, '.claude'), { recursive: true });
+    mkdirSync(join(REPO, 'scripts'));
+    mkdirSync(cwd);
+    writeFileSync(join(REPO, '.claude/settings.json'), JSON.stringify({ hooks: {
+      UserPromptSubmit: [group], PostToolUse: [{ ...group, matcher: '*' }],
+    } }));
+    const isolate = () => isolateDispatchSession(cwd, {
+      ensureHooks: (o) => ensureDispatchGuardHooks({ ...o, repoRoot: REPO }),
+    });
+    const settings = () => JSON.parse(readFileSync(join(cwd, '.claude/settings.local.json'), 'utf8'));
+    try { run({ root, REPO, cwd, isolate, settings }); }
+    finally { rmSync(root, { recursive: true, force: true }); }
+  }
+
+  it('the operator broadcast hook rides into the scratch worker as an absolute command', () => {
+    broadcastFixture(({ REPO, isolate, settings }) => {
+      const result = isolate();
+      expect(result.hooks.ok).toBe(true);
+      for (const event of ['UserPromptSubmit', 'PostToolUse']) {
+        expect(settings().hooks[event]?.flatMap((g) => g.hooks.map((h) => h.command)))
+          .toEqual([`node "${REPO}/scripts/broadcast-inject.mjs"`]);
+      }
+      expect(result.hooks.count).toBe(4); // Two fallback deny guards plus both broadcast events.
+      expect(result.worktreeSettings).toEqual({ bgIsolation: 'none' });
+    });
+  });
+
+  it('broadcast merging preserves other keys and hooks and adds no duplicates on a second call', () => {
+    broadcastFixture(({ cwd, isolate, settings }) => {
+      mkdirSync(join(cwd, '.claude'));
+      writeFileSync(join(cwd, '.claude/settings.local.json'), JSON.stringify({ env: { FIXTURE: '1' }, hooks: {
+        Stop: [{ hooks: [{ type: 'command', command: 'echo stop' }] }],
+        PostToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: 'echo mine' }] }],
+      } }));
+      isolate();
+      const once = settings();
+      expect(once.hooks.UserPromptSubmit).toHaveLength(1);
+      expect(once.hooks.PostToolUse).toHaveLength(2);
+      isolate();
+      expect(settings()).toEqual(once);
+      expect(once.env).toEqual({ FIXTURE: '1' });
+      expect(once.hooks.Stop[0].hooks[0].command).toBe('echo stop');
+      expect(once.hooks.PostToolUse[0].hooks[0].command).toBe('echo mine');
+    });
+  });
+
+  it('the absolute broadcast command runs from scratch with empty stdin event', () => {
+    broadcastFixture(({ root, REPO: fixtureRepo, cwd, isolate, settings }) => {
+      // Copy only the executable under test; all runtime state lives in this fixture.
+      copyFileSync(new URL('../../broadcast-inject.mjs', import.meta.url), join(fixtureRepo, 'scripts/broadcast-inject.mjs'));
+      isolate();
+      const command = settings().hooks.UserPromptSubmit?.[0].hooks[0].command;
+      expect(command).toBe(`node "${fixtureRepo}/scripts/broadcast-inject.mjs"`);
+      const out = spawnSync(process.execPath, [command.slice(6, -1)], {
+        cwd, input: '{}', encoding: 'utf8', timeout: 5000, maxBuffer: 65536,
+        env: { HOME: root, AGENT_BROADCAST_DIR: join(root, 'broadcasts') },
+      });
+      expect(out.error).toBeUndefined();
+      expect(out.status).toBe(0);
+      expect(out.stderr).toBe('');
+    });
+  });
+
+  it('broadcast selection refuses unknown commands and bookkeeping while preserving matcher and hook options', () => {
+    const hook = { type: 'command', command: 'node scripts/broadcast-inject.mjs', timeout: 3 };
+    const group = { matcher: 'Bash', hooks: [hook,
+      ...['node scripts/bootstrap-session.mjs', 'node scripts/session-reaper.mjs',
+        'node scripts/broadcast-inject.mjs --extra', 'node scripts/broadcast-inject.mjs; echo bad',
+        ' node scripts/broadcast-inject.mjs'].map((command) => ({ type: 'command', command })),
+      { ...hook, type: 'prompt' },
+    ] };
+    expect(dispatchIsolation.dispatchBroadcastHooks({ repoRoot: '/fixture repo', hooks: {
+      UserPromptSubmit: [group], PostToolUse: [], Stop: [group],
+    } })).toEqual({ UserPromptSubmit: [{ matcher: 'Bash', hooks: [{ ...hook,
+      command: 'node "/fixture repo/scripts/broadcast-inject.mjs"',
+    }] }], PostToolUse: [] });
+  });
+
+  it.each([undefined, '{broken'])('unreadable repo settings (%s) retain both operator control events', (body) => {
+    broadcastFixture(({ cwd, REPO }) => {
+      const fs = memoryFs(body === undefined ? {} : { [join(REPO, '.claude/settings.json')]: body });
+      const result = ensureDispatchGuardHooks({ cwd, repoRoot: REPO, ...fs });
+      const settings = JSON.parse(fs.files[join(cwd, '.claude/settings.local.json')]);
+      expect(result.count).toBe(4);
+      for (const event of ['UserPromptSubmit', 'PostToolUse']) {
+        expect(settings.hooks[event]).toEqual([{ hooks: [{ type: 'command',
+          command: `node "${REPO}/scripts/broadcast-inject.mjs"`,
+        }] }]);
+      }
+    });
+  });
+
   it('isolateDispatchSession (the one call every dispatch path makes) preserves pinned guard-bash and guard-lane commands', () => {
     const cwd = mkdtempSync(join(tmpdir(), 'dispatch-guards-'));
     try {
