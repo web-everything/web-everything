@@ -30,7 +30,7 @@ import { AUTOMATION_LOGINS, isTrustedMarkerAuthor } from '../lib/marker-authorsh
 import { reviewedHeadsOf } from './mechanical-round-cap.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { isHumanOperatorComment } from '../lib/operator-identity.mjs';
-import { parseOperatorAnswer } from './stand-down-answer-core.mjs';
+import { parseOperatorAnswer, parseNoCodeRearmReceipt } from './stand-down-answer-core.mjs';
 import { standDownComments } from './stand-down.mjs';
 import { parseNoCodeOwedStandDown } from './fix-procedure.mjs';
 import { REARM_COMMENT_MARKER, SAME_HEAD_WAKE_TRAILER, isFixRoundRearmComment } from './rearm-round-count.mjs';
@@ -281,11 +281,35 @@ export function rearmWindow(comments) {
     capBlocked: capBlockedId !== null && capBlockedId === standDownIds.at(-1) };
 }
 
-export function decideEmptyFixRound({ comments, liveHead, noCodeBinding } = {}) {
+/** Structured evidence supplements the operator's one-use resume; it never creates authorization. */
+export function noCodeOwedAuthorization({ comments, liveHead, labels, reviews } = {}) {
+  const held = reason => ({ allowed: false, reason: `no-code evidence withheld; operator inspection required: ${reason}` });
+  if (typeof liveHead !== 'string' || !/^[0-9a-f]{40}$(?![\s\S])/.test(liveHead)) return held('live head unreadable');
+  if (!Array.isArray(comments) || comments.length > 1000
+    || comments.some(c => typeof c?.body !== 'string' || c.body.length > 65536)) return held('comments unreadable or oversized; inspect the full thread');
+  if (!Array.isArray(labels) || !labels.every(l => typeof l === 'string')) return held('labels unreadable');
+  if (!labels.includes('review:changes') || labels.some(l => ['red-team:blocked', 'red-team:pending'].includes(l))) return held('live review labels do not permit a no-code resume');
+  if (!Array.isArray(reviews) || reviews.length > 1000
+    || reviews.some(r => !['APPROVED', 'COMMENTED', 'DISMISSED'].includes(r?.state))) return held('formal reviews unreadable, oversized or still hold the repair');
+  const thread = comments.map(normaliseComment);
+  const window = rearmWindow(thread);
+  if (window.resumeHead !== liveHead || window.claims?.length !== 0) return held('no current operator-authorized first resume at this head');
+  const answerAt = thread.findLastIndex(c => parseOperatorAnswer(c));
+  const answer = parseOperatorAnswer(thread[answerAt]);
+  if (answer?.noCodeOwed !== true || answer.head?.toLowerCase() !== liveHead) return held('no current head-bound operator no-code ruling');
+  if (thread.slice(answerAt + 1).some(c => isTrustedMarkerAuthor({ ...c, viewerDidAuthor: false })
+    && (parseNoCodeRearmReceipt(c) || [REARM_COMMENT_MARKER, NO_CHANGE_COMMENT_MARKER].some(m => c.body.trimStart().startsWith(m))))) {
+    return held('operator no-code resume already consumed');
+  }
+  return { allowed: true };
+}
+
+export function decideEmptyFixRound({ comments, liveHead, noCodeBinding, labels, reviews } = {}) {
   if (noCodeBinding !== undefined) {
     const matches = Array.isArray(comments) ? comments.filter(c => parseNoCodeOwedStandDown(c, noCodeBinding)) : [];
-    return matches.length === 1 && liveHead === noCodeBinding?.head
-      ? { empty: false, noCodeResume: true } : { empty: true };
+    if (matches.length !== 1 || liveHead !== noCodeBinding?.head) return { empty: true };
+    const authorization = noCodeOwedAuthorization({ comments, liveHead, labels, reviews });
+    return authorization.allowed ? { empty: false, noCodeResume: true } : { empty: true };
   }
   const live = String(liveHead ?? '').trim().toLowerCase();
   if (!/^[0-9a-f]{7,40}$/.test(live) || !Array.isArray(comments)) return { empty: false };

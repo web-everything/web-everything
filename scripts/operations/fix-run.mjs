@@ -7,6 +7,9 @@ import { stripVTControlCharacters } from 'node:util';
 import { boundedCiLogTail } from '../lib/ci-log-evidence.mjs';
 import { buildStandDownComment } from '../conveyor/stand-down.mjs';
 import { buildNoCodeOwedStandDown } from '../conveyor/fix-procedure.mjs';
+import { noCodeOwedAuthorization, rearmWindow } from '../conveyor/rearm-review.mjs';
+import { createGhProvider } from '../lib/review-label-provider.mjs';
+import { readGh } from '../lib/proc-read.mjs';
 import { randomUUID } from 'node:crypto';
 import { repeatedFindingPlan, applyScopeReset, resolveFixSafety } from '../conveyor/repeated-finding-reset.mjs';
 /**
@@ -669,6 +672,13 @@ export async function runFixCli(argv = [], {
   },
   spawnCodex = async (...args) => (await import('./codex-delivery-provider.mjs')).defaultSpawnCodexAgent(...args),
   readComments = readAllComments,
+  readNoCodeSnapshot = ({ repo, pr, cwd }) => {
+    const provider = createGhProvider({ exec: (args, opts) => readGh(args, {
+      ...opts, cwd, timeout: 60_000, maxBuffer: 8 * 1024 * 1024,
+    }) });
+    const state = provider.readPrState(repo, pr);
+    return { ...state, reviews: provider.readPrReviews(repo, pr) };
+  },
   readCiHeal = readCiHealInputs,
   timingPolicy = resolveTimingPolicy().fix,
   readChecks = readReviewChecks,
@@ -1253,15 +1263,29 @@ export async function runFixCli(argv = [], {
         }
       }
       if (!openSendBacks.length && !evidence.reason) {
-        const emission = emitNoCodeOwedStandDown({ repo: launch.repo ?? ghRepoSlug('we'),
-          pr: Number(pr), head: before, runId, claimId: holder, reason }, {
-          readState: () => {
-            const state = probeLaneHead({ lanePath, pr, repo: launch.repo, holder, run, readLease });
-            return { head: state.laneHead, prHead: state.prHead, clean: state.clean, claimId: state.lease?.holder };
-          }, write,
-        });
-        // A withheld record is a normal terminal status; stderr remains for launcher failures.
-        if (!emission.emitted) write(`fix-run: ${emission.reason}\n`);
+        try {
+          // Absence of send-backs proves nothing about the outstanding review finding. Re-read the operator
+          // window and live forge holds while the lane is still owned, immediately before terminal emission.
+          const comments = await readComments(pr, { repo: launch.repo });
+          if (!Array.isArray(comments) || rearmWindow(comments).resumeHead !== before) {
+            throw new Error('no current operator-authorized first resume at this head');
+          }
+          const repo = launch.repo ?? ghRepoSlug('we');
+          const snapshot = await readNoCodeSnapshot({ repo, pr, cwd: weRoot });
+          const authorization = noCodeOwedAuthorization({ comments, liveHead: snapshot?.headRefOid,
+            labels: snapshot?.labels?.map(l => l?.name), reviews: snapshot?.reviews });
+          if (!authorization.allowed) throw new Error(authorization.reason);
+          const emission = emitNoCodeOwedStandDown({ repo, pr: Number(pr), head: before, runId, claimId: holder, reason }, {
+            readState: () => {
+              const state = probeLaneHead({ lanePath, pr, repo: launch.repo, holder, run, readLease });
+              return { head: state.laneHead, prHead: state.prHead, clean: state.clean, claimId: state.lease?.holder };
+            }, write,
+          });
+          if (!emission.emitted) write(`fix-run: ${emission.reason}\n`);
+        } catch (e) {
+          // Withholding terminal evidence cannot fall through to a same-head rearm.
+          write(`fix-run: no-code evidence withheld; operator inspection required: ${singleLine(e?.message ?? e)}\n`);
+        }
       }
       result = `${outcome} (${singleLine(reason)}; claim released, PR is re-planned)`;
     } else {
