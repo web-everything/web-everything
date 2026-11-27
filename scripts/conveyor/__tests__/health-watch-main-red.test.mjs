@@ -778,6 +778,55 @@ const expectPersisted = (writeState, next) => {
 };
 
 describe('WATCH-DAEMON-WE — durable MAIN-RED contract', () => {
+  it.each([
+    ['event id alone', event => ({ kind: 'MAIN-RED', eventId: event.eventId })],
+    ['missing timestamp', ({ at, ...event }) => event],
+    ['invalid timestamp', event => ({ ...event, at: 'unknown' })],
+    ['missing full head', ({ head, ...event }) => event],
+    ['conflicting full head', event => ({ ...event, head: TIP_SHA })],
+    ['missing feed head', ({ feedHead, ...event }) => event],
+    ['conflicting kind', event => ({ ...event, kind: 'future-kind' })],
+    ['missing repository', ({ repo, ...event }) => event],
+    ['missing ready-PR count', ({ blockedReadyPrs, ...event }) => event],
+    ['invalid ready-PR count', event => ({ ...event, blockedReadyPrs: -1 })],
+    ['missing evidence', ({ failingJobs, ...event }) => event],
+    ['conflicting evidence', event => ({ ...event, failingJobs: [] })],
+  ])('refuses matching history with %s before feed/state advancement, then retries after repair', async (_name, corrupt) => {
+    const dir = mkdtempSync(join(tmpdir(), 'watch-main-red-dedupe-'));
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(START + 30 * MINUTE);
+    try {
+      const alertsPath = join(dir, 'alerts.jsonl');
+      const item = plan().items[0];
+      const safe = parseFeedLine(diffFeed([], [item], START + 30 * MINUTE).lines[0]);
+      const complete = { ...safe, kind: 'MAIN-RED', feedHead: safe.head, head: RED_SHA };
+      // Even a complete match must not hide a second, incomplete matching record.
+      const history = `${JSON.stringify(complete)}\n${JSON.stringify(corrupt(complete))}\n`;
+      writeFileSync(alertsPath, history);
+      const { publish: _publish, ...args } = wrapperInput({ dir });
+      const publishFeed = vi.fn();
+      await expect(runMainRedAlert({ ...args, alertsPath, publishFeed }))
+        .rejects.toThrow(/alert history.*repair.*retry/i);
+      expect(publishFeed).not.toHaveBeenCalled();
+      expect(args.writeState).not.toHaveBeenCalled();
+      expect(readFileSync(alertsPath, 'utf8')).toBe(history);
+
+      writeFileSync(alertsPath, ''); // Operator archives the incomplete history and retries.
+      await runMainRedAlert({ ...args, alertsPath, publishFeed });
+      const records = readFileSync(alertsPath, 'utf8').trim().split('\n').map(JSON.parse);
+      expect(records).toEqual([complete]);
+      expect(publishFeed).toHaveBeenCalledTimes(1);
+      expect(args.writeState).toHaveBeenCalledTimes(1);
+      await runMainRedAlert({ ...args, alertsPath, publishFeed, now: args.now + MINUTE,
+        readDetails: () => ({ ...details(), blockedReadyPrs: 9 }) });
+      expect(readFileSync(alertsPath, 'utf8')).toBe(`${JSON.stringify(complete)}\n`);
+      expect(publishFeed).toHaveBeenCalledTimes(2);
+      expect(args.writeState).toHaveBeenCalledTimes(2);
+    } finally {
+      clock.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('state corruption publishes repair instructions even when ordinary unknown is already open, and deduplicates retries', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'watch-main-red-corruption-'));
     try {

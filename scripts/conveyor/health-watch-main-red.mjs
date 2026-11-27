@@ -2,6 +2,7 @@
 import { createHash } from 'node:crypto';
 import { appendFileSync, closeSync, mkdirSync, openSync, readSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import { withFileLock, writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { isGhDeferred } from '../lib/gh-deferred.mjs';
@@ -147,20 +148,31 @@ function readAlertState(dir, fileIo) {
 function appendMainRedAlert(item, path, now, fileIo) {
   mkdirSync(dirname(path), { recursive: true });
   return withFileLock(`${path}.lock`, () => {
+    // Reuse the feed's recursive sanitation and field bounds for untrusted evidence.
+    const safe = parseFeedLine(diffFeed([], [item], now).lines[0]);
+    const alert = { ...safe, kind: 'MAIN-RED', feedHead: safe.head, head: item.fullHead };
     let events, text;
+    let matches;
     try {
       text = readBounded(path, 8 * 1024 * 1024, fileIo) ?? '';
       events = text.split('\n').filter(line => line.trim()).map(line => JSON.parse(line));
       if (events.some(event => !event || typeof event !== 'object' || Array.isArray(event)
         || typeof event.kind !== 'string')) throw new Error('Incomplete alert history');
+      matches = events.filter(event => event.eventId === item.eventId);
+      // An id alone is not proof of durable publication. Validate every match,
+      // including duplicates after a complete record, before advancing either cursor.
+      if (matches.some(event => typeof event.at !== 'string' || !Number.isFinite(Date.parse(event.at))
+        || !(event.blockedReadyPrs === null
+          || (Number.isSafeInteger(event.blockedReadyPrs) && event.blockedReadyPrs >= 0))
+        || Object.keys(alert).some(key => key !== 'at' && key !== 'blockedReadyPrs'
+          && !isDeepStrictEqual(event[key], alert[key])))) throw new Error('Incomplete matching alert');
     } catch {
       throw new Error('Main-red alert history unreadable/oversized; repair or archive alerts.jsonl and retry');
     }
-    if (events.some(event => event.eventId === item.eventId)) return;
-    // Reuse the feed's recursive sanitation and field bounds for untrusted evidence.
-    const safe = parseFeedLine(diffFeed([], [item], now).lines[0]);
+    // Time and the ready-PR count may change on retry without changing event identity.
+    if (matches.length) return;
     const separator = text && !text.endsWith('\n') ? '\n' : '';
-    appendFileSync(path, `${separator}${JSON.stringify({ ...safe, kind: 'MAIN-RED', feedHead: safe.head, head: item.fullHead })}\n`);
+    appendFileSync(path, `${separator}${JSON.stringify(alert)}\n`);
   });
 }
 
