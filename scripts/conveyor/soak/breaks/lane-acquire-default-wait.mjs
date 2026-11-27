@@ -51,6 +51,8 @@ export async function replayAcquireDeadline({ waitMs = 30, reaperMs = 0, free = 
     listScanTimeoutMs: () => 120_000, listCacheTtlMs: () => 0,
     lastListWasLockPartial: false, lastScanPartial: false,
     laneEligibilityProbeFailed: false,
+    // cmdAcquire's failure message names the failed lanes; the replay has no real probe errors to summarise.
+    eligibilityProbeSummary: () => 'lane-1 (fixture probe failure)',
     readListCache: () => null, tryTakeListLock: () => true, readLockOwner: () => null,
     releaseListLock() {}, writeListCache() {},
     scanAcquirable: () => {
