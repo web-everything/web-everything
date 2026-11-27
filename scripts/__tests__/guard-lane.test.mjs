@@ -176,11 +176,15 @@ describe('laneGuardDecision — Standards-owned paths', () => {
 
   it('CLI fails closed when the protected directory identity cannot be read', () => {
     const unreadableWorkspace = path.join(ws, 'unreadable-workspace');
+    const unreadableRoot = path.join(unreadableWorkspace, 'webeverything');
     const unreadableStandards = path.join(unreadableWorkspace, '.operations/handoff/standards');
+    // Root validation must succeed so the hook reaches the unreadable Standards identity.
+    mkdirSync(unreadableRoot, { recursive: true });
     mkdirSync(path.dirname(unreadableStandards), { recursive: true });
     symlinkSync(unreadableStandards, unreadableStandards);
+    expect(() => statSync(unreadableStandards)).toThrow(/ELOOP/);
     const result = runHook('0', path.join(unreadableWorkspace, 'probe.md'), true, 'Write',
-      path.join(unreadableWorkspace, 'webeverything'));
+      unreadableRoot);
     expect(result.error).toBeUndefined();
     expect(result.status, result.stderr).toBe(2);
     expect(result.stderr).toContain('handoff/designs/<id>-standards-request.md');
