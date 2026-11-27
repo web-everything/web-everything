@@ -109,11 +109,14 @@ export function drawArm({ kind, subject, policy, capacity, exclude = [], builder
   if (!Object.hasOwn(policy.kinds, kind)) return refuse('unknown-kind');
   if (typeof subject !== 'string' || !subject.length || !strings(exclude)) return refuse('invalid-input');
   if (!object(capacity)) return refuse('missing-capacity');
+  if (lens !== undefined && !allowedLenses.includes(lens)) return refuse('unknown-lens');
   const kindLens = kind === 'red-team' ? kind : kind?.startsWith('review-') && kind !== 'review-lens' ? kind.slice(7) : undefined;
   // Security is a floor: overrides cannot waive independence or reviewer strength.
   if ((lens === 'security' || kindLens === 'security') &&
     lensOverride !== undefined && lensOverride !== 'security') return refuse('kind-lens-mismatch');
-  if (lensOverride !== undefined) lens = lensOverride;
+  if (kindLens && lensOverride !== undefined && lensOverride !== kindLens) return refuse('kind-lens-mismatch');
+  // An explicit key lens is a floor even on generic build/review kinds.
+  if (lensOverride !== undefined && !isKeyLens(lens, policy)) lens = lensOverride;
   if (kindLens && lens !== undefined && lens !== kindLens) return refuse('kind-lens-mismatch');
   lens ??= kindLens;
   if ((kind === 'review-lens' || lens !== undefined) && !allowedLenses.includes(lens)) return refuse('unknown-lens');

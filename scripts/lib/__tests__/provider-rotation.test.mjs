@@ -31,6 +31,34 @@ const freeze = value => { if (value && typeof value === 'object') {
 const realPolicy = () => JSON.parse(readFileSync('scripts/settings/provider-rotation.json', 'utf8')).providerRotation;
 
 describe('pure provider rotation', () => {
+  it('refuses an unknown original lens before considering an override', () => {
+    for (const kind of ['review-lens', 'build']) {
+      for (const lensOverride of ['style', 'security']) {
+        expect(draw({ kind, lens: 'bogus', lensOverride, builder }))
+          .toMatchObject({ arm: null, refusal: 'unknown-lens' });
+      }
+    }
+  });
+  it('generic correctness and red-team overrides preserve vendor independence and small-model exclusions', () => {
+    for (const kind of ['review-lens', 'build']) {
+      for (const lens of ['correctness', 'red-team']) {
+        for (const lensOverride of ['style', 'simplicity', null]) {
+          for (const counting of [true, false]) {
+            const p = clone(policy); p.mode = 'on';
+            const args = { kind, lens, lensOverride, counting, builder, policy: p,
+              capacity, subject: 'fixture#generic-key-override' };
+            p.kinds[kind].arms = [arms[0]];
+            expect(drawArm(args)).toMatchObject({ arm: null, refusal: 'no-cross-vendor-seat' });
+            expect(routeFor(args)).toEqual({ route: null, shadow: null, refusal: 'no-cross-vendor-seat' });
+            p.kinds[kind].arms = [entry('claude', 'haiku', 'anthropic', 'small', 1)];
+            expect(drawArm(args)).toMatchObject({ arm: null, refusal: 'no-eligible-arm' });
+            p.kinds[kind].arms = [arms[2]];
+            expect(routeFor(args).route).toEqual(arms[2].arm);
+          }
+        }
+      }
+    }
+  });
   it.each(['review-security', 'review-correctness', 'red-team'])(
     '%s cannot lose vendor independence through lensOverride', kind => {
       const p = clone(policy); p.mode = 'on'; p.kinds[kind].arms = [arms[0]];
