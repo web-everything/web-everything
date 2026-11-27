@@ -1345,6 +1345,21 @@ describe('CI-heal salvage before agent dispatch', () => {
       ? 'routed-outcomes-unreadable' : variant === 'ledger-unreadable' ? 'fix-loop-unreadable' : 'fix-cause-unknown' }));
     if (variant === 'outcomes-unreadable') expect(result.refusals[0].why).toMatch(/restore.*routed.*operator answer cannot/i);
   });
+  it.each(['fix-loop-exhausted', 'raw per-head repair session ceiling reached'])(
+    'an unrelated park does not release interrupted unknown-cause evidence (%s)', async reason => {
+      const now = Date.parse('2026-11-26T12:00:00Z'), head = entry.headRefOid;
+      const root = mkdtempSync(join(tmpdir(), 'ci-heal-unrelated-park-'));
+      const cwd = vi.spyOn(process, 'cwd').mockReturnValue(root);
+      const ledger = loop({ readRows: () => [{ v: 1, kind: 'park', repo: 'we', pr: entry.prNumber, head, reason,
+        at: new Date(now - 8 * 3600000).toISOString() }],
+        readRouted: () => ({ 'we#3895': [{ head, at: now - 1000, outcome: 'failed', cause: 'unknown' }] }) });
+      try {
+        const { result, dispatch } = await exercise(() => null, { root, now, fixLoop: ledger,
+          readPrComments: () => [], fixConfig: { hold: true, maxSessions: 3, windowHours: 6 }, postParkComment: vi.fn() });
+        expect(dispatch).not.toHaveBeenCalled();
+        expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'fix-cause-unknown' }));
+      } finally { cwd.mockRestore(); rmSync(root, { recursive: true, force: true }); }
+    });
   it.each(['answered', 'interrupted', 'new-failure', 'budget-park', 'raw-ceiling'])('CI-heal honors an unknown-cause answer while preserving %s evidence', async variant => {
     const { buildStandDownComment } = await import('../../conveyor/stand-down.mjs');
     const { buildOperatorAnswer, latestOperatorAnswer } = await import('../../conveyor/stand-down-answer-core.mjs');

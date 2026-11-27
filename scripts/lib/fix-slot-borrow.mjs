@@ -216,10 +216,14 @@ export function consecutiveUnproductiveOnHead(table, { repo = 'we', pr, head }) 
   return count;
 }
 
+export const UNKNOWN_CAUSE_PARK_REASON = 'fix-cause-unknown';
+export const isUnknownCausePark = (row, { repo, pr, head }) =>
+  row?.kind === 'park' && row.reason === UNKNOWN_CAUSE_PARK_REASON && row.repo === repo && row.pr === pr && row.head === head;
+
 /** New unknown/invalid causes cannot silently authorize another launch if parking was interrupted.
  * Legacy rows without cause are deliberately excluded from this recovery rule. */
 export function unparkedUnknownOnHead(table, { repo = 'we', pr, head }, rows) {
-  if (rows.some(row => row.kind === 'park' && row.repo === repo && row.pr === pr && row.head === head)) return false;
+  if (rows.some(row => isUnknownCausePark(row, { repo, pr, head }))) return false;
   for (const row of [...(table?.[`${repo}#${pr}`] ?? [])].reverse()) {
     if (row.outcome === 'pushed') break;
     if (row.head === head && Object.hasOwn(row, 'cause') && routedOutcomeCause(row) === 'unknown') return true;

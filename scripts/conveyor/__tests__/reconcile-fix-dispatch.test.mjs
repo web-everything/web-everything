@@ -3303,6 +3303,49 @@ describe('unknown-cause park recovery', () => {
     pickFreeLanes: () => [1], tryResume: () => ({ resumed: false }), tryResumeRound: null,
     readPushHold: () => null, listBuildClaims: () => [], listFixClaims: () => [],
     dispatch: () => ({ agentId: 'test' }), fixConfig: config, ...overrides });
+  async function withUnrelatedParkFixture(reason, exercise) {
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const root = mkdtempSync(join(tmpdir(), 'unrelated-park-'));
+    const cwd = vi.spyOn(process, 'cwd').mockReturnValue(root);
+    const rows = [{ v: 1, kind: 'park', repo: 'we', pr: entry.prNumber, head, reason,
+      at: new Date(now - 8 * 3600000).toISOString() }];
+    const append = vi.fn(row => rows.push({ ...row, v: 1, at: new Date(now).toISOString() }));
+    const dispatch = vi.fn(() => ({ agentId: 'test' }));
+    const options = { root, clock: () => now, stepNow: () => now, stepLog: () => {},
+      priorityShadow: null, prStackSettings: { enabled: false }, fixSettings: {},
+      readMainRedPriorityRecord: () => null, readLaneTips: () => new Map(),
+      readPrComments: () => [], dispatch,
+      fixLoop: { readRows: () => [...rows], append,
+        readRouted: () => ({ 'we#1764': [{ head, at: now - 1000, outcome: 'failed', cause: 'unknown' }] }) } };
+    try { await exercise({ options, rows, append, dispatch }); }
+    finally { cwd.mockRestore(); rmSync(root, { recursive: true, force: true }); }
+  }
+  it.each(['fix-loop-exhausted', 'raw per-head repair session ceiling reached'])(
+    'an unrelated park does not release interrupted unknown-cause evidence (%s)', async reason => {
+      await withUnrelatedParkFixture(reason, ({ options, dispatch }) => {
+        const result = run(options);
+        expect(dispatch).not.toHaveBeenCalled();
+        expect(result.reconcileRefusalDetails).toContainEqual(expect.objectContaining({ kind: 'fix-loop-parked' }));
+      });
+    });
+  it.each(['fix-loop-exhausted', 'raw per-head repair session ceiling reached'])(
+    'recovery completes an unknown-cause park even when an unrelated park exists on the head (%s)', async reason => {
+      const { buildStandDownComment } = await import('../stand-down.mjs');
+      await withUnrelatedParkFixture(reason, ({ options, rows, append, dispatch }) => {
+        const recovery = { ...options,
+          reconcile: () => ({ dispatch: [], refusals: [{ kind: 'stood-down', prNumber: entry.prNumber }] }),
+          readPrComments: () => [{ author: { login: 'web-everything' },
+            body: buildStandDownComment({ reason: 'fix-cause-unknown', head }) }] };
+        run(recovery);
+        expect(append).toHaveBeenCalledTimes(1);
+        expect(append).toHaveBeenCalledWith({ kind: 'park', reason: 'fix-cause-unknown', head, repo: 'we', pr: entry.prNumber });
+        run(recovery);
+        expect(append).toHaveBeenCalledTimes(1);
+        expect(rows).toHaveLength(2);
+        expect(dispatch).not.toHaveBeenCalled();
+      });
+    });
   it('a park row with fix-cause-unknown stops dispatch on that head and lapses on a new head', () => {
     const park = { v: 1, kind: 'park', repo: 'we', pr: 1764, head, reason: 'fix-cause-unknown', at: new Date(now - 8 * 3600000).toISOString() };
     const dispatch = vi.fn(() => ({ agentId: 'test' }));

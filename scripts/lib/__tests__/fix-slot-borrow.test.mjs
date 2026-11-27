@@ -179,6 +179,41 @@ describe('a borrowed fix is a normal claim that the build daemon counts', () => 
 
 
 describe('routed Codex outcomes', () => {
+  const unknownId = { repo: 'we', pr: 7, head: 'abc' };
+  const unknownTable = { 'we#7': [{ head: 'abc', at: 1, outcome: 'failed', cause: 'unknown' }] };
+  const unknownPark = { kind: 'park', ...unknownId, reason: 'fix-cause-unknown' };
+  const parkCases = [
+    ['no park', [], true],
+    ['budget park', [{ ...unknownPark, reason: 'fix-loop-exhausted' }], true],
+    ['raw ceiling', [{ ...unknownPark, reason: 'raw per-head repair session ceiling reached' }], true],
+    ['other head', [{ ...unknownPark, head: 'def' }], true],
+    ['other PR', [{ ...unknownPark, pr: 8 }], true],
+    ['other repo', [{ ...unknownPark, repo: 'pl' }], true],
+    ['other kind', [{ ...unknownPark, kind: 'outcome' }], true],
+    ...['repo', 'pr', 'head', 'reason'].map(key => {
+      const row = { ...unknownPark }; delete row[key];
+      return [`missing ${key}`, [row], true];
+    }),
+    ['matching unknown park', [unknownPark], false],
+  ];
+  it.each(parkCases)('unparkedUnknownOnHead: an unrelated park does not cover unknown evidence (%s)', async (_name, rows, expected) => {
+    const { unparkedUnknownOnHead } = await import('../fix-slot-borrow.mjs');
+    expect(unparkedUnknownOnHead(unknownTable, unknownId, rows)).toBe(expected);
+  });
+  it('unparkedUnknownOnHead stops at pushed in array order and excludes legacy rows without cause', async () => {
+    const { unparkedUnknownOnHead } = await import('../fix-slot-borrow.mjs');
+    expect(unparkedUnknownOnHead({ 'we#7': [...unknownTable['we#7'],
+      { head: 'abc', at: 0, outcome: 'pushed' }] }, unknownId, [])).toBe(false);
+    expect(unparkedUnknownOnHead({ 'we#7': [{ head: 'abc', at: 1, outcome: 'failed' }] }, unknownId, [])).toBe(false);
+  });
+  it('isUnknownCausePark matches only repo, PR, head and fix-cause-unknown', async () => {
+    const { isUnknownCausePark, UNKNOWN_CAUSE_PARK_REASON } = await import('../fix-slot-borrow.mjs');
+    expect(UNKNOWN_CAUSE_PARK_REASON).toBe('fix-cause-unknown');
+    for (const [name, rows, unparked] of parkCases) {
+      for (const row of rows) expect(isUnknownCausePark(row, unknownId), name).toBe(!unparked);
+    }
+    for (const row of [null, undefined, {}]) expect(isUnknownCausePark(row, unknownId)).toBe(false);
+  });
   it('counts only model rows: two model misses then ten excluded rows still count 2', async () => {
     const { recordRoutedOutcome, consecutiveUnproductiveOnHead } = await import('../fix-slot-borrow.mjs');
     let table = {};

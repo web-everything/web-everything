@@ -196,7 +196,7 @@ import { readPrHeads, applyNetScopeToReconcile, markRebaseExemptUsed, rebaseOver
 import micromatch from 'micromatch';
 import { criticalWorkVerdict } from '../lib/critical-work.mjs';
 import { resolveFixCriticalGlobs, resolveFixExecutionMode } from '../lib/fix-executor-chain.mjs';
-import { BORROW_REASON, readRoutedOutcomes, unparkedUnknownOnHead, consecutiveUnproductiveOnHead, mergeOntoFor, chooseFixExecutor, claudeOnlyReason, formatFixExecutorLog, stampFixExecutor } from '../lib/fix-slot-borrow.mjs';
+import { BORROW_REASON, readRoutedOutcomes, isUnknownCausePark, unparkedUnknownOnHead, consecutiveUnproductiveOnHead, mergeOntoFor, chooseFixExecutor, claudeOnlyReason, formatFixExecutorLog, stampFixExecutor } from '../lib/fix-slot-borrow.mjs';
 import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
 import { removePromptFile, releaseAnsweredUnknownCause } from '../operations/fix-run.mjs';
 export { releaseAnsweredUnknownCause };
@@ -2168,7 +2168,7 @@ export function runReconcileFixDispatch({
           if (isOperatorAnswerStandDownSuperseded(comments, index)) continue;
           const head = standDownHead(comment.body);
           if (!/^[a-f0-9]{40}$/i.test(head ?? '')) continue;
-          if (rows.some(r => r.kind === 'park' && r.repo === repoKey && r.pr === refusal.prNumber && r.head === head)) continue;
+          if (rows.some(r => isUnknownCausePark(r, { repo: repoKey, pr: refusal.prNumber, head }))) continue;
           const park = { kind: 'park', repo: repoKey, pr: refusal.prNumber, head, reason: 'fix-cause-unknown' };
           fixLoop.append(park);
           rows = [...rows, { ...park, v: 1, at: new Date(now).toISOString() }];

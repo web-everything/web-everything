@@ -55,6 +55,26 @@ ruling through we:scripts/conveyor/reconcile-fix-dispatch.mjs into fresh and res
 the work instructions. The original answer is retained byte-for-byte in the structured record and brief;
 HTML comment delimiters are escaped in the visible quote so quoted marker text stays inert.
 
+## Unknown-cause park coverage (fix admission)
+
+Only a park matching repo, PR, head and reason `fix-cause-unknown` covers unknown-cause evidence.
+A park with any other reason, including `fix-loop-exhausted` or
+`raw per-head repair session ceiling reached`, never covers it.
+
+`unparkedUnknownOnHead(table, id, rows)` in we:scripts/lib/fix-slot-borrow.mjs returns true when
+scanning the PR's routed rows from last to first, stopping at the first `pushed` row, finds a row
+on `id.head` with an explicit `cause` resolving to `unknown`, and no row in `rows` satisfies
+`isUnknownCausePark(row, id)`. Order is array position, not timestamp comparison. A true result
+holds fix and CI-heal admission.
+
+When not dry-run, recovery completes missing parks for at most four `stood-down` refusals per pass.
+A refusal qualifies when it has a trusted, unsuperseded `fix-cause-unknown` stand-down whose head
+is a valid 40-hex SHA and no `isUnknownCausePark` row exists. Recovery appends that park once;
+later passes deduplicate it through the same predicate.
+
+The predicate binds no episode. Release of an answered episode belongs only to
+`releaseAnsweredUnknownCause`.
+
 ## PR description handoff: live case #3181
 
 After merge, from the WE checkout, the orchestrator should run this exact command on the operator's
