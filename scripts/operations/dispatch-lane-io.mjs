@@ -1,6 +1,7 @@
 import { NO_PROMPT_SESSION_KINDS } from '../lib/no-prompt-command-rules.mjs';
 import { RESTRICTED_PROVIDER_TOOLS } from './minimal-context-provider.mjs';
 import { stopSession } from './dispatch-abort.mjs';
+import { pinnedHookCommand } from '../lib/pinned-hook-command.mjs';
 import { appendBuildRequirements, resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { applyTestsFirstPolicy } from '../lib/tests-first-policy.mjs';
 import { readPreparePolicy } from '../conveyor/prepare-policy-settings.mjs';
@@ -1992,6 +1993,7 @@ export function defaultClaudeProvider(request, {
   const argv = buildAgentArgv({
     advisor,
     sessionId: request.sessionId,
+    resumeSessionId: request.resumeSessionId ?? null,
     payload: { prompt: request.prompt, sessionSlug: request.sessionSlug, num: request.num, launchKind: request.launchKind },
     extraArgs: request.extraArgs,
     systemPromptFile: request.systemPromptFile,
@@ -2027,8 +2029,8 @@ export function defaultClaudeProvider(request, {
   // A background-session resume must stay on the background provider, even when new workers are wrapped.
   // wrappedArgvFromBg only supports fresh launches; sending a resume there either refuses it or lets an
   // alternate launcher return an unchecked replacement. Wrapped-worker continuation uses requestWrappedResume.
-  // Keep every resume below, behind the same identity check and foreign-session cleanup.
-  if (wrapKind(kind) && !request.resumeSessionId) {
+  // Only lean repair resumes bypass the wrapper; other kinds retain wrapper enforcement.
+  if (wrapKind(kind) && !(lean && request.resumeSessionId)) {
     const launched = launchWrapped({
       role: kind, session: request.sessionSlug, bgArgv: argv, cwd: request.cwd, env: workerSpawnEnv(spawnEnv ?? process.env), pr: request.pr ?? null,
       item: request.num ?? null, model: launchedModel, sessionId: request.sessionId,
@@ -2042,7 +2044,7 @@ export function defaultClaudeProvider(request, {
   }
   const stdout = String(spawnAgent(argv, spawnEnv ? { cwd: request.cwd, env: spawnEnv } : { cwd: request.cwd }) ?? '');
   const handle = parseBackgroundedId(stdout);
-  if (lean && request.resumeSessionId && handle !== String(request.resumeSessionId)) {
+  if (request.resumeSessionId && handle !== String(request.resumeSessionId)) {
     if (handle) {
       // Added resume flags can make the CLI fork. Deregister that exact replacement before reporting
       // failure; never stop the requested session or start another attempt here. A failed stop stays
@@ -2627,13 +2629,26 @@ function leanDaemonEnv(env) {
     !['CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_SETTINGS'].includes(key)));
 }
 
-/** Only the tool safety hooks belong in the daemon profile. Resolve them independently of its scratch cwd. */
+/** Safety guards run from the pinned clone, independently of the worker's scratch cwd. */
 function leanDaemonHooks() {
-  const command = (script) => `node '${join(REPO_ROOT, 'scripts', script).replaceAll("'", "'\\''")}'`;
-  return { PreToolUse: [
-    { matcher: 'Edit|Write', hooks: [{ type: 'command', command: command('guard-lane.mjs') }] },
-    { matcher: 'Bash', hooks: [{ type: 'command', command: command('guard-bash.mjs') }] },
-  ] };
+  const hook = (script, args = [], options) => ({ type: 'command', command: pinnedHookCommand(`scripts/${script}`, args, options) });
+  return {
+    PreToolUse: [
+      { matcher: 'Edit|Write', hooks: [
+        hook('guard-lane.mjs'),
+        hook('lint-locus-prefix.mjs', ['--pre']),
+        hook('lint-invisible-characters.mjs'),
+        hook('check-memory.mjs', ['--pre']),
+        hook('backlog-guard.mjs', ['--pre']),
+        hook('guard-backward-edge.mjs'),
+      ] },
+      { matcher: 'Bash', hooks: [hook('guard-bash.mjs')] },
+    ],
+    Stop: [{ hooks: [
+      hook('guard-stop-passive-wait.mjs', [], { stop: true }),
+      hook('guard-stop-background-running.mjs', [], { stop: true }),
+    ] }],
+  };
 }
 
 export function buildAgentArgv({

@@ -11,6 +11,15 @@ const SUFFIX = "; code=$?; [ \"$code\" -eq 0 ] || exit 2'";
 const STOP_PREFIX = `sh -c '${LAUNCHER}; stop guard skipped" >&2; exit 1; }; exec node "$launcher" --stop-hook `;
 const STOP_SUFFIX = "'";
 
+/** Build only literal script/flag invocations accepted by the pinned wrapper recognizer. */
+export function pinnedHookCommand(script, args = [], { stop = false } = {}) {
+  const command = `${stop ? STOP_PREFIX : PREFIX}${[script, ...args].join(' ')}${stop ? STOP_SUFFIX : SUFFIX}`;
+  if (!(stop ? pinnedStopHookScript(command) : pinnedHookScript(command))) {
+    throw new Error('Invalid pinned guard script or flags');
+  }
+  return command;
+}
+
 function scriptBetween(command, prefix, suffix) {
   if (typeof command !== 'string' || !command.startsWith(prefix) || !command.endsWith(suffix)) return null;
   const invocation = command.slice(prefix.length, -suffix.length);
