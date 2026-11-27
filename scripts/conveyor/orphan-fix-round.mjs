@@ -276,9 +276,14 @@ export async function defaultRedispatch({ slug, pr, reconcile }) {
   const dispatched = (result.dispatched ?? []).filter((d) => Number(d.pr ?? d.prNumber) === Number(pr));
   const refusals = only(result.refusals);
   const why = [...refusals, ...only(result.reconcileRefusalDetails)].map((r) => `${r.kind}: ${r.why ?? ''}`).join('; ');
+  // The dispatcher's deferred-read return precedes every launch. An empty
+  // diagnostic is still explicit evidence; contradictory results are not.
+  const readDeferred = typeof result.readDeferred === 'string'
+    && Array.isArray(result.dispatched) && result.dispatched.length === 0
+    && Array.isArray(result.refusals) && result.refusals.length === 0;
   return dispatched.length ? { ok: true } : {
-    ok: false, why: why || 'the dispatcher planned no fix for it',
-    launchNotStarted: refusals.length > 0 && refusals.every(r => PRELAUNCH_REFUSALS.has(r.kind)),
+    ok: false, why: why || (readDeferred ? `read deferred: ${result.readDeferred || 'deferred'}` : 'the dispatcher planned no fix for it'),
+    launchNotStarted: readDeferred || (refusals.length > 0 && refusals.every(r => PRELAUNCH_REFUSALS.has(r.kind))),
   };
 }
 

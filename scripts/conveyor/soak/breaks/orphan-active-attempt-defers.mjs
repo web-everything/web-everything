@@ -1,9 +1,45 @@
 /** Concurrent orphan passes must not park a PR while its first dispatch is in flight. */
 import { spawnSync } from 'node:child_process';
+import { strictEqual, match } from 'node:assert';
+import { mkdtempSync, rmSync, readdirSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ghRepoSlug } from '../../../lib/constellation-repos.mjs';
 
 const root = fileURLToPath(new URL('../../../../', import.meta.url));
+
+/** The wrapper injects the production adapter with hermetic dispatcher IO. */
+export async function replayReadDeferral(redispatch) {
+  const { runOrphanFixRoundPass } = await import('../../orphan-fix-round.mjs');
+  const attemptRoot = mkdtempSync(join(tmpdir(), 'orphan-read-deferred-'));
+  try {
+    let escalations = 0;
+    const options = { attemptRoot, env: {}, nowMs: Date.parse('2026-10-10T12:00:00Z'),
+      repos: [{ key: 'we', slug: ghRepoSlug('we') }],
+      listBounced: () => [{ number: 1, labels: ['review:changes'], headRefOid: 'a'.repeat(40), isDraft: false }],
+      readComments: async () => [
+        { createdAt: '2026-10-10T10:00:00Z', body: '🔁 review — changes requested',
+          includesCreatedEdit: false, author: { login: 'web-everything' } },
+        { createdAt: '2026-10-10T11:00:00Z', body: '🔓 conveyor fix-end — fix claim released',
+          includesCreatedEdit: false, author: { login: 'web-everything' } },
+      ],
+      isOwned: async () => false, resolveProfile: () => ({ capabilities: { fix: true } }),
+      redispatch, postComment: async () => { throw new Error('marker unavailable'); },
+      escalate: async () => { escalations += 1; return { ok: true }; },
+    };
+    const ledger = () => JSON.parse(readFileSync(join(attemptRoot,
+      readdirSync(attemptRoot).find(name => name.endsWith('.json'))), 'utf8'));
+    await runOrphanFixRoundPass(options);
+    strictEqual(ledger().pending, false, 'a deferred read must release the prelaunch reservation');
+    strictEqual(ledger().confirmed, 0, 'a deferred read must not spend an attempt');
+    const retry = await runOrphanFixRoundPass(options);
+    match(retry.rows[0]?.result, /^re-dispatched/);
+    strictEqual(ledger().pending, false);
+    strictEqual(ledger().confirmed, 1);
+    strictEqual(escalations, 0, 'read budget recovery must not park the PR for a human');
+  } finally { rmSync(attemptRoot, { recursive: true, force: true }); }
+}
 
 export function probe(checkout) {
   const child = spawnSync(process.execPath, ['--input-type=module', '-e', `

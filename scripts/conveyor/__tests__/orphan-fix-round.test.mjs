@@ -1182,8 +1182,29 @@ describe('durable orphan redispatch budget', () => {
     } finally { dispatcher.mockRestore(); }
   });
 
+  it.each(['author-lookup budget exhausted', ''])('a deferred read (%j) releases the reservation and retries after recovery', async readDeferred => {
+    const f = fixture();
+    const dispatcher = vi.spyOn(fixDispatch, 'runReconcileFixDispatch')
+      .mockReturnValueOnce({ dispatched: [], refusals: [], readDeferred })
+      .mockReturnValueOnce({ dispatched: [{ pr: 4715 }], refusals: [] });
+    try {
+      await f.run({ redispatch: defaultRedispatch });
+      expect(f.ledgers()[0]).toMatchObject({ confirmed: 0, pending: false });
+      const retry = await f.run({ redispatch: defaultRedispatch });
+      expect(dispatcher).toHaveBeenCalledTimes(2);
+      expect(retry.rows[0].result).toMatch(/^re-dispatched/);
+      expect(f.ledgers()[0]).toMatchObject({ confirmed: 1, pending: false });
+      expect(f.escalate).not.toHaveBeenCalled();
+    } finally { dispatcher.mockRestore(); }
+  });
+
   it.each([
     ['empty response', {}],
+    ['read deferral without explicit empty arrays', { readDeferred: 'deferred' }],
+    ['non-string read deferral', { dispatched: [], refusals: [], readDeferred: true }],
+    ['read deferral with ambiguous refusal', { dispatched: [], readDeferred: 'deferred',
+      refusals: [{ pr: 4715, kind: 'dispatch-failed' }] }],
+    ['read deferral with another launch', { dispatched: [{ pr: 9 }], refusals: [], readDeferred: 'deferred' }],
     ['no dispatch confirmation', { dispatched: [], refusals: [] }],
     ['other PR only', { dispatched: [{ pr: 9 }], refusals: [{ pr: 9, kind: 'fix-cap' }] }],
     ['mixed capacity and timeout', { dispatched: [], refusals: [
