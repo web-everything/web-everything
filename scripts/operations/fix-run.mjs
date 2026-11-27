@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { deriveAgyFixAdmission } from '../lib/agy-fix-admission.mjs';
+import { ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 import { readCiJobLog } from '../lib/gh-ci-log.mjs';
 import { stripVTControlCharacters } from 'node:util';
@@ -1252,7 +1253,7 @@ export async function runFixCli(argv = [], {
         }
       }
       if (!openSendBacks.length && !evidence.reason) {
-        const emission = emitNoCodeOwedStandDown({ repo: launch.repo ?? 'web-everything/web-everything',
+        const emission = emitNoCodeOwedStandDown({ repo: launch.repo ?? ghRepoSlug('we'),
           pr: Number(pr), head: before, runId, claimId: holder, reason }, {
           readState: () => {
             const state = probeLaneHead({ lanePath, pr, repo: launch.repo, holder, run, readLease });
