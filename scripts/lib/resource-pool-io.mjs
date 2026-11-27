@@ -197,7 +197,8 @@ export function readPoolSource(source, { paths, coord, env = process.env, nowMs 
   heavyStatus = () => readPoolHeavyHeld({ env }),
   laneStatus = () => readPoolLaneStatus({ env, nowMs, cwd, run, readJson: json, readRegistry }),
   processAlive = poolPidAlive, readStart = pidStartTime, host = hostname(), namespace = pidNamespace(),
-  slotAlive = (data, { statusAt }) => {
+  slotAlive } = {}) {
+  const processSlotAlive = data => {
     const killAlive = pid => {
       const alive = processAlive(pid);
       if (typeof alive !== 'boolean') throw Error('unknown process liveness');
@@ -205,7 +206,8 @@ export function readPoolSource(source, { paths, coord, env = process.env, nowMs 
     };
     if (data.host && data.host !== host) return null;
     return probeSlotAlive(data, { killAlive, readStart, host, namespace });
-  } } = {}) {
+  };
+  slotAlive ??= processSlotAlive;
   let expiredRedTeamRows = 0;
   try {
     const holders = [];
@@ -288,7 +290,10 @@ export function readPoolSource(source, { paths, coord, env = process.env, nowMs 
         if (row.pid == null) throw Error(`unknown red-team liveness: ${entry.name}; missing pid; inspect status manually`);
         if (!Number.isSafeInteger(row.pid) || row.pid <= 0) throw Error(`invalid red-team pid: ${entry.name}`);
         if (typeof row.pidStart !== 'string' || !row.pidStart.trim()) throw Error(`invalid red-team pidStart: ${entry.name}`);
-        const alive = slotAlive(row, { statusAt });
+        // Old rows bypass the slot callback only after direct process-identity evidence.
+        // Age alone never releases a live holder or excuses unreadable liveness.
+        const alive = nowMs - statusAt > RED_TEAM_HARD_LEASE_CEILING_MS
+          ? processSlotAlive(row) : slotAlive(row, { statusAt });
         if (typeof alive !== 'boolean') throw Error(`unknown red-team liveness: ${entry.name}; inspect host/process access`);
         if (alive) add('redTeam', `${row.repo}:${row.pr}:${row.head}`, 2, 1);
         else if (nowMs - statusAt > RED_TEAM_HARD_LEASE_CEILING_MS) expiredRedTeamRows++;

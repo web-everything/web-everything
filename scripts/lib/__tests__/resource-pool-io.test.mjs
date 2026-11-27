@@ -56,7 +56,8 @@ beforeEach(() => {
 afterEach(() => { guard.active = false; fs.rmSync(coord, { recursive: true, force: true }); });
 const read = (source, options = {}) => readPoolSource(source, { paths, env, nowMs, cwd: coord, readRegistry: () => ({ repos: [{ name: 'web-everything' }] }), namespace: 'local', host: 'studio',
   listCommands: () => `${process.pid} 1 node resource-pool.mjs`, roundBudget: () => ({ live: 2 }),
-  laneStatus: () => ({ lanes: [] }), heavyStatus: () => ({ held: [] }), slotAlive: () => true, ...options });
+  laneStatus: () => ({ lanes: [] }), heavyStatus: () => ({ held: [] }), processAlive: () => { throw Error('unexpected process probe'); },
+  readStart: () => { throw Error('unexpected process identity read'); }, slotAlive: () => true, ...options });
 const settingsArgs = () => ({ env: {}, read: () => ({ value: structuredClone(POOL_DEFAULTS), taint: [] }),
   platform: {}, operatorOverride: {}, enumOverride: { ok: false, reason: 'absent' } });
 const expectClosed = settings => {
@@ -283,7 +284,7 @@ it('expires red-team leases strictly after 24h but never excuses unreadable evid
   fs.writeFileSync(file, JSON.stringify(status()));
   fs.utimesSync(file, new Date(clock - RED_TEAM_HARD_LEASE_CEILING_MS), new Date(clock - RED_TEAM_HARD_LEASE_CEILING_MS));
   expect(read('redTeam', { nowMs: clock }).holders).toHaveLength(1);
-  expect(read('redTeam', { nowMs: clock + 1, slotAlive: () => { throw Error('must not probe'); } }))
+  expect(read('redTeam', { nowMs: clock + 1, processAlive: () => false, slotAlive: () => { throw Error('must not probe'); } }))
     .toMatchObject({ ok: true, holders: [], expiredRedTeamRows: 1 });
   fs.writeFileSync(file, '{'); expect(read('redTeam', { nowMs: clock + 1 }).ok).toBe(false);
 });
@@ -293,8 +294,38 @@ it('counts an expired red-team lease before consulting slot liveness', () => {
   const statusAt = clock - RED_TEAM_HARD_LEASE_CEILING_MS - 1;
   fs.utimesSync(file, new Date(statusAt), new Date(statusAt));
   const slotAlive = vi.fn(() => { throw Error('expired lease must not probe'); });
-  expect(read('redTeam', { nowMs: clock, slotAlive }))
+  expect(read('redTeam', { nowMs: clock, processAlive: () => false, slotAlive }))
     .toMatchObject({ ok: true, holders: [], expiredRedTeamRows: 1 });
+  expect(slotAlive).not.toHaveBeenCalled();
+});
+it('an expired red-team lease with a matching live process identity remains counted before the slot callback', () => {
+  const clock = 200000000, file = join(paths.redTeam, filename);
+  fs.writeFileSync(file, JSON.stringify({ ...status(), host: 'studio', pidNamespace: 'local' }));
+  const statusAt = clock - RED_TEAM_HARD_LEASE_CEILING_MS - 1;
+  fs.utimesSync(file, new Date(statusAt), new Date(statusAt));
+  const processAlive = vi.fn(() => true), readStart = vi.fn(() => 'owner-start');
+  const slotAlive = vi.fn(() => false);
+  expect(read('redTeam', { nowMs: clock, processAlive, readStart, slotAlive }))
+    .toMatchObject({ ok: true, holders: [{ kind: 'redTeam', class: 2, size: 1 }], expiredRedTeamRows: 0 });
+  expect(processAlive).toHaveBeenCalledWith(123);
+  expect(readStart).toHaveBeenCalledWith(123);
+  expect(slotAlive).not.toHaveBeenCalled();
+});
+it.each([
+  ['throwing', () => { throw Error('unreadable process'); }],
+  ['unknown', () => null],
+])('an expired red-team lease with a %s process probe fails closed before the slot callback', (_, probe) => {
+  const clock = 200000000, file = join(paths.redTeam, filename);
+  fs.writeFileSync(file, JSON.stringify(status()));
+  const statusAt = clock - RED_TEAM_HARD_LEASE_CEILING_MS - 1;
+  fs.utimesSync(file, new Date(statusAt), new Date(statusAt));
+  const processAlive = vi.fn(probe), readStart = vi.fn(() => 'owner-start');
+  const slotAlive = vi.fn(() => true);
+  expect(read('redTeam', { nowMs: clock, processAlive, readStart, slotAlive }))
+    .toMatchObject({ ok: false, holders: [], expiredRedTeamRows: 0,
+      error: expect.stringContaining('inspect source and rerun') });
+  expect(processAlive).toHaveBeenCalledWith(123);
+  expect(readStart).not.toHaveBeenCalled();
   expect(slotAlive).not.toHaveBeenCalled();
 });
 it('foreign hosts and unknown local probes stay unknown; only ESRCH proves death', () => {
