@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { checkoutState, sharedRunEnv, sharedSmokeIdentity, readSharedPass, publishSharedPass,
@@ -532,6 +533,54 @@ function realRepo(dir, files) {
 }
 
 describe('audit: shared evidence never bypasses current inputs or ownership', () => {
+  it('NODE_OPTIONS preload gives null', () => {
+    expect(f.key()?.key).toMatch(/^[a-f0-9]{64}$/);
+    for (const value of ['--require=fixture', '-r fixture', '-rfixture', '--import=fixture', '--loader fixture', '--experimental-loader=fixture']) {
+      f.env.NODE_OPTIONS = value;
+      expect(f.key()).toBeNull();
+      expect(f.logs.at(-1)).toContain('env-preload-unbound');
+    }
+  });
+  it('shim target under ignored state dir gives null', () => {
+    shim(); expect(f.key()?.key).toMatch(/^[a-f0-9]{64}$/);
+    for (const name of ['.operations', '.conveyor']) {
+      shim({ moduleRoot: join(f.runningRoot, name) });
+      f.repos.get(f.runningRoot).ignored = `${name}/\0`;
+      expect(f.key()).toBeNull();
+      expect(f.logs.at(-1)).toContain('runtime-target-ignored');
+    }
+  });
+  it('shim with extra import gives null', () => {
+    const { lines } = shim(), path = join(f.bins, 'gh');
+    const safe = [...lines, "const fs = require('node:fs');",
+      `const mod = import(${JSON.stringify(pathToFileURL(join(f.runningRoot, 'one.mjs')).href)});`].join('\n');
+    write(path, safe); expect(f.key()?.key).toMatch(/^[a-f0-9]{64}$/);
+    for (const extra of ["require('unbound-package');", "import('unbound-package');",
+      `import(${JSON.stringify(pathToFileURL(write(join(base, 'outside.mjs'), 'export {};')).href)});`,
+      'require(process.env.EXTRA_MODULE);', 'import(process.env.EXTRA_MODULE);']) {
+      write(path, safe + '\n' + extra);
+      expect(f.key()).toBeNull();
+      expect(f.logs.at(-1)).toContain('runtime-shim-import');
+    }
+  });
+  it('extension-less shebang target gives null', () => {
+    const { native } = shim(); expect(f.key()?.key).toMatch(/^[a-f0-9]{64}$/);
+    write(native, '#!/bin/sh\nexec node unbound.mjs');
+    expect(f.key()).toBeNull();
+    expect(f.logs.at(-1)).toContain('runtime-script');
+  });
+  it('publish never removes a quarantined lock', () => {
+    const options = { ...f.store(), result: pass(), canPublish };
+    const lock = join(f.stateDir, 'smoke-shared', `${options.identity.key}.lock`), moved = `${lock}.stale-12345678`;
+    const owner = write(join(moved, 'owner.json'), '{"token":"replacement"}');
+    fs.mkdirSync(`${lock}.guard`);
+    fs.utimesSync(moved, 0, new Date(f.now() - 86400001));
+    const remove = vi.fn((...args) => fs.rmSync(...args));
+    expect(publishSharedPass({ ...options, fs: { ...fs, rmSync: remove } })).toBe(true);
+    expect(remove.mock.calls.some(([path]) => path === moved)).toBe(false);
+    expect(fs.readFileSync(owner, 'utf8')).toBe('{"token":"replacement"}');
+    expect(fs.existsSync(`${lock}.guard`)).toBe(true);
+  });
   it('rechecks the environment on an hour-old hit and preserves refusals and missing-runner fallback', async () => {
     expect(publishSharedPass({ ...f.store(), result: pass(), canPublish })).toBe(true);
     f.advance(3600000);

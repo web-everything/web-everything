@@ -3,7 +3,7 @@ import * as FS from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
 import { hostname, homedir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { operatorOverridesPath } from '../operator-override-reader.mjs';
 import { operatorPreferencesPath } from '../policy-cascade.mjs';
 export const RUNNING_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -98,9 +98,13 @@ export function sharedSmokeIdentity(o) {
   const findCheckout = o.findCheckout ?? (p => { let dir = dirname(p); for (let n = 0; n < 128; n++) { check(); if (stat(join(dir, '.git'))) return dir; if (dirname(dir) === dir) return undefined; dir = dirname(dir); } fail('runtime-checkout-depth: run full smoke; inspect target'); });
   const bindTarget = p => {
     const real = fs.realpathSync(p), checkout = findCheckout(real);
-    if (checkout) return [state(checkout, true), deps(join(checkout, 'node_modules'))];
+    if (checkout) {
+      if (['.operations', '.conveyor'].includes(relative(fs.realpathSync(checkout), real).split(sep)[0])) fail('runtime-target-ignored');
+      return [state(checkout, true), deps(join(checkout, 'node_modules'))];
+    }
     const snap = snapshotRoot(real); if (snap) return state(snap);
-    if (/\.(mjs|js|cjs)$/.test(real)) fail('runtime-module-unbound'); return digest(read(real));
+    if (/\.(mjs|js|cjs)$/.test(real)) fail('runtime-module-unbound');
+    const b = read(real); if (b.subarray(0, 2).toString() === '#!') fail('runtime-script'); return digest(b);
   };
   try {
     // Location may be omitted only when the child's reference names the verified owner checkout.
@@ -125,6 +129,7 @@ export function sharedSmokeIdentity(o) {
     const refresh = o.refresh, minted = refresh?.applied === true && refresh.before && refresh.after && refresh.before.GH_TOKEN !== refresh.after.GH_TOKEN && refresh.after.GH_TOKEN === runEnv.GH_TOKEN;
     const env = pack(Object.keys(runEnv).sort().filter(k => !SHARED_SMOKE_ENV_LOCATION.includes(k) && !(minted && SHARED_SMOKE_ENV_CREDENTIAL.includes(k))).map(k => {
       check(); const v = runEnv[k]; if (typeof v !== 'string') fail('env-value-invalid'); let file = '';
+      if (/--(?:require|import|(?:experimental-)?loader)|(?:^|\s|["'])-r/.test(v)) fail('env-preload-unbound');
       if (isAbsolute(v)) { const st = maybe(() => fs.statSync(v)); if (st?.isFile()) { if (st.size > 4 * 1024 ** 2) fail('env-file-oversized: run full smoke; inspect input file'); file = digest(read(v)); } }
       return [k, v, file];
     }));
@@ -142,6 +147,13 @@ export function sharedSmokeIdentity(o) {
           let p; try { p = JSON.parse(m[2]); } catch { fail('runtime-shim-layout'); } if (!isAbsolute(p)) fail('runtime-shim-layout'); targets.set(m[1], p);
         }
         if (['GH_THROTTLE_CLI', 'REAL_GH_THROTTLE_CLI', 'APP_REFRESH_CLI'].some(k => !targets.has(k))) fail('runtime-shim-layout');
+        const urls = new Set([...targets].filter(([k]) => k !== 'CACHE_PATH').map(([, p]) => pathToFileURL(p).href));
+        if (/^\s*import\s+(?!\()/m.test(text)) fail('runtime-shim-import');
+        for (const m of text.matchAll(/\b(?:require|import)\s*\(/g)) {
+          check(); const literal = text.slice(m.index + m[0].length).match(/^\s*("(?:[^"\\]|\\.)*"|'[^'\\]*')\s*\)/); if (!literal) fail('runtime-shim-import');
+          let spec; try { spec = literal[1][0] === '"' ? JSON.parse(literal[1]) : literal[1].slice(1, -1); } catch { fail('runtime-shim-import'); }
+          if (!spec.startsWith('node:') && !urls.has(spec)) fail('runtime-shim-import');
+        }
         bound.push([...targets].filter(([k]) => k !== 'CACHE_PATH').sort().map(([k, p]) => [k, bindTarget(p)]));
       }
       if (name === 'git') bound.push(gitRead(git, root, ['--version'], runEnv)); return bound;
@@ -177,7 +189,7 @@ export function publishSharedPass(o) {
     atomic(fs, join(dir, `${i.key}.pass.json`), r, true); notice(o, 'smoke-shared-published', { key: i.key });
     try { const names = fs.readdirSync(dir); if (names.length > 10000) notice(o, 'smoke-shared-prune-deferred', { reason: 'entry-limit; operator should prune aged records' });
       for (const name of names.slice(0, 10000)) { const p = join(dir, name), st = maybe(() => fs.lstatSync(p)); if (!st) continue; const age = now() - st.mtimeMs;
-        if ((/^[a-f0-9]{64}\.pass\.json$/.test(name) && age >= 86400000) || ((name.endsWith('.tmp') || /^[a-f0-9]{64}\.lock\.stale-[a-f0-9]{8}$/.test(name)) && age >= 3600000)) maybe(() => fs.rmSync(p, { recursive: true })); }
+        if ((/^[a-f0-9]{64}\.pass\.json$/.test(name) && age >= 86400000) || (name.endsWith('.tmp') && age >= 3600000)) maybe(() => fs.rmSync(p, { recursive: true })); }
     } catch { notice(o, 'smoke-shared-prune-deferred', { reason: 'prune-unreadable; operator should inspect store' }); }
     return true;
   } catch (e) { notice(o, 'smoke-shared-store-error', { reason: 'publish-or-prune-failed: run full smoke; inspect store permissions and disk' }); return false; }
