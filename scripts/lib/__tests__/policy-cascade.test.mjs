@@ -653,6 +653,32 @@ it.each([
 
 describe('SD15 audit safety regressions', () => {
   const quiet = () => {};
+  it('refuses replacing or erasing ancestors of declared safety leaves', () => {
+    for (const replacement of [false, null, {}, { other: true }]) {
+      for (const layer of ['company', 'tool', 'operator', 'envValues']) {
+        const r = resolveCascade({ policy: 'futureGate', standard: { guard: { required: true } },
+          safetyLeaves: ['guard.required'], [layer]: { guard: replacement }, log: quiet });
+        expect(r.value.guard.required).toBe(true);
+        if (!replacement || layer === 'envValues') expect(r.invalid.join(' ')).toMatch(/ancestor.*safety/);
+      }
+    }
+  });
+  it('broken layer evidence preserves stricter effective booleans and numeric limits', () => {
+    for (const [leaf, baseline, tighter] of [['enabled', true, false], ['maxFiles', 9, 2]]) {
+      const r = resolveCascade({ policy: 'ciUnitRerun', standard: { [leaf]: baseline }, company: { [leaf]: tighter },
+        layerErrors: { team: 'incomplete evidence' }, log: quiet });
+      expect(r.value[leaf]).toBe(tighter);
+      expect(r.sources[leaf]).toBe('unresolved:team');
+      expect(r.invalid.join(' ')).toMatch(/team.*repair layer/);
+    }
+  });
+  it('personal preferences cannot weaken an env-set gate with unknown safety direction', () => {
+    const r = resolveCascade({ policy: 'build', standard: { finalGate: 'related' },
+      envValues: { finalGate: 'full' }, operator: { finalGate: 'none' }, log: quiet });
+    expect(r.value.finalGate).toBe('full');
+    expect(r.sources.finalGate).toBe('env');
+    expect(r.invalid.join(' ')).toMatch(/operator.finalGate.*env.*repair/);
+  });
   it('broken or partial layer evidence retains the standard referral guard', () => {
     for (const layer of ['platform', 'company', 'org', 'team', 'repo', 'tool', 'operator']) {
       const r = resolveCascade({ policy: 'review', standard: { unattendedAcceptRequiresCleanReferrals: true },

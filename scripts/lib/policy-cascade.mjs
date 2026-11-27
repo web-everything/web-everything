@@ -160,16 +160,33 @@ export function resolveCascade({ standard, platform, company, org, team, repo, t
     return out;
   };
   const remember = (key, entry) => history.set(key, [...(history.get(key) ?? []), entry]);
+  // Owner objects merge, but scalar ancestors and whole-key env replacements can erase guards.
+  const erasesSafety = (path, value) => {
+    const protectedPaths = [...safetyLeaves.map(leaf => leaf ? leaf.split('.') : []),
+      ...[...eff.values()].filter(e => isSafety(e.path.join('.'))).map(e => e.path)];
+    return protectedPaths.some(parts => parts.length > path.length
+      && path.every((part, i) => parts[i] === part)
+      && parts.slice(path.length).reduce((v, part) => isObj(v) && Object.hasOwn(v, part) ? v[part] : undefined, value) === undefined);
+  };
   const apply = (name, layer) => {
     if (layer === undefined || layer === null) return;
     for (const [key, { path, v }] of candidates(layer)) {
       const leaf = path.join('.');
+      if (erasesSafety(path, v)) {
+        invalid.push(`${name}${at(path)}: ancestor replacement erases safety leaves; repair value`);
+        continue;
+      }
       if ((OPERATOR_ONLY.has(policy?.split('.')[0]) || OPERATOR_ONLY.has(path[0])) && name !== 'operator') {
         invalid.push(`${name}${at(path)}: operator-only policy; only the operator-owned preferences file may set it`);
         log(`policy-cascade: ignoring ${name} operator-only policy; only the operator-owned preferences file may set it`);
         continue;
       }
       if (!check(path, v)) { invalid.push(`${name}${at(path)}=${JSON.stringify(v)}`); continue; }
+      if (name === 'operator' && !directionFor(policy, leaf) && !CAPACITY_LEAVES[`${policy}.${leaf}`]
+        && history.get(key)?.some(entry => entry.layer === 'env')) {
+        invalid.push(`operator${at(path)}: env value has unknown safety direction; repair direction`);
+        continue;
+      }
       const capacity = CAPACITY_LEAVES[`${policy}.${leaf}`];
       if (name === 'operator' && capacity) {
         const from = history.get(key)?.at(-1)?.v;
@@ -208,6 +225,10 @@ export function resolveCascade({ standard, platform, company, org, team, repo, t
       v = rest;
     }
     const path = k === '' ? [] : [k];
+    if (erasesSafety(path, v)) {
+      invalid.push(`env${at(path)}: ancestor replacement erases safety leaves; repair value`);
+      continue;
+    }
     if (!check(path, v)) { invalid.push(`env${at(path)}=${JSON.stringify(v)}`); continue; }
     if (policy || safetyLeaves.length) {
       // Unknown safety semantics refuse; unclassified non-safety preferences retain their legacy shadow notice.
@@ -282,12 +303,20 @@ export function resolveCascade({ standard, platform, company, org, team, repo, t
   }
   for (const [layer, reason] of Object.entries(layerErrors)) {
     invalid.push(`${layer}: ${reason}; repair layer before safety resolution`);
+    const unresolvedValue = (key, entry) => {
+      const baseline = defaults.get(key)?.v;
+      const direction = directionFor(policy, entry.path.join('.'));
+      // Keep proven tightening; a default alone cannot resolve missing numeric evidence.
+      if (direction && entry.v !== baseline && !isLoosening(direction, baseline, entry.v)) return entry.v;
+      return typeof baseline === 'boolean' ? baseline : undefined;
+    };
     for (const [key, entry] of eff) if (isSafety(entry.path.join('.'))) {
-      eff.set(key, { ...entry, v: typeof defaults.get(key)?.v === 'boolean' ? defaults.get(key).v : undefined, layer: `unresolved:${layer}` });
+      eff.set(key, { ...entry, v: unresolvedValue(key, entry), layer: `unresolved:${layer}` });
     }
     for (const leaf of safetyLeaves) {
       const path = leaf ? leaf.split('.') : [];
-      eff.set(path.join(SEP), { path, v: typeof defaults.get(path.join(SEP))?.v === 'boolean' ? defaults.get(path.join(SEP)).v : undefined, layer: `unresolved:${layer}` });
+      const key = path.join(SEP);
+      eff.set(key, { path, v: unresolvedValue(key, eff.get(key) ?? { path }), layer: `unresolved:${layer}` });
     }
   }
   const sources = {};
