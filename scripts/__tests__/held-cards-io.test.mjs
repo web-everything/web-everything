@@ -94,10 +94,13 @@ process.exitCode = await main(['add', '--title=' + process.argv[2]], { writeFile
     const h = harness();
     expect(await h.run(['status'])).toBe(0);
     expect(h.out.join('')).toContain('QUIET — ok to file 2 held cards');
-    expect(JSON.parse(fs.readFileSync(h.state)).openPrs).toBe(2);
-    fs.writeFileSync(h.state, JSON.stringify({ openPrs: 1 }));
+    expect(h.calls.filter(c => c.bin === 'gh').map(c => c.args[c.args.indexOf('--repo') + 1]))
+      .toEqual(['web-everything/web-everything', 'frontier-ui/frontierui', 'plateauapp/plateau-app']);
+    expect(JSON.parse(fs.readFileSync(h.state)).openPrs).toBe(3);
+    // A persisted snapshot from the former two-repo roster still participates in growth detection.
+    fs.writeFileSync(h.state, JSON.stringify({ openPrs: 2 }));
     expect(await h.run(['status', '--json'])).toBe(1);
-    expect(JSON.parse(h.out.at(-1)).reasons).toContain('PR queue grew 1 → 2');
+    expect(JSON.parse(h.out.at(-1)).reasons).toContain('PR queue grew 2 → 3');
     expect(await h.run(['status'])).toBe(0);
     const busy = harness({ load: 30 });
     expect(await busy.run(['status'])).toBe(1);

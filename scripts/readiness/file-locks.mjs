@@ -257,18 +257,21 @@ export const draftSidecarFor = entry => `draft.${createHash('sha256').update(JSO
   entry.owner, entry.meta?.sessionId, entry.meta?.tokenHash, entry.meta?.claimedAt,
 ])).digest('hex')}`;
 
-/** Strict raw evidence for claim scans; fold in the same owner heartbeat as readLockEntry. */
-export function readClaimEvidence(dir, { strict = true } = {}) {
-  const entry = JSON.parse(readFileSync(join(dir, 'lock.json'), 'utf8'));
+/** Strict claim scans validate raw timestamps before reading either sidecar: a heartbeat cannot
+ * rehabilitate malformed lock.json evidence. Tolerant lock readers retain their recovery behavior.
+ * `readFile` injects filesystem reads for isolated evidence/order probes. */
+export function readClaimEvidence(dir, { strict = true, readFile = readFileSync } = {}) {
+  const entry = JSON.parse(readFile(join(dir, 'lock.json'), 'utf8'));
   if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('Invalid lock entry');
+  if (strict && !isStrictUtcTimestamp(entry.heartbeatAt)) throw new Error('Invalid raw lock timestamp');
   try {
-    const beat = readFileSync(join(dir, heartbeatFileFor(entry.owner)), 'utf8').trim();
+    const beat = readFile(join(dir, heartbeatFileFor(entry.owner)), 'utf8').trim();
     if (!isStrictUtcTimestamp(beat)) throw new Error('Invalid heartbeat evidence');
     if (Date.parse(beat) > Date.parse(entry.heartbeatAt)) entry.heartbeatAt = beat;
   } catch (error) { if (strict && error.code !== 'ENOENT') throw error; }
   let sidecarAt = null;
   try {
-    const draft = JSON.parse(readFileSync(join(dir, draftSidecarFor(entry)), 'utf8'));
+    const draft = JSON.parse(readFile(join(dir, draftSidecarFor(entry)), 'utf8'));
     if (draft?.preDraft !== false || !isStrictUtcTimestamp(draft.at)) throw new Error('Invalid draft evidence');
     sidecarAt = draft.at;
   } catch (error) { if (strict && error.code !== 'ENOENT') throw error; }

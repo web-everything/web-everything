@@ -16,6 +16,10 @@ main = "worker.mjs"
 compatibility_date = "2026-06-19"
 workers_dev = true
 
+# Diagnostic only: off|shadow. Enforcing occurrence dedupe (on) is refused in this slice.
+[vars]
+OCC_DEDUPE = "shadow"
+
 [[durable_objects.bindings]]
 name = "PR_EVENT_LOG"
 class_name = "PrEventLog"

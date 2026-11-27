@@ -4,7 +4,7 @@ import {mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, symlinkSy
 import {join} from 'node:path';
 import {createHash} from 'node:crypto';
 import {easternTimestamp} from '../forge-exec-run.mjs';
-import {checkRemoteHealth,recordRemoteResult,peekRemoteTelemetry} from '../forge-remote-health.mjs';
+import {checkRemoteHealth,recordRemoteResult,peekRemoteTelemetry,peekRemoteBreaker,remoteHealthFile} from '../forge-remote-health.mjs';
 
 const roots=[];
 const scratch=()=>{const root=mkdtempSync(join(process.env.TMPDIR,'forge-health-quar-'));roots.push(root);return root;};
@@ -15,6 +15,52 @@ const sample=(over={})=>({sampledAtET:easternTimestamp(now),cores:8,loadPerCore:
 const check=(root,t)=>checkRemoteHealth({root,settings,clock:()=>now,readTelemetry:async()=>t,ping:async()=>false});
 const invalid=root=>readdirSync(root).filter(n=>n.startsWith('health-g2.json.invalid-')).sort();
 const legacy=()=>({v:1,lastReadAt:now,telemetry:sample(),failures:0,backoffUntil:0,trigger:'',lastGoodAt:now,lastGoodTelemetry:sample()});
+
+describe('read-only remote breaker peek',()=>{
+  const host='mesa-01';
+  const state=(over={})=>({v:1,lastReadAt:null,telemetry:null,failures:0,
+    backoffUntil:now+60000,trigger:'maxLoadPerCore',...over});
+  function peekBytes(bytes,expected) {
+    const root=scratch(),file=remoteHealthFile(root,host);
+    writeFileSync(file,bytes);
+    const before=readdirSync(root);
+    expect(peekRemoteBreaker({root,host,clock:()=>now})).toEqual(expected);
+    expect(readdirSync(root)).toEqual(before);
+    expect(readFileSync(file,'utf8')).toBe(bytes);
+  }
+  it('peekRemoteBreaker reports an open breaker without writing',()=>{
+    peekBytes(JSON.stringify(state()),{open:true,reason:'backoff-maxLoadPerCore'});
+  });
+  it('peekRemoteBreaker leaves an unreachable backoff closed for the ping lift',()=>{
+    peekBytes(JSON.stringify(state({trigger:'forge-unreachable'})),{open:false});
+  });
+  it('a malformed state without salvage never skips a host',()=>{
+    peekBytes('{broken',{open:false});
+  });
+  it('salvaged breaker fields still open the breaker',()=>{
+    peekBytes(JSON.stringify(state({extra:true})),{open:true,reason:'backoff-maxLoadPerCore'});
+  });
+  it.each([0,1])('expiry boundary (%s ms)',offset=>{
+    peekBytes(JSON.stringify(state({backoffUntil:now+offset})),offset?{open:true,reason:'backoff-maxLoadPerCore'}:{open:false});
+  });
+  it('missing state is closed and creates nothing',()=>{
+    const base=scratch(),root=join(base,'absent');
+    expect(peekRemoteBreaker({root,host,clock:()=>now})).toEqual({open:false});
+    expect(readdirSync(base)).toEqual([]);
+    expect(existsSync(root)).toBe(false);
+  });
+  it('legacy seed opens the breaker without creating g2 state',()=>{
+    const root=scratch(),file=join(root,'health-'+createHash('sha256').update(host).digest('hex')+'.json');
+    const bytes=JSON.stringify(state());writeFileSync(file,bytes);
+    expect(peekRemoteBreaker({root,host,clock:()=>now})).toEqual({open:true,reason:'backoff-maxLoadPerCore'});
+    expect(readdirSync(root)).toEqual([file.slice(root.length+1)]);
+    expect(readFileSync(file,'utf8')).toBe(bytes);
+    expect(existsSync(remoteHealthFile(root,host))).toBe(false);
+  });
+  it('oversized state defers to the locked health check without mutation',()=>{
+    peekBytes(' '.repeat(70001),{open:false});
+  });
+});
 
 describe('health state generation isolation',()=>{
   it.each(['forge','other-forge'])('seeds an active legacy breaker for %s without carrying telemetry or touching legacy bytes',async host=>{

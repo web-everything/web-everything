@@ -4,12 +4,13 @@
  *   `node_modules` is swapped in at a pass boundary; the loop side never installs. Real temp dirs and a real job
  *   store; the runtime's reattach pass and the installer are injected (no npm, no detached child).
  */
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   refreshDepsAsJob, resolveDepsAsJob, installStep, swapNodeModules, depsStore, runDepsJob,
@@ -21,8 +22,23 @@ import {
 import { defineJobKind, markFailed, markLaunching } from '../daemon-jobs.mjs';
 import { lockfileKey } from '../daemon-job-snapshots.mjs';
 
+// Keep the real durable runtime; inject its process identity and clock instead of probing the host.
+vi.mock('../daemon-jobs-runtime.mjs', async (importOriginal) => {
+  const runtime = await importOriginal();
+  return {
+    ...runtime,
+    runJob: (options) => runtime.runJob({
+      ...options, host: 'deps-fixture-host', pid: 42,
+      readStart: () => 'Thu Nov 26 12:00:00 2026', now: () => 1_795_713_600_000,
+    }),
+  };
+});
+
 const tmp = [];
 const mk = (p) => { const d = mkdtempSync(join(tmpdir(), p)); tmp.push(d); return d; };
+// The existing entry-contract assertion is relative to this source tree, not the launching shell.
+beforeEach(() => { vi.spyOn(process, 'cwd').mockReturnValue(resolve(dirname(fileURLToPath(import.meta.url)), '../../..')); });
+afterEach(() => { vi.restoreAllMocks(); });
 afterEach(() => { while (tmp.length) rmSync(tmp.pop(), { recursive: true, force: true }); });
 
 const SHA = 'a'.repeat(40);
@@ -115,6 +131,18 @@ describe('refreshDepsAsJob — the loop side never installs', () => {
 });
 
 describe('job child — npm never runs lifecycle scripts (the daemon holds the operator\'s credentials)', () => {
+  it('propagates installer failure while keeping lifecycle scripts disabled and execution bounded', () => {
+    const into = mk('deps-install-failure-');
+    const failure = new Error('fixture npm failure');
+    const exec = vi.fn(() => { throw failure; });
+    expect(() => depsJobInstaller({ exec, timeoutMs: 1234 })(into)).toThrow(failure);
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec).toHaveBeenCalledWith('npm', [...DEPS_JOB_NPM_ARGS], {
+      cwd: into, stdio: ['ignore', 'ignore', 'pipe'], timeout: 1234,
+    });
+    expect(DEPS_JOB_NPM_ARGS).toContain('--ignore-scripts');
+  });
+
   it('the declared argv carries --ignore-scripts', () => {
     expect(DEPS_JOB_NPM_ARGS[0]).toBe('ci');
     expect(DEPS_JOB_NPM_ARGS).toContain('--ignore-scripts');

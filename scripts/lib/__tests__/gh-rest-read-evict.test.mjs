@@ -4,7 +4,7 @@
  *   then oldest-first until under the byte cap; it only ever names regular files shaped `<32 hex>.json`.
  */
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, writeFileSync, symlinkSync, existsSync, utimesSync, readdirSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, symlinkSync, existsSync, utimesSync, readdirSync, readFileSync, chmodSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { planEtagEviction, pruneEtagDir, maybePruneEtagDir, ghRestGetJson } from '../gh-rest-read.mjs';
@@ -102,13 +102,38 @@ describe('audit round 2', () => {
   });
 });
 
+describe('scan errors', () => {
+  it.skipIf(process.getuid?.() === 0)('a non-ENOENT per-file lstat error is reported and the prune is not stamped', () => {
+    const root = mkdtempSync(join(tmpdir(), 'etag-scan-'));
+    const dir = join(root, 'cache');
+    mkdirSync(dir);
+    const file = join(dir, `${hex(1)}.json`);
+    writeFileSync(file, 'x');
+    const old = new Date(NOW - 9 * DAY);
+    utimesSync(file, old, old);
+    chmodSync(dir, 0o444);
+    try {
+      expect(pruneEtagDir(dir, { now: NOW })).toMatchObject({ error: 'EACCES', incomplete: true });
+      expect(maybePruneEtagDir(dir, { now: NOW, force: true })).toMatchObject({ ran: true, error: 'EACCES', incomplete: true });
+      expect(existsSync(`${dir}.prune-stamp`)).toBe(false);
+    } finally {
+      chmodSync(dir, 0o755);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('missing cache file is a plain miss', () => {
-  it('sends an unconditional GET and caches the answer when the file was evicted', () => {
+  it('caches the answer: a second call sends If-None-Match', () => {
     const dir = mkdtempSync(join(tmpdir(), 'etag-evict-'));
     const calls = [];
     const exec = (_c, argv) => { calls.push(argv); return 'HTTP/2.0 200 OK\r\nEtag: "e1"\r\n\r\n[1]'; };
-    const r = ghRestGetJson('repos/o/r/pulls', { exec, dir, env: { HOME: dir } });
+    const options = { exec, dir, env: { HOME: dir, VITEST: '1' }, now: () => 0 };
+    const r = ghRestGetJson('repos/o/r/pulls', options);
     expect(r.json).toEqual([1]);
     expect(calls[0]).not.toContain('-H');
+    expect(readdirSync(dir).filter((name) => /^[0-9a-f]{32}\.json$/.test(name))).toHaveLength(1);
+    ghRestGetJson('repos/o/r/pulls', options);
+    expect(calls[1]).toContain('If-None-Match: "e1"');
   });
 });

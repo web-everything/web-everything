@@ -1,12 +1,14 @@
 /** Pure red-main attention planning and the health tick's bounded IO adapter. */
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, opendirSync, openSync, readSync, closeSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
+import { appendFileSync, closeSync, mkdirSync, opendirSync, openSync, readSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
+import { withFileLock, writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { isGhDeferred } from '../lib/gh-deferred.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
-import { publishAttention } from '../operations/needs-you-feed.mjs';
+import { diffFeed, parseFeedLine, publishAttention } from '../operations/needs-you-feed.mjs';
+import { handoffHome } from '../lib/handoff-path.mjs';
 import { mainRedState, latestCheckVerdicts, findOwnerPrs, mainCiRedSettings, measureMainQueue, mainFailureSignature,
   MAIN_RED_METRIC_LIMITS, validMainRedMetric, reportMainRedMetrics } from './main-ci-red-core.mjs';
 import { DEFAULT_REPO_SLUG, readRunJobs, readFailingTests, readOpenPrsForOwner } from './main-ci-red-io.mjs';
@@ -17,7 +19,7 @@ export function mainRedAlertSettings(config = {}) {
 }
 
 export function planMainRedAlert(input = {}) {
-  const { runs, tip, readOk = true, now, prev = {},
+  const { runs, tip, readOk = true, stateUnreadable = false, now, prev = {},
     settings = mainRedAlertSettings(), details } = input;
   const next = { ...prev, seq: Number.isSafeInteger(prev.seq) && prev.seq >= 0 ? prev.seq : 0 };
   const items = [];
@@ -28,10 +30,14 @@ export function planMainRedAlert(input = {}) {
   // (red -> proven green -> identical red, distinct heads, persisted seq and quiet-tick deduplication).
   const emit = (item) => {
     next.seq += 1;
-    items.push({ ...item, head: `${item.head}:${next.seq}` });
+    const head = `${item.head}:${next.seq}`;
+    const eventId = `${item.kind}:${createHash('sha256')
+      .update(JSON.stringify([base.repo, head, item.fullHead ?? null])).digest('hex')}`;
+    items.push({ ...item, head, eventId });
   };
   const base = { repo: DEFAULT_REPO_SLUG, pr: 0 };
-  const state = readOk ? mainRedState(runs, { tip }) : { status: 'unknown' };
+  let state = readOk ? mainRedState(runs, { tip }) : { status: 'unknown' };
+  if (state.status === 'red' && !/^[a-f0-9]{40}$/i.test(state.latestRed?.sha ?? '')) state = { status: 'unknown' };
   const tipVerdicts = Array.isArray(tip?.checkRuns)
     ? [...latestCheckVerdicts(tip.checkRuns).values()] : [];
   const tipReadable = !!tip?.sha && tipVerdicts.length > 0
@@ -57,7 +63,10 @@ export function planMainRedAlert(input = {}) {
   if (state.status === 'green' && !provenGreen && !prev.fingerprint) return finish();
   if (!['red', 'green'].includes(state.status) || (state.status === 'green' && !provenGreen)) {
     if (!prev.unknownEmitted) emit({ ...base, kind: 'main-status-unknown',
-      head: 'main-status-unknown', reason: 'Main CI status is unavailable' });
+      head: stateUnreadable ? 'main-state-unreadable' : 'main-status-unknown',
+      reason: stateUnreadable
+        ? 'Main-red state unreadable; repair main-red-alert.json and retry'
+        : 'Main CI status is unavailable' });
     next.unknownEmitted = true;
     return finish();
   }
@@ -68,6 +77,7 @@ export function planMainRedAlert(input = {}) {
       reason: 'Main CI is green again' });
     next.fingerprint = null;
     next.fingerprintParts = null;
+    next.fullHead = null;
     return finish();
   }
   if (now - state.redSinceMs < settings.mainRedAlertAfterMin * 60_000) return finish();
@@ -86,25 +96,91 @@ export function planMainRedAlert(input = {}) {
   const fingerprintParts = { firstRedSha, since, failingJobs, firstFailingTest, fixPrs };
   const fingerprint = createHash('sha256')
     .update(JSON.stringify(fingerprintParts)).digest('hex');
-  if (fingerprint !== prev.fingerprint) emit({ ...base, kind: 'main-red', head: fingerprint,
+  const fullHead = state.latestRed.sha;
+  // Legacy state has no fullHead; migrate it quietly when the fingerprint matches.
+  if (fingerprint !== prev.fingerprint || (prev.fullHead && prev.fullHead !== fullHead)) emit({ ...base, kind: 'main-red', head: fingerprint, fullHead,
     since, firstRedSha, failingJobs, firstFailingTest, fixPrs,
     blockedReadyPrs: details?.blockedReadyPrs ?? null,
     reason: `Main CI red since ${since}: ${firstFailingTest || failingJobs[0] || firstRedSha.slice(0, 7)}`.slice(0, 100),
   });
   next.fingerprint = fingerprint;
   next.fingerprintParts = fingerprintParts;
+  next.fullHead = fullHead;
   return finish();
 }
 
-function readAlertState(dir) {
+/** Read at most limit + 1 bytes, including files that grow while being read. */
+function readBounded(path, limit, { open = openSync, read = readSync, close = closeSync } = {}) {
+  let fd;
   try {
-    const value = JSON.parse(readFileSync(join(dir, 'main-red-alert.json'), 'utf8'));
-    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid main-red alert state');
-    return value;
+    fd = open(path, 'r');
+    const buffer = Buffer.alloc(limit + 1);
+    let size = 0;
+    while (size < buffer.length) {
+      const count = read(fd, buffer, size, buffer.length - size, null);
+      if (!count) break;
+      size += count;
+    }
+    if (size > limit) throw new Error('Input exceeds read limit');
+    return buffer.subarray(0, size).toString('utf8');
   } catch (error) {
-    if (error.code === 'ENOENT') return {};
+    if (error.code === 'ENOENT') return null;
     throw error;
-  }
+  } finally { if (fd !== undefined) close(fd); }
+}
+
+function validAlertState(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  if (value.seq !== undefined && (!Number.isSafeInteger(value.seq) || value.seq < 0)) return false;
+  if (value.unknownEmitted !== undefined && typeof value.unknownEmitted !== 'boolean') return false;
+  if (value.fingerprint != null && !/^[a-f0-9]{64}$/.test(value.fingerprint)) return false;
+  if (value.fullHead != null && !/^[a-f0-9]{40}$/i.test(value.fullHead)) return false;
+  const parts = value.fingerprintParts;
+  return parts == null || (typeof parts === 'object' && !Array.isArray(parts)
+    && typeof parts.firstRedSha === 'string' && Number.isFinite(Date.parse(parts.since))
+    && Array.isArray(parts.failingJobs) && parts.failingJobs.every(job => typeof job === 'string')
+    && Array.isArray(parts.fixPrs) && parts.fixPrs.every(pr => Number.isSafeInteger(pr) && pr > 0)
+    && (parts.firstFailingTest === null || typeof parts.firstFailingTest === 'string'));
+}
+
+function readAlertState(dir, fileIo) {
+  const text = readBounded(join(dir, 'main-red-alert.json'), 64 * 1024, fileIo);
+  return text === null ? {} : JSON.parse(text);
+}
+
+/** The JSON alert is durable before the legacy feed and producer cursor advance.
+ * Replay after either write fails deduplicates under the same alert-file lock.
+ * Unknown/oversized history refuses publication: repair/archive it and retry.
+ */
+function appendMainRedAlert(item, path, now, fileIo) {
+  mkdirSync(dirname(path), { recursive: true });
+  return withFileLock(`${path}.lock`, () => {
+    // Reuse the feed's recursive sanitation and field bounds for untrusted evidence.
+    const safe = parseFeedLine(diffFeed([], [item], now).lines[0]);
+    const alert = { ...safe, kind: 'MAIN-RED', feedHead: safe.head, head: item.fullHead };
+    let events, text;
+    let matches;
+    try {
+      text = readBounded(path, 8 * 1024 * 1024, fileIo) ?? '';
+      events = text.split('\n').filter(line => line.trim()).map(line => JSON.parse(line));
+      if (events.some(event => !event || typeof event !== 'object' || Array.isArray(event)
+        || typeof event.kind !== 'string')) throw new Error('Incomplete alert history');
+      matches = events.filter(event => event.eventId === item.eventId);
+      // An id alone is not proof of durable publication. Validate every match,
+      // including duplicates after a complete record, before advancing either cursor.
+      if (matches.some(event => typeof event.at !== 'string' || !Number.isFinite(Date.parse(event.at))
+        || !(event.blockedReadyPrs === null
+          || (Number.isSafeInteger(event.blockedReadyPrs) && event.blockedReadyPrs >= 0))
+        || Object.keys(alert).some(key => key !== 'at' && key !== 'blockedReadyPrs'
+          && !isDeepStrictEqual(event[key], alert[key])))) throw new Error('Incomplete matching alert');
+    } catch {
+      throw new Error('Main-red alert history unreadable/oversized; repair or archive alerts.jsonl and retry');
+    }
+    // Time and the ready-PR count may change on retry without changing event identity.
+    if (matches.length) return;
+    const separator = text && !text.endsWith('\n') ? '\n' : '';
+    appendFileSync(path, `${separator}${JSON.stringify(alert)}\n`);
+  });
 }
 
 function writeAlertState(dir, next) {
@@ -146,16 +222,32 @@ function readAlertDetails({ state, config }) {
 }
 
 export async function runMainRedAlert({ probe, dir, now = Date.now(), config = {},
-  publish = publishAttention, readState = readAlertState, writeState = writeAlertState,
-  readDetails = readAlertDetails, writeMetrics = appendMainRedMetrics } = {}) {
-  const prev = await readState(dir);
+  publish, publishFeed = publishAttention, alertsPath,
+  fileIo, readState = (dir) => readAlertState(dir, fileIo),
+  writeState = writeAlertState, readDetails = readAlertDetails,
+  writeMetrics = appendMainRedMetrics } = {}) {
+  const send = publish ?? (async (item) => {
+    if (item.kind === 'main-red') appendMainRedAlert(item,
+      alertsPath ?? join(handoffHome(), 'state', 'alerts.jsonl'), now, fileIo);
+    await publishFeed(item);
+  });
+  let prev;
+  try {
+    prev = await readState(dir);
+    if (!validAlertState(prev)) throw new Error('Invalid main-red alert state');
+  } catch {
+    const result = planMainRedAlert({ readOk: false, stateUnreadable: true, now });
+    for (const item of result.items) await send(item);
+    // Never replace unreadable evidence or interpret its missing fingerprint as healthy.
+    return { ...result, stateUnreadable: true };
+  }
   const readOk = !!probe && !probe.error;
   const state = readOk ? mainRedState(probe.runs, { tip: probe.tip }) : { status: 'unknown' };
   let details = null;
   try { details = await readDetails({ state, probe, config }); } catch { /* alert with unknown details */ }
   const result = planMainRedAlert({ runs: probe?.runs, tip: probe?.tip, readOk, now,
     prev, settings: mainRedAlertSettings(config), details });
-  for (const item of result.items) await publish(item);
+  for (const item of result.items) await send(item);
   // Keep the original event/timestamp owed until the journal acknowledges it. Alert state can
   // advance independently: pending events survive restart and later red/green transitions.
   const pending = prev.pendingMetrics ?? [];

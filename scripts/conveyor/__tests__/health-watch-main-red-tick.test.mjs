@@ -65,6 +65,17 @@ beforeEach(() => {
 afterEach(() => { io.active = false; });
 
 describe('tick — main-red alert publication gate', () => {
+  it('unreadable main-red state increments persistent probe-error streaks instead of clearing escalation', async () => {
+    runMainRedAlert.mockResolvedValue({ stateUnreadable: true, items: [], next: {} });
+    for (let sample = 1; sample <= 4; sample += 1) {
+      const summary = await tick({ ...baseFlags,
+        now: new Date(Date.parse(NOW) + sample * 60_000).toISOString() }, deps);
+      expect(summary.probeErrors.mainRedAlert).toMatch(/state.*unreadable.*repair.*retry/i);
+      const state = JSON.parse(io.files.get('/isolated-health/state.json'));
+      expect(state.probeErrors.mainRedAlert.count).toBe(sample);
+    }
+  });
+
   it.each([
     ['dry-run', true], ['no-gh', true],
     ['logs-dir', '/isolated-logs'], ['state-root', '/isolated-state'], ['lock-root', '/isolated-locks'],

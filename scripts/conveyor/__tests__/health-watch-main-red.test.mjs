@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdtempSync, openSync, readFileSync, readSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mainRedState } from '../main-ci-red-core.mjs';
@@ -7,6 +7,12 @@ import { diffFeed, parseFeedLine } from '../../operations/needs-you-feed.mjs';
 import {
   mainRedAlertSettings, planMainRedAlert, runMainRedAlert,
 } from '../health-watch-main-red.mjs';
+
+// Guard the production default even on the pre-implementation red run.
+vi.mock('../../operations/needs-you-feed.mjs', async (original) => ({
+  ...await original(),
+  publishAttention: vi.fn(() => { throw new Error('test must inject the feed publisher'); }),
+}));
 
 const MINUTE = 60_000;
 const SINCE = '2026-10-26T12:00:00.000Z';
@@ -772,6 +778,236 @@ const expectPersisted = (writeState, next) => {
   // Permit the state IO adapter to also receive dir; the saved next must be exact.
   expect(writeState.mock.calls[0]).toContainEqual(next);
 };
+
+describe('WATCH-DAEMON-WE — durable MAIN-RED contract', () => {
+  it.each([
+    ['event id alone', event => ({ kind: 'MAIN-RED', eventId: event.eventId })],
+    ['missing timestamp', ({ at, ...event }) => event],
+    ['invalid timestamp', event => ({ ...event, at: 'unknown' })],
+    ['missing full head', ({ head, ...event }) => event],
+    ['conflicting full head', event => ({ ...event, head: TIP_SHA })],
+    ['missing feed head', ({ feedHead, ...event }) => event],
+    ['conflicting kind', event => ({ ...event, kind: 'future-kind' })],
+    ['missing repository', ({ repo, ...event }) => event],
+    ['missing ready-PR count', ({ blockedReadyPrs, ...event }) => event],
+    ['invalid ready-PR count', event => ({ ...event, blockedReadyPrs: -1 })],
+    ['missing evidence', ({ failingJobs, ...event }) => event],
+    ['conflicting evidence', event => ({ ...event, failingJobs: [] })],
+  ])('refuses matching history with %s before feed/state advancement, then retries after repair', async (_name, corrupt) => {
+    const dir = mkdtempSync(join(tmpdir(), 'watch-main-red-dedupe-'));
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(START + 30 * MINUTE);
+    try {
+      const alertsPath = join(dir, 'alerts.jsonl');
+      const item = plan().items[0];
+      const safe = parseFeedLine(diffFeed([], [item], START + 30 * MINUTE).lines[0]);
+      const complete = { ...safe, kind: 'MAIN-RED', feedHead: safe.head, head: RED_SHA };
+      // Even a complete match must not hide a second, incomplete matching record.
+      const history = `${JSON.stringify(complete)}\n${JSON.stringify(corrupt(complete))}\n`;
+      writeFileSync(alertsPath, history);
+      const { publish: _publish, ...args } = wrapperInput({ dir });
+      const publishFeed = vi.fn();
+      await expect(runMainRedAlert({ ...args, alertsPath, publishFeed }))
+        .rejects.toThrow(/alert history.*repair.*retry/i);
+      expect(publishFeed).not.toHaveBeenCalled();
+      expect(args.writeState).not.toHaveBeenCalled();
+      expect(readFileSync(alertsPath, 'utf8')).toBe(history);
+
+      writeFileSync(alertsPath, ''); // Operator archives the incomplete history and retries.
+      await runMainRedAlert({ ...args, alertsPath, publishFeed });
+      const records = readFileSync(alertsPath, 'utf8').trim().split('\n').map(JSON.parse);
+      expect(records).toEqual([complete]);
+      expect(publishFeed).toHaveBeenCalledTimes(1);
+      expect(args.writeState).toHaveBeenCalledTimes(1);
+      await runMainRedAlert({ ...args, alertsPath, publishFeed, now: args.now + MINUTE,
+        readDetails: () => ({ ...details(), blockedReadyPrs: 9 }) });
+      expect(readFileSync(alertsPath, 'utf8')).toBe(`${JSON.stringify(complete)}\n`);
+      expect(publishFeed).toHaveBeenCalledTimes(2);
+      expect(args.writeState).toHaveBeenCalledTimes(2);
+    } finally {
+      clock.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('state corruption publishes repair instructions even when ordinary unknown is already open, and deduplicates retries', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'watch-main-red-corruption-'));
+    try {
+      const now = START + 30 * MINUTE;
+      const ordinary = plan({ readOk: false });
+      let open = diffFeed([], ordinary.items, now).openKeys;
+      const lines = [];
+      const args = wrapperInput({ dir, now, publish: async item => {
+        const diff = diffFeed(open, [item], now, { incomplete: true });
+        open = diff.openKeys;
+        lines.push(...diff.lines);
+      }, readState: () => { throw new Error('unreadable fixture state'); } });
+      await runMainRedAlert(args);
+      expect(lines).toHaveLength(1);
+      expect(parseFeedLine(lines[0])).toMatchObject({ kind: 'main-status-unknown',
+        reason: expect.stringMatching(/state.*unreadable.*repair.*retry/i) });
+      await runMainRedAlert(args);
+      expect(lines).toHaveLength(1);
+      expect(args.writeState).not.toHaveBeenCalled();
+      expect(args.readDetails).not.toHaveBeenCalled();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    ['state', 'main-red-alert.json', 64 * 1024],
+    ['history', 'alerts.jsonl', 8 * 1024 * 1024],
+  ])('%s limit requests and reads at most limit + 1 bytes from oversized input', async (kind, filename, limit) => {
+    const dir = mkdtempSync(join(tmpdir(), 'watch-main-red-read-budget-'));
+    try {
+      const path = join(dir, filename);
+      // Twice the limit distinguishes a bounded read from reading everything then refusing.
+      writeFileSync(path, Buffer.alloc(2 * limit, ' '));
+      const requested = [], read = [];
+      const fileIo = {
+        open: vi.fn(openSync),
+        read: vi.fn((fd, buffer, offset, length, position) => {
+          requested.push(length);
+          const count = readSync(fd, buffer, offset, length, position);
+          read.push(count);
+          return count;
+        }),
+        close: vi.fn(closeSync),
+      };
+      const args = wrapperInput({ dir, fileIo });
+      if (kind === 'state') {
+        delete args.readState;
+        const result = await runMainRedAlert(args);
+        expect(result.stateUnreadable).toBe(true);
+        expect(kinds(result)).toEqual(['main-status-unknown']);
+      } else {
+        delete args.publish;
+        args.publishFeed = vi.fn();
+        args.alertsPath = path;
+        await expect(runMainRedAlert(args)).rejects.toThrow(/alert history.*repair.*retry/i);
+        expect(args.publishFeed).not.toHaveBeenCalled();
+      }
+      expect(args.writeState).not.toHaveBeenCalled();
+      expect(fileIo.open).toHaveBeenCalledWith(path, 'r');
+      expect(requested.length).toBeGreaterThan(0);
+      expect(requested.reduce((sum, bytes) => sum + bytes, 0)).toBeLessThanOrEqual(limit + 1);
+      expect(read.reduce((sum, bytes) => sum + bytes, 0)).toBe(limit + 1);
+      expect(fileIo.close).toHaveBeenCalledTimes(1);
+      expect(fileIo.close).toHaveBeenCalledWith(fileIo.open.mock.results[0].value);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('each MAIN-RED event carries a stable event id and full head across replay and restart; a new head gets a new id', () => {
+    const initial = plan();
+    const replay = plan({ now: START + 31 * MINUTE });
+    expect(initial.items[0]).toMatchObject({ fullHead: RED_SHA, eventId: expect.stringMatching(/^main-red:[a-f0-9]{64}$/) });
+    expect(replay.items[0].eventId).toBe(initial.items[0].eventId);
+    const persisted = JSON.parse(JSON.stringify(initial.next));
+    expect(plan({ prev: persisted }).items).toEqual([]);
+    const changed = plan({ prev: persisted, runs: [
+      run(TIP_SHA, 'failure', '2026-10-26T12:25:00.000Z', 3), ...redRuns(),
+    ] });
+    expect(changed.items).toHaveLength(1);
+    expect(changed.items[0].fullHead).toBe(TIP_SHA);
+    expect(changed.items[0].eventId).not.toBe(initial.items[0].eventId);
+    expect(plan({ prev: JSON.parse(JSON.stringify(changed.next)), runs: [
+      run(TIP_SHA, 'failure', '2026-10-26T12:25:00.000Z', 3), ...redRuns(),
+    ] }).items).toEqual([]);
+  });
+
+  it('reports unknown rather than publishing MAIN-RED without a full failing head', async () => {
+    const args = wrapperInput({ probe: { runs: redRuns().map(r => ({ ...r, headSha: 'short' })) } });
+    const result = await runMainRedAlert(args);
+    expect(kinds(result)).toEqual(['main-status-unknown']);
+  });
+
+  it.each(['malformed JSON', 'invalid shape', 'invalid fields', 'oversized state', 'unreadable state'])(
+    '%s produces a bounded unknown diagnostic, preserves evidence and requests operator recovery', async (scenario) => {
+      const dir = mkdtempSync(join(tmpdir(), 'watch-main-red-state-'));
+      try {
+        const path = join(dir, 'main-red-alert.json');
+        const text = scenario === 'malformed JSON' ? '{broken'
+          : scenario === 'invalid shape' ? '[]'
+          : scenario === 'invalid fields' ? JSON.stringify({ fingerprintParts: { failingJobs: 42 } })
+          : ' '.repeat(64 * 1024 + 1);
+        writeFileSync(path, text);
+        const { readState: _read, ...args } = wrapperInput({ dir,
+          probe: { runs: greenRuns(), tip: passingTip() } });
+        if (scenario === 'unreadable state') args.readState = () => { throw new Error('secret\u001b\n'.repeat(1000)); };
+        const result = await runMainRedAlert(args);
+        expect(kinds(result)).toEqual(['main-status-unknown']);
+        expect(result.stateUnreadable).toBe(true);
+        const item = args.publish.mock.calls[0][0];
+        expect(item.reason).toMatch(/state.*unreadable/i);
+        expect(item.reason).toMatch(/repair.*retry/i);
+        expect(item.reason.length).toBeLessThanOrEqual(100);
+        expect(item.reason).not.toMatch(/[\u0000-\u001f]/);
+        expect(args.readDetails).not.toHaveBeenCalled();
+        expect(args.writeState).not.toHaveBeenCalled();
+        expect(readFileSync(path, 'utf8')).toBe(text);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    },
+  );
+
+  it('injects MAIN-RED into alerts.jsonl once, including after publish succeeds but state persistence fails', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'watch-main-red-alerts-'));
+    try {
+      const alertsPath = join(dir, 'alerts.jsonl');
+      const publishFeed = vi.fn();
+      const { publish: _publish, readState: _read, writeState: _write, ...args } = wrapperInput({ dir });
+      const failedWrite = vi.fn(() => { throw new Error('state disk unavailable'); });
+      await expect(runMainRedAlert({ ...args, alertsPath, publishFeed, writeState: failedWrite })).rejects.toThrow('state disk unavailable');
+      const first = readFileSync(alertsPath, 'utf8');
+      const [event] = first.trim().split('\n').map(JSON.parse);
+      expect(event).toMatchObject({ kind: 'MAIN-RED', head: RED_SHA,
+        eventId: expect.stringMatching(/^main-red:[a-f0-9]{64}$/), at: new Date(args.now).toISOString() });
+      await runMainRedAlert({ ...args, alertsPath, publishFeed, now: args.now + MINUTE });
+      await runMainRedAlert({ ...args, alertsPath, publishFeed, now: args.now + 2 * MINUTE });
+      expect(readFileSync(alertsPath, 'utf8')).toBe(first);
+      expect(publishFeed).toHaveBeenCalledTimes(2);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    ['without a terminal newline', ''],
+    ['with a terminal newline', '\n'],
+  ])('appends MAIN-RED after valid history %s and keeps both records independently parseable', async (_name, ending) => {
+    const dir = mkdtempSync(join(tmpdir(), 'watch-main-red-newline-'));
+    try {
+      const alertsPath = join(dir, 'alerts.jsonl');
+      const prior = { at: SINCE, kind: 'future-kind', eventId: 'fixture:prior-event' };
+      writeFileSync(alertsPath, JSON.stringify(prior) + ending);
+      const { publish: _publish, ...args } = wrapperInput({ dir });
+      const publishFeed = vi.fn();
+      await runMainRedAlert({ ...args, alertsPath, publishFeed });
+      const text = readFileSync(alertsPath, 'utf8');
+      expect(text.endsWith('\n')).toBe(true);
+      const lines = text.slice(0, -1).split('\n');
+      expect(lines).toHaveLength(2);
+      const records = lines.map(line => JSON.parse(line));
+      expect(records[0]).toEqual(prior);
+      expect(records[1]).toMatchObject({ kind: 'MAIN-RED', head: RED_SHA,
+        eventId: expect.stringMatching(/^main-red:[a-f0-9]{64}$/) });
+      await runMainRedAlert({ ...args, alertsPath, publishFeed, now: args.now + MINUTE });
+      expect(readFileSync(alertsPath, 'utf8')).toBe(text);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each(['malformed', 'oversized'])('refuses %s alert history visibly with operator recovery and no state clearance', async (scenario) => {
+    const dir = mkdtempSync(join(tmpdir(), 'watch-main-red-history-'));
+    try {
+      const alertsPath = join(dir, 'alerts.jsonl');
+      const text = scenario === 'malformed' ? '{broken\n' : ' '.repeat(8 * 1024 * 1024 + 1);
+      writeFileSync(alertsPath, text);
+      const { publish: _publish, ...args } = wrapperInput({ dir });
+      const publishFeed = vi.fn();
+      await expect(runMainRedAlert({ ...args, alertsPath, publishFeed })).rejects.toThrow(/alert history.*repair.*retry/i);
+      expect(args.writeState).not.toHaveBeenCalled();
+      expect(publishFeed).not.toHaveBeenCalled();
+      expect(readFileSync(alertsPath, 'utf8')).toBe(text);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
 
 describe('runMainRedAlert — injected IO', () => {
   it('reads details and prior state, publishes each planned item and persists next', async () => {
