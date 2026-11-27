@@ -54,13 +54,15 @@ function fixture() {
   put(root, 'scripts/settings/gh-throttle.json', '{}');
   const pool = join(base, 'pool'); const state = join(base, 'state'); mkdirSync(pool); mkdirSync(state);
   const env = { PATH: process.env.PATH, HOME: base, TMPDIR: base, LANE_POOL_ROOT: pool,
+    LANE_POOL_CANONICAL_ORIGIN: 'https://example.test/we.git',
     GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null',
     WE_PLATFORM_PREFERENCES_FILE: join(base, 'operator.json'), WE_DAEMON_SMOKE_STATE_DIR: state, WE_DAEMON_STATE_DIR: state,
     WE_DISPATCH_CWD_ROOT: join(base, 'dispatch') };
   ok(root, ['add', '.']); ok(root, ['commit', '-qm', 'fixture']);
   const predictedCandidatePath = join(state, 'clone.candidate-first');
+  const overridesFile = join(base, 'operator-overrides.json');
   return { root, base, env, predictedCandidatePath, sha: ok(root, ['rev-parse', 'HEAD']),
-    suite: { root, env, checks }, git: args => git(root, args) };
+    overridesFile, suite: { root, env, checks, overridesFile }, git: args => git(root, args) };
 }
 function harnessFixture() {
   const f = fixture();
@@ -82,6 +84,7 @@ function harnessFixture() {
   runtime('scripts/lib/lane-pool-paths.mjs', 'defaultPoolRoot');
   runtime('scripts/lib/lane-git-hardening.mjs', 'scrubGitRepoEnv');
   runtime('scripts/lib/policy-cascade.mjs', 'operatorPreferencesPath');
+  put(f.root, 'runtime/lib/operator-override-reader.mjs', `export const operatorOverridesPath = () => ${JSON.stringify(f.overridesFile)};`);
   runtime('scripts/lib/daemon-live-smoke.mjs', 'SMOKE_CHECKS, SMOKE_BUDGET_ENV');
   put(f.root, 'scripts/lib/daemon-live-smoke.mjs',
     "import './github-app-auth-env.mjs'; import './resource-admission.mjs';");
@@ -98,7 +101,7 @@ function harnessFixture() {
 }
 function identity(f, extra = {}) {
   return sharedSmokeIdentity({ root: f.root, sha: f.sha, env: f.env,
-    predictedCandidatePath: f.predictedCandidatePath, suiteRoot: f.root, checks, ...extra });
+    predictedCandidatePath: f.predictedCandidatePath, suiteRoot: f.root, checks, overridesFile: f.overridesFile, ...extra });
 }
 // This is an explicitly refused production edge, not an exception authorizing sharing.
 // Audit the remaining graph too, so an earlier refusal cannot hide a later regression.
@@ -233,6 +236,69 @@ function auditFixture() {
 }
 
 describe('fix-round audit regressions (hermetic)', () => {
+  it('finding 3: unresolved package evidence logs a refusal instead of licensing reuse', () => {
+    const f = auditFixture(); const reasons = [];
+    put(f.root, 'entry.mjs', "import 'missing-package/subpath';");
+    expect(suiteManifest({ ...f.suite, log: { error: reason => reasons.push(reason) } })).toBeNull();
+    expect(reasons.join('\n')).toMatch(/package.*per-clone smoke/);
+  });
+  it('finding 3: refuses a symlinked installation whose Node resolution can differ', () => {
+    const f = auditFixture();
+    put(f.root, 'entry.mjs', "import 'linked-package';");
+    put(f.root, 'packages/linked/package.json', '{"name":"linked-package","version":"1.0.0"}');
+    put(f.root, 'packages/linked/index.js', 'module.exports = 1;');
+    put(f.root, 'package-lock.json', '{"packages":{"node_modules/linked-package":{"version":"1.0.0"}}}');
+    mkdirSync(join(f.root, 'node_modules'));
+    symlinkSync(join(f.root, 'packages/linked'), join(f.root, 'node_modules/linked-package'), 'dir');
+    expect(suiteManifest(f.suite)).toBeNull();
+  });
+  it('finding 4: an unsupported environment read in an imported file disables the key', () => {
+    const f = auditFixture(); put(f.root, 'entry.mjs', "import './dependency.mjs';");
+    put(f.root, 'dependency.mjs', 'const selected = process.env[controlName];');
+    const reasons = [];
+    expect(codeEnvNames(f.root, { ...f.suite, entries: ['entry.mjs'], log: { error: reason => reasons.push(reason) } })).toBeNull();
+    expect(reasons.join('\n')).toMatch(/env.*dynamic.*per-clone smoke/);
+    expect(f.key()).toBeNull();
+  });
+  it('finding 5: untracked settings are bounded and non-object policy refuses sharing', () => {
+    const f = auditFixture(); const reasons = [];
+    put(f.root, 'scripts/settings/extra.json', ' '.repeat(1024 * 1024 + 1));
+    expect(suiteManifest({ ...f.suite, log: { error: reason => reasons.push(reason) } })).toBeNull();
+    expect(reasons.join('\n')).toMatch(/input-too-large.*per-clone smoke/);
+    put(f.root, 'scripts/settings/extra.json', '[]');
+    expect(suiteManifest(f.suite)).toBeNull();
+  });
+  it('finding 6: non-object operator stores and disappearance during a read refuse sharing', () => {
+    const f = auditFixture(); writeFileSync(f.overridesFile, '[]');
+    expect(suiteManifest(f.suite)).toBeNull();
+    writeFileSync(f.overridesFile, '{}');
+    const reasons = [];
+    expect(suiteManifest({ ...f.suite, log: { error: reason => reasons.push(reason) }, readFile: file => {
+      if (file === f.overridesFile) throw Object.assign(new Error('operator-store-disappeared'), { code: 'ENOENT' });
+      return readFileSync(file);
+    } })).toBeNull();
+    expect(reasons.join('\n')).toMatch(/operator-store-disappeared.*per-clone smoke/);
+  });
+  it('finding 7: arbitrary inherited input and empty values remain part of the effective environment', () => {
+    const f = auditFixture(); const options = { root: f.root, env: f.env, ownershipOk: true, log: f.suite.log };
+    const absent = effectiveEnvHash(options);
+    expect(effectiveEnvHash({ ...options, env: { ...f.env, LANG: 'fr_CA' } })).not.toBe(absent);
+    expect(effectiveEnvHash({ ...options, env: { ...f.env, LANG: '' } })).not.toBe(absent);
+  });
+  it('finding 8: envIgnore cannot hide fixture, authentication, or inherited controls', () => {
+    const f = auditFixture();
+    for (const name of ['FAKE_GH_FIXTURE', 'GH_TOKEN', 'CI']) {
+      const options = { root: f.root, ownershipOk: true, envIgnore: [name], log: f.suite.log };
+      const a = effectiveEnvHash({ ...options, env: { ...f.env, [name]: 'a' } });
+      const b = effectiveEnvHash({ ...options, env: { ...f.env, [name]: 'b' } });
+      expect(a === null || a !== b, name).toBe(true);
+    }
+  });
+  it('finding 9: empty credentials have content evidence distinct from absent credentials', () => {
+    const f = auditFixture(); const options = { root: f.root, env: { ...f.env, CUSTOM_PASSWORD: '' }, ownershipOk: true };
+    expect(effectiveEnvEntries(options)).toContainEqual(['CUSTOM_PASSWORD', hash('')]);
+    expect(effectiveEnvHash(options)).not.toBe(effectiveEnvHash({ ...options, env: f.env }));
+  });
   it('finding 1: pins each admitted call and refuses a push-bearing replacement with the same count', () => {
     const file = 'scripts/lib/daemon-rebuild/shared-smoke-key.mjs';
     const source = "spawnSync('git', ['-C', root, ...args], { timeout: 5000 });";
@@ -366,7 +432,7 @@ describe('K2: strict suite manifest', () => {
   it('K2a: locates the running root and covers the fixture harness closure', () => {
     expect(RUNNING_ROOT).toBe(resolve(dirname(fileURLToPath(import.meta.url)), '../../..'));
     const f = harnessFixture(); const root = f.root;
-    const manifest = suiteManifest({ root, env: f.env }); expect(manifest).not.toBeNull();
+    const manifest = suiteManifest({ root, env: f.env, overridesFile: f.overridesFile }); expect(manifest).not.toBeNull();
     const paths = manifest.map(([p]) => p);
     const entries = [...SUITE_ENTRIES, ...SMOKE_CHECKS.flatMap(check => check.codeEntries ?? [])];
     const tracked = git(root, ['ls-files', '-z', '--', ...entries]);
@@ -381,7 +447,7 @@ describe('K2: strict suite manifest', () => {
       'scripts/conveyor/pr-snapshot.mjs', 'scripts/lib/gh-throttle.mjs', 'scripts/lib/under-test.mjs', 'scripts/lib/under-test.cjs']) {
       expect(paths).toContain(path);
     }
-    expect(smokeSuiteHash({ root, env: f.env })).toMatch(/^[a-f0-9]{64}$/);
+    expect(smokeSuiteHash({ root, env: f.env, overridesFile: f.overridesFile })).toMatch(/^[a-f0-9]{64}$/);
   });
   it('K2b: missing entries, deleted imports, unreadable inputs and escaped targets refuse sharing', () => {
     const f = fixture(); expect(suiteManifest(f.suite)).not.toBeNull();
@@ -413,6 +479,10 @@ describe('K2: strict suite manifest', () => {
       if (path === f.env.WE_PLATFORM_PREFERENCES_FILE) throw Object.assign(new Error('denied'), { code: 'EACCES' });
       return readFileSync(path);
     } })).toBeNull();
+    // Package imports need installed evidence as well as the lockfile under test.
+    put(f.root, 'node_modules/a-package/package.json', '{"name":"a-package","version":"1.0.0"}');
+    put(f.root, 'node_modules/a-package/index.js', 'module.exports = {};');
+    put(f.root, 'package-lock.json', '{"lockfileVersion":3,"packages":{"node_modules/a-package":{"version":"1.0.0"}}}');
     put(f.root, 'entry.mjs', "import 'a-package'"); expect(suiteManifest(f.suite).map(([p]) => p)).toContain('package-lock.json');
     rmSync(join(f.root, 'package-lock.json')); expect(suiteManifest(f.suite)).toBeNull();
   });
@@ -503,7 +573,7 @@ describe('production harness coverage', () => {
       if (!scope || scope.has(path)) expect(audit.sources.has(path), path).toBe(true);
     }
     const refusals = [];
-    expect(suiteManifest({ root, env: f.env, log: { error: reason => refusals.push(reason) } })).toBeNull();
+    expect(suiteManifest({ root, env: f.env, overridesFile: f.overridesFile, log: { error: reason => refusals.push(reason) } })).toBeNull();
     expect(refusals).toHaveLength(1);
     expect(refusals[0]).toContain('suite:nonliteral-load:scripts/readiness/remote-client-import.cjs:');
   }, 30_000);

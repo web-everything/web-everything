@@ -1,7 +1,7 @@
 /** Shared smoke identity. No claims, proofs or adoption writes belong in this module. */
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { readFileSync, realpathSync, statSync } from 'node:fs';
+import { readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,6 +11,7 @@ import { candidateSmokeEnv, candidateWorktreePath } from './candidate.mjs';
 import { defaultPoolRoot } from '../lane-pool-paths.mjs';
 import { scrubGitRepoEnv } from '../lane-git-hardening.mjs';
 import { operatorPreferencesPath } from '../policy-cascade.mjs';
+import { operatorOverridesPath } from '../operator-override-reader.mjs';
 
 export const RUNNING_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 export const SUITE_ENTRIES = Object.freeze([
@@ -84,12 +85,12 @@ export function smokeIdentityComponents(git, sha, { nodeVersion = process.versio
 }
 
 /** Shared strict walker for the running suite and the candidate's code-row env reads. */
-function walk({ root, entries, env, readFile = readFileSync }) {
+function walk({ root, entries, env, readFile = readFileSync, git = gitAt, checkEnv = false }) {
   root = realpathSync(root);
   const bytes = new Map(); const sources = new Map(); const reads = []; const auditedReads = [];
   const pending = entries.map(p => resolve(root, p));
   const jsonLiterals = [];
-  let packageUsed = false;
+  const packages = new Set();
   function read(path) {
     if (!within(root, path) || !within(root, realpathSync(path))) throw new Error(`out-of-root:${relative(root, path)}`);
     if (!bytes.has(path)) {
@@ -102,11 +103,50 @@ function walk({ root, entries, env, readFile = readFileSync }) {
     }
     return bytes.get(path);
   }
+  function packageLoad(file, spec) {
+    // A lockfile alone is not evidence of what Node will execute. Only ordinary,
+    // in-root installed packages with matching locked versions are supported.
+    if (!/^(?:@[a-z\d_-]+\/)?[a-z\d_-]+(?:\/[a-z\d_.-]+)*$/i.test(spec)) throw new Error('package-specifier-unsupported');
+    const parts = spec.split('/'); const name = parts.splice(0, spec.startsWith('@') ? 2 : 1).join('/');
+    let dir = dirname(file); let installed;
+    for (;;) {
+      const path = join(dir, 'node_modules', name);
+      try { if (!statSync(path).isDirectory()) throw new Error('package-not-directory'); installed = path; break; }
+      catch (e) { if (e.code !== 'ENOENT') throw e; }
+      if (dir === root) break;
+      dir = dirname(dir);
+    }
+    if (!installed) throw new Error(`package-not-installed:${name}`);
+    if (realpathSync(installed) !== installed) throw new Error(`package-symlink-unsupported:${name}`);
+    const lock = JSON.parse(String(read(join(root, 'package-lock.json'))));
+    const meta = JSON.parse(String(read(join(installed, 'package.json'))));
+    const locked = lock.packages?.[relative(root, installed).split(sep).join('/')];
+    if (!locked || locked.link || typeof locked.version !== 'string' || !locked.version
+      || meta.name !== name || meta.version !== locked.version || meta.exports != null || meta.imports != null) throw new Error(`package-evidence-unverified:${name}`);
+    if (!packages.has(installed)) {
+      packages.add(installed);
+      const dirs = [installed]; let count = 0;
+      while (dirs.length) {
+        const current = dirs.pop();
+        if (!within(root, realpathSync(current))) throw new Error('package-out-of-root');
+        for (const item of readdirSync(current, { withFileTypes: true })) {
+          if (++count > MAX_FILES) throw new Error('package-file-limit');
+          const path = join(current, item.name);
+          if (item.isDirectory()) dirs.push(path);
+          else if (item.isFile()) read(path);
+          else throw new Error('package-file-unsupported');
+        }
+      }
+    }
+    const target = parts.length ? join(installed, ...parts) : resolve(installed, meta.main ?? 'index.js');
+    if (!within(installed, target)) throw new Error('package-entry-out-of-root');
+    resolveLoad(file, `./${relative(dirname(file), target)}`);
+  }
   function resolveLoad(file, spec) {
     if (spec.startsWith('node:')) return;
     if (!spec.startsWith('.')) {
       if (isAbsolute(spec) || !/^[@a-z\d_-][^\s]*$/i.test(spec)) throw new Error('load-specifier-invalid');
-      packageUsed = true; return;
+      packageLoad(file, spec); return;
     }
     const base = resolve(dirname(file), spec);
     if (!within(root, base)) throw new Error('load-out-of-root');
@@ -138,7 +178,9 @@ function walk({ root, entries, env, readFile = readFileSync }) {
       reads.push({ file, name, line });
       if (pin) auditedReads.push(pin);
     }
-    const envObject = n => n && (n.getText(ast) === 'process.env' || n.getText(ast) === 'env' || n.getText(ast).endsWith('.env'));
+    const envObject = n => n && (ts.isIdentifier(n) && n.text === 'env'
+      || ts.isPropertyAccessExpression(n) && n.name.text === 'env'
+      || ts.isElementAccessExpression(n) && n.argumentExpression && ts.isStringLiteralLike(n.argumentExpression) && n.argumentExpression.text === 'env');
     function visit(n) {
       if ((ts.isImportDeclaration(n) || ts.isExportDeclaration(n)) && n.moduleSpecifier) resolveLoad(path, n.moduleSpecifier.text);
       if (ts.isCallExpression(n)) {
@@ -161,12 +203,25 @@ function walk({ root, entries, env, readFile = readFileSync }) {
       if (ts.isVariableDeclaration(n) && ts.isObjectBindingPattern(n.name) && envObject(n.initializer)) {
         for (const binding of n.name.elements) if (!binding.dotDotDotToken) envRead(binding, (binding.propertyName ?? binding.name).text);
       }
+      if (checkEnv) {
+        if (ts.isElementAccessExpression(n) && envObject(n.expression) && !ts.isStringLiteralLike(n.argumentExpression)) throw new Error(`env-dynamic-read:${file}`);
+        if (ts.isVariableDeclaration(n) && n.initializer && envObject(n.initializer)
+          && (!ts.isObjectBindingPattern(n.name) || n.name.elements.some(b => b.dotDotDotToken || b.propertyName && ts.isComputedPropertyName(b.propertyName)))) throw new Error(`env-dynamic-binding:${file}`);
+        if (ts.isVariableDeclaration(n) && n.initializer?.getText(ast) === 'process' && ts.isObjectBindingPattern(n.name)
+          && n.name.elements.some(b => (b.propertyName ?? b.name).getText(ast) === 'env' || b.dotDotDotToken)) throw new Error(`env-dynamic-process-alias:${file}`);
+        if (envObject(n)) {
+          const parent = n.parent;
+          const member = (ts.isPropertyAccessExpression(parent) || ts.isElementAccessExpression(parent)) && parent.expression === n;
+          const destructured = ts.isVariableDeclaration(parent) && parent.initializer === n && ts.isObjectBindingPattern(parent.name);
+          if (!member && !destructured && !(ts.isPropertyAccessExpression(parent) && parent.name === n)) throw new Error(`env-dynamic-use:${file}`);
+        }
+      }
       ts.forEachChild(n, visit);
     }
     visit(ast);
   }
   // Track by basename only for basename literals; slash-containing paths have one exact meaning.
-  const trackedText = output(gitAt(root, ['ls-files', '-z', '--', '*.json'], env), 'tracked-json-unreadable');
+  const trackedText = output(git(root, ['ls-files', '-z', '--', '*.json'], env), 'tracked-json-unreadable');
   if (trackedText && !trackedText.endsWith('\0')) throw new Error('tracked-json-incomplete');
   const tracked = trackedText.split('\0').filter(Boolean);
   if (tracked.length > MAX_FILES) throw new Error('tracked-json-limit');
@@ -179,45 +234,59 @@ function walk({ root, entries, env, readFile = readFileSync }) {
       catch (e) { if (e.code === 'ENOENT' && SUITE_JSON_RUNTIME_NAMES.includes(literal) && !tracked.includes(relative(root, path))) continue; throw e; }
     }
   }
-  for (const path of tracked.filter(p => /^scripts\/settings\/[^/]+\.json$/.test(p)
+  const settings = new Set(tracked.filter(p => /^scripts\/settings\/[^/]+\.json$/.test(p)
     || /^scripts\/lib\/[^/]*settings[^/]*\.json$/.test(p) || /^scripts\/lib\/delivery-[^/]+\.json$/.test(p)
-    || p === 'scripts/dispatch-settings.json')) read(resolve(root, path));
-  if (packageUsed) read(join(root, 'package-lock.json'));
+    || p === 'scripts/dispatch-settings.json'));
+  for (const dir of ['scripts/settings', 'scripts/lib', 'scripts']) {
+    const items = readdirSync(resolve(root, dir));
+    if (items.length > MAX_FILES) throw new Error('settings-file-limit');
+    for (const name of items) if (name.endsWith('.json') && (dir === 'scripts/settings'
+      || dir === 'scripts/lib' && (/settings/.test(name) || /^delivery-/.test(name))
+      || dir === 'scripts' && name === 'dispatch-settings.json')) settings.add(`${dir}/${name}`);
+  }
+  for (const file of settings) {
+    const value = JSON.parse(String(read(resolve(root, file))));
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`policy-not-object:${file}`);
+  }
   return { bytes, reads, auditedReads, root };
 }
 
 /** Sorted [repo-relative path, content hash] entries plus named checks and operator-file evidence. */
-export function suiteManifest({ root = RUNNING_ROOT, env = process.env, checks = SMOKE_CHECKS, readFile = readFileSync, log = console } = {}) {
+export function suiteManifest({ root = RUNNING_ROOT, env = process.env, checks = SMOKE_CHECKS,
+  readFile = readFileSync, git = gitAt, overridesFile, log = console } = {}) {
   try {
     const entries = [...SUITE_ENTRIES, ...checks.flatMap(c => c.codeEntries ?? [])];
-    const walked = walk({ root, entries, env, readFile });
+    const walked = walk({ root, entries, env, readFile, git });
     const manifest = [...walked.bytes].map(([p, data]) => [relative(walked.root, p), hash(data)]);
-    const platform = operatorPreferencesPath(env);
-    let platformHash;
-    try {
-      if (statSync(platform).size > MAX_BYTES) throw new Error('input-too-large');
-      const data = readFile(platform);
+    for (const [name, path] of [['@operator-platform', operatorPreferencesPath(env)], ['@operator-overrides', overridesFile ?? operatorOverridesPath()]]) {
+      let info;
+      try { info = statSync(path); }
+      catch (e) { if (e.code !== 'ENOENT') throw e; manifest.push([name, 'absent']); continue; }
+      if (!info.isFile() || info.size > MAX_BYTES) throw new Error('operator-input-too-large-or-not-file');
+      const data = readFile(path);
       if (Buffer.byteLength(data) > MAX_BYTES) throw new Error('input-too-large');
-      JSON.parse(String(data));
-      platformHash = hash(data);
-    } catch (e) { if (e.code !== 'ENOENT') throw e; platformHash = 'absent'; }
-    manifest.push(['@operator-platform', platformHash], ['@smoke-checks', hash(JSON.stringify(checks.map(({ name, kind, mayBeTransient, codeEntries }) => ({ name, kind, mayBeTransient, codeEntries })) ))]);
+      const value = JSON.parse(String(data));
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('operator-policy-not-object');
+      manifest.push([name, hash(data)]);
+    }
+    manifest.push(['@smoke-checks', hash(JSON.stringify(checks.map(({ name, kind, mayBeTransient, codeEntries }) => ({ name, kind, mayBeTransient, codeEntries })) ))]);
     return manifest.sort((a, b) => order(a[0], b[0]));
   } catch (e) { return refuse(`suite:${e.message}`, log); }
 }
 export function smokeSuiteHash(options) { const manifest = suiteManifest(options); return manifest && hash(JSON.stringify(manifest)); }
 
 /** Literal reads, with exact-line audited reads excluded only from names (all sites remain inspectable). */
-export function codeEnvNames(treeRoot, { entries = SMOKE_CHECKS.filter(c => c.kind === 'code').flatMap(c => c.codeEntries ?? []), env = process.env, log = console } = {}) {
+export function codeEnvNames(treeRoot, { entries = SMOKE_CHECKS.filter(c => c.kind === 'code').flatMap(c => c.codeEntries ?? []),
+  env = process.env, git = gitAt, readFile = readFileSync, log = console } = {}) {
   try {
-    const { reads, auditedReads } = walk({ root: treeRoot, entries, env });
+    const { reads, auditedReads } = walk({ root: treeRoot, entries, env, git, readFile, checkEnv: true });
     const names = [...new Set(reads.filter(r => !auditedReads.some(p => p.file === r.file && p.name === r.name && p.exactLineText === r.line)).map(r => r.name))].sort(order);
     return { names, reads, auditedReads };
   } catch (e) { return refuse(`env-closure:${e.message}`, log); }
 }
 
-function ownershipPaths(root, env) {
-  const paths = ['--show-toplevel', '--git-dir', '--git-common-dir'].map(flag => resolve(root, oneLine(gitAt(root, ['rev-parse', flag], env), `ownership-probe:${flag}`)));
+function ownershipPaths(root, env, git) {
+  const paths = ['--show-toplevel', '--git-dir', '--git-common-dir'].map(flag => resolve(root, oneLine(git(root, ['rev-parse', flag], env), `ownership-probe:${flag}`)));
   if (realpathSync(paths[0]) !== realpathSync(root)) throw new Error('ownership-root-mismatch');
   return [...paths, dirname(paths[2])];
 }
@@ -229,18 +298,18 @@ function ownershipSafe(paths, liveRoot, env) {
   }
 }
 /** Predicted candidate may be absent; its parent and every live Git ownership path must be readable. */
-export function preSlotOwnershipOk(liveRoot, predictedCandidatePath, env = process.env, { log = console } = {}) {
+export function preSlotOwnershipOk(liveRoot, predictedCandidatePath, env = process.env, { log = console, git = gitAt } = {}) {
   try {
     if (!isAbsolute(liveRoot) || !isAbsolute(predictedCandidatePath)) throw new Error('ownership-path-invalid');
-    const paths = ownershipPaths(liveRoot, env);
+    const paths = ownershipPaths(liveRoot, env, git);
     ownershipSafe([...paths, ...paths.map(p => realpathSync(p)), predictedCandidatePath, dirname(predictedCandidatePath), realpathSync(dirname(predictedCandidatePath))], liveRoot, env);
     return true;
   } catch (e) { refuse(e.message, log); return false; }
 }
 /** Confirmation only permits/downgrades reuse. It never computes or changes a key. */
-export function confirmCandidateOwnership(candidatePath, liveRoot, env = process.env, { log = console } = {}) {
+export function confirmCandidateOwnership(candidatePath, liveRoot, env = process.env, { log = console, git = gitAt } = {}) {
   try {
-    const live = ownershipPaths(liveRoot, env); const candidate = ownershipPaths(candidatePath, env);
+    const live = ownershipPaths(liveRoot, env, git); const candidate = ownershipPaths(candidatePath, env, git);
     if (realpathSync(live[2]) !== realpathSync(candidate[2])) throw new Error('ownership-common-dir-mismatch');
     const paths = [...live, ...candidate, candidatePath, dirname(candidatePath)];
     ownershipSafe([...paths, ...paths.map(p => realpathSync(p))], liveRoot, env);
@@ -253,13 +322,17 @@ export function effectiveEnvEntries({ root, env = process.env, envIgnore = [], e
   try {
     if (!ownershipOk) throw new Error('env-ownership-unconfirmed');
     if (!Array.isArray(envIgnore) || envIgnore.some(n => typeof n !== 'string') || !Array.isArray(extraNames) || extraNames.some(n => typeof n !== 'string')) throw new Error('env-names-invalid');
-    const effective = candidateSmokeEnv({ root, env });
     const budgets = [...Object.values(SMOKE_BUDGET_ENV), 'WE_REBUILD_SMOKE_TOTAL_MS', 'WE_REBUILD_SMOKE_FALLBACK_MIN_MS', 'WE_REBUILD_SMOKE_FAIL_FAST'];
+    // Only the enumerated irrelevant controls may be omitted. A caller cannot
+    // turn an authentication, fixture or future safety input into an exception.
+    if (envIgnore.some(name => ![...PER_LAUNCH_ENV, ...budgets].includes(name))) throw new Error('env-ignore-protected');
+    if (typeof env?.PATH !== 'string' || !env.PATH || typeof env.HOME !== 'string' || !env.HOME) throw new Error('env-inheritance-unavailable');
+    if (typeof env.LANE_POOL_CANONICAL_ORIGIN !== 'string' || !env.LANE_POOL_CANONICAL_ORIGIN) throw new Error('env-origin-unavailable');
+    const effective = candidateSmokeEnv({ root, env });
     return Object.entries(effective).filter(([name, value]) => value !== undefined
-      && (/^(WE_|GH_|GITHUB_|LANE_POOL_|NODE_|VITEST_)/.test(name) || EXPLICIT_HASHED_ENV.includes(name) || extraNames.includes(name))
-      && ![...PER_LAUNCH_ENV, ...budgets, ...envIgnore].includes(name)).map(([name, value]) => {
+      && ![...PER_LAUNCH_ENV, ...budgets].includes(name)).map(([name, value]) => {
       if (typeof value !== 'string') throw new Error('env-value-invalid');
-      return [name, name === 'WE_SMOKE_LIVE_CLONE' ? '<present>' : /TOKEN|SECRET|PASSWORD|PRIVATE_KEY|CREDENTIAL|AUTH/i.test(name) ? (value === '' ? '' : '<present>') : value];
+      return [name, name === 'WE_SMOKE_LIVE_CLONE' ? '<present>' : /TOKEN|SECRET|PASSWORD|PRIVATE_KEY|CREDENTIAL|AUTH/i.test(name) ? hash(value) : value];
     }).sort((a, b) => order(a[0], b[0]));
   } catch (e) { return refuse(e.message, log); }
 }
@@ -268,15 +341,19 @@ export function effectiveEnvHash(options) { const entries = effectiveEnvEntries(
 /** Pre-slot identity: all failures disable sharing. Suite always belongs to the running harness. */
 export function sharedSmokeIdentity({ root, sha, env = process.env, predictedCandidatePath,
   suiteRoot = RUNNING_ROOT, checks = SMOKE_CHECKS, envIgnore = [], extraNames = [],
-  host = hostname(), nodeVersion = process.version, log = console }) {
+  host = hostname(), nodeVersion = process.version, git = gitAt, readFile = readFileSync, overridesFile, log = console }) {
   try {
-    if (!preSlotOwnershipOk(root, predictedCandidatePath, env, { log })) return null;
-    const components = smokeIdentityComponents(args => gitAt(root, args, env), sha, { nodeVersion, log });
+    if (!preSlotOwnershipOk(root, predictedCandidatePath, env, { log, git })) return null;
+    const components = smokeIdentityComponents(args => git(root, args, env), sha, { nodeVersion, log });
     if (!components) return null;
-    const liveOrigin = oneLine(gitAt(root, ['remote', 'get-url', 'origin'], env), 'origin-unreadable');
+    const liveOrigin = oneLine(git(root, ['remote', 'get-url', 'origin'], env), 'origin-unreadable');
     if (!/^[^/]*:/.test(liveOrigin) || !host) throw new Error('origin-or-host-invalid');
-    const suiteHash = smokeSuiteHash({ root: suiteRoot, env, checks, log }); if (!suiteHash) return null;
-    const entries = effectiveEnvEntries({ root, env, envIgnore, extraNames, ownershipOk: true, log }); if (!entries) return null;
+    const suiteHash = smokeSuiteHash({ root: suiteRoot, env, checks, log, git, readFile, overridesFile }); if (!suiteHash) return null;
+    const coverage = codeEnvNames(suiteRoot, { entries: checks.filter(c => c.kind === 'code').flatMap(c => c.codeEntries ?? []), env, git, readFile, log });
+    if (!coverage) return null;
+    if (coverage.names.some(name => PER_LAUNCH_ENV.includes(name))) throw new Error('env-per-launch-uncovered');
+    const entries = effectiveEnvEntries({ root, env: { ...env, LANE_POOL_CANONICAL_ORIGIN: env.LANE_POOL_CANONICAL_ORIGIN ?? liveOrigin },
+      envIgnore, extraNames: [...extraNames, ...coverage.names], ownershipOk: true, log }); if (!entries) return null;
     const envHash = hash(JSON.stringify(entries));
     const key = hash(JSON.stringify([1, components.tree, components.lockHash, components.nodeVersion, suiteHash, envHash, host, liveOrigin]));
     return { ...components, key, suiteHash, envHash, envNames: entries.map(([name]) => name), host, liveOrigin };
