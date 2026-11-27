@@ -85,9 +85,13 @@ describe('boot evidence privacy (S2a audit)', () => {
   });
 
   it.each([
-    ['SIGKILL', null],
-    [null, 1],
-  ])('a caught import report retains signal=%s and exitCode=%s with private raw evidence (F1)', async (signal, status) => {
+    ['SIGKILL', null, 'SIGKILL', null],
+    [null, 1, null, 1],
+    ['SIGTERM', 0, 'SIGTERM', 0],
+    ['invalid-signal', '1', null, null],
+    ['SIGKILL\nprivate-signal-sentinel', 1.5, null, null],
+    [42, Number.MAX_SAFE_INTEGER + 1, null, null],
+  ])('a caught import report preserves valid termination metadata and rejects invalid values: signal=%s, status=%s (F1)', async (signal, status, expectedSignal, expectedExitCode) => {
     const rawError = 'TypeError: private "caught-child-sentinel" | at fixture.mjs:1:1';
     const result = await checkDaemonEntriesBoot({
       root, diagnosticsDir: join(root, 'diagnostics'), clock: () => 1_000_000,
@@ -100,7 +104,7 @@ describe('boot evidence privacy (S2a audit)', () => {
     });
     const entry = result.entries[0];
     for (const failure of [entry, entry.attempts[0]]) {
-      expect(failure).toMatchObject({ kind: 'import failed', signal, exitCode: status });
+      expect(failure).toMatchObject({ kind: 'import failed', signal: expectedSignal, exitCode: expectedExitCode });
       expect(Object.getOwnPropertyDescriptor(failure, 'rawError')).toMatchObject({ value: rawError, enumerable: false });
       expect(JSON.stringify(failure)).not.toContain('caught-child-sentinel');
     }

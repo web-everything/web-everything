@@ -321,7 +321,8 @@ marking budget interruptions. Only an all-timeout boot failure set at the full r
 counts as env-timeout (caps at least `MIN_OWN_CAP_MS`, each attempt's measured `elapsedMs`
 at least `min(minElapsedMs, cap * 0.9)`; aggregate row time cannot substitute for entry timing).
 An import failure already reported on child stdout remains `import failed` even when a pending
-timer keeps the child alive until a timeout kills it.
+timer keeps the child alive until a timeout kills it. Preserve the caught child's validated signal
+and exit code alongside that import report; keep raw import evidence non-enumerable.
 Mixed import failures, crashes, budget slices and missing entry evidence remain code failures.
 
 Smoke diagnostics never carry raw child stderr or stdout (operator decision, PR 5460). A boot or

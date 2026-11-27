@@ -384,10 +384,11 @@ async function bootOneEntry(entry, { root, timeoutMs, bootMinChildMs, runChild, 
   const keep = (text) => writeStderrTail(text, { dir: diagnosticsDir, label: `boot-${entry}`, now });
   // The culprit attribution (`daemon-rebuild/smoke.mjs#smokeFailureFiles`) reads these typed paths, not the text.
   const filesIn = (text) => sourceFilesIn(text, root).filter(isRepoFile);
-  const importFailure = (parsed, elapsedMs) => {
+  const importFailure = (parsed, elapsedMs, childFailure = {}) => {
     // Preserve the entire child error, including literal delimiters and stack tails.
     const error = parsed.error;
-    const failure = { entry, ok: false, kind: 'import failed', startedAt, elapsedMs, signal: null, exitCode: null,
+    const failure = { entry, ok: false, kind: 'import failed', startedAt, elapsedMs,
+      signal: smokeSignal(childFailure?.signal), exitCode: smokeExitCode(childFailure?.status),
       errorClass: smokeErrorClass(error), files: filesIn(error), stderrFile: keep(error) };
     // In-process only: NON-ENUMERABLE, so it never serialises (a result must never carry raw child text out). It is the
     // byte-exact child error `failsSameChecks` compares for exact equality, since `errorClass` is lossy (masked, truncated).
@@ -404,7 +405,7 @@ async function bootOneEntry(entry, { root, timeoutMs, bootMinChildMs, runChild, 
     // Only a complete failure report overrides the child failure; malformed/missing output stays failed.
     let parsed;
     try { parsed = JSON.parse(e?.stdout); } catch { /* no complete harness report */ }
-    if (validImportFailureReport(parsed)) return importFailure(parsed, elapsedMs);
+    if (validImportFailureReport(parsed)) return importFailure(parsed, elapsedMs, e);
     const stderr = String(e?.stderr ?? '');
     // The rebuild's own budget refusal and the bounded child's own kill reasons (never child text): kept verbatim,
     // matched exactly, so a timeout still reads as one.
