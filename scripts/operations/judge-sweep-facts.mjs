@@ -67,7 +67,6 @@ function deriveResponsibility(pr, thresholds) {
   if (judgment.needsJudgment && judgment.reason !== 'waiting-fixer-not-dispatched') {
     return result('judge', 'Inspect PR evidence and rule on the outstanding judgment.');
   }
-  if (pr.conflictOwnershipError) return result('operator', pr.conflictOwnershipError);
   if (pr.fixerRunning) return result('fixer', 'Complete the active repair and publish its result.');
   if (labels.includes('ready-to-merge')) return result('drain', 'Merge after required gates pass.');
   if (labels.some(l => ['review:accepted', 'review:human', 'status:needs-you'].includes(l))) {
@@ -88,9 +87,12 @@ function deriveResponsibility(pr, thresholds) {
     ['review-status:draft-withdrawn', 'status:needs-human', 'review-status:needs-human'].includes(l))) {
     return result('orchestrator', 'Inspect the hold and assign the next responsible worker.');
   }
-  // Empty-owner fallback only, after every guard above. Only an explicit CONFLICTING on a known non-draft PR counts.
-  if (pr.mergeable === 'CONFLICTING' && pr.isDraft === false && !labels.includes('hold:fix')
-    && !labels.includes(pr.fixHoldLabel ?? 'hold:fix')
+  // Validation only governs the empty-owner conflict fallback; it cannot displace a responsible worker.
+  if (pr.isDraft === false && pr.mergeable !== 'MERGEABLE' && pr.conflictOwnershipError) {
+    return { ...result('operator', pr.conflictOwnershipError), conflictFallback: true };
+  }
+  // Only an explicit CONFLICTING on a known non-draft PR counts. Effective and worker holds may differ.
+  if (pr.mergeable === 'CONFLICTING' && pr.isDraft === false && !labels.includes(pr.fixHoldLabel ?? 'hold:fix')
     && !labels.includes(pr.workerFixHoldLabel ?? 'hold:fix')) {
     return { ...result('fixer', 'Resolve the conflict.'), conflictFallback: true };
   }
@@ -108,8 +110,7 @@ export function needsJudgment(pr, thresholds = STALL_DEFAULTS) {
     && ownerAge(pr) > (thresholds.unownedMinutes ?? STALL_DEFAULTS.unownedMinutes)) {
     const responsibility = deriveResponsibility(pr, thresholds);
     // Only the conflict fallback may name a fixer that was never dispatched.
-    if (['nobody', 'orchestrator'].includes(responsibility.nextOwner) || responsibility.conflictFallback
-      || pr.conflictOwnershipError) {
+    if (['nobody', 'orchestrator'].includes(responsibility.nextOwner) || responsibility.conflictFallback) {
       return { needsJudgment: true, reason: 'unowned: inspect PR and assign the next responsible worker' };
     }
   }

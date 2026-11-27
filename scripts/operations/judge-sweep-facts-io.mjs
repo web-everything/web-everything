@@ -55,7 +55,7 @@ export function resolveStallThresholds({ env = process.env, readFile = readFileS
     ? Object.fromEntries(Object.keys(STALL_DEFAULTS).filter(k => Object.hasOwn(value, k)).map(k => [k, value[k]])) : {};
   const plat = platform === undefined ? platformPreference('judgeSweepStall', { env, readFile }) : platform;
   return cascadePolicy('judgeSweepStall', pick(tool), {
-    standard: STALL_DEFAULTS, platform: pick(plat), envValues: pick(envValues), env, log,
+    standard: STALL_DEFAULTS, platform: pick(plat), operatorOverride: {}, envValues: pick(envValues), env, log,
     valid: v => typeof v === 'number' && Number.isFinite(v) && v > 0,
   }).value;
 }
@@ -79,7 +79,9 @@ export function resolveFixHoldLabel({ env = process.env, readFile = readFileSync
   };
   const platform = scalar(prefs.fixHoldLabel);
   const resolved = cascadePolicy('fixHoldLabel', scalar(tool), { standard: FIX_HOLD_LABEL,
-    platform, envValues: { '': env.WE_FIX_HOLD_LABEL }, valid, env, log });
+    // Preferences were already read through the injected port. Neither missing preferences nor this
+    // non-capacity policy should trigger an implicit host settings/override-store read in the cascade.
+    platform: platform ?? null, operatorOverride: {}, envValues: { '': env.WE_FIX_HOLD_LABEL }, valid, env, log });
   log?.(`judge-sweep fix hold label=${resolved.value} source=${resolved.sources['']}`);
   return { ...resolved, workerFixHoldLabel: env.WE_FIX_HOLD_LABEL || FIX_HOLD_LABEL, error: errors.length || resolved.invalid.length
     ? 'Inspect the effective fix hold label settings and rerun.' : null };

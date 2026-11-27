@@ -994,6 +994,32 @@ it.each(['ready-to-merge', 'operator-accepted'])('preserves %s ownership despite
 });
 
 
+const ownershipRules = [
+  ['active fixer', { fixerRunning: true }, 'fixer'],
+  ['merge admission', { labels: ['ready-to-merge'] }, 'drain'],
+  ...['review:accepted', 'review:human', 'status:needs-you'].map(label => [label, { labels: [label] }, 'operator']),
+  ...['review:pending', 'status:awaiting-review'].map(label => [label, { labels: [label] }, 'review']),
+  ['red-team state', { redTeam: { state: 'pending' } }, 'red-team'],
+  ['red-team label', { labels: ['red-team:pending'] }, 'red-team'],
+  ...['review:changes', 'status:answered-waiting-fixer'].map(label =>
+    [label, { labels: [label], minutesSinceFixDispatch: 5 }, 'fixer']),
+  ['draft', { isDraft: true }, 'orchestrator'],
+  ...['review-status:draft-withdrawn', 'status:needs-human', 'review-status:needs-human'].map(label =>
+    [label, { labels: [label] }, 'orchestrator']),
+];
+it.each(ownershipRules.flatMap(([rule, patch, nextOwner]) =>
+  ['MERGEABLE', 'CONFLICTING', 'UNKNOWN', null].map(mergeable => ({ rule, patch, nextOwner, mergeable }))))(
+  'conflict validation preserves $rule ownership for $mergeable', ({ patch, nextOwner, mergeable }) => {
+    const input = facts({ labels: [], owner: null, fixerRunning: false, minutesSinceUpdate: 1,
+      minutesSinceFixLoop: 90, isDraft: false, ...patch, mergeable });
+    const before = buildJudgeSweepBundle({ prs: [input] }).prs[0];
+    expect(before.nextOwner).toBe(nextOwner);
+    const after = buildJudgeSweepBundle({ prs: [{ ...input,
+      conflictOwnershipError: 'Inspect conflict ownership settings and rerun.' }] }).prs[0];
+    expect(after).toMatchObject({ nextOwner, needsJudgment: before.needsJudgment, reason: before.reason,
+      nextStep: before.nextStep });
+  });
+
 it('unknown mergeability preserves judgment for an ownerless 90-minute-old fix loop', () => {
   const input = facts({ owner: null, fixerRunning: false, minutesSinceUpdate: 1,
     minutesSinceFixLoop: 90, mergeable: 'UNKNOWN', isDraft: false,
@@ -1003,9 +1029,22 @@ it('unknown mergeability preserves judgment for an ownerless 90-minute-old fix l
     nextStep: input.conflictOwnershipError });
 });
 
-it.each(['hold:fix', 'custom:fix', 'worker:fix'])(
+it.each([
+  ['MERGEABLE', false, 'nobody'], ['UNKNOWN', true, 'orchestrator'], ['UNKNOWN', undefined, 'nobody'],
+])('conflict validation does not route mergeable or draft-unknown PRs (%s, draft=%s)', (mergeable, isDraft, nextOwner) => {
+  expect(judgeSweepFacts.deriveNextOwner(facts({ mergeable, isDraft,
+    conflictOwnershipError: 'Inspect hold settings and rerun.' }))).toMatchObject({ nextOwner });
+});
+
+it.each(['custom:fix', 'worker:fix'])(
   'conflict fallback respects %s alongside effective and worker hold overrides', label => {
     expect(judgeSweepFacts.deriveNextOwner(facts({ mergeable: 'CONFLICTING', isDraft: false,
       fixHoldLabel: 'custom:fix', workerFixHoldLabel: 'worker:fix', labels: [label] })))
       .toMatchObject({ nextOwner: 'nobody' });
   });
+
+it('effective and worker hold overrides replace the default hold label', () => {
+  expect(judgeSweepFacts.deriveNextOwner(facts({ mergeable: 'CONFLICTING', isDraft: false,
+    fixHoldLabel: 'custom:fix', workerFixHoldLabel: 'worker:fix', labels: ['hold:fix'] })))
+    .toMatchObject({ nextOwner: 'fixer', nextStep: 'Resolve the conflict.' });
+});

@@ -1,13 +1,14 @@
 /** Bounded observations must expose grants that need evidence beyond list + comments. */
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { resolveHumanReviewSurfaces } from '../../lib/human-review-surfaces.mjs';
 import * as referralCards from '../../lib/referral-card-readable.mjs';
 import { runGhSync } from '../../lib/gh-throttle.mjs';
-import { createJudgeSweepFactsReader, createShapeCache, JUDGE_SWEEP_REPO, operatorGh, readCheckoutState, readFromFreshOrigin, resolveFixHoldLabel } from '../judge-sweep-facts-io.mjs';
+import { createJudgeSweepFactsReader, createShapeCache, JUDGE_SWEEP_REPO, operatorGh, readCheckoutState, readFromFreshOrigin, resolveFixHoldLabel, resolveStallThresholds } from '../judge-sweep-facts-io.mjs';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import fs, { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { homedir, tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { buildJudgeSweepBundle } from '../judge-sweep-facts.mjs';
 import { buildShapePlan } from '../../review-core-cli.mjs';
@@ -18,8 +19,38 @@ import { mandatoryReferralReviewer, normalizeFinding, referralFindingKey, render
   REFERRAL_DROP_REASON, REFERRAL_SUPERSEDE_REASON, validateReferralRecord } from '../../lib/jury-core.mjs';
 
 vi.mock('../../lib/gh-throttle.mjs', async original => ({ ...await original(), runGhSync: vi.fn() }));
+const settingsIO = { reads: [], violations: [] };
+let restoreSettingsRead;
+// The shared Vitest setup supplies a private HOME and account homedir. Pin preferences there for this file.
+// Record host settings access even when production catches an IO error, so it still fails the test.
+beforeEach(() => {
+  vi.stubEnv('WE_PLATFORM_PREFERENCES_FILE', join(homedir(), 'sentinel-platform-preferences.json'));
+  const original = fs.readFileSync;
+  fs.readFileSync = (path, ...args) => {
+    const name = String(path);
+    if (/(?:platform-preferences|delivery-priority-settings|operator-overrides)\.json$/.test(name)) {
+      settingsIO.reads.push(name);
+      const privateRoots = [homedir(), userInfo().homedir];
+      const versioned = /\/scripts\/lib\/delivery-(?:platform-preferences|priority-settings)\.json$/.test(name);
+      if (!versioned && !privateRoots.some(root => name.startsWith(`${root}/`))) {
+        settingsIO.violations.push(name);
+        throw new Error('settings read outside the private sentinel home');
+      }
+    }
+    return original(path, ...args);
+  };
+  // Native .mjs imports retain builtin bindings; a Vitest module mock alone does not cover those callers.
+  syncBuiltinESMExports();
+  restoreSettingsRead = () => { fs.readFileSync = original; syncBuiltinESMExports(); };
+});
 
-afterEach(() => { vi.resetAllMocks(); vi.unstubAllEnvs(); });
+afterEach(() => {
+  restoreSettingsRead();
+  const violations = settingsIO.violations.splice(0);
+  settingsIO.reads.length = 0;
+  vi.resetAllMocks(); vi.unstubAllEnvs();
+  expect(violations, 'host settings reads outside private homes').toEqual([]);
+});
 
 const repo = 'o/r', head = 'a'.repeat(40), at = '2026-10-22T13:00:00Z';
 // Keep the production cap; detail fixtures explicitly use round three (cap - 2).
@@ -615,6 +646,9 @@ it.each([
   ['a malformed head', [{ ...goodPr, headSha: 'abc' }], false],
   ['missing evidenceErrors', [{ ...goodPr, evidenceErrors: undefined }], false],
   ['non-array labels', [{ ...goodPr, labels: 'x' }], false],
+  ['object-shaped hold label', [{ ...goodPr, mergeable: 'CONFLICTING', isDraft: false,
+    labels: [{ name: 'hold:fix' }] }], false],
+  ['non-string label among strings', [{ ...goodPr, labels: ['hold:fix', null] }], false],
   ['a non-finite age', [{ ...goodPr, minutesSinceUpdate: null }], false],
   ['a valid PR', [goodPr], true],
 ])('validates the fresh PR shape: %s', (_name, prs, ok) => {
@@ -1111,6 +1145,21 @@ const hardenedOptions = extra => options({ env: {}, log: () => {},
   readFile: () => '{}', readStallThresholds: () => ({}),
   cardReadable: () => false, shape: () => ({ humanRequired: false }), ...extra });
 const hardenedRead = extra => createJudgeSweepFactsReader(hardenedOptions(extra))({ repo });
+const ioOwnershipCases = [false, true].flatMap(fresh => ['UNKNOWN', null].flatMap(mergeable =>
+  ['fixer', 'drain', 'review', 'red-team'].map(nextOwner => ({ fresh, mergeable, nextOwner }))));
+it.each(ioOwnershipCases)(
+  'unknown mergeability preserves IO owner $nextOwner (fresh=$fresh, mergeable=$mergeable)',
+  ({ fresh, mergeable, nextOwner }) => {
+    const labels = { fixer: [], drain: ['ready-to-merge'], review: ['review:pending'], 'red-team': ['red-team:pending'] }[nextOwner];
+    const local = hardenedRead({ gh: () => JSON.stringify([pr({ mergeable, isDraft: false,
+      labels: labels.map(name => ({ name })) })]),
+      readJobs: () => nextOwner === 'fixer' ? [{ repo, pr: 1, kind: 'fix-run' }] : [] });
+    // An old fix loop used to widen pending-review judgment even though review still owns the PR.
+    local.prs[0].minutesSinceFixLoop = 90;
+    const result = fresh ? hardenedRead({ checkoutState: () => ({ behind: 1 }), readFresh: () => local }) : local;
+    expect(buildJudgeSweepBundle(result).prs[0]).toMatchObject({ nextOwner, needsJudgment: false });
+  });
+
 it.each([false, true])('validates unknown merge state on current/fresh paths (fresh=%s)', fresh => {
   for (const mergeable of [undefined, null, 'UNKNOWN', 'BOGUS']) {
     const local = hardenedRead({ gh: () => JSON.stringify([pr({ mergeable, isDraft: false })]) });
@@ -1121,8 +1170,8 @@ it.each([false, true])('validates unknown merge state on current/fresh paths (fr
       : { nextOwner: 'operator', nextStep: expect.stringMatching(/mergeability.*rerun/) });
   }
 });
-it.each([false, true])('custom hold label preserves the default on current/fresh paths (fresh=%s)', fresh => {
-  for (const [label, nextOwner] of [['custom:fix', 'nobody'], ['hold:fix', 'nobody']]) {
+it.each([false, true])('custom environment hold label replaces the default on current/fresh paths (fresh=%s)', fresh => {
+  for (const [label, nextOwner] of [['custom:fix', 'nobody'], ['hold:fix', 'fixer']]) {
     const env = { WE_FIX_HOLD_LABEL: 'custom:fix', WE_POLICY_CASCADE_LOG: '1' };
     const log = vi.fn();
     const local = hardenedRead({ env, log, gh: () => JSON.stringify([pr({ labels: [{ name: label }],
@@ -1179,6 +1228,37 @@ it('preserves fresh-origin effective hold settings despite different stale-check
     readFile: () => { throw new Error('stale settings unreadable'); } });
   expect(result.prs[0]).toEqual(local.prs[0]);
   expect(buildJudgeSweepBundle(result).prs[0].nextOwner).toBe('nobody');
+});
+
+it('resolves hold and stall settings only through injected reads, including empty platform preferences', () => {
+  const readFile = vi.fn(() => '{}');
+  const before = settingsIO.reads.length;
+  const resolved = resolveFixHoldLabel({ env: {}, readFile, log: () => {} });
+  expect(resolved).toMatchObject({ value: 'hold:fix', error: null, sources: { '': 'standard' } });
+  expect(resolveStallThresholds({ env: {}, readFile, log: () => {} })).toMatchObject({ unownedMinutes: 45 });
+  expect(settingsIO.reads.slice(before)).toEqual([]);
+  expect(readFile).toHaveBeenCalled();
+});
+
+it('the settings sentinel rejects an outside-home read even if the caller catches it', async () => {
+  const { readFileSync } = await import('node:fs');
+  const outside = join(tmpdir(), 'outside-settings-sentinel', '.claude', 'platform-preferences.json');
+  expect(() => readFileSync(outside, 'utf8')).toThrow(/outside the private sentinel home/);
+  expect(settingsIO.violations.splice(0)).toEqual([outside]);
+});
+
+it.each([
+  ['unowned conflict', { mergeable: 'CONFLICTING', isDraft: false }, 'operator'],
+  ['active fixer', { mergeable: 'CONFLICTING', isDraft: false, fixerRunning: true }, 'fixer'],
+  ['merge admission', { mergeable: 'MERGEABLE', labels: ['ready-to-merge'] }, 'drain'],
+  ['pending review', { mergeable: 'UNKNOWN', labels: ['review:pending'] }, 'review'],
+])('fresh-origin rows without fixHoldLabel refuse only conflict fallback: %s', (_name, patch, nextOwner) => {
+  const { fixHoldLabel, ...legacyPr } = { ...goodPr, ...patch };
+  const result = hardenedRead({ checkoutState: () => ({ behind: 2 }),
+    readFresh: () => ({ prs: [legacyPr] }),
+    readFile: () => { throw new Error('stale settings must not be read'); } });
+  expect(result.prs[0].conflictOwnershipError).toMatch(/hold label.*rerun/);
+  expect(buildJudgeSweepBundle(result).prs[0].nextOwner).toBe(nextOwner);
 });
 
 it.each(['platform', 'tool'])('a %s hold override preserves the worker default hold', layer => {
