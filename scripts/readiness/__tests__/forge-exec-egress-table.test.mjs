@@ -1,6 +1,6 @@
 // @vitest-environment node
 import {beforeEach, afterEach, describe, it, expect, vi} from 'vitest';
-import {mkdtemp, mkdir, writeFile, readFile, rm, symlink, realpath} from 'node:fs/promises';
+import {mkdtemp, mkdir, writeFile, readFile, rm, symlink, realpath, readdir, stat} from 'node:fs/promises';
 import {join} from 'node:path';
 import {createHash} from 'node:crypto';
 import {createRunner, digestInput, digestArgv, execute, cliFailure} from '../forge-exec-run.mjs';
@@ -83,7 +83,67 @@ const ruleset = uid => `table inet forge_exec_egress {
   }
 }`;
 
+const numericListing = (uids, verdict, priority) => ruleset(uids.join(', '))
+  .replace('reject with icmpx type admin-prohibited', verdict)
+  .replace('priority filter', 'priority ' + priority);
+const plannedUIDs = Array.from({length: 8}, (_, i) => 999 - i);
+
 describe('egress table readiness', () => {
+  it.each(['reject with icmpx type admin-prohibited', 'reject with icmpx admin-prohibited',
+    'reject with icmpx type 3', 'reject with icmpx 3'].flatMap(verdict => ['0', 'filter'].map(priority => [verdict, priority])))(
+    'numeric nft listing covers every planned first-install UID: %s / %s', async (verdict, priority) => {
+      probeResult = {code: 0, stdout: numericListing(plannedUIDs, verdict, priority)};
+      for (const uid of plannedUIDs) await expect(makeRunner().egressReady(uid)).resolves.toBeUndefined();
+    });
+  it.each(['nft-n-forge-exec-egress-mesa-01.txt', 'nft-forge-exec-egress-mesa-01.txt'])(
+    'captured Mesa-01 nft listing is accepted: %s', async file => {
+      probeResult = {code: 0, stdout: await readFile(new URL('./fixtures/' + file, import.meta.url), 'utf8')};
+      // Preserve the capture: this host had occupied UIDs, unlike the fresh fixture.
+      for (const uid of [987, 988, 990, 993, 994, 995, 996, 999])
+        await expect(makeRunner().egressReady(uid)).resolves.toBeUndefined();
+      await expect(makeRunner().egressReady(991)).rejects.toMatchObject({code: 'egress-uid-uncovered'});
+    });
+  it.each(['reject with icmpx 0', 'reject with icmpx port-unreachable', 'reject', 'accept', 'reject with tcp reset'])(
+    'other verdicts still refuse: %s', async verdict => {
+      probeResult = {code: 0, stdout: numericListing(plannedUIDs, verdict, '0')};
+      await expect(makeRunner().egressReady(999)).rejects.toMatchObject({
+        code: 'egress-table-unrecognized',
+        message: 'Egress table inet forge_exec_egress has an unrecognised ruleset; use local fallback',
+      });
+    });
+  it.each([
+    ['unrecognised table', 'egress-table-unrecognized'],
+    ['uncovered UID', 'egress-uid-uncovered'],
+  ])('active-worker prepare refuses an %s', async (_name, code) => {
+    await mkdir(join(root, 'runs', 'slot-14'), {recursive: true, mode: 0o710});
+    const {uid} = await stat(root);
+    probeResult = {code: 0, stdout: code === 'egress-table-unrecognized' ? 'unknown' : ruleset(uid + 1)};
+    const runner = createRunner({testRoot: root, testPath: bin + ':/usr/bin:/bin', testEgressProbe: probe,
+      clock: () => 1800000000000,
+      testDrainStat: async () => { throw Object.assign(new Error('fixture: no drain'), {code: 'ENOENT'}); },
+      testReapProbe: {uidBusy: async () => false, unitActive: async () => false}});
+    await expect(runner.prepare({nonce, label: 'abcdef-1'})).rejects.toMatchObject({code});
+    expect((await readdir(join(root, 'receipts'))).filter(file => file.endsWith('.prepared'))).toEqual([]);
+    expect(await ran()).toBe(false);
+  });
+  it.each([
+    ['unrecognised table', 'egress-table-unrecognized'],
+    ['uncovered UID', 'egress-uid-uncovered'],
+  ])('active-worker run refuses an %s before execution', async (_name, code) => {
+    await mkdir(join(root, 'runs', 'slot-14'), {recursive: true, mode: 0o710});
+    const {uid} = await stat(root);
+    probeResult = {code: 0, stdout: ruleset(uid)};
+    const runner = createRunner({testRoot: root, testPath: bin + ':/usr/bin:/bin', testEgressProbe: probe,
+      clock: () => 1800000000000,
+      testDrainStat: async () => { throw Object.assign(new Error('fixture: no drain'), {code: 'ENOENT'}); },
+      testReapProbe: {uidBusy: async () => false, unitActive: async () => false}});
+    const request = await requestFor(runner);
+    probeResult = {code: 0, stdout: code === 'egress-table-unrecognized' ? 'unknown' : ruleset(uid + 1)};
+    await expect(runner.run(request)).rejects.toMatchObject({code});
+    expect(await ran()).toBe(false);
+    expect(JSON.parse(await readFile(join(root, 'receipts', request.run + '.rejected'), 'utf8')))
+      .toMatchObject({reason: 'snapshot-rejected', run: request.run, phase: 'rejected'});
+  });
   it.each([
     ['absent table', () => ({code: 1})],
     ['nonzero exit', () => ({code: 2})],
@@ -115,7 +175,7 @@ describe('egress table readiness', () => {
   });
   it.each(['', 'garbage', 'meta skuid { 2014 } jump slot_egress'])('refuses incomplete UID evidence %j', async stdout => {
     probeResult = {code: 0, stdout};
-    await expect(makeRunner().egressReady(2014)).rejects.toMatchObject({code: 'egress-uid-uncovered'});
+    await expect(makeRunner().egressReady(2014)).rejects.toMatchObject({code: 'egress-table-unrecognized'});
   });
   it.each([
     ['preceding unconditional accept', text => text.replace('meta skuid', 'accept\n    meta skuid')],
@@ -133,7 +193,7 @@ describe('egress table readiness', () => {
     ['trailing unknown evidence', text => text + '\nunknown'],
   ])('refuses UID coverage with %s', async (_name, change) => {
     probeResult = {code: 0, stdout: change(ruleset(2014))};
-    await expect(makeRunner().egressReady(2014)).rejects.toMatchObject({code: 'egress-uid-uncovered'});
+    await expect(makeRunner().egressReady(2014)).rejects.toMatchObject({code: 'egress-table-unrecognized'});
   });
   it.each([
     ['numeric priority and singleton UID', text => text.replace('priority filter', 'priority 0').replace('{ 2014 } jump', '2014 jump')],

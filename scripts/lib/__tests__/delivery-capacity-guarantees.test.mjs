@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { assessCapacity } from '../delivery-capacity.mjs';
 
 const host = { idlePct: 22, memGb: 6 };
@@ -8,6 +8,52 @@ const pr = (number, labels = []) => ({
 });
 
 describe('delivery capacity documented safety guarantees', () => {
+  describe('complete and attributable evidence', () => {
+    beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(new Date('2026-11-15T12:00:00Z')); });
+    afterEach(() => vi.useRealTimers());
+
+    const unattributedRows = () => [pr(1), { number: 2, labels: [], additions: 10, deletions: 0,
+      updatedAt: '2026-11-15T12:00:00Z', files: ['a.mjs'] }];
+
+    it('an array-carried discoveryIncomplete marker forces count fallback and holds starts', () => {
+      const rows = [pr(1)];
+      Object.defineProperty(rows, 'discoveryIncomplete', { value: true });
+      const readout = assessCapacity({ prs: rows, host, policy: { mode: 'units' } });
+      expect(readout).toMatchObject({ mode: 'count', verdict: 'hold', slots: 0 });
+      expect(readout.fallbackReason).toMatch(/discovery incomplete.*inspect full population/);
+      expect(readout.why).toContain(readout.fallbackReason);
+    });
+
+    it('builder population with a provenance-less row forces count fallback and holds starts', () => {
+      const readout = assessCapacity({ prs: unattributedRows(), host,
+        policy: { mode: 'units', population: 'builder' } });
+      expect(readout).toMatchObject({ mode: 'count', used: 2, verdict: 'hold', slots: 0 });
+      expect(readout.fallbackReason).toMatch(/lacks provenance/);
+      expect(readout.why).toContain(readout.fallbackReason);
+    });
+
+    it('all population admits rows without provenance', () => {
+      const readout = assessCapacity({ prs: unattributedRows(), host,
+        policy: { mode: 'units', population: 'all' } });
+      expect(readout).toMatchObject({ mode: 'units', verdict: 'build', openCount: 2 });
+      expect(readout.fallbackReason).toBeUndefined();
+    });
+
+    it('builder population with empty headRefName holds starts', () => {
+      const readout = assessCapacity({ prs: [{ ...pr(1), headRefName: '' }], host,
+        policy: { mode: 'units', population: 'builder' } });
+      expect(readout).toMatchObject({ mode: 'count', used: 1, verdict: 'hold', slots: 0 });
+      expect(readout.fallbackReason).toMatch(/lacks provenance/);
+    });
+
+    it('builder population without a marker admits full provenance without an optional body', () => {
+      const readout = assessCapacity({ prs: [pr(1)], host,
+        policy: { mode: 'units', population: 'builder' } });
+      expect(readout).toMatchObject({ mode: 'units', used: 4, openCount: 1, verdict: 'build' });
+      expect(readout.fallbackReason).toBeUndefined();
+    });
+  });
+
   it.each([null, undefined, [], 'bad row', {}, { number: '2' }, { number: NaN },
     { number: Infinity }, { number: 1.5 }])('malformed PR row forces count fallback and holds starts: %j', row => {
     const readout = assessCapacity({ prs: [pr(1), row], host, policy: { mode: 'units' } });
