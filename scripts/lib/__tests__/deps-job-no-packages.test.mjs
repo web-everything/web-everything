@@ -141,6 +141,23 @@ describe('bounded dependency syntax evidence (hermetic fixtures)', () => {
     expect(f.read).toHaveBeenCalledTimes(1);
   });
 
+  it.each(['absolute path', 'file URL'].flatMap((form) =>
+    ['require', 'import'].map((load) => [form, load])))(
+    'rejects an indented top-level package load in a root-local %s dependency reached by %s',
+    (form, load) => {
+      const f = syntaxFixture({
+        'entry.mjs': '',
+        'target.mjs': '  await import("external");',
+      });
+      const absolute = resolve(f.root, 'target.mjs');
+      const specifier = form === 'file URL' ? pathToFileURL(absolute).href : absolute;
+      writeFileSync(resolve(f.root, 'entry.mjs'), `${load}(${JSON.stringify(specifier)});`);
+
+      expect(inspectImports('entry.mjs', f).packages).toEqual(['entry.mjs -> target.mjs -> external']);
+      expect(f.read.mock.calls.map(([path]) => path)).toEqual(['entry.mjs', 'target.mjs']);
+    },
+  );
+
   it.each(['require', 'import'].flatMap((load) =>
     ['relative path', 'absolute path', 'file URL'].flatMap((form) =>
       ['call', 'quoted heuristic'].map((syntax) => [load, form, syntax]))))(

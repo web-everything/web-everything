@@ -55,8 +55,8 @@ const NON_CLAIMS = Object.freeze([
 
 /**
  * Bounded syntax evidence, never a proof of the runtime import closure. Follow import/re-export
- * declarations and local require/import targets on non-indented lines, refusing nonliteral
- * specifiers as UNKNOWN. Keep the previous conservative text heuristic, including quoted eval
+ * declarations and top-level require/import targets regardless of indentation, refusing nonliteral
+ * specifiers as UNKNOWN. Keep the previous conservative non-indented heuristic, including quoted eval
  * loads: runtime non-claims must never exempt a previously rejected load. No source is executed.
  * All IO, paths, time and the TypeScript syntax API are supplied by the caller; this module
  * must load without installed packages. Incomplete evidence throws with a repair/retry action.
@@ -121,10 +121,10 @@ export function inspectDepsImports(entry, { root: repoRoot, read, now, syntax: t
     const lines = text.split('\n');
     const startupPackages = new Set();
     const startupLocals = new Set();
-    const calls = [source];
+    const calls = [{ node: source, inFunction: false }];
     while (calls.length) {
       checkTime();
-      const node = calls.pop();
+      const { node, inFunction } = calls.pop();
       if (ts.isCallExpression(node) && (node.expression.kind === ts.SyntaxKind.ImportKeyword
         || (ts.isIdentifier(node.expression) && node.expression.text === 'require')
         || (ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'require')
@@ -132,14 +132,15 @@ export function inspectDepsImports(entry, { root: repoRoot, read, now, syntax: t
           && node.expression.argumentExpression.text === 'require'))) {
         const line = lines[source.getLineAndCharacterOfPosition(node.getStart(source)).line];
         const argument = node.arguments[0];
-        if (/^\S/.test(line)) {
+        if (!inFunction || /^\S/.test(line)) {
           if (!argument || !ts.isStringLiteral(argument)) refuse(`unknown-specifier: ${path}`);
           const target = classify(argument.text, path);
           if (target.local) startupLocals.add(target.local);
           if (target.package) startupPackages.add(target.package);
         }
       }
-      ts.forEachChild(node, (child) => { calls.push(child); });
+      const childInFunction = inFunction || ts.isFunctionLike(node);
+      ts.forEachChild(node, (child) => { calls.push({ node: child, inFunction: childInFunction }); });
     }
     for (const line of lines) {
       checkTime();
