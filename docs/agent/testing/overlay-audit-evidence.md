@@ -1,8 +1,6 @@
-# Overlay audit evidence
+## Overlay audit evidence: waiver precedence
 
 Spec for `scripts/lib/overlay-audit-evidence.mjs` (`loadAuditEvidence`, `auditEvidenceFor`). Tests: `scripts/lib/__tests__/overlay-audit-evidence.test.mjs`.
-
-## Waiver precedence
 
 For each exact ref, case-insensitive SHA, and ruling, validated tool/platform entries shadow lower-priority entries even when revoked; revocation never enables fallback.
 
