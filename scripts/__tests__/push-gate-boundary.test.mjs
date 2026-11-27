@@ -48,7 +48,7 @@ describe('push-gate lint (negative test 14)', () => {
 function admit(sources, entries) {
   const found = {};
   for (const [file, source] of Object.entries(sources)) {
-    const sites = findRawPushes(source, file); // Parse errors must never become allowlisted sites.
+    const sites = findRawPushes(source, file, entries[file]?.commands); // Parse errors must never become allowlisted sites.
     if (sites.length) found[file] = sites.length;
   }
   for (const file of new Set([...Object.keys(sources), ...Object.keys(entries)])) {
@@ -87,4 +87,37 @@ describe('push-gate boundary over the real tree', () => {
     const entries = Object.fromEntries(Object.entries(allow.entries).filter(([file]) => !scope || scope.has(file)));
     admit(sources, entries);
   });
+});
+
+
+it('command pins reject a raw git push even when the site count stays unchanged', () => {
+  const entries = { [fixtureFile]: { ...pinned[fixtureFile], commands: [['rev-parse', '--verify']] } };
+  expect(() => admit({ [fixtureFile]: cp + "spawnSync('git', ['-C', dir, 'rev-parse', '--verify', ref]);" }, entries)).not.toThrow();
+  expect(() => admit({ [fixtureFile]: cp + "spawnSync('git', ['push', ref]);" }, entries)).toThrow(/command/);
+});
+
+it.each([
+  "spawnSync('git', [...prefix, 'rev-parse', '--verify', ref]);",
+  "spawnSync('git', ['-C', dir, ...rest, 'rev-parse', '--verify', ref]);",
+  "spawnSync('git', [...args]);",
+  "spawnSync('git', ['rev-parse', ...flags, ref]);",
+  "spawnSync('git', ['rev-parse', '--verify', ...flags]);",
+])('command pins treat a spread operand as an unknown command (fail closed): %s', call => {
+  const entries = { [fixtureFile]: { ...pinned[fixtureFile], commands: [['rev-parse', '--verify']] } };
+  expect(() => admit({ [fixtureFile]: cp + call }, entries)).toThrow(/command/);
+});
+
+it.each([
+  "spawnSync('git', ['rev-parse', '--verify', ref], {shell:true});",
+  "spawnSync('git', ['rev-parse', '--verify', ref], {shell:'/bin/sh'});",
+  "spawnSync('git', ['rev-parse', '--verify', ref], options);",
+  "spawnSync('git', ['rev-parse', '--verify', ref], {...options});",
+  "spawnSync('git', ['rev-parse', '--verify', ref], {shell:enabled});",
+  "spawnSync('git', ['rev-parse', '--verify', ref], {get shell() { return true; }});",
+  "spawnSync('git', ['rev-parse', '--verify', 'HEAD'], {shell:true});",
+  "spawnSync('git', ['rev-parse', '--verify', ref], {...options, shell:false});",
+  "spawnSync('git', ['rev-parse', '--verify', ref], {[option]:true});",
+])('command pins refuse shell execution and unknown spawn options: %s', call => {
+  const entries = { [fixtureFile]: { ...pinned[fixtureFile], commands: [['rev-parse', '--verify']] } };
+  expect(() => admit({ [fixtureFile]: cp + call }, entries)).toThrow(/command/);
 });

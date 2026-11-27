@@ -2098,6 +2098,10 @@ describe('overlay list — concurrent add vs. a rebuild auto-remove (two real pr
     // The overlay-conflict guard (epic #3383/#4075) now resolves `--ref` for real before registering it — a
     // real branch, even an empty-diff one, so `add` has something to verify against.
     pushBranch(originDir, 'lane/new', (dir) => writeFile(dir, 'n.txt', 'n\n'));
+    env.HOME = base;
+    const { recordPassingOverlayAudit } = await import('../../__tests__/fixtures/overlay-audit.mjs');
+    recordPassingOverlayAudit({ home: base, head: gitOk(originDir, ['rev-parse', 'refs/heads/lane/new']).trim(),
+      base: gitOk(originDir, ['rev-parse', 'refs/heads/main']).trim() });
     const marker = join(base, 'rmw-window-open');
 
     const script = `

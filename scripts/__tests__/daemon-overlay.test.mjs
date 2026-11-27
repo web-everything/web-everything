@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { withAddGuardLock, stackAwareOverlayCheck, findStackBases, main, replaceRegistration } from '../daemon-overlay.mjs';
 import { overlayFilePath, addOverlay, readOverlays } from '../lib/daemon-overlays.mjs';
 import { admitHotpatchRef, guardedRegister } from '../lib/daemon-load-overlay.mjs';
+import { recordPassingOverlayAudit } from './fixtures/overlay-audit.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CLI = resolve(HERE, '..', 'daemon-overlay.mjs');
@@ -54,6 +55,8 @@ function pushBranch(originDir, ref, mutate, { base = 'origin/main' } = {}) {
   gitOk(dir, ['add', '-A']);
   gitOk(dir, ['commit', '-q', '-m', `overlay: ${ref}`]);
   gitOk(dir, ['push', '-q', 'origin', `HEAD:refs/heads/${ref}`]);
+  recordPassingOverlayAudit({ home: dirname(originDir), head: gitOk(dir, ['rev-parse', 'HEAD']).trim(),
+    base: gitOk(originDir, ['rev-list', '--max-parents=0', 'refs/heads/main']).trim() });
 }
 function advanceMain(originDir, mutate) {
   pushBranch(originDir, 'main', mutate, { base: 'origin/main' });
@@ -75,7 +78,7 @@ function makeFixture() {
   gitOk(cloneDir, ['push', '-q', '-u', 'origin', 'main']);
   gitOk(cloneDir, ['fetch', '-q', 'origin']);
   const overlayDir = mktemp('we-overlay-cli-state-');
-  const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: overlayDir, WE_DAEMON_OVERLAY_STACK_BASES: '{}' };
+  const env = { ...process.env, HOME: base, WE_DAEMON_OVERLAY_DIR: overlayDir, WE_DAEMON_OVERLAY_STACK_BASES: '{}' };
   return { originDir, cloneDir, overlayDir, env };
 }
 
@@ -135,6 +138,7 @@ describe.each(['guardedRegister', 'add', 'replace', 'replace --check', 'admitHot
     const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
       if (door === 'add') {
+        vi.stubEnv('HOME', f.env.HOME);
         vi.stubEnv('WE_DAEMON_OVERLAY_DIR', f.overlayDir);
         vi.stubEnv('WE_DAEMON_OVERLAY_STACK_BASES', '{}');
         process.exitCode = 0;
@@ -369,7 +373,7 @@ describe('daemon-overlay.mjs add — the overlay-conflict guard', () => {
 
     const r = runCli(['add', `--clone=${cloneDir}`, '--ref=lane/other', '--pr=5'], env);
     expect(r.status).toBe(0);
-    expect(r.stderr).toBe('');
+    expect(r.stderr).toBe('daemon-overlay: overlaySafety.auditEvidence=refuse (source=default)\n');
 
     const state = overlayStateFile(overlayDir, cloneDir);
     expect(state.overlays.map((o) => o.ref).sort()).toEqual(['lane/fix-procedure', 'lane/other']);

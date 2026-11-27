@@ -834,7 +834,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         message: blocking.map((ref) => `stale-registration: ${ref} (${blockingReasons[ref]})`).join('; '), blocking, blockingReasons,
         fallback: 'Retain the registrations; rebase and retest the overlapping refs, or resolve the combined-test evidence failure and retry.',
       });
-      if (!out.check.ok) return stop('check-unverifiable');
+      if (!out.check.ok) return stop('check-unverifiable', { detail: out.check.reason || 'incomplete loader check' });
       if (!out.check.clean) return stop('check-conflict');
       out.swap = { contained };
       if (rows.some((row) => row.ref === out.effectiveRef)) out.registered = 'already';
@@ -883,7 +883,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
         } else if (out.registered !== 'already') {
           const result = loader('add', out.clone, out.effectiveRef, [`--expected-sha=${out.effectiveSha}`, `--reason=${input.why || `prototype-load: ${input.daemon} ${out.effectiveRef}`}`, `--by=${env.USER || 'unknown'}`]);
           out.registration = result;
-          if (result.code !== 0) return stop('register-failed');
+          if (result.code !== 0) return stop('register-failed', { detail: lastJson(result)?.conflictCheck?.reason || 'registration refused' });
           out.registered = true;
           const evidence = lastJson(result)?.conflictCheck;
           if (evidence?.ok !== true || evidence.clean !== true || evidence.candSha !== out.effectiveSha) {

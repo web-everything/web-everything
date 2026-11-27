@@ -126,6 +126,9 @@ function fixture(options = {}) {
       if (action === 'add' && overlaySafetySettings(config.env, { readSettings: () => options.safetySettings || {} }).noPr === 'refuse') {
         return fail(3, JSON.stringify({ check: { ok: false, reason: 'no-pr' }, wouldRegister: false }));
       }
+      if (action === 'add' && options.auditRefuses === (args.includes('--check') ? 'check' : 'register')) {
+        return fail(3, JSON.stringify({ [args.includes('--check') ? 'check' : 'conflictCheck']: { ok: false, reason: 'no-audit-evidence' }, wouldRegister: false }));
+      }
       if (args.includes('--check')) {
         if (options.checkRaw) return options.checkRaw;
         if (options.unverifiable === ref) return fail(1, JSON.stringify({ check: { ok: false, reason: 'ref-unresolved' } }), 'WARNING overlay NO PR');
@@ -3651,4 +3654,14 @@ describe('recorder-to-load same-diff waiver admission', () => {
         .toMatchObject({ ok: false, stopReason: 'no-canonical-audit' });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+});
+
+
+it.each(['check', 'register'])('surfaces loader audit refusal with code 3 at %s', async stage => {
+  const f = fixture({ auditRefuses: stage });
+  const result = await f.run();
+  expect(result).toMatchObject({ ok: false, registered: false,
+    stopReason: stage === 'check' ? 'check-unverifiable' : 'register-failed', detail: 'no-audit-evidence' });
+  expect(stage === 'check' ? result.check.code : result.registration.code).toBe(3);
+  expect(f.admitted).toEqual([]);
 });

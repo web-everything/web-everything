@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { retireRegistration, replaceRegistration, settlePendingDrops, readPendingDrops, recoverDrops, inferPrNumber } from '../daemon-overlay.mjs';
 import { addOverlay, recordEdgeResolution } from '../lib/daemon-overlays.mjs';
 import { planRebuild } from '../lib/daemon-rebuild.mjs';
+import { recordPassingOverlayAudit } from './fixtures/overlay-audit.mjs';
 
 const CLI = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'daemon-overlay.mjs');
 const dirs = [];
@@ -35,13 +36,14 @@ function fixture() {
   gitOk(clone, ['commit', '-q', '-m', 'init']);
   gitOk(clone, ['remote', 'add', 'origin', origin]);
   gitOk(clone, ['push', '-q', '-u', 'origin', 'main']);
+  const auditBase = gitOk(clone, ['rev-parse', 'HEAD']);
   const author = join(base, 'author');
   gitOk(base, ['clone', '-q', origin, author]);
   const state = mktemp('we-overlay-rr-state-');
   // gh stub: no PR heads any ref; every other GitHub question fails (fails closed in the planner).
   const bin = mktemp('we-overlay-rr-gh-');
   writeFileSync(join(bin, 'gh'), '#!/bin/sh\nif [ "$1 $2" = "pr list" ]; then echo "[]"; exit 0; fi\nif [ "$1 $2" = "repo view" ]; then echo \'{"nameWithOwner":"web-everything/web-everything","url":"https://github.com/web-everything/web-everything"}\'; exit 0; fi\nexit 1\n', { mode: 0o755 });
-  const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, WE_DAEMON_OVERLAY_DIR: state, WE_DAEMON_OVERLAY_STACK_BASES: '{}', WE_OVERLAY_NO_PR: 'warn' };
+  const env = { ...process.env, HOME: base, PATH: `${bin}:${process.env.PATH}`, WE_DAEMON_OVERLAY_DIR: state, WE_DAEMON_OVERLAY_STACK_BASES: '{}', WE_OVERLAY_NO_PR: 'warn' };
   /** Commit `file` on `ref` (starting from `from`) and push it; returns the new tip. */
   const push = (ref, file, content, from = 'origin/main') => {
     gitOk(author, ['fetch', '-q', 'origin']);
@@ -50,7 +52,9 @@ function fixture() {
     gitOk(author, ['add', '-A']);
     gitOk(author, ['commit', '-q', '-m', `${ref}: ${file}`]);
     gitOk(author, ['push', '-q', '-f', 'origin', `HEAD:refs/heads/${ref}`]);
-    return gitOk(author, ['rev-parse', 'HEAD']);
+    const head = gitOk(author, ['rev-parse', 'HEAD']);
+    recordPassingOverlayAudit({ home: base, head, base: auditBase });
+    return head;
   };
   const run = (args, extraEnv = {}) => spawnSync(process.execPath, [CLI, ...args, `--clone=${clone}`, '--json'], { encoding: 'utf8', timeout: 60_000, env: { ...env, ...extraEnv } });
   const list = () => {

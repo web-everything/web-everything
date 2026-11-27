@@ -2,7 +2,7 @@
  * NON-CLAIMS: This lint is a tripwire for honest accidental pushes only.
  * Deliberate evasion (dynamic or concatenated command strings, executable variables,
  * reassigned aliases, dynamic imports, .call(), shell escapes such as g\it pu\sh,
- * unlisted git global flags, and call identity beyond the pinned per-file count)
+ * unlisted git global flags, and call identity beyond per-file counts and optional literal command pins)
  * is NOT caught. The security boundary is the S1 gate (scripts/lib/authorized-push.mjs)
  * plus S6's shell refusal. authorized-push.mjs is exempt because it is the gate itself.
  * Inspect syntax only, never execute the source.
@@ -27,8 +27,9 @@ export function isLintedScript(path) {
     && path !== 'scripts/lib/authorized-push.mjs';
 }
 
-/** One site per shell match or argv call; unreadable or unparsable evidence requires manual inspection. */
-export function findRawPushes(source, filename = 'scripts/source.mjs') {
+/** One site per shell match or argv call; unreadable or unparsable evidence requires manual inspection.
+ * Optional commands pins require each site's literal normalized Git subcommand/flags to match exactly. */
+export function findRawPushes(source, filename = 'scripts/source.mjs', commands) {
   if (typeof source !== 'string') throw new Error(`${filename}: unreadable source; inspect manually`);
   const file = ts.createSourceFile(filename, source, ts.ScriptTarget.Latest, true,
     /\.(?:ts|mts|cts)$/.test(filename) ? ts.ScriptKind.TS : ts.ScriptKind.JS);
@@ -93,6 +94,45 @@ export function findRawPushes(source, filename = 'scripts/source.mjs') {
   };
   const fullyStatic = node => ts.isStringLiteralLike(node)
     || (ts.isArrayLiteralExpression(node) && node.elements.every(fullyStatic));
+  // A pin proves argv execution only. Unknown options can enable a shell and turn operands into commands.
+  const pinnableOptions = node => {
+    const options = node.arguments[2];
+    return node.arguments.length <= 3 && (!options || (ts.isObjectLiteralExpression(options)
+      && options.properties.every(property => (ts.isPropertyAssignment(property) || ts.isShorthandPropertyAssignment(property))
+        && (ts.isIdentifier(property.name) || ts.isStringLiteralLike(property.name))
+        && nameOf(property.name) !== '__proto__'
+        && (nameOf(property.name) !== 'shell' || (ts.isPropertyAssignment(property) && property.initializer.kind === ts.SyntaxKind.FalseKeyword)))));
+  };
+  // Normalize only a literal git argv prefix: discard global options and their values, then retain the
+  // subcommand and its literal flags. Positional/dynamic operands are not command identity. Shells and
+  // unknown global options cannot supply a command pin.
+  const commandOf = node => {
+    if (!node.arguments[0] || staticText(node.arguments[0]) !== 'git'
+      || !node.arguments[1] || !ts.isArrayLiteralExpression(node.arguments[1]) || !pinnableOptions(node)) return null;
+    const args = node.arguments[1].elements;
+    let i = 0;
+    const valued = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--config-env', '--exec-path']);
+    while (i < args.length) {
+      if (ts.isSpreadElement(args[i])) return null;
+      const word = staticText(args[i]);
+      if (word === undefined) return null;
+      if (!word.startsWith('-')) break;
+      if (valued.has(word)) { i += 2; continue; }
+      if (GLOBAL_FLAGS.has(word) || /^(?:--(?:git-dir|work-tree|namespace|config-env|exec-path)=|-C.|-c.)/.test(word)) { i++; continue; }
+      return null;
+    }
+    const subcommand = args[i] && staticText(args[i++]);
+    if (!subcommand) return null;
+    const command = [subcommand];
+    for (; i < args.length; i++) {
+      // A spread can expand to flags (or to the subcommand itself): the command is unknown, never skipped.
+      if (ts.isSpreadElement(args[i])) return null;
+      const word = staticText(args[i]);
+      if (word === undefined || !word.startsWith('-')) break;
+      command.push(word);
+    }
+    return command;
+  };
   const visit = node => {
     if (ts.isCallExpression(node)) {
       const callee = node.expression, name = nameOf(callee);
@@ -105,7 +145,16 @@ export function findRawPushes(source, filename = 'scripts/source.mjs') {
         const argv = gitCommand ? Array.from(node.arguments).slice(1, 2)
           : Array.from(node.arguments).filter(arg => !ts.isObjectLiteralExpression(arg));
         if ((gitCommand || /git/i.test(name)) && !argv.every(fullyStatic)) kind = { kind: 'unresolved', count: kind?.count || 1 };
+        if (gitCommand && commands !== undefined && !pinnableOptions(node)) kind = { kind: 'unresolved', count: kind?.count || 1 };
         if (kind) for (let i = 0; i < kind.count; i++) {
+          if (commands !== undefined) {
+            const command = commandOf(node);
+            if (!Array.isArray(commands) || !commands.length || commands.some(pin => !Array.isArray(pin)
+              || !pin.length || !pin.every(word => typeof word === 'string' && word.length))
+              || !command || !commands.some(pin => JSON.stringify(pin) === JSON.stringify(command))) {
+              throw new Error(`${filename}: raw git command ${JSON.stringify(command)} is not pinned; review command and allowlist`);
+            }
+          }
           sites.push({ line: file.getLineAndCharacterOfPosition(node.getStart(file)).line + 1, kind: kind.kind });
         }
       }

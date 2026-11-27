@@ -62,6 +62,7 @@ import { createHotpatchReaders } from './hotpatch-readers.mjs';
 import { readHeadSha, isSafeBranchName } from './daemon-self-sync.mjs';
 import { gitRun } from './main-staleness.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
+import { auditEvidenceFor, loadAuditEvidence, mainCovers } from './overlay-audit-evidence.mjs';
 import {
   pickSmokeDiagnostics, smokeDiagnosticsDir, smokeErrorClass, smokeExitCode, smokeSignal, strictEnvInteger, writeStderrTail,
 } from './daemon-boot-smoke.mjs';
@@ -72,14 +73,6 @@ import {
   addOverlay, removeOverlay, appendOverlayEvent, allowConflictGate, readOverrideViewerLogin, readOverlayState,
 } from './daemon-overlays.mjs';
 
-/**
- * The SAME admission `daemon-overlay add` runs (2026-10-21, Codex audit of PR #5809: load-overlay registered with no
- * conflict check at all, a side door around add's guard). Under add's per-clone add-guard lock: preview the ref against
- * origin/main + every other registered overlay (stack-aware, merge-tree), then register only when it merges clean, or
- * when it is a CONFIRMED conflict and the operator-credential `--allow-conflict` gate passed. A check that cannot run
- * (corrupt store, fetch/merge-tree error) refuses: fail closed, as add does.
- * @returns {Promise<{registered:true, check:object}|{registered:false, reason:string, check?:object}>}
- */
 /**
  * RS-HP-3 (the ONE door): a hotpatch/* ref registers only when the hotpatch admission (CI receipt + own-sha audit) passes
  * for the exact candidate sha the merge check fetched, and origin/<ref> is still that sha afterwards. Fail closed.
@@ -100,7 +93,15 @@ export async function admitHotpatchRef({ root, ref, candSha, env = process.env, 
   } catch { return refused('hotpatch-not-admitted'); }
 }
 
-export async function guardedRegister({ root, ref, pr, env, gate, register, admitHotpatch = null, checkFn = null, tipOf = null }) {
+/**
+ * The SAME admission `daemon-overlay add` runs (2026-10-21, Codex audit of PR #5809: load-overlay registered with no
+ * conflict check at all, a side door around add's guard). Under add's per-clone add-guard lock: preview the ref against
+ * origin/main + every other registered overlay (stack-aware, merge-tree), then register only when it merges clean, or
+ * when it is a CONFIRMED conflict and the operator-credential `--allow-conflict` gate passed. A check that cannot run
+ * (corrupt store, fetch/merge-tree error) refuses: fail closed, as add does.
+ * @returns {Promise<{registered:true, check:object}|{registered:false, reason:string, check?:object}>}
+ */
+export async function guardedRegister({ root, ref, pr, env, gate, register, settings = overlaySafetySettings(env), log = console, warnings = [], admitHotpatch = null, checkFn = null, tipOf = null }) {
   // Lazy: daemon-overlay.mjs imports this module (overlaySafetySettings), so a static import would be a cycle.
   const { stackAwareOverlayCheck, withAddGuardLock, remoteTip } = await import('../daemon-overlay.mjs');
   return withAddGuardLock(root, env, async () => {
@@ -110,10 +111,26 @@ export async function guardedRegister({ root, ref, pr, env, gate, register, admi
       root, ref, pr, existingOverlays: st.overlays.filter((o) => o?.ref !== ref), env,
     });
     if (!check.ok) return { registered: false, reason: 'conflict-check-failed', check };
+    const envMode = env.WE_OVERLAY_AUDIT_EVIDENCE?.trim();
+    const tightened = !!envMode && envMode !== 'warn';
+    const mode = settings.auditEvidence === 'warn' && !tightened ? 'warn' : 'refuse';
+    log.error?.(`daemon-load-overlay: overlaySafety.auditEvidence=${mode} (source=${tightened ? 'environment' : settings.auditEvidenceSource ?? 'default'})`);
+    const options = { ...loadAuditEvidence({ env, cwd: root }), ref, covers: base => mainCovers(base, { cwd: root, env }) };
+    const existing = st.overlays.find(o => o?.ref === ref);
+    const shas = [check.candSha, ...(existing?.edgeResolution !== undefined ? [existing.edgeResolution?.sha] : [])];
+    for (const sha of shas) {
+      const audit = auditEvidenceFor(sha, options);
+      if (!audit.ok) {
+        const refuse = mode === 'refuse' || audit.kind !== 'missing';
+        log.error?.(`daemon-load-overlay: ${refuse ? 'REFUSED' : 'WARNING'} — ${ref}: ${audit.detail}. Run codex-audit for this SHA or record a matching operator waiver.`);
+        if (refuse) return { registered: false, reason: 'no-audit-evidence', check: { ...check, ok: false, reason: 'no-audit-evidence', detail: audit.detail } };
+        warnings.push('no-audit-evidence');
+      }
+    }
     const hp = await admitHotpatchRef({ root, ref, candSha: check.candSha, env, admitHotpatch, tipOf: tipOf ?? ((r) => remoteTip({ root, ref: r, env })) });
     if (!hp.ok) return { registered: false, reason: hp.reason, check };
     if (!check.clean && !gate.override) return { registered: false, reason: 'conflict', check };
-    register(!check.clean ? { ...gate.override, files: check.files, conflicting: check.conflicting } : null);
+    register(!check.clean ? { ...gate.override, files: check.files, conflicting: check.conflicting } : null, check.candSha);
     return { registered: true, check };
   });
 }
@@ -262,7 +279,7 @@ function readSettingsFile() {
 /**
  * The overlay-safety settings: built-in defaults, then `overlaySafety` in daemon-rebuild-settings.json, then env.
  * An invalid safety value falls back to the default (never to "off"). Launch retries use the overlaySmoke policy cascade.
- * @returns {{dispatchSmoke:'on'|'off', dispatchPaths:string[], noPr:'warn'|'refuse', smokeTimeoutMs:number, smokeKind:'ci-heal'|'fix'}}
+ * @returns {{dispatchSmoke:'on'|'off', dispatchPaths:string[], noPr:'warn'|'refuse', auditEvidence:'refuse'|'warn', auditEvidenceSource:string, smokeTimeoutMs:number, smokeKind:'ci-heal'|'fix'}}
  */
 export function overlaySafetySettings(env = process.env, { readSettings = readSettingsFile } = {}) {
   const declared = readSettings() || {};
@@ -283,7 +300,15 @@ export function overlaySafetySettings(env = process.env, { readSettings = readSe
     ? env.WE_OVERLAY_DISPATCH_PATHS.split(',').map((x) => x.trim()).filter(Boolean) : null;
   const filePaths = Array.isArray(file.dispatchPaths) && file.dispatchPaths.every((x) => typeof x === 'string') ? file.dispatchPaths : null;
   const timeout = Number(env?.WE_OVERLAY_DISPATCH_SMOKE_TIMEOUT_MS ?? file.smokeTimeoutMs);
+  const fileAudit = pick(undefined, file.auditEvidence, ['refuse', 'warn'], 'refuse');
+  const envAudit = pick(env?.WE_OVERLAY_AUDIT_EVIDENCE, fileAudit, ['refuse', 'warn'], 'refuse');
+  const auditEvidence = fileAudit === 'refuse' || envAudit === 'refuse' ? 'refuse' : 'warn';
+  const envAuditSet = typeof env?.WE_OVERLAY_AUDIT_EVIDENCE === 'string'
+    ? !!env.WE_OVERLAY_AUDIT_EVIDENCE.trim() : env?.WE_OVERLAY_AUDIT_EVIDENCE != null;
+  const auditEvidenceSource = envAuditSet && envAudit === 'refuse'
+    ? 'environment' : file.auditEvidence === undefined ? 'default' : 'tool';
   return {
+    auditEvidence, auditEvidenceSource,
     dispatchLaunchRetries: retries.value.dispatchLaunchRetries,
     dispatchLaunchRetriesSource: retries.sources.dispatchLaunchRetries,
     dispatchSmoke: pick(env?.WE_OVERLAY_DISPATCH_SMOKE, file.dispatchSmoke, ['on', 'off'], 'on'),
@@ -742,12 +767,12 @@ export async function runDaemonLoadOverlay({
 
   // Every REAL registration goes through add's guard (guardedRegister). An injected `addOverlayFn` (unit wiring tests)
   // registers nothing real, so it is not guarded unless the caller also injects `admit`.
-  const register = (override) => addOverlayFn(root, {
-    ref, pr, addedBy: by, reason, now, ...(override ? { conflictOverride: override } : {}),
+  const register = (override, auditedSha) => addOverlayFn(root, {
+    ref, pr, addedBy: by, reason, now, ...(auditedSha ? { auditedSha } : {}), ...(override ? { conflictOverride: override } : {}),
   }, { env });
   const admitFn = admit ?? (addOverlayFn === addOverlay ? guardedRegister : null);
   if (admitFn) {
-    const admitted = await admitFn({ root, ref, pr, env, gate, register });
+    const admitted = await admitFn({ root, ref, pr, env, gate, register, settings: safety, log, warnings });
     if (!admitted.registered) {
       const c = admitted.check;
       log.error?.(`daemon-load-overlay: REFUSED — ${ref} ${admitted.reason === 'conflict'

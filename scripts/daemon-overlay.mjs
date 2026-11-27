@@ -126,6 +126,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { safeRegistrationRef, validSha } from './operations/prototype-load.mjs';
 import { previewOverlayConflict, writeRebuildRequest } from './lib/daemon-rebuild.mjs';
 import { overlaySafetySettings, admitHotpatchRef } from './lib/daemon-load-overlay.mjs';
+import { auditEvidenceFor, loadAuditEvidence, mainCovers } from './lib/overlay-audit-evidence.mjs';
 import { pruneStaleOverlayRecords } from './lib/daemon-clone-registry.mjs';
 import { workspaceFor } from './lib/lane-pool-paths.mjs';
 import { readOverlayStale } from './lib/daemon-rebuild/overlay-prune.mjs';
@@ -660,6 +661,15 @@ export async function replaceRegistration({ root, ref, old, expectedSha, pr = nu
     if (!check.ok) return { ok: false, refused: check.reason, containment, check, code: 1 };
     if (check.candSha !== expectedSha) return { ok: false, refused: 'sha-moved', containment, check, code: 3 };
     if (!check.clean) return { ok: false, refused: 'conflict', containment, check, code: 3 };
+    const { auditEvidence, auditEvidenceSource } = overlaySafetySettings(env);
+    const evidence = auditEvidenceFor(check.candSha, { ...loadAuditEvidence({ env, cwd: root }), ref,
+      covers: base => mainCovers(base, { cwd: root, env }) });
+    process.stderr.write(`daemon-overlay: overlaySafety.auditEvidence=${auditEvidence} (source=${auditEvidenceSource})\n`);
+    if (!evidence.ok) {
+      const refuse = auditEvidence === 'refuse' || evidence.kind !== 'missing';
+      process.stderr.write(`daemon-overlay: ${refuse ? 'REFUSED' : 'WARNING'} — ${ref}: ${evidence.detail}. Run codex-audit for this SHA or record a matching operator waiver.\n`);
+      if (refuse) return { ok: false, refused: 'no-audit-evidence', containment, check, code: 3 };
+    }
     const hp = await admitHotpatchRef({ root, ref, candSha: check.candSha, env, admitHotpatch: deps.admitHotpatch, tipOf: tip });
     if (!hp.ok) return { ok: false, refused: hp.reason, containment, check, code: 3 };
     return { ok: true, oldEntry, containment, check };
@@ -671,7 +681,7 @@ export async function replaceRegistration({ root, ref, old, expectedSha, pr = nu
     if (!proof.ok) return { ...proof, settled };
     // The replacement carries the old work, so it inherits an explicit pin unless the caller set one itself.
     const pin = pinned !== undefined ? pinned : (proof.oldEntry.pinned === true ? true : undefined);
-    addOverlay(root, { ref, pr, addedBy: by, reason, pinned: pin }, { env });
+    addOverlay(root, { ref, pr, addedBy: by, reason, pinned: pin, auditedSha: proof.check.candSha }, { env });
     appendOverlayEvent(root, {
       kind: 'added', ref, pr, by, reason, replaces: old, ...(pin !== undefined ? { pinned: pin } : {}), ...(pr == null ? { noPr: true } : {}),
     }, { env });
@@ -921,7 +931,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     if (allowNoPr && !reason?.trim()) {
       return fail('--allow-no-pr requires --reason=<why>');
     }
-    const { noPr } = overlaySafetySettings(process.env);
+    const { noPr, auditEvidence, auditEvidenceSource } = overlaySafetySettings(process.env);
     if (pr == null) {
       const refused = noPr === 'refuse' && !allowNoPr;
       if (!refused || flags.check) {
@@ -961,6 +971,22 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       if (check.ok && flags['expected-sha'] && check.candSha !== flags['expected-sha']) {
         return { ...check, ok: false, reason: 'sha-moved', expectedSha: flags['expected-sha'] };
       }
+      if (check.ok) {
+        process.stderr.write(`daemon-overlay: overlaySafety.auditEvidence=${auditEvidence} (source=${auditEvidenceSource})\n`);
+        const sha = flags['expected-sha'] || check.candSha;
+        const options = { ...loadAuditEvidence({ env, cwd: root }), ref: flags.ref,
+          covers: base => mainCovers(base, { cwd: root, env }) };
+        // Same SHA set the loader audits: the candidate plus the existing registration's retained edge SHA.
+        const existing = overlayState.overlays.find(o => o?.ref === flags.ref);
+        const shas = [sha, ...(existing?.edgeResolution !== undefined ? [existing.edgeResolution?.sha] : [])];
+        for (const audited of shas) {
+          const evidence = auditEvidenceFor(audited, options);
+          if (evidence.ok) continue;
+          const refuse = auditEvidence === 'refuse' || evidence.kind !== 'missing';
+          process.stderr.write(`daemon-overlay: ${refuse ? 'REFUSED' : 'WARNING'} — ${flags.ref}: ${evidence.detail} (overlaySafety.auditEvidence=${auditEvidence}, source=${auditEvidenceSource}). Run codex-audit for this SHA or record a matching operator waiver.\n`);
+          if (refuse) return { ...check, ok: false, reason: 'no-audit-evidence', detail: evidence.detail };
+        }
+      }
       return check;
     };
 
@@ -989,7 +1015,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
           + `would be REFUSED${allowConflict ? ' (but --allow-conflict is set, so it would register anyway)' : ''}.\n`);
       }
       if (check.ok && !check.clean && !allowConflict) process.exitCode = 3;
-      else if (!check.ok) process.exitCode = check.reason === 'sha-moved' ? 3 : 1;
+      else if (!check.ok) process.exitCode = ['sha-moved', 'no-audit-evidence'].includes(check.reason) ? 3 : 1;
       return;
     }
 
@@ -1013,7 +1039,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
         // is safe to override; it does not cover "the check itself could not run".
         process.stderr.write(`daemon-overlay: could not verify ${flags.ref} merges clean (${describeFailure(check)}) — refusing to register. Pass --allow-conflict --reason=... only for a CONFIRMED conflict this guard itself reported.\n`);
         if (asJson) process.stdout.write(`${JSON.stringify({ conflictCheck: check })}\n`);
-        process.exitCode = check.reason === 'sha-moved' ? 3 : 1;
+        process.exitCode = ['sha-moved', 'no-audit-evidence'].includes(check.reason) ? 3 : 1;
         return null;
       }
       // RS-HP-3: the same hotpatch door as guardedRegister: admitted sha == candidate sha, or no registration.
@@ -1046,7 +1072,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       // mutex and returns immediately — this never touches the clone's tree or its reader/writer lock. See the
       // file header for why that lock was dropped here.
       const list = addOverlay(root, {
-        ref: flags.ref, pr, addedBy: by, reason, pinned,
+        ref: flags.ref, pr, addedBy: by, reason, pinned, auditedSha: check.candSha,
         ...(!check.clean && gate.override ? { conflictOverride: { ...gate.override, files: check.files } } : {}),
       }, { env });
       appendOverlayEvent(root, {

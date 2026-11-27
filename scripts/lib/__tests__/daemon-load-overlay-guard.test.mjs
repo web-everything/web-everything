@@ -15,6 +15,7 @@ import { rebuildClone, dryRunRebuild, previewOverlayConflict } from '../daemon-r
 import { stackAwareOverlayCheck } from '../../daemon-overlay.mjs';
 import * as planner from '../daemon-rebuild/plan.mjs';
 import * as strategies from '../daemon-rebuild/overlay-strategies.mjs';
+import { recordPassingOverlayAudit } from '../../__tests__/fixtures/overlay-audit.mjs';
 
 const temps = [];
 afterEach(() => {
@@ -42,6 +43,7 @@ function fixture() {
   gitOk(clone, ['commit', '-q', '-m', 'init']);
   gitOk(clone, ['remote', 'add', 'origin', origin]);
   gitOk(clone, ['push', '-q', '-u', 'origin', 'main']);
+  const auditBase = gitOk(clone, ['rev-parse', 'HEAD']).trim();
   const author = join(base, 'author');
   gitOk(base, ['clone', '-q', origin, author]);
   const push = (ref, files, from = 'origin/main') => {
@@ -51,10 +53,12 @@ function fixture() {
     gitOk(author, ['add', '-A']);
     gitOk(author, ['commit', '-q', '-m', ref]);
     gitOk(author, ['push', '-q', '-f', 'origin', `HEAD:refs/heads/${ref}`]);
-    return gitOk(author, ['rev-parse', 'HEAD']).trim();
+    const head = gitOk(author, ['rev-parse', 'HEAD']).trim();
+    recordPassingOverlayAudit({ home: base, head, base: auditBase });
+    return head;
   };
   const env = {
-    ...process.env, WE_DAEMON_OVERLAY_DIR: mktemp('we-load-guard-overlay-'), WE_DAEMON_OVERLAY_STACK_BASES: '{}',
+    ...process.env, HOME: base, WE_DAEMON_OVERLAY_DIR: mktemp('we-load-guard-overlay-'), WE_DAEMON_OVERLAY_STACK_BASES: '{}',
   };
   push('lane/fix-procedure', { 'shared.mjs': 'export const X = 2;\n' });
   push('lane/promote-stale-green', { 'shared.mjs': 'export const X = 3;\n' });
