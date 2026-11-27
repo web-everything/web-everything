@@ -922,6 +922,11 @@ export function unlandableStateReason(state) {
   return `merge state ${st} (BEHIND⇒needs rebase, DIRTY/BLOCKED/DRAFT⇒not landable) — left for its author`;
 }
 
+export function drainPinnedCwd(repo, { isLocalRepo, siblingCloneDir }) {
+  if (isLocalRepo(repo)) return undefined;
+  const dir = siblingCloneDir(repo);
+  return typeof dir === 'string' && dir ? dir : undefined;
+}
 /** Unreadable verification defers this pass before any review-label writer runs. */
 export function decideDrainReviewGate({ labels, ...gateInputs }, readOptions) {
   if (readOptions?.workflowOnly && !decideDrainWorkflowEditHold({
@@ -939,13 +944,18 @@ export function decideDrainReviewGate({ labels, ...gateInputs }, readOptions) {
   let files = readOptions?.files;
   // A listing is trusted only with explicit completeness AND a head it was read at (#6021): an omitted flag or SHA
   // (the files-only shape) is unknown evidence and takes the pinned read below, never a default-trusted listing.
+  const pinned = readOptions?.local
+    ? { cwd: readOptions.cwd ?? process.cwd(), base: readOptions.defaultBranch ?? 'main' }
+    : (typeof readOptions?.pinnedCwd === 'string' && readOptions.pinnedCwd
+      && typeof readOptions.defaultBranch === 'string' && readOptions.defaultBranch)
+      ? { cwd: readOptions.pinnedCwd, base: readOptions.defaultBranch } : null;
   let netRead = false;
   let filesComplete = Array.isArray(files) && readOptions?.filesComplete === true
     && typeof readOptions.listedHeadSha === 'string' && !!readOptions.listedHeadSha
     && (!evidence.headSha || readOptions.listedHeadSha.toLowerCase() === evidence.headSha.toLowerCase());
-  if (!filesComplete && readOptions?.workflowEditSetting !== 'off' && readOptions?.local) {
+  if (!filesComplete && readOptions?.workflowEditSetting !== 'off' && pinned) {
     const read = readPinnedChangedFiles({ headSha: evidence.headSha || readOptions.listedHeadSha,
-      base: readOptions.defaultBranch ?? 'main', cwd: readOptions.cwd ?? process.cwd(),
+      base: pinned.base, cwd: pinned.cwd,
       exec: readOptions.exec ?? execFileSync });
     if (read.error) return { action: 'defer', applyLabel: null,
       reason: `workflow-edit change list unreadable — merge deferred this pass: ${read.error}` };
@@ -957,10 +967,10 @@ export function decideDrainReviewGate({ labels, ...gateInputs }, readOptions) {
     headSha: evidence.headSha || readOptions?.listedHeadSha, humanClearedSha: evidence.humanClearedSha, setting: readOptions?.workflowEditSetting });
   // A listing that says "hold" may be stale: after a refresh merge GitHub's file list still shows main's content. Confirm
   // against the NET diff (merge-base...head) at the exact head before parking; unreadable fails closed (defer).
-  if (workflow.hold && !workflow.defer && !netRead && readOptions?.workflowEditSetting !== 'off' && readOptions?.local
+  if (workflow.hold && !workflow.defer && !netRead && readOptions?.workflowEditSetting !== 'off' && pinned
     && typeof readOptions.defaultBranch === 'string' && readOptions.defaultBranch) { // unknown base: keep the listing's hold
     const read = readPinnedChangedFiles({ headSha: evidence.headSha || readOptions.listedHeadSha,
-      base: readOptions.defaultBranch, cwd: readOptions.cwd ?? process.cwd(),
+      base: pinned.base, cwd: pinned.cwd,
       exec: readOptions.exec ?? execFileSync });
     // Unreadable or empty net diff never clears: the listing's hold stands (fail closed, same as before this recheck).
     if (!read.error && read.files.length > 0) {
@@ -5899,7 +5909,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   process.stderr.write(`policy · drainWorkflowEditHuman=${workflowEditSetting.value} (${workflowEditSetting.source})\n`);
   const workflowReadOptions = (v) => ({ files: v.listedFiles, filesComplete: v.listedFilesComplete,
     listedHeadSha: v.listedHeadSha, workflowEditSetting: workflowEditSetting.value,
-    local: isLocalRepo(v.repo), defaultBranch: defaultBranchOf(v.repo) });
+    local: isLocalRepo(v.repo), defaultBranch: defaultBranchOf(v.repo), pinnedCwd: drainPinnedCwd(v.repo, { isLocalRepo, siblingCloneDir }) });
   // x2e120n — the pass timer starts at sweepOnce entry, including setup. See pass-timings.mjs's header for the full
   // rationale; the short version: attach `result.timings` + print one unconditional stderr summary line so
   // "why is a pass slow" has a real breakdown instead of a single opaque `ms`.
