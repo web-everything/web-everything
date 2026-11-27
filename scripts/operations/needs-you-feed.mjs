@@ -444,17 +444,23 @@ export async function publishHandlingStage({ stage, path, readStage, readHandler
   };
   await current();
   let handler;
-  try { handler = await readHandler(scope); } catch { throw refuse('handler'); }
+  try { handler = await readHandler({ ...scope }); } catch { throw refuse('handler'); }
   const observed = Date.parse(handler?.observedAt), timestamp = now();
+  const fresh = () => {
+    let time; try { time = now(); } catch { throw refuse('handler'); }
+    if (!Number.isFinite(time) || time < observed || time - observed > 300000) throw refuse('handler');
+  };
   if (!handler || handler.registered !== true || handler.authority !== scope.stage || handler.live !== true
     || !text(handler.handler) || !text(handler.owner) || !Number.isFinite(observed) || !Number.isFinite(timestamp)
     || timestamp < observed || timestamp - observed > 300000) throw refuse('handler');
   const evidence = { ...scope, registered: true, handler: handler.handler, authority: handler.authority,
     owner: handler.owner, live: true, observedAt: new Date(observed).toISOString(), publishedAt: new Date(timestamp).toISOString() };
   await current();
+  fresh();
   try { mkdirSync(dirname(path), { recursive: true }); writeJsonAtomic(path, evidence); }
   catch { throw refuse('handler publication'); }
   await current();
+  fresh();
   await activate(evidence);
   return evidence;
 }

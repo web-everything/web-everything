@@ -17,6 +17,43 @@ function fixture() {
   return { options, handler, activate };
 }
 describe('HANDLING-COMBO-A-WE handler publication', () => {
+  it('handler reader cannot redirect the validated scope by mutating its argument', async () => {
+    const { options, handler, activate } = fixture();
+    const original = { ...options.stage };
+    options.readHandler = scope => {
+      // An adapter may retain and mutate its input; it must never own the internal scope.
+      try { Object.assign(scope, { run: 'other', claim: 'other', round: 2, head: 'b'.repeat(40), sequence: 2 }); } catch { /* frozen input is also safe */ }
+      return { ...handler };
+    };
+    options.readStage = () => ({ ...original });
+    const evidence = await publishHandlingStage(options);
+    expect(evidence).toMatchObject(original);
+    expect(JSON.parse(readFileSync(options.path, 'utf8'))).toMatchObject(original);
+    expect(activate).toHaveBeenCalledWith(evidence);
+  });
+  it.each([2, 3])('handler evidence expiring during awaited stage read %s refuses activation', async delayedRead => {
+    const { options, activate } = fixture();
+    let timestamp = options.now(), reads = 0;
+    options.now = () => timestamp;
+    options.readStage = async () => {
+      if (++reads === delayedRead) { await Promise.resolve(); timestamp += 300001; }
+      return { ...options.stage };
+    };
+    await expect(publishHandlingStage(options)).rejects.toThrow(/handler.*operator/i);
+    expect(activate).not.toHaveBeenCalled();
+  });
+  it.each(['run', 'claim', 'round', 'stage', 'head', 'sequence'])('a %s change only after publication refuses activation', async field => {
+    const { options, activate } = fixture();
+    let sawPublication = false;
+    options.readStage = () => {
+      sawPublication = existsSync(options.path);
+      return sawPublication ? { ...options.stage, [field]: 'changed' } : { ...options.stage };
+    };
+    await expect(publishHandlingStage(options)).rejects.toThrow(/stage.*operator/i);
+    expect(sawPublication).toBe(true);
+    expect(JSON.parse(readFileSync(options.path, 'utf8'))).toMatchObject(options.stage);
+    expect(activate).not.toHaveBeenCalled();
+  });
   it('a stage without published handler evidence is not activated; publication precedes activation', async () => {
     const { options, activate } = fixture();
     activate.mockImplementation(evidence => {

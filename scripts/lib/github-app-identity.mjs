@@ -262,6 +262,18 @@ function primaryInstallation(installations) {
   return installations['web-everything'] ?? Object.values(installations)[0];
 }
 
+/** Both steward credential paths share the same configuration and App separation boundary. */
+function stewardApp(identity, env) {
+  const app = normaliseRoleApp(identity?.roles?.steward);
+  const keyRef = app && resolveKeyRef(app.key, env);
+  if (!app || !keyRef || identity.invalid?.some(s => s.endsWith('.steward') || s.startsWith(IDENTITY_ENV))
+    || GITHUB_APP_ROLES.some(r => String(identity.roles?.[r]?.appId ?? '').trim() === app.appId)
+    || String(env?.WE_GITHUB_APP_ID ?? '').trim() === app.appId) {
+    throw new Error('steward identity refused; operator must configure a distinct delivery.identity.steward App and key');
+  }
+  return { app, keyRef };
+}
+
 /**
  * PURE: the ordered Apps to try for `requestedRole`: role → worker → today's App. Roles with no usable config are
  * `skipped` (with why). `loud` is true once any role is configured: from then on every fallback is reported.
@@ -270,12 +282,7 @@ function primaryInstallation(installations) {
 export function buildIdentityChain({ requestedRole = FALLBACK_ROLE, identity, env = {}, cachePath }) {
   const id = identity ?? resolveDeliveryIdentity({});
   if (requestedRole === STEWARD_ROLE) {
-    const app = id.roles?.steward;
-    const keyRef = app && resolveKeyRef(app.key, env);
-    if (!app || !keyRef || id.invalid?.some(s => s.endsWith('.steward'))
-      || GITHUB_APP_ROLES.some(r => id.roles?.[r]?.appId === app.appId)) {
-      throw new Error('steward identity refused; operator must configure a distinct delivery.identity.steward App and key');
-    }
+    const { app, keyRef } = stewardApp(id, env);
     const candidate = { role: STEWARD_ROLE, appId: app.appId, installations: app.installations,
       installationId: primaryInstallation(app.installations), keyRef,
       privateKeyPath: keyRef.file ?? `keychain:${keyRef.keychain.service}`,
@@ -328,16 +335,18 @@ export function shimRoleTable({ identity, cachePath }) {
 /** Validate a steward token using a trusted App-token reader, never inherited gh/operator credentials.
  * readToken must return verified App id, installation, expiry and permissions from the mint/cache authority.
  */
-export async function stewardToken({ identity, installationId, readToken, now = Date.now }) {
+export async function stewardToken({ identity, installationId, readToken, now = Date.now, env = process.env }) {
   const refuse = () => new Error('steward token refused; operator must provision or refresh the scoped App token');
-  const app = identity?.roles?.steward;
+  const { app } = stewardApp(identity, env);
   if (!app || typeof readToken !== 'function' || !Object.values(app.installations).includes(String(installationId))) throw refuse();
   let receipt;
   try { receipt = await readToken({ appId: app.appId, installationId: String(installationId), required: ROLE_REQUIRED_PERMISSIONS.steward }); }
   catch { throw refuse(); }
+  let timestamp;
+  try { timestamp = now(); } catch { throw refuse(); }
   if (!receipt || receipt.appId !== app.appId || receipt.installationId !== String(installationId)
     || typeof receipt.token !== 'string' || !receipt.token || !Number.isFinite(Date.parse(receipt.expiresAt))
-    || Date.parse(receipt.expiresAt) <= now()
+    || !Number.isFinite(timestamp) || Date.parse(receipt.expiresAt) <= timestamp
     || Object.entries(ROLE_REQUIRED_PERMISSIONS.steward).some(([key, level]) =>
       receipt.permissions?.[key] !== level && !(level === 'read' && receipt.permissions?.[key] === 'write'))) throw refuse();
   return receipt.token;
