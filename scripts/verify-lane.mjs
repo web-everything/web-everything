@@ -87,7 +87,8 @@ import { writeFileSync, renameSync, existsSync, readFileSync, readdirSync, unlin
 import { execFileSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { join, resolve } from 'node:path';
+import { join, resolve, relative, sep } from 'node:path';
+import { selectTargetedBreaks, soakCacheOk } from './conveyor/soak/targeted-breaks.mjs';
 import { recordLocalSlotFallback } from './lib/remote-fallback-log.mjs';
 import { recordTerminalVerifyOutcome, clearDeferredMarker } from './lib/lane-verify-deferred.mjs'; // R893 — own file; no other marker reader can see it
 import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyStartBody, verifyFinishBody, verificationInfrastructureFailure as baseInfrastructureFailure, verifyGateDecision, readVerifyMarker, resolveVerifyOptions, waitForVerifySettle, resolveWaitCeilingMs, VERIFY_MARKER_NONCE_ENV, markerNonceSuffix, greenLedgerDir, greenLedgerWritable, shouldRecordGreen, recordGreenLedger, hasGreenLedger } from './lib/lane-verify.mjs';
@@ -665,12 +666,25 @@ if (preStart && !preStart.corrupt && (['green', 'red', 'infrastructure-failure']
 // that evidence miss the cache once; the next completed run records it.
 const treeHashNow = () => computeWorkingTreeHash({ runGit: git, fileMode: (f) => lstatSync(join(REPO, f)).mode });
 const currentTreeHash = MODE === 'run' ? null : treeHashNow();
+// Card-only keeps its existing early return and never imports the target registry.
+// Selection belongs to the executing verifier; every input under test belongs to REPO.
+const SOAK_RUNNER = fileURLToPath(new URL('./conveyor/soak/targeted-breaks.mjs', import.meta.url));
+const soakSelectStarted = performance.now();
+const soakSelection = resolvedGate?.decision?.mode === 'card-only-skip'
+  ? { status: 'none', files: [], estSeconds: 0 }
+  : await selectTargetedBreaks({ root: REPO, changed: localChangedSet({ base: 'origin/main', runGit: git })?.changedFiles ?? null });
+const soakSelectMs = Math.round(performance.now() - soakSelectStarted);
+const soakEvidenceOk = soakCacheOk(preStart, soakSelection, gateExplicit);
+if (preStart?.status === 'green' && !soakEvidenceOk) {
+  process.stderr.write(`verify-lane: cache miss — soak evidence ${soakSelection.reason ?? preStart.phases?.soak?.status ?? 'missing-or-different-files'}\n`);
+}
 const cacheHit = MODE !== 'run' && preStart && !preStart.corrupt
   && preStart.status === 'green'
   && preStart.sha === headSha
   && currentTreeHash != null && preStart.treeHash === currentTreeHash
   && preStart.suites === GATE
-  && preStart.executedGate === (resolvedGate?.command ?? GATE);
+  && preStart.executedGate === (resolvedGate?.command ?? GATE)
+  && soakEvidenceOk;
 
 if (cacheHit) {
   const cachedDetail = `green for ${headSha.slice(0, 8)} — working tree unchanged since that verification (content hash + gate match); no new run needed.${describeIsolatedRetry(preStart)}`;
@@ -774,6 +788,9 @@ if (fullRetryGate) {
 const fullFallbackGate = resolvedGate?.decision?.mode === 'full' && resolvedGate.testCommand === 'npx vitest run';
 const guardGate = retryableGate || fullFallbackGate;
 const phasedTestGate = retryableGate || fullRetryGate || fullFallbackGate;
+const soakFields = { path: phasedTestGate ? 'phased' : 'whole-gate', files: soakSelection.files,
+  estSeconds: soakSelection.estSeconds, selectMs: soakSelectMs };
+let soakPhase = { ...soakSelection, ...soakFields };
 // The helper resolves environment overrides over the running checkout's cached settings file.
 const phaseAdmission = verifyPhaseAdmissionEnabled(process.env) && phasedTestGate;
 const admissionPhases = {};
@@ -1340,6 +1357,59 @@ try {
   if (phasedTestGate && resolvedGate.standardsCommand && phaseResults.every(p => continueAfter(p.result))) {
     phaseResults.push({ phase: 'standards', result: await timedRunGate('standardsMs', resolvedGate.standardsCommand) });
   }
+  if (gateExplicit) {
+    soakPhase = { status: 'skipped', reason: 'explicit-gate', ...soakFields };
+  } else if (!phaseResults.every(p => continueAfter(p.result))) {
+    const stopped = phaseResults.find(p => !continueAfter(p.result)).result;
+    soakPhase = { status: 'skipped', reason: 'earlier-phase-red',
+      detail: stopped.signal ? 'signal' : verificationInfrastructureFailure(stopped) ? 'infrastructure' : 'red', ...soakFields };
+  } else if (soakSelection.status === 'run') {
+    const reportDir = mkdtempSync(join(tmpdir(), 'verify-soak-'));
+    const report = join(reportDir, 'report.json');
+    process.stderr.write(`⏱ targeted soak: ${soakFields.files.length} file(s), ${soakFields.estSeconds} estimated file-seconds\n`);
+    try {
+      let soak;
+      try {
+        soak = await timedRunGate('soakMs', process.execPath,
+          [SOAK_RUNNER, 'run', `--root=${REPO}`, `--report=${report}`, '--', ...soakFields.files]);
+      } catch (error) {
+        soakPhase = { status: 'failed', ...(phaseMs.soakMs == null ? { reason: 'admission-refused' } : {}),
+          ...soakFields, detail: String(error.message).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 500) };
+        throw error;
+      }
+      const mode = phaseAdmission ? 'per-phase' : admission.remote ? 'whole-gate-remote-own' : 'inherited';
+      const soakAdmission = { mode, slotted: currentAdmission.ok === true,
+        waitedMs: mode === 'inherited' ? 0 : currentAdmission.waitedMs, timedOut: Boolean(currentAdmission.timedOut) };
+      let reportText = null;
+      try {
+        if (nodeFs.statSync(report).size > 8 * 1024 * 1024) throw Error('report exceeds read bound');
+        reportText = readFileSync(report, 'utf8');
+      } catch (error) { process.stderr.write(`FAIL targeted soak: inventory-unavailable — ${String(error.message).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 500)}; restore reporting and rerun verify.\n`); }
+      const cwd = realpathSync(REPO);
+      const inventory = alwaysRunInventory({ reportText, files: soakFields.files, cwd });
+      let reportedFiles = [];
+      // The unchanged helper verifies assertion execution. Supply all reported names
+      // separately to detect extras as well as missing selected files.
+      if (inventory.reason !== 'inventory-unavailable') {
+        reportedFiles = [...new Set(JSON.parse(reportText).testResults.map(row => relative(cwd, String(row?.name ?? '')).split(sep).join('/')))];
+      }
+      const extra = alwaysRunInventory({ reportText, files: reportedFiles, cwd }).executed.filter(file => !soakFields.files.includes(file)).sort();
+      const reason = extra.length ? 'unselected-executed' : inventory.missing.length ? 'not-executed' : null;
+      if (reason) {
+        const files = extra.length ? extra : inventory.missing;
+        process.stderr.write(`FAIL targeted soak: ${reason}: ${files.join(', ')}; restore exact execution and rerun verify.\n`);
+        soak = { ...soak, exitCode: soak.exitCode === 0 ? 1 : soak.exitCode,
+          failureDetails: mergeFailureDetails([soak.failureDetails, { tests: files.map(file => ({ file, name: null })), summary: `${reason}: ${files.join(', ')}`, truncated: false }].filter(Boolean).map(details => ({ phase: 'soak', details }))) };
+      }
+      soakPhase = { status: soak.exitCode === 0 && !soak.signal ? 'passed' : 'failed', ...soakFields,
+        soakMs: Math.round(phaseMs.soakMs), admission: soakAdmission, executed: inventory.executed, missing: inventory.missing, extra,
+        ...(reason ? { reason } : {}) };
+      phaseResults.push({ phase: 'soak', result: soak });
+    } finally { rmSync(reportDir, { recursive: true, force: true }); }
+  }
+  if (soakPhase.status === 'deferred' || soakPhase.status === 'skipped' || soakPhase.status === 'none') {
+    process.stderr.write(`verify-lane: targeted soak ${soakPhase.status}/${soakPhase.reason ?? 'empty-selection'}: ${soakFields.files.length} file(s), ${soakFields.estSeconds} estimated file-seconds${soakPhase.detail ? ` — ${soakPhase.detail}` : ''}; merge queue remains authoritative.\n`);
+  }
   // The verdict is the FIRST non-zero phase (an earlier red is never masked by a later green); failure details
   // from every red phase are merged so each problem is visible in one run.
   const red = phaseResults.filter(p => p.result.exitCode !== 0 || p.result.signal);
@@ -1349,7 +1419,7 @@ try {
     : (red[0] ?? phaseResults.at(-1)).result.failureDetails;
   // Perf 42 — an out-of-diff red is compared with origin/main's tip while this run still holds its heavy slot.
   // Measured once per main sha (cached); any error leaves `baseFailures` null, i.e. the red stays a real red.
-  baseCandidate = baseRerunCandidate({ exitCode, signal, phaseResults, failureDetails,
+  baseCandidate = phaseResults.some(p => p.phase === 'soak' && (p.result.exitCode !== 0 || p.result.signal)) ? null : baseRerunCandidate({ exitCode, signal, phaseResults, failureDetails,
     changedFiles: Array.isArray(resolvedGate?.decision?.changedFiles) ? [...resolvedGate.decision.changedFiles, ...editedDuringRun] : null });
   const baseSha = baseCandidate && !infrastructureNow(exitCode, signal, failureDetails) ? tryGit(['rev-parse', 'origin/main']) : null;
   if (baseSha) {
@@ -1404,7 +1474,7 @@ const builtPhases = buildVerifyPhases({ admission: { mode: phaseAdmission ? 'pha
   alwaysRun: alwaysRun.declared.length ? alwaysRun : null });
 builtPhases.executedTests = sharedTestCounts.length && sharedTestCounts.every(Number.isSafeInteger)
   ? sharedTestCounts.reduce((sum, n) => sum + n, 0) : null;
-const phases = admissionFallback ? { ...builtPhases, admissionFallback } : builtPhases;
+const phases = { ...builtPhases, ...(admissionFallback ? { admissionFallback } : {}), soak: soakPhase };
 
 const retryAudit = isolatedRetryAudit(retriedFailures, isolatedRetry);
 const diagnostic = { ...(exitCode === 0 ? {} : { failureDetails }), ...retryAudit, ...(flakes.length ? { flakes } : {}) };

@@ -12,7 +12,7 @@
  *   sibling run B would claim the marker.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, chmodSync, readdirSync, renameSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, chmodSync, readdirSync, renameSync, symlinkSync } from 'node:fs';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -103,6 +103,286 @@ export function loadVerifySettingsFile(path = ${JSON.stringify(settings)}, optio
 const GATE_ONLY_ENV = /^(WE_HEAVY_|WE_VERIFY_|VERIFY_|WE_BUILD_FINAL_|WE_LOAD_|WE_QUEUE_|WE_REQUIRE_VERIFIED$|WE_LAND_UNVERIFIED$|WE_FORGE_|FORGE_)/;
 const gateScrubbedEnv = () => Object.fromEntries(Object.entries(process.env).filter(([k]) => !GATE_ONLY_ENV.test(k)));
 const headSha = () => execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim();
+
+// MQ-SOAK-PULLS: registry, commands, settings, admission and host observations are fixture-owned.
+// The loader substitutes IO ports in the child, without production environment/test bypasses.
+describe('MQ-SOAK-PULLS local verify phase', () => {
+  const sourceRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+  const breakDir = 'scripts/conveyor/soak/breaks/';
+  function soakFixture({ soakExit = 0, firstExit = 0, report = 'ok', phaseAdmission = true, remote = false,
+    refuse = false, timeout = false, standards = true, changed = true, timings = true, config = true,
+    whole = false, runAll = true, count = 1, firstSignal = false, live = false, alias = false,
+    fullFallback = false, initialRefusal = false, soakCeiling = false } = {}) {
+    const fixtureHome = join(dir, '.git', 'home');
+    const scratch = join(dir, '.git', 'scratch');
+    mkdirSync(fixtureHome); mkdirSync(scratch);
+    mkdirSync(join(dir, breakDir), { recursive: true });
+    mkdirSync(join(dir, 'scripts/ci'), { recursive: true });
+    const files = Array.from({ length: count }, (_, i) => `${breakDir}a${i}.soak.test.mjs`);
+    for (const file of files) {
+      writeFileSync(join(dir, file.replace('.soak.test.mjs', '.mjs')), "const PATH='source.mjs'; export default {fixedBy:{paths:[PATH]}};");
+      writeFileSync(join(dir, file), '// fixture assertion handled by injected vitest\n');
+    }
+    if (live) {
+      const vitest = pathToFileURL(join(sourceRoot, 'node_modules/vitest/dist/index.js')).href;
+      for (const file of files) writeFileSync(join(dir, file), `import {it,expect} from ${JSON.stringify(vitest)}; it${report === 'missing' && file === files.at(-1) ? '.skip' : ''}('fixture assertion',()=>expect(true).toBe(true));`);
+      writeFileSync(join(dir, breakDir, 'xa0.soak.test.mjs'), `import {it,expect} from ${JSON.stringify(vitest)}; it('unselected',()=>expect(false).toBe(true));`);
+      if (alias) {
+        symlinkSync(join(dir, files[0]), join(dir, breakDir, 'alias.soak.test.mjs'));
+        writeFileSync(join(dir, breakDir, 'alias.mjs'), "export default {fixedBy:{paths:['source.mjs']}};");
+      }
+    }
+    if (config) writeFileSync(join(dir, 'vitest.soak.config.ts'), 'export default { test: {} };');
+    if (timings) writeFileSync(join(dir, 'scripts/ci/test-timings.json'), JSON.stringify({ soak: Object.fromEntries(files.map(file => [file, 1])) }));
+    writeFileSync(join(dir, 'source.mjs'), 'export const value = 1;');
+    writeFileSync(join(dir, 'package.json'), '{"type":"module"}');
+    execFileSync('git', ['add', '.'], { cwd: dir });
+    execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'fixture'], { cwd: dir });
+    execFileSync('git', ['branch', 'origin/main'], { cwd: dir });
+    if (changed) writeFileSync(join(dir, 'source.mjs'), 'export const value = 2;');
+    const calls = join(dir, '.git', 'calls.jsonl');
+    const bin = join(dir, '.git', 'bin'); mkdirSync(bin);
+    const fake = `#!/usr/bin/env node
+import {readFileSync,writeFileSync,appendFileSync,existsSync} from 'node:fs';
+const args=process.argv.slice(2);
+appendFileSync(${JSON.stringify(calls)},JSON.stringify({args,held:existsSync(${JSON.stringify(join(dir, '.git/held'))})})+'\\n');
+const config=args.indexOf('--config');
+if(config>=0){
+ if(${live}) {
+  const {spawnSync}=await import('node:child_process');
+  const r=spawnSync(process.execPath,[${JSON.stringify(join(sourceRoot, 'node_modules/vitest/vitest.mjs'))},...args.slice(1),'--maxWorkers=1','--minWorkers=1'],{stdio:'inherit',timeout:15000,maxBuffer:1048576});
+  if(r.error) throw r.error; if(r.signal) throw Error('fixture Vitest signal '+r.signal); if(!Number.isInteger(r.status)) throw Error('fixture Vitest unknown exit');process.exit(r.status);
+ }
+ const source=readFileSync(args[config+1],'utf8');
+ const includes=JSON.parse(source.match(/include: (\\[[^\\n]+\\])/)[1]);
+ const reportArg=args.find(a=>a.startsWith('--outputFile.json='));
+ if(reportArg && ${JSON.stringify(report)}!=='unavailable') {
+  const names=${report === 'extra' ? `includes.concat(${JSON.stringify(join(dir, breakDir, 'extra.soak.test.mjs'))})` : 'includes'};
+  writeFileSync(reportArg.slice('--outputFile.json='.length),JSON.stringify({testResults:names.map(name=>({name,assertionResults:[{status:${JSON.stringify(report === 'missing' ? 'pending' : soakExit ? 'failed' : 'passed')},fullName:'fixture soak assertion'}]}))}));
+ }
+ process.exit(${soakExit});
+}
+if(${firstSignal} && !args.includes('standards')) process.kill(process.pid,'SIGTERM');
+process.exit(args.includes('standards')?0:${firstExit});
+`;
+    writeFileSync(join(bin, 'npx'), fake); chmodSync(join(bin, 'npx'), 0o755);
+    const gate = fullFallback ? 'npx vitest run' : whole ? `${shellQuote(process.execPath)} -e 'process.exit(${firstExit})'`
+      : 'npx vitest run fixture.test.mjs --passWithNoTests';
+    const plan = { command: gate, testCommand: gate, standardsCommand: standards && !whole ? 'npx standards' : null,
+      scanCommands: [], gateReasons: [], decision: { mode: fullFallback ? 'full' : 'related', changedFiles: ['source.mjs'], testTimeoutFactor: 1,
+        settingsSource: { standards: 'fixture' }, standards: { policy: 'auto', scoped: false }, reasons: [], selection: { files: ['fixture.test.mjs'] } } };
+    const gateUrl = pathToFileURL(join(sourceRoot, 'scripts/lib/verify-lane-gate.mjs')).href;
+    const settingsUrl = pathToFileURL(join(sourceRoot, 'scripts/lib/verify-settings.mjs')).href;
+    const admissionUrl = pathToFileURL(join(sourceRoot, 'scripts/readiness/heavy-admission.mjs')).href;
+    const settingsFile = join(dir, '.git', 'settings.json');
+    writeFileSync(settingsFile, JSON.stringify({ alwaysRunTests: [], retryFailed: 1, isolatedRetry: 'off', runAllPhases: runAll, phaseAdmission, revertRed: 'off', sharedGreenReuse: false }));
+    const loader = join(dir, '.git', 'soak-loader.mjs');
+    const routingUrl = pathToFileURL(join(sourceRoot, 'scripts/lib/verify-remote-routing.mjs')).href;
+    const routingOverrides = `export * from ${JSON.stringify(routingUrl + '?original')};
+import {phaseAdmissionPlan as original} from ${JSON.stringify(routingUrl + '?original')};
+export const decidePhaseRemote=async()=>({remote:true,reason:'fixture-remote'});
+export const phaseAdmissionPlan=o=>o.command===${JSON.stringify(gate)}?{command:o.command,takeLocalSlot:false,setHeld:false}:original(o);`;
+    const gateOverrides = `export * from ${JSON.stringify(gateUrl + '?original')};
+export const resolveDefaultGate=()=>(${JSON.stringify(plan)});
+export const matchRequestedDefaultGate=()=>(${whole ? 'undefined' : JSON.stringify(plan)});
+export const initializeVerifierIdentity=()=>({sha:'a'.repeat(40),dirty:false});
+export const verifyPolicyKey=()=> 'fixture-policy';`;
+    const admissionOverrides = `export * from ${JSON.stringify(admissionUrl + '?original')};
+import {writeFileSync,rmSync,appendFileSync} from 'node:fs';
+let acquires=0;
+export const admissionLockRoot=()=>${JSON.stringify(join(dir, '.git/pool'))};
+export const resolveCap=()=>1; export const resolveTimeoutMs=()=>1;
+export async function acquireSlotBlocking(){ acquires++;
+ appendFileSync(${JSON.stringify(calls)},JSON.stringify({acquire:acquires})+'\\n');
+ if(${initialRefusal} || (${fullFallback && refuse} && acquires>1)) return {ok:false,timedOut:true,waitedMs:5};
+ if(${refuse} && acquires>1) throw Error('fixture admission refused');
+ if(${timeout}) return {ok:false,timedOut:true,waitedMs:5};
+ writeFileSync(${JSON.stringify(join(dir, '.git/held'))},'held');return {ok:true,slot:0,waitedMs:2}; }
+export const releaseOwnedSlot=()=>{rmSync(${JSON.stringify(join(dir, '.git/held'))},{force:true});return true;};
+export const heartbeatOwnedSlot=()=>true;`;
+    writeFileSync(loader, `export async function load(url,context,next){
+ if(url===${JSON.stringify(gateUrl)}) return {format:'module',shortCircuit:true,source:${JSON.stringify(gateOverrides)}};
+ if(url===${JSON.stringify(admissionUrl)}) return {format:'module',shortCircuit:true,source:${JSON.stringify(admissionOverrides)}};
+ if(url===${JSON.stringify(settingsUrl)}) return {format:'module',shortCircuit:true,source:${JSON.stringify(`export * from ${JSON.stringify(settingsUrl + '?original')}; import {loadVerifySettingsFile as load} from ${JSON.stringify(settingsUrl + '?original')};export const loadVerifySettingsFile=()=>load(${JSON.stringify(settingsFile)});`)}};
+ if(url.endsWith('/tools-root-guard.mjs')) return {format:'module',shortCircuit:true,source:''};
+ if(url.endsWith('/tree-watchdog.mjs')) return {format:'module',shortCircuit:true,source:${JSON.stringify(`let calls=0;export function startTreeWatchdog({pid}){let fired=false;const timer=${soakCeiling}&&++calls===2?setTimeout(()=>{fired=true;process.kill(pid,'SIGKILL');},30):null;return {stop:()=>{clearTimeout(timer);return Promise.resolve();},fired:()=>fired,settled:()=>Promise.resolve()};}`)}};
+ ${remote ? `if(url===${JSON.stringify(routingUrl)}) return {format:'module',shortCircuit:true,source:${JSON.stringify(routingOverrides)}};` : ''}
+ return next(url,context); }`);
+    const preload = join(dir, '.git', 'soak-preload.mjs');
+    writeFileSync(preload, `import {register,syncBuiltinESMExports} from 'node:module';
+import os from 'node:os';import cp from 'node:child_process';
+os.homedir=()=>${JSON.stringify(fixtureHome)};os.loadavg=()=>[0,0,0];os.cpus=()=>[{model:'fixture'}];
+const RealDate=Date,clockStart=performance.now();const clockNow=()=>1795780800000+performance.now()-clockStart;
+globalThis.Date=class extends RealDate{constructor(...args){super(...(args.length?args:[clockNow()]));}static now(){return clockNow();}};
+const exec=cp.execFileSync;cp.execFileSync=(cmd,args,opts)=>{if(cmd==='git'){if(args.includes('remote'))return 'https://fixture.invalid/repo.git\\n';return exec(cmd,args,opts);}throw Error('un-injected host call: '+cmd);};
+syncBuiltinESMExports();register(${JSON.stringify(pathToFileURL(loader).href)});`);
+    if (soakCeiling) writeFileSync(preload, readFileSync(preload, 'utf8') + `\nif(process.argv[1]?.endsWith('/targeted-breaks.mjs')){\n${keepAliveScript({ maxLifetimeMs: 5000 })}\nawait new Promise(()=>{});\n}\n`);
+    const prefs = join(dir, '.git', 'preferences.json'); writeFileSync(prefs, '{"heavyAdmission":{"remote":{"enabled":false}}}');
+    const env = { ...gateScrubbedEnv(), HOME: fixtureHome, TMPDIR: scratch, PATH: `${bin}:${process.env.PATH}`,
+      NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`, WE_PLATFORM_PREFERENCES: prefs,
+      WE_COORDINATION_ROOT: join(dir, '.git/coordination'), LANE_POOL_ROOT: join(dir, '.git/lanes'),
+      WE_VERIFY_PHASE_ADMISSION: phaseAdmission ? '1' : '0', WE_VERIFY_RUN_ALL_PHASES: runAll ? '1' : '0', WE_VERIFY_REVERT_RED: 'off' };
+    function invoke(args = []) {
+      const r = spawnSync(process.execPath, [join(sourceRoot, 'scripts/verify-lane.mjs'), ...args, '--json'], { cwd: dir, env, encoding: 'utf8', timeout: 20000, maxBuffer: 1024 * 1024 });
+      expect(r.error, r.stderr).toBeUndefined();
+      expect(r.stdout.trim(), r.stderr).not.toBe('');
+      const json = JSON.parse(r.stdout.trim().split('\n').at(-1));
+      const persisted = existsSync(marker()) ? JSON.parse(readFileSync(marker(), 'utf8')) : null;
+      if (!args.includes('run')) expect(json.phases?.soak).toEqual(persisted?.phases?.soak);
+      return { ...r, json, persisted };
+    }
+    return { invoke, files, gate, raw: () => spawnSync(process.execPath, [join(sourceRoot, 'scripts/verify-lane.mjs'), '--json'], { cwd: dir, env, encoding: 'utf8', timeout: 20000, maxBuffer: 1024 * 1024 }),
+      calls: () => existsSync(calls) ? readFileSync(calls, 'utf8').trim().split('\n').map(JSON.parse) : [] };
+  }
+  it('dispatched-default-old-checkout-runs-soak after standards and persists inventory', () => {
+    const f = soakFixture();
+    const r = f.invoke([`--gate=${f.gate}`, '--run-id=fixture-default']);
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.json.phases.soak, JSON.stringify(r.json)).toMatchObject({ status: 'passed', path: 'phased', files: f.files, executed: f.files, missing: [], extra: [], soakMs: expect.any(Number), selectMs: expect.any(Number), admission: { mode: 'per-phase', slotted: true, timedOut: false } });
+    const commands = f.calls().filter(c => c.args);
+    expect(commands.at(-2).args).toEqual(['standards']);
+    expect(commands.at(-1).args).toContain('--config');
+    expect(commands.at(-1).held).toBe(true);
+    expect(existsSync(join(dir, '.git/held'))).toBe(false);
+  });
+  it.each(['ok', 'missing', 'unavailable', 'extra'])('soak red or incomplete execution stays red without retry: %s', report => {
+    const f = soakFixture({ report, soakExit: report === 'ok' ? 1 : 0 });
+    const r = f.invoke();
+    expect(r.status, r.stderr).toBe(2);
+    expect(r.json.phases.soak.status).toBe('failed');
+    if (report !== 'ok') expect(r.json.phases.soak.reason).toBe(report === 'extra' ? 'unselected-executed' : 'not-executed');
+    expect(f.calls().filter(c => c.args?.includes('--config'))).toHaveLength(1);
+    expect(r.stderr).not.toContain('Comparing ');
+    expect(r.stderr).not.toContain('Re-running only');
+  });
+  it('explicit-override-skips', () => {
+    const f = soakFixture(); const r = f.invoke([`--gate=${f.gate}`]);
+    expect(r.json.phases.soak).toMatchObject({ status: 'skipped', reason: 'explicit-gate', files: f.files });
+  });
+  it.each([{ config: false, reason: 'selector-error' }, { timings: false, reason: 'timings-unavailable' }, { count: 65, reason: 'over-budget' }])('named deferral preserves the earlier verdict: %j', options => {
+    const f = soakFixture(options); const r = f.invoke();
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.json.phases.soak).toMatchObject({ status: 'deferred', reason: options.reason });
+  });
+  it('none is recorded and no-standards still runs selected soak', () => {
+    const f = soakFixture({ standards: false }); const r = f.invoke();
+    expect(r.json.phases.soak.status).toBe('passed');
+    expect(f.calls().some(c => c.args?.includes('standards'))).toBe(false);
+  });
+  it.each([false, true])('earlier red respects runAllPhases=%s', runAll => {
+    const f = soakFixture({ firstExit: 1, runAll }); const r = f.invoke();
+    expect(r.status, r.stderr).toBe(2);
+    expect(r.json.phases.soak).toMatchObject(runAll ? { status: 'passed' } : { status: 'skipped', reason: 'earlier-phase-red', detail: 'red' });
+  });
+  it.each([false, true])('whole-gate-local inherits slotted/unslotted ownership, timeout=%s', timeout => {
+    const f = soakFixture({ phaseAdmission: false, timeout }); const r = f.invoke();
+    expect(r.json.phases.soak.admission).toEqual({ mode: 'inherited', slotted: !timeout, timedOut: timeout, waitedMs: 0 });
+    expect(f.calls().filter(c => c.acquire)).toHaveLength(1);
+  });
+  it('admission refusal records exact schema and persists exit 2', () => {
+    const f = soakFixture({ refuse: true, standards: false }); const r = f.invoke();
+    expect(r.status, r.stderr).toBe(2);
+    expect(r.json.phases.soak).toEqual({ status: 'failed', reason: 'admission-refused', path: 'phased', files: f.files, estSeconds: 1, selectMs: expect.any(Number), detail: 'fixture admission refused' });
+    expect(f.calls().some(c => c.args?.includes('--config'))).toBe(false);
+  });
+  it('whole-gate default runs soak and run mode leaves no marker', () => {
+    const f = soakFixture({ whole: true }); const r = f.invoke(['run']);
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.json.phases.soak).toMatchObject({ status: 'passed', path: 'whole-gate' });
+    expect(existsSync(marker())).toBe(false);
+  });
+  it.each([undefined, { status: 'failed' }, { status: 'skipped', reason: 'explicit-gate' }, { status: 'deferred', reason: 'selector-error' }, { status: 'passed', files: ['different'] }])('legacy or invalid cached evidence re-runs: %j', evidence => {
+    const f = soakFixture(); expect(f.invoke().status).toBe(0);
+    const cached = JSON.parse(readFileSync(marker(), 'utf8'));
+    if (evidence) cached.phases.soak = evidence; else delete cached.phases.soak;
+    writeFileSync(marker(), JSON.stringify(cached));
+    const r = f.invoke();
+    expect(r.stderr).toContain('cache miss — soak evidence');
+    expect(r.json.phases.soak.status).toBe('passed');
+    expect(f.calls().filter(c => c.args?.includes('--config'))).toHaveLength(2);
+  });
+  it('cache-hit-with-soak preserves stored phases and marker bytes', () => {
+    const f = soakFixture(); expect(f.invoke().status).toBe(0);
+    const before = readFileSync(marker(), 'utf8'); const r = f.invoke();
+    expect(r.json.reason).toBe('cached'); expect(readFileSync(marker(), 'utf8')).toBe(before);
+    expect(f.calls().filter(c => c.args?.includes('--config'))).toHaveLength(1);
+  });
+  it.each([false, true])('whole-gate-remote soak owns its local admission, timeout=%s', timeout => {
+    const f = soakFixture({ whole: true, phaseAdmission: false, remote: true, timeout });
+    const r = f.invoke();
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.json.phases.soak.admission).toEqual({ mode: 'whole-gate-remote-own', slotted: !timeout, waitedMs: timeout ? 5 : 2, timedOut: timeout });
+    expect(r.json.phases.admissionWaitMs).toBe(0);
+    expect(f.calls().filter(c => c.acquire)).toHaveLength(1);
+    expect(f.calls().find(c => c.args?.includes('--config')).held).toBe(!timeout);
+    expect(existsSync(join(dir, '.git/held'))).toBe(false);
+  });
+  it('admission-per-phase-timeout records actual unslotted state', () => {
+    const f = soakFixture({ timeout: true }); const r = f.invoke();
+    expect(r.json.phases.soak.admission).toEqual({ mode: 'per-phase', slotted: false, waitedMs: 5, timedOut: true });
+    expect(r.json.phases.admissionPhases.soak.timedOut).toBe(true);
+  });
+  it('earlier-infrastructure-with-run-all still skips soak', () => {
+    const f = soakFixture({ firstExit: 143 }); const r = f.invoke();
+    expect(r.json.phases.soak).toEqual({ status: 'skipped', reason: 'earlier-phase-red', detail: 'infrastructure', path: 'phased', files: f.files, estSeconds: 1, selectMs: expect.any(Number) });
+    expect(f.calls().some(c => c.args?.includes('--config'))).toBe(false);
+  });
+  it('earlier-signal-with-run-all still skips soak', () => {
+    const f = soakFixture({ firstSignal: true }); const r = f.invoke();
+    expect(r.json.phases.soak).toMatchObject({ status: 'skipped', reason: 'earlier-phase-red', detail: 'signal' });
+  });
+  it('none permits a legacy cache and leaves stored marker bytes unchanged', () => {
+    const f = soakFixture({ changed: false, timings: false }); const first = f.invoke();
+    expect(first.json.phases.soak).toMatchObject({ status: 'none', files: [] });
+    const cached = first.persisted; delete cached.phases.soak;
+    const bytes = JSON.stringify(cached); writeFileSync(marker(), bytes);
+    const r = f.invoke(); expect(r.json.reason).toBe('cached');
+    expect(r.json.phases.soak).toBeUndefined(); expect(readFileSync(marker(), 'utf8')).toBe(bytes);
+  });
+  it('same over-budget evidence permits cache reuse', () => {
+    const f = soakFixture({ count: 65 }); expect(f.invoke().json.phases.soak.reason).toBe('over-budget');
+    expect(f.invoke().json.reason).toBe('cached');
+  });
+  it('explicit skip followed by a dispatched default misses cache', () => {
+    const f = soakFixture(); expect(f.invoke([`--gate=${f.gate}`]).json.phases.soak.reason).toBe('explicit-gate');
+    const r = f.invoke([`--gate=${f.gate}`, '--run-id=default-after-override']);
+    // Dispatch uses priorAudit.gateExplicit; a fresh default request clears that provenance.
+    expect(r.json.phases.soak.status).toBe('skipped');
+    const cached = r.persisted; delete cached.gateExplicit; writeFileSync(marker(), JSON.stringify(cached));
+    const run = f.invoke([`--gate=${f.gate}`, '--run-id=fresh-default']);
+    expect(run.json.phases.soak.status).toBe('passed');
+    expect(run.stderr).toContain('cache miss — soak evidence');
+  });
+  it.each([false, true])('real runner proves exact-file inventory with canonical symlink=%s', alias => {
+    const f = soakFixture({ live: true, alias }); const r = f.invoke();
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.json.phases.soak).toMatchObject({ status: 'passed', files: f.files, executed: f.files, missing: [], extra: [] });
+  }, 20000);
+  it('real runner reports skipped-only file as missing', () => {
+    const f = soakFixture({ live: true, count: 2, report: 'missing' }); const r = f.invoke();
+    expect(r.status, r.stderr).toBe(2);
+    expect(r.json.phases.soak).toMatchObject({ status: 'failed', reason: 'not-executed', missing: [f.files[1]] });
+  }, 20000);
+  it('initial-admission-refusal-unchanged: full fallback exits before any phase', () => {
+    const f = soakFixture({ fullFallback: true, initialRefusal: true }); const r = f.raw();
+    expect(r.error, r.stderr).toBeUndefined(); expect(r.status).toBe(1);
+    expect(r.stderr).toContain('full fallback heavy admission timed out without a slot');
+    expect(r.stdout).toBe(''); expect(f.calls().some(c => c.args)).toBe(false);
+    expect(JSON.parse(readFileSync(marker(), 'utf8')).phases).toBeUndefined();
+  });
+  it('soak-admission-refusal-exit-2: full fallback stays red without infrastructure', () => {
+    const f = soakFixture({ fullFallback: true, refuse: true, standards: false }); const r = f.invoke();
+    expect(r.status, r.stderr).toBe(2); expect(r.json.infrastructure).toBeUndefined();
+    expect(r.json.phases.soak).toEqual({ status: 'failed', reason: 'admission-refused', path: 'phased', files: f.files, estSeconds: 1, selectMs: expect.any(Number), detail: expect.stringContaining('full fallback heavy admission timed out without a slot') });
+    expect(f.calls().some(c => c.args?.includes('--config'))).toBe(false);
+  });
+  it('soak-phase-ceiling names soak as the timed-out phase', () => {
+    const f = soakFixture({ soakCeiling: true, standards: false }); const r = f.invoke();
+    expect(r.status, r.stderr).not.toBe(0);
+    expect(r.json.infrastructure).toMatchObject({ reason: 'verify-timeout', phase: 'soak' });
+    expect(r.json.phases.soak.status).toBe('failed');
+  });
+});
 
 /** Run verify-lane in the temp repo with a custom gate; return { code, json }. Never throws on non-zero exit. */
 function runVerify(gate) {

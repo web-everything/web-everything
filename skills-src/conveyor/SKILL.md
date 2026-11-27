@@ -914,14 +914,30 @@ tick it checks: the clone is git-clean, at most one main move behind and never l
 its bound, `tickOnce` and `onTick` did not throw, no stale-refusal streak, owed work got dispatched.
 
 - `npm run test:soak` — the 50-tick soak plus one regression scenario per live break, all in one process (use
-  this locally). CI splits the same coverage across a 4-way matrix (`we:scripts/conveyor/soak/shard-files.mjs`,
-  `npm run test:soak:shard -- --shard=<i>/4`) — shard 1 is always the 50-tick baseline, shards 2-4 round-robin the
-  break scenarios — behind the required `daemon-soak` check (an aggregator over the `soak-shard` matrix), on every
-  PR touching `we:skills-src/conveyor/`, `we:scripts/conveyor/`, `we:scripts/lib/daemon-*`,
-  `we:scripts/lib/gh-app-shim.mjs`, `we:scripts/lib/main-staleness.mjs`, `we:scripts/lane-pool*`,
-  `we:scripts/review-set-label.mjs` or `we:scripts/operations/*dispatch*`. A new break scenario file lands in a
-  shard automatically — no shard list to update.
+  this locally). CI splits the same coverage across an 8-way matrix (`we:scripts/conveyor/soak/shard-files.mjs`,
+  `npm run test:soak:shard -- --shard=<i>/8`) behind the required `daemon-soak` aggregator. R1068 runs the shards
+  in the merge queue, on push to main and on dispatch, never on `pull_request`; PRs pass `daemon-soak` immediately
+  with "deferred to merge queue". The derived-scope rule lives in `we:.github/workflows/ci.yml`.
+  A new break scenario file lands in a shard automatically — no shard list to update.
 - `node scripts/conveyor/soak/run.mjs soak|break <id>|list` — the same runs from a shell, one report line per tick.
+
+Local `verify-lane` selects each break whose scenario, test sibling or imported `default.fixedBy.paths` touches
+the `localChangedSet` versus origin/main, within both 64 files and 900 estimated file-seconds. It runs argv
+`<execPath> <verifier dir>/conveyor/soak/targeted-breaks.mjs run --root=<checkout> -- <files>` through the runner
+beside the executing verifier, including for dispatched defaults and older checkouts. Exact canonical includes
+prevent substring matches; a green requires every selected file's executed assertions in the JSON inventory
+and no extra executed files, else `failed/not-executed` or `failed/unselected-executed`. Selection precedence is
+`deferred/changed-set-unknown`, `deferred/selector-error`, `none`, `deferred/timings-unavailable`,
+`deferred/over-budget`, then run. The only skips are `explicit-gate` for a genuine operator override
+(`gateExplicit === true`) and `earlier-phase-red` when `continueAfter` refuses (`detail`: red, signal or
+infrastructure); `runAllPhases` permits ordinary earlier reds. Every result records selection, path and timing.
+Soak always runs locally: its own slot for per-phase or whole-gate remote admission, otherwise the whole-gate
+local slot or unslotted state. Full-fallback soak admission refusal exits 2, red, without an infrastructure
+classification. A current empty selection permits cache reuse; otherwise default requests require passed
+same-file evidence or the same over-budget deferral. A genuine repeated operator override may reuse its own
+same-file `skipped/explicit-gate` record under the existing sha/tree/command cache key. Transient deferrals
+always miss the default cache. Soak reds receive neither
+isolated retries nor base comparisons; deferrals name the reason and leave the merge queue authoritative.
 - **THE RULE: every daemon bug fix adds its real-world case** as a scenario in `we:scripts/conveyor/soak/breaks/`
   and proves it with `node scripts/conveyor/soak/red-green.mjs --break=<id>` (RED on the tree before the fix,
   GREEN with it). The fix-agent brief carries the same rule. A break whose fix is not yet on the tree under test
