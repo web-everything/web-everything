@@ -261,14 +261,25 @@ function hasStandardsAncestor(real, weRoot) {
   }
 }
 
-/** Resolve a target to its REAL path: follow symlinks; for a not-yet-existing file realpath the nearest
- *  existing ancestor dir so the location still classifies; fall back to the raw resolved path. */
+/** Follow filesystem traversal before normalizing parent segments. For a new target, resolve its
+ * nearest existing ancestor and append the missing descendants. Unreadable traversal must throw:
+ * a lexical fallback could erase a symlink and classify a different location. */
 export function resolveReal(file) {
-  let real = path.resolve(file);
-  try { real = realpathSync(real); } catch {
-    try { real = path.join(realpathSync(path.dirname(real)), path.basename(real)); } catch { /* keep raw */ }
+  let current = path.isAbsolute(file) ? file : `${process.cwd()}${SEP}${file}`;
+  const missing = [];
+  while (true) {
+    try {
+      // The JS realpath implementation normalizes `..` before resolving symlinks; native follows
+      // the same traversal as the eventual Edit/Write, including symlink targets containing `..`.
+      return path.resolve(realpathSync.native(current), ...missing);
+    } catch (error) {
+      if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error;
+      const parent = path.dirname(current);
+      if (parent === current) throw error;
+      missing.unshift(path.basename(current));
+      current = parent;
+    }
   }
-  return real + '';
 }
 
 // ── CLI wrapper: stdin event → exit code (only when run directly, not when imported by the test) ──────────
@@ -277,8 +288,16 @@ if (process.argv[1] && realpathSyncSafe(process.argv[1]) === realpathSyncSafe(fi
     const ev = JSON.parse(readFileSync(0, 'utf8') || '{}');
     const file = ev?.tool_input?.file_path;
     const weRoot = hookRoot(import.meta.url);
-    const real = file ? resolveReal(file) : null;
     const sessionRole = classifySession(process.env).role;
+    let real;
+    try { real = file ? resolveReal(file) : null; } catch {
+      if (sessionRole === 'worker' || sessionRole === 'unknown') {
+        process.stderr.write('guard-lane: edit BLOCKED — cannot resolve Standards ownership; ' +
+          'propose the change in handoff/designs/<id>-standards-request.md\n');
+        process.exit(2);
+      }
+      throw new Error('Cannot resolve edit target');
+    }
     // Standards ownership has no worker escape hatch; LANE_GUARD_OFF only bypasses lane checks.
     if (real && (sessionRole === 'worker' || sessionRole === 'unknown')) {
       const msg = standardsOwnershipDecision(real, weRoot, sessionRole, hasStandardsAncestor(real, weRoot));

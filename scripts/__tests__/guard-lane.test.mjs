@@ -94,6 +94,61 @@ describe('laneGuardDecision — Standards-owned paths', () => {
     encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024,
   });
 
+  // Keep the spelling intact: path.join/resolve would erase the traversal being tested.
+  mkdirSync(path.join(weRoot, '.claude'), { recursive: true });
+  mkdirSync(path.join(weRoot, 'skills-src'), { recursive: true });
+  symlinkSync('../skills-src', path.join(weRoot, '.claude/skills'));
+  symlinkSync('skills', path.join(weRoot, '.claude/skills-chain'));
+  symlinkSync('.claude/skills/../../.operations/handoff/standards', path.join(weRoot, 'standards-via-parents'));
+  const traversal = `${weRoot}/.claude/skills/../../.operations/handoff/standards`;
+
+  it('CLI rejects a symlink followed by parent segments that names the same protected inode', () => {
+    const alias = `${traversal}/drafts/core/authority/x.md`;
+    const canonicalStat = statSync(target);
+    const aliasStat = statSync(alias);
+    expect([aliasStat.dev, aliasStat.ino]).toEqual([canonicalStat.dev, canonicalStat.ino]);
+    expect(realpathSync.native(alias)).toBe(target);
+    for (const file of [target, alias]) {
+      const result = runHook('1', file);
+      expect(result.error).toBeUndefined();
+      expect(result.status, `${file}: ${result.stderr}`).toBe(2);
+      expect(result.stderr).toMatch(/Standards-owned/);
+    }
+  });
+
+  it.each(['1', '0'])('CLI preserves traversal for existing and missing descendants with marker %s', (marker) => {
+    for (const prefix of [traversal, traversal.replace(`${ws}/`, ''),
+      traversal.replace('/skills/', '/skills-chain/'), `${weRoot}/standards-via-parents`]) {
+      for (const suffix of ['', '/drafts/core/authority/x.md', '/new.md', '/new/deep/schema.json']) {
+        const result = runHook(marker, prefix + suffix, true, suffix.includes('new') ? 'Write' : 'Edit');
+        expect(result.error).toBeUndefined();
+        expect(result.status, `${prefix + suffix}: ${result.stderr}`).toBe(2);
+        expect(result.stderr).toMatch(/Standards-owned/);
+      }
+    }
+  });
+
+  it('resolveReal preserves symlink traversal for existing targets and multiple missing descendants', () => {
+    expect(resolveReal(`${traversal}/drafts/core/authority/x.md`)).toBe(target);
+    expect(resolveReal(`${traversal}/new/deep/schema.json`)).toBe(`${standards}/new/deep/schema.json`);
+  });
+
+  it('CLI still allows traversal into a sibling directory and the orchestrator', () => {
+    mkdirSync(path.join(ws, '.operations/handoff/designs'), { recursive: true });
+    const sibling = `${weRoot}/.claude/skills/../../.operations/handoff/designs/new.md`;
+    expect(runHook('1', sibling).status).toBe(0);
+    expect(runHook(undefined, `${traversal}/drafts/core/authority/x.md`).status).toBe(0);
+  });
+
+  it('CLI fails closed when parent segments follow an unresolvable symlink', () => {
+    const loop = path.join(ws, 'traversal-loop');
+    symlinkSync('traversal-loop', loop);
+    const result = runHook('1', `${loop}/../unrelated/new.md`, true);
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(2);
+    expect(result.stderr).toContain('handoff/designs/<id>-standards-request.md');
+  });
+
   it.each(['1', '0'])('CLI exits 2 with Standards-owned guidance for marker %s', (marker) => {
     const result = runHook(marker);
     expect(result.error).toBeUndefined();
