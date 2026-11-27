@@ -24,7 +24,7 @@ it('real verify-lane runGate hands WE_FORGE_GATE_DISPATCH=1 without a held local
   writeFileSync(preferences,JSON.stringify({heavyAdmission:{remote:{enabled:true,mode:'always'}}}));
   // Exercise the eligible npm wrapper; raw node gates deliberately retain local admission.
   writeFileSync(join(repo,'package.json'),JSON.stringify({scripts:{'check:standards':`node ${JSON.stringify(gate)}`}}));
-  // Only telemetry IO is fake: verify's real policy, health check and admission plan still run.
+  // Inject telemetry and runner readiness IO; the real policy, health check and admission plan still run.
   const loader=join(scratch,'telemetry-loader.mjs'),preload=join(scratch,'preload.mjs');
   const telemetry=new URL('../forge-telemetry.mjs',import.meta.url).href;
   const admission=new URL('../heavy-admission.mjs',import.meta.url).href;
@@ -52,6 +52,10 @@ const evidence={held:process.env.WE_HEAVY_ADMISSION_HELD??null,dispatch:process.
 writeFileSync(${JSON.stringify(wire)},JSON.stringify(evidence));
 await main(['run','--repo='+process.cwd(),'--','npm','run','check:standards'],{
   home:${JSON.stringify(scratch)},
+  targetExec:async ({file,args})=>{
+    evidence.probe={file,args};
+    return {code:0};
+  },
   remoteExec:async options=>{
     writeFileSync(${JSON.stringify(wire)},JSON.stringify({...evidence,argv:options.argv}));
     return {mode:'remote',code:0,run:'r-fixture'};
@@ -67,7 +71,8 @@ await main(['run','--repo='+process.cwd(),'--','npm','run','check:standards'],{
   });
   expect(result.error).toBeUndefined();
   expect(result.status,result.stderr).toBe(0);
-  expect(JSON.parse(readFileSync(wire,'utf8'))).toEqual({held:null,dispatch:'1',argv:['npm','run','check:standards']});
+  expect(JSON.parse(readFileSync(wire,'utf8'))).toEqual({held:null,dispatch:'1',argv:['npm','run','check:standards'],
+    probe:{file:'ssh',args:['--','mesa-01','test -x /usr/local/libexec/forge-exec-run.mjs']}});
   const marker=JSON.parse(readFileSync(join(repo,'.git','.lane-verify'),'utf8'));
   expect(marker.status).toBe('green');
   expect(marker.ranOn).toEqual({location:'remote',phases:{standards:{location:'remote',receiptId:'r-fixture'}}});
@@ -90,6 +95,7 @@ const exec=async call=>{
   if(call.file==='git'){const r=spawnSync('git',call.args,{cwd:call.cwd});return {code:r.status,stdout:r.stdout};}
   transport.push({file:call.file,args:call.args,input:call.input});
   if(call.file==='rsync')return {code:0,stdout:''};
+  if(call.file==='ssh'&&call.args.at(-1)==='test -x /usr/local/libexec/forge-exec-run.mjs')return {code:0,stdout:''};
   const action=call.args.at(-1).split(' ').at(-1);
   if(action==='true')return {code:0,stdout:''};
   if(action==='bases')return {code:254,stdout:''};
@@ -98,7 +104,7 @@ const exec=async call=>{
   if(action==='finish')return {code:0,stdout:${confirmed}?JSON.stringify({v:1,nonce:request.nonce,run:request.run,inputDigest:request.inputDigest,argvDigest:request.argvDigest,lock:request.lock,manifestDigest:request.manifestDigest,phase:'test',code:${code}}):'unconfirmed'};
   throw new Error('Unexpected transport');
 };
-const result=await main({argv:['npm','run','check:standards'],cwd:process.cwd(),env:process.env,exec,
+const result=await main({argv:['npm','run','check:standards'],cwd:process.cwd(),env:process.env,exec,targetExec:exec,
   home:${JSON.stringify(scratch)},
   listFiles:async()=>['package.json','package-lock.json'],lockRoot:${JSON.stringify(join(scratch,'heavy'))},
   readTelemetry:async()=>({sampledAtET:(await import(${JSON.stringify(new URL('../forge-exec-run.mjs',import.meta.url).href)})).easternTimestamp(Date.now()),cores:8,loadPerCore:0.1,memFreePct:90,activeRuns:0,recent:[]}),
@@ -115,4 +121,6 @@ writeFileSync(${JSON.stringify(wire)},JSON.stringify(transport));process.exitCod
   const sent=readFileSync(wire,'utf8');
   expect(sent).not.toContain(marker);expect(sent).not.toContain('.lane-verify');expect(sent).not.toContain('FORGE_PRIVATE_MARKER');
   expect(JSON.parse(sent).filter(c=>c.args.at(-1)?.endsWith(' run'))).toHaveLength(1);
+  expect(JSON.parse(sent).filter(c=>c.args.at(-1)==='test -x /usr/local/libexec/forge-exec-run.mjs'))
+    .toEqual([{file:'ssh',args:['--','mesa-01','test -x /usr/local/libexec/forge-exec-run.mjs']}]);
 },40000);
