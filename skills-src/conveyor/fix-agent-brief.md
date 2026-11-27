@@ -180,7 +180,8 @@ For a question unrelated to referral findings, omit `--finding-refs` and require
 answer. Legacy stand-downs without these subjects also require an explicit answer.
 
 ```bash
-node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=needs-judgment \
+HEAD_SHA="$(set +e; LSF="$(mktemp)"; GIT_TERMINAL_PROMPT=0 perl -e 'setpgrp(0,0); exec @ARGV' git ls-remote --exit-code origin "refs/heads/{{LANE_REF}}" >"$LSF" 2>/dev/null </dev/null & LSP=$!; LSRC=124; for _ in $(seq 1 40); do if ! kill -0 "$LSP" 2>/dev/null; then wait "$LSP"; LSRC=$?; break; fi; sleep 0.5; done; kill -KILL -- "-$LSP" 2>/dev/null; wait "$LSP" 2>/dev/null; H=""; [ "$LSRC" -eq 0 ] && H="$(head -n 1 "$LSF" | cut -f1)"; printf '%s' "$H" | grep -Eqx '[0-9a-f]{40}' || H=""; rm -f "$LSF"; echo "HEAD-LOOKUP rc=$LSRC head=${H:-none} at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >&2; printf '%s' "$H")" || HEAD_SHA=""
+node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=needs-judgment ${HEAD_SHA:+--head="$HEAD_SHA"} \
   --finding-refs="$(cat -- "$FINDING_REFS_FILE")" \
   --detail="<one line — what you could not decide>"
 node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=escalated-needs-judgment
@@ -209,7 +210,7 @@ gh pr view {{PR_NUM}} --json title,body,comments --repo {{REPO}}
 Take the **latest** such comment as the authoritative ask — read its findings table and its
 `**Advisory outcome:** \`changes\`` line. Everything else in step 2 above still applies unchanged: reproduce the
 finding red before you touch code, and if it is ambiguous or needs judgment you cannot safely make, **stand
-down** exactly as step 2 says (`stand-down.mjs {{PR_NUM}} --reason=needs-judgment`) — this population is never
+down** by running the needs-judgment stand-down block in step 2 exactly as written — this population is never
 exempt from that escalation path. **Do NOT** treat this comment as a human-ceremony bounce: it explicitly is
 not one (its own text says so, twice), so nothing here ever touches `review:human`, `review:pending`, or
 `review:accepted` — this repair's only output is the fix itself plus the durable marker at step 7a.
@@ -309,7 +310,8 @@ base is something else; the same reproduce/resolve/escalate discipline applies e
 different ref.)
 
 ```bash
-node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=conflict \
+HEAD_SHA="$(set +e; LSF="$(mktemp)"; GIT_TERMINAL_PROMPT=0 perl -e 'setpgrp(0,0); exec @ARGV' git ls-remote --exit-code origin "refs/heads/{{LANE_REF}}" >"$LSF" 2>/dev/null </dev/null & LSP=$!; LSRC=124; for _ in $(seq 1 40); do if ! kill -0 "$LSP" 2>/dev/null; then wait "$LSP"; LSRC=$?; break; fi; sleep 0.5; done; kill -KILL -- "-$LSP" 2>/dev/null; wait "$LSP" 2>/dev/null; H=""; [ "$LSRC" -eq 0 ] && H="$(head -n 1 "$LSF" | cut -f1)"; printf '%s' "$H" | grep -Eqx '[0-9a-f]{40}' || H=""; rm -f "$LSF"; echo "HEAD-LOOKUP rc=$LSRC head=${H:-none} at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >&2; printf '%s' "$H")" || HEAD_SHA=""
+node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=conflict ${HEAD_SHA:+--head="$HEAD_SHA"} \
   --detail="<one line — what made the overlap unsafe to resolve automatically>"
 node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=escalated-conflict
 node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
@@ -362,7 +364,7 @@ node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo=
 > ```
 >
 > If the overlap is a genuine same-line conflict you cannot safely resolve, the same stand-down escalation above
-> applies unchanged (`stand-down.mjs {{PR_NUM}} --repo={{REPO}} --reason=conflict --detail=...`) — this mode
+> applies unchanged: run the conflict stand-down block in step 3 exactly as written — this mode
 > changes only what a *successful* resolution hands back with, never the escalation path.
 
 > **STALE-BASE MODE — dispatched with `mode: stale-base-rebase`.** The PR base is main but a required job
@@ -526,7 +528,8 @@ The same holds for the blocked-on-infra and load-flake exits: they release the c
 unverified head is never handed back for review or landed.)
 
 ```bash
-node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=gate-red \
+HEAD_SHA="$(set +e; LSF="$(mktemp)"; GIT_TERMINAL_PROMPT=0 perl -e 'setpgrp(0,0); exec @ARGV' git ls-remote --exit-code origin "refs/heads/{{LANE_REF}}" >"$LSF" 2>/dev/null </dev/null & LSP=$!; LSRC=124; for _ in $(seq 1 40); do if ! kill -0 "$LSP" 2>/dev/null; then wait "$LSP"; LSRC=$?; break; fi; sleep 0.5; done; kill -KILL -- "-$LSP" 2>/dev/null; wait "$LSP" 2>/dev/null; H=""; [ "$LSRC" -eq 0 ] && H="$(head -n 1 "$LSF" | cut -f1)"; printf '%s' "$H" | grep -Eqx '[0-9a-f]{40}' || H=""; rm -f "$LSF"; echo "HEAD-LOOKUP rc=$LSRC head=${H:-none} at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >&2; printf '%s' "$H")" || HEAD_SHA=""
+node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=gate-red ${HEAD_SHA:+--head="$HEAD_SHA"} \
   --detail="<one line — which check stayed red>"
 node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=gate-red
 node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
@@ -733,7 +736,7 @@ it. When a human takes over a `review:changes` bounce (the `/finish` `review-cha
    NEVER use `git checkout --ours/--theirs`, `git checkout -- <file>`, `git restore`, or `git reset` on a file:
    the auto-mode classifier denies those as "[Irreversible Local Destruction]" (live: fix-3964, PR #3964).
    Hand-merged hunks still use the Edit tool, then `git add`.
-   If you stop instead, run `node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --reason=conflict`
+   If you stop instead, run the conflict stand-down block in step 3 exactly as written
    so the PR records that a repair was attempted and deliberately abandoned — the auto-fix loop then leaves it
    to you (#3296).
 4. **Re-push HEAD to the same `lane/*` ref** — update the PR in place, never open a new one (step 6 above).

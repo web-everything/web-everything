@@ -7,7 +7,7 @@
  *   `<primary>/agent-memory-src/`), must be denied and routed to a lane.
  */
 import { describe, it, expect, afterAll } from 'vitest';
-import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, existsSync, rmSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, existsSync, rmSync, realpathSync, statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -16,6 +16,249 @@ import { laneGuardDecision, resolveReal, workspaceRootOf } from '../guard-lane.m
 import { daemonCloneRoots, classifyOverlayRecord, pruneStaleOverlayRecords } from '../lib/daemon-clone-registry.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+
+describe('laneGuardDecision — Standards-owned paths', () => {
+  const ws = mkdtempSync(path.join(realpathSync(tmpdir()), 'guard-standards-'));
+  afterAll(() => rmSync(ws, { recursive: true, force: true }));
+  const weRoot = path.join(ws, 'webeverything');
+  const standards = path.join(ws, '.operations/handoff/standards');
+  const target = path.join(standards, 'drafts/core/authority/x.md');
+  mkdirSync(weRoot, { recursive: true });
+  mkdirSync(path.dirname(target), { recursive: true });
+  writeFileSync(target, '{}');
+
+  it('a worker-marked session is refused an edit under .operations/handoff/standards/drafts', () => {
+    expect(laneGuardDecision(target, weRoot, { sessionRole: 'worker' })).toMatch(/Standards-owned/);
+  });
+
+  it('fails closed for an unknown session role and names the proposal route', () => {
+    expect(laneGuardDecision(target, weRoot, { sessionRole: 'unknown' }))
+      .toContain('standards/ is Standards-owned: propose the change in handoff/designs/<id>-standards-request.md, never edit it');
+  });
+
+  it('allows the orchestrator/Standards session', () => {
+    expect(laneGuardDecision(target, weRoot, { sessionRole: 'orchestrator' })).toBeNull();
+  });
+
+  it('preserves callers that omit sessionRole', () => {
+    expect(laneGuardDecision(target, weRoot)).toBeNull();
+  });
+
+  it.each(['designs', 'build-queue', 'standards-other'])('allows workers in the sibling %s directory', (dir) => {
+    expect(laneGuardDecision(path.join(ws, '.operations/handoff', dir, 'x.md'), weRoot,
+      { sessionRole: 'worker' })).toBeNull();
+  });
+
+  it('protects the full standards subtree and its root from a lane launch root', () => {
+    const laneRoot = path.join(ws, '.lanes/web-everything/lane-7');
+    for (const file of [standards, path.join(standards, 'core/x.md')]) {
+      expect(laneGuardDecision(file, laneRoot, { sessionRole: 'worker' })).toMatch(/Standards-owned/);
+    }
+  });
+
+  it('refuses a worker editing through a symlink into standards', () => {
+    const alias = path.join(ws, 'standards-alias');
+    symlinkSync(standards, alias);
+    expect(laneGuardDecision(resolveReal(path.join(alias, 'drafts/core/authority/x.md')), weRoot,
+      { sessionRole: 'worker' })).toMatch(/Standards-owned/);
+  });
+
+  it.each(['worker', 'unknown'])('refuses case-variant Standards paths for %s sessions', (sessionRole) => {
+    const variants = [
+      path.join(ws, '.operations/handoff/STANDARDS'),
+      path.join(ws, '.operations/handoff/StAnDaRdS/new/schema.json'),
+      path.join(ws, '.OPERATIONS/HANDOFF/standards/new/schema.json'),
+      target.toUpperCase(),
+    ];
+    for (const file of variants) {
+      expect(laneGuardDecision(file, weRoot, { sessionRole }), file).toMatch(/Standards-owned/);
+    }
+  });
+
+  it('allows case-variant sibling names and the Standards orchestrator', () => {
+    expect(laneGuardDecision(path.join(ws, '.operations/handoff/STANDARDS-other/x.md'), weRoot,
+      { sessionRole: 'worker' })).toBeNull();
+    expect(laneGuardDecision(target.toUpperCase(), weRoot,
+      { sessionRole: 'orchestrator' })).toBeNull();
+  });
+
+  const runHook = (marker, file = target, optOut = false, toolName = 'Edit', root = weRoot) => spawnSync(process.execPath, [path.join(here, '../guard-lane.mjs')], {
+    cwd: ws,
+    env: {
+      HOME: ws, TMPDIR: ws, WE_HOOK_ROOT: root,
+      WE_DAEMON_OVERLAY_DIR: path.join(ws, 'overlay-state'),
+      ...(optOut ? { LANE_GUARD_OFF: '1' } : {}),
+      ...(marker === undefined ? {} : { WE_CONVEYOR_WORKER: marker }),
+    },
+    input: JSON.stringify({ tool_name: toolName, tool_input: { file_path: file } }),
+    encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024,
+  });
+
+  it.each(['1', '0'])('CLI exits 2 with Standards-owned guidance for marker %s', (marker) => {
+    const result = runHook(marker);
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(2);
+    expect(result.stderr).toMatch(/Standards-owned/);
+  });
+
+  it.each(['1', '0'])('CLI refuses case variants and new descendants for marker %s', (marker) => {
+    for (const file of [
+      path.join(ws, '.operations/handoff/STANDARDS'),
+      path.join(ws, '.OPERATIONS/HANDOFF/StAnDaRdS/drafts/core/authority/schema.json'),
+    ]) {
+      const result = runHook(marker, file);
+      expect(result.error).toBeUndefined();
+      expect(result.status, `${file}: ${result.stderr}`).toBe(2);
+      expect(result.stderr).toMatch(/Standards-owned/);
+    }
+  });
+
+  const caseAlias = path.join(ws, '.operations/handoff/STANDARDS/drafts/core/authority/x.md');
+  it.skipIf(!existsSync(caseAlias))('CLI denies both spellings of the same live file on a case-insensitive filesystem', () => {
+    const canonicalStat = statSync(target);
+    const aliasStat = statSync(caseAlias);
+    expect([aliasStat.dev, aliasStat.ino]).toEqual([canonicalStat.dev, canonicalStat.ino]);
+    for (const file of [target, caseAlias]) {
+      const result = runHook('1', file);
+      expect(result.error).toBeUndefined();
+      expect(result.status, `${file}: ${result.stderr}`).toBe(2);
+      expect(result.stderr).toMatch(/Standards-owned/);
+    }
+  });
+
+  it('CLI allows the unmarked orchestrator/Standards session', () => {
+    const result = runHook(undefined);
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toBe('');
+  });
+
+  // These spellings alias the protected directories on the live macOS filesystem. Only the
+  // filesystem can tell us its equivalence rules; keep portable runs explicit about skipped aliases.
+  const unicodeAliases = [
+    path.join(ws, '.operations/handoff/\u017ftandards'),
+    path.join(ws, '.operations/handoff/standard\u017f'),
+  ];
+  describe.each(unicodeAliases)('filesystem alias %s', (alias) => {
+    it.skipIf(!existsSync(alias))('CLI rejects identical directory inodes, existing files and new descendants', () => {
+      const canonicalStat = statSync(standards);
+      const aliasStat = statSync(alias);
+      expect([aliasStat.dev, aliasStat.ino]).toEqual([canonicalStat.dev, canonicalStat.ino]);
+      for (const marker of ['1', '0']) {
+        for (const suffix of ['', 'drafts/core/authority/x.md', 'new/deep/schema.json']) {
+          const file = path.join(alias, suffix);
+          const result = runHook(marker, file);
+          expect(result.error).toBeUndefined();
+          expect(result.status, `${file}: ${result.stderr}`).toBe(2);
+          expect(result.stderr).toMatch(/Standards-owned/);
+        }
+      }
+    });
+  });
+
+  it('CLI rejects multiple missing descendants below a symlink to a Standards subdirectory', () => {
+    const alias = path.join(ws, 'authority-alias');
+    symlinkSync(path.dirname(target), alias);
+    const result = runHook('1', path.join(alias, 'new/deep/schema.json'));
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(2);
+    expect(result.stderr).toMatch(/Standards-owned/);
+  });
+
+  // The OS applies `..` AFTER following a symlink; collapsing `..` lexically first lands on an unrelated path.
+  describe('symlink followed by parent-directory segments', () => {
+    const drafts = path.join(standards, 'drafts');
+    const deepLink = path.join(ws, 'deep-link');
+    const relLink = path.join(ws, 'rel-link');
+    const danglingLink = path.join(ws, 'dangling-link');
+    const statusFile = path.join(standards, 'STATUS.md');
+    writeFileSync(statusFile, 'x');
+    symlinkSync(path.join(drafts, 'core', 'authority'), deepLink);
+    symlinkSync('.operations/handoff/standards/drafts', relLink);
+    symlinkSync(path.join(standards, 'not-yet-created'), danglingLink);
+
+    it('resolveReal applies `..` to the symlink target, not lexically', () => {
+      // String concatenation on purpose: path.join would collapse the `..` lexically in the test itself.
+      expect(resolveReal(`${deepLink}/../../../STATUS.md`)).toBe(statusFile);
+      expect(resolveReal(`${deepLink}/../../../new/deep/x.md`))
+        .toBe(path.join(standards, 'new/deep/x.md'));
+      expect(resolveReal(`${relLink}/../STATUS.md`)).toBe(statusFile);
+      expect(resolveReal(`${danglingLink}/x.md`)).toBe(path.join(standards, 'not-yet-created/x.md'));
+    });
+
+    it.each(['1', '0'])('CLI refuses `..` after a symlink into Standards for marker %s', (marker) => {
+      for (const file of [
+        `${deepLink}/../../../STATUS.md`,
+        `${deepLink}/../../../new/deep/x.md`,
+        `${relLink}/../STATUS.md`,
+        `${danglingLink}/new/x.md`,
+        `${deepLink}/./../../.././STATUS.md`,
+      ]) {
+        for (const optOut of [false, true]) {
+          const result = runHook(marker, file, optOut);
+          expect(result.error).toBeUndefined();
+          expect(result.status, `${file} optOut=${optOut}: ${result.stderr}`).toBe(2);
+          expect(result.stderr).toMatch(/Standards-owned/);
+        }
+      }
+    });
+
+    it('CLI does not over-block `..` that leaves Standards via a symlink', () => {
+      const result = runHook('1', `${deepLink}/../../../../../allowed.md`, true);
+      expect(result.status, result.stderr).not.toBe(2);
+    });
+  });
+
+  it('CLI fails closed with proposal guidance when target ancestry cannot be resolved', () => {
+    const loop = path.join(ws, 'loop');
+    symlinkSync(loop, loop);
+    const result = runHook('1', path.join(loop, 'new/schema.json'), true);
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(2);
+    expect(result.stderr).toContain('handoff/designs/<id>-standards-request.md');
+  });
+
+  it('CLI fails closed when the protected directory identity cannot be read', () => {
+    const unreadableWorkspace = path.join(ws, 'unreadable-workspace');
+    const unreadableRoot = path.join(unreadableWorkspace, 'webeverything');
+    const unreadableStandards = path.join(unreadableWorkspace, '.operations/handoff/standards');
+    // Root validation must succeed so the hook reaches the unreadable Standards identity.
+    mkdirSync(unreadableRoot, { recursive: true });
+    mkdirSync(path.dirname(unreadableStandards), { recursive: true });
+    symlinkSync(unreadableStandards, unreadableStandards);
+    expect(() => statSync(unreadableStandards)).toThrow(/ELOOP/);
+    const result = runHook('0', path.join(unreadableWorkspace, 'probe.md'), true, 'Write',
+      unreadableRoot);
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(2);
+    expect(result.stderr).toContain('handoff/designs/<id>-standards-request.md');
+  });
+
+  it.each(['1', '0'])('CLI keeps Standards ownership enforced with lane opt-out for marker %s', (marker) => {
+    for (const toolName of ['Edit', 'Write']) {
+      for (const file of [target, path.join(standards, 'new/deep/schema.json'),
+        ...unicodeAliases.filter(existsSync).map((alias) => path.join(alias, 'new/deep/schema.json'))]) {
+        const result = runHook(marker, file, true, toolName);
+        expect(result.error).toBeUndefined();
+        expect(result.status, `${toolName} ${file}: ${result.stderr}`).toBe(2);
+        expect(result.stderr).toContain('handoff/designs/<id>-standards-request.md');
+      }
+    }
+  });
+
+  it('CLI preserves the lane opt-out for primary edits and allows orchestrator and sibling paths', () => {
+    for (const [marker, file] of [
+      ['1', path.join(weRoot, 'probe.md')],
+      [undefined, target],
+      ['1', path.join(ws, '.operations/handoff/standards-other/probe.md')],
+    ]) {
+      const result = runHook(marker, file, true);
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stderr).toBe('');
+    }
+  });
+});
 
 // A fake constellation: <workspace>/{webeverything,frontierui} primaries + a <workspace>/.lanes/ clone.
 const WORKSPACE = '/ws';
