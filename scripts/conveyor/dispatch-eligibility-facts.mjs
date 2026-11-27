@@ -3,6 +3,11 @@ import { known, unread, POPULATIONS } from './dispatch-eligibility.mjs';
 import { liveResultGateState, parseRedTeamGateMarker } from '../lib/red-team-gate.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 
+/** PR fields consumed by buildEligibilityFacts; keep the consumer-field fixture in sync. */
+export const ELIGIBILITY_FACT_PR_FIELDS = Object.freeze([
+  'alreadyLandedInMain', 'labels', 'number', 'headRefOid',
+]);
+
 function isRecord(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
