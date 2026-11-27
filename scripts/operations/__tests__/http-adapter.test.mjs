@@ -38,7 +38,7 @@ import { types } from 'node:util';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createServer } from 'node:http';
 import { get as httpGet, request as httpRequest } from 'node:http';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, statSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
 import { dirname, join, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1242,4 +1242,42 @@ describe('capacity writers are CLI only', () => {
     expect(response.status).toBe(200);
     expect(response.body.readOnly).toBe(true);
   });
+});
+
+it('http read-only leaves cache untouched while reading all repo pools and a live old holder', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pool-http-'));
+  try {
+    const { readPoolSource, readPoolJson } = await import('../../lib/resource-pool-io.mjs');
+    const { readPoolLaneStatus } = await import('../../lib/resource-pool-lanes.mjs');
+    const pools = join(root, 'pools'), redTeam = join(root, 'red-team'); mkdirSync(redTeam);
+    const readRegistry = () => ({ repos: [{ name: 'one' }, { name: 'two' }] });
+    const caches = [];
+    for (const name of ['one', 'two']) {
+      const pool = join(pools, name), lane = join(pool, 'lane-8'); mkdirSync(lane, { recursive: true });
+      writeFileSync(join(lane, '.lane-lease'), JSON.stringify({ session: `fix-${name}`, acquiredAt: new Date(0).toISOString(), reserved: true }));
+      const file = join(pool, '.lane-status-cache.json'); writeFileSync(file, 'untouched cache');
+      caches.push({ file, bytes: readFileSync(file), mtimeMs: statSync(file).mtimeMs });
+    }
+    const head = 'a'.repeat(40);
+    writeFileSync(join(redTeam, `we-12-${head}.json`), JSON.stringify({ repo: 'we', pr: 12, head,
+      status: 'running', pid: 123, pidStart: 'start', host: 'fixture' }));
+    const env = { HOME: root, LANE_POOL_ROOT: pools }, nowMs = 9000000000000;
+    const run = () => join(root, '.lanes', 'one', 'lane-8');
+    const laneStatus = () => readPoolLaneStatus({ env, cwd: root, nowMs, run, readRegistry, readJson: file => readPoolJson(file).data });
+    const collect = () => Object.fromEntries(['workers', 'redTeam'].map(source => [source, readPoolSource(source, {
+      env, cwd: root, nowMs, paths: { redTeam }, run, laneStatus, heavyStatus: () => ({ held: [] }),
+      host: 'fixture', namespace: 'fixture', processAlive: () => true, readStart: () => 'start',
+    })]));
+    const declaration = op('pool-shadow-fixture', { input: {}, verdictFrom: 'read', read: compute({ reads: [], fn: collect }) });
+    const registry = createRegistry(); registry.register(declaration);
+    const res = await handleOperationRequest({ method: 'GET', url: '/operations/pool-shadow-fixture/run' }, {
+      names: () => ['pool-shadow-fixture'], resolve: () => ({ declaration, registry }), store: refusingStore(), newRunId: idMinter(),
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.verdict.workers).toMatchObject({ ok: true, holders: [{ jobId: 'fix-one' }, { jobId: 'fix-two' }] });
+    expect(res.body.verdict.redTeam).toMatchObject({ ok: true, holders: [{ kind: 'redTeam' }] });
+    for (const { file, bytes, mtimeMs } of caches) {
+      expect(readFileSync(file)).toEqual(bytes); expect(statSync(file).mtimeMs).toBe(mtimeMs);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
