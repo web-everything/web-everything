@@ -140,6 +140,9 @@ export function checkSiblingBase({ git, ref, sha, base = 'main', now = () => per
       // A fetched remote-tracking ref's reflog holds fetch updates, never 'branch: Created from'.
       // Its creation record is the matching local lane's; with no local lane there is none, so it fails closed below.
       const creationRef = name.startsWith('refs/remotes/origin/') ? `refs/heads/${lane}` : name;
+      if (creationRef !== name) {
+        try { resolveCommit(creationRef); } catch { throw new Error(`missing lane creation evidence for ${lane}`); }
+      }
       const history = list(read(['reflog', 'show', '--max-count=2049', '--format=%H%x00%gs', creationRef, '--']));
       if (history.length > 2048) throw new Error('lane creation evidence exceeds 2048 reflog entries');
       const creation = /^([a-f0-9]{40})\0branch: Created from .+$/.exec(history.at(-1) || '');
