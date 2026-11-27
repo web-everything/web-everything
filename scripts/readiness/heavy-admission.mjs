@@ -159,7 +159,7 @@ import { createRequire } from 'node:module';
 import { daemonEventsPath } from '../lib/daemon-events.mjs';
 import { shadowAdmission, readSnapshot } from '../lib/resource-admission.mjs';
 import { hostLoadAdmission } from '../lib/host-load.mjs';
-import { DEFAULT_HOST_MAX_WAIT_MS, loadHostOverloadSettings } from '../lib/host-overload-settings.mjs';
+import { DEFAULT_HOST_MAX_WAIT_MS, DEFAULT_SNAPSHOT_MAX_FRESH_MS, loadHostOverloadSettings } from '../lib/host-overload-settings.mjs';
 import { LEGACY_SETTINGS_PATH, readDeclaredSettings } from '../lib/settings-files.mjs';
 import { cutoverDecision, loadResourceGateSettings } from '../lib/resource-gate.mjs';
 import { LEASE_FILENAME, isLeaseStale } from '../lib/lane-lease.mjs';
@@ -2005,12 +2005,14 @@ export function loadAdmissionDecision({
  * A day with no host-sampler file yet reads as all-null/empty — {@link loadAdmissionDecision} then fails open,
  * never a read error. `root` defaults to the REAL shared telemetry root ({@link resolveHostRoot}) but is
  * overridable, same "injectable seam, real default" shape `readHostToday` itself already has.
- * @param {{root?:string, now?:Date, window?:number}} [o]
+ * `readRecords` injects that reader; errors propagate rather than inventing evidence. Memory corroboration
+ * expires at the shared snapshot freshness limit. Every swap sample in the requested window must be valid.
+ * @param {{root?:string, now?:Date, window?:number, readRecords?:typeof readHostToday}} [o]
  * @returns {{idlePctSamples:number[], pressureLevel:number|null, load1:number|null, cores:number|null, freePct:number|null, swapGrowthMb:number|null}}
  */
-export function readLatestLoad({ root = resolveHostRoot(), now = new Date(), window = DEFAULT_LOAD_ADMISSION_WINDOW } = {}) {
+export function readLatestLoad({ root = resolveHostRoot(), now = new Date(), window = DEFAULT_LOAD_ADMISSION_WINDOW, readRecords = readHostToday } = {}) {
   const dayKey = utcDayKey(now);
-  const { records } = readHostToday(root, dayKey);
+  const { records } = readRecords(root, dayKey);
   // A non-positive/non-integer `window` (never produced by `resolveLoadAdmissionWindow`'s own clamp, but this
   // function is exported and callable directly) falls back to the documented default rather than reading as
   // "no windowing" — an UNBOUNDED `slice(-0)` would silently take the WHOLE day's samples, surprising for what
@@ -2036,8 +2038,10 @@ export function readLatestLoad({ root = resolveHostRoot(), now = new Date(), win
     .filter(s => Number.isFinite(Date.parse(s.timestamp)))
     .map(s => ({ ...s, value: s.value == null ? NaN : Number(s.value) })));
   const latestMemory = (name) => {
-    const value = latestValue(memorySamples(name));
-    return Number.isFinite(value) && value >= 0 ? value : null;
+    const sample = memorySamples(name).at(-1);
+    const ageMs = now.getTime() - Date.parse(sample?.timestamp);
+    return Number.isFinite(sample?.value) && sample.value >= 0 && ageMs >= 0 && ageMs <= DEFAULT_SNAPSHOT_MAX_FRESH_MS
+      ? sample.value : null;
   };
   const available = latestMemory('available_bytes') ?? latestMemory('free_bytes');
   const total = latestMemory('total_bytes');
@@ -2049,7 +2053,8 @@ export function readLatestLoad({ root = resolveHostRoot(), now = new Date(), win
     load1: load1Samples.length ? median(load1Samples) : null,
     cores: latestValue(extractSamplesByName(records, 'host.cpu.count')),
     freePct: Number.isFinite(available) && available >= 0 && Number.isFinite(total) && total > 0 ? available / total * 100 : null,
-    swapGrowthMb: swap.length >= 2 && Number.isFinite(firstSwap) && firstSwap >= 0 && Number.isFinite(lastSwap) && lastSwap >= 0
+    swapGrowthMb: swap.length >= 2 && swap.every(s => Number.isFinite(s.value) && s.value >= 0
+      && now.getTime() - Date.parse(s.timestamp) >= 0 && now.getTime() - Date.parse(s.timestamp) <= DEFAULT_SNAPSHOT_MAX_FRESH_MS)
       ? (lastSwap - firstSwap) / (1024 * 1024) : null,
   };
 }

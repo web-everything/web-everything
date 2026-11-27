@@ -9,8 +9,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, mkdirSync, realpathSync, symlinkSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
 import { execFileSync, execSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir, userInfo } from 'node:os';
-import { join, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   classifyCommandKind, DEFAULT_FAST_MAX_FILES,
   DEFAULT_ADMISSION_CAP, DEFAULT_TIMEOUT_MS, DEFAULT_ADMISSION_CEILING_MS, ADMISSION_SWITCH_ENV,
@@ -165,7 +165,7 @@ describe('CLI relative --repo', () => {
     const env = { ...process.env };
     delete env.LANE_POOL_ROOT;
     execFileSync(process.execPath, [
-      resolve('scripts/readiness/heavy-admission.mjs'),
+      fileURLToPath(new URL('../heavy-admission.mjs', import.meta.url)),
       'acquire', '--repo=.', '--cap=1', '--json',
     ], { cwd: repo, env, encoding: 'utf8' });
     const held = heldSlots({ lockRoot: join(lockRoot, '.lanes', '.admission', 'heavy'), cap: 1 });
@@ -718,7 +718,7 @@ function cliEnv(poolRoot, extra = {}) {
   delete env.CI; delete env.WE_HEAVY_ADMISSION; delete env[ADMISSION_HELD_ENV];
   return env;
 }
-const CLI = resolve('scripts/readiness/heavy-admission.mjs');
+const CLI = fileURLToPath(new URL('../heavy-admission.mjs', import.meta.url));
 
 describe('admissionBypassReason — when the wrapper is a pass-through', () => {
   it('queues by default', () => expect(admissionBypassReason({ env: {}, poolExists: true })).toBeNull());
