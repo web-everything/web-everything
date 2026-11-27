@@ -175,6 +175,8 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   'scripts/ci/rerun-failed-once.mjs',
   // Red-team reprobe requests dedupe across gate sources and restarts with an exclusive `wx` create.
   'scripts/lib/red-team-queue-state.mjs',
+  // Red-main metric events dedupe across writers and state-write retries with an exclusive `wx` create.
+  'scripts/conveyor/health-watch-main-red.mjs',
   'scripts/conveyor/health-file-request.mjs', 'scripts/lib/review-seat-pool.mjs', 'scripts/daemon-overlay.mjs',
   'scripts/lib/daemon-overlays.mjs', 'scripts/lib/lane-repair.mjs', 'scripts/lib/overlay-adoption.mjs', 'scripts/lib/we-scan-cache.mjs',
   'scripts/readiness/forge-exec-run.mjs', 'scripts/lib/review-shadow-budget.mjs', 'scripts/readiness/reservations.mjs',
