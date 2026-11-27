@@ -3,7 +3,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { resolveHumanReviewSurfaces } from '../../lib/human-review-surfaces.mjs';
 import { runGhSync } from '../../lib/gh-throttle.mjs';
-import { createJudgeSweepFactsReader, createShapeCache, JUDGE_SWEEP_REPO, operatorGh, readCheckoutState, readFromFreshOrigin } from '../judge-sweep-facts-io.mjs';
+import { createJudgeSweepFactsReader, createShapeCache, JUDGE_SWEEP_REPO, operatorGh, readCheckoutState, readFromFreshOrigin, resolveFixHoldLabel } from '../judge-sweep-facts-io.mjs';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
@@ -1094,13 +1094,13 @@ it.each([[undefined], [null], ['UNKNOWN']])('an unknown or missing merge state i
     latestVerdict: { accepted: true }, redTeam: { state: 'clear' }, openReferrals: [], openSendBacks: [] }] }).prs[0])
     .toMatchObject({ needsJudgment: true, reason: 'clean-and-owed-approval' });
 });
-it.each([[7], ['BOGUS'], ['unknown'], [''], [false], [{}], [[]]])('assigns explicit operator ownership for an invalid merge state (%s)', mergeable => {
+it.each([[7], ['BOGUS'], ['unknown'], [''], [false], [{}], [[]]])('requires judgment for an invalid merge state (%s)', mergeable => {
   const row = hardenedRead({ gh: () => JSON.stringify([pr({ mergeable, isDraft: false })]) }).prs[0];
   expect(row.mergeable).toBeNull();
   expect(row.conflictOwnershipError).toBe('Inspect PR mergeability and rerun; merge state is unknown or unreadable.');
-  expect(row.evidenceErrors).toEqual([]);
+  expect(row.evidenceErrors).toEqual(['merge state unavailable; inspect PR mergeability']);
   expect(buildJudgeSweepBundle({ prs: [row] }).prs[0]).toMatchObject({
-    needsJudgment: false, nextOwner: 'operator', nextStep: row.conflictOwnershipError,
+    needsJudgment: true, nextOwner: 'judge', reason: 'evidence-unavailable: inspect PR evidence and rerun',
   });
 });
 
@@ -1115,8 +1115,9 @@ it.each([false, true])('validates unknown merge state on current/fresh paths (fr
     const local = hardenedRead({ gh: () => JSON.stringify([pr({ mergeable, isDraft: false })]) });
     const result = fresh ? hardenedRead({ checkoutState: () => ({ behind: 1 }),
       readFresh: () => ({ ...local, prs: local.prs.map(({ conflictOwnershipError, ...row }) => row) }) }) : local;
-    expect(buildJudgeSweepBundle(result).prs[0]).toMatchObject({ nextOwner: 'operator',
-      nextStep: expect.stringMatching(/mergeability.*rerun/) });
+    expect(buildJudgeSweepBundle(result).prs[0]).toMatchObject(mergeable === 'BOGUS'
+      ? { nextOwner: 'judge', needsJudgment: true, reason: 'evidence-unavailable: inspect PR evidence and rerun' }
+      : { nextOwner: 'operator', nextStep: expect.stringMatching(/mergeability.*rerun/) });
   }
 });
 it.each([false, true])('custom hold label replaces the default on current/fresh paths (fresh=%s)', fresh => {
@@ -1148,4 +1149,57 @@ it('head-changed detail refuses conflict routing without dispatch', () => {
   expect(row).toMatchObject({ nextOwner: 'judge', needsJudgment: true });
   expect(row.evidenceErrors.join(' ')).toMatch(/head changed/);
   expect(gh.mock.calls.every(([args]) => args[0] === 'pr' && ['list', 'view'].includes(args[1]))).toBe(true);
+});
+
+// Audit regressions: every settings/observation source is injected.
+it.each(['platform', 'tool'])('rejects an object-shaped scalar hold at the %s layer', layer => {
+  const dir = mkdtempSync(join(tmpdir(), 'hold-scalar-'));
+  try {
+    const platformPath = join(dir, 'platform.json');
+    const env = { WE_PLATFORM_PREFERENCES_FILE: platformPath };
+    const readFile = path => JSON.stringify(String(path) === platformPath
+      ? (layer === 'platform' ? { fixHoldLabel: { nested: 'custom:fix' } } : {})
+      : (layer === 'tool' ? { fix: { holdLabel: { nested: 'custom:fix' } } } : {}));
+    const resolved = resolveFixHoldLabel({ env, readFile, log: () => {} });
+    expect(resolved.error).toMatch(/hold label.*rerun/);
+    expect(typeof resolved.value).toBe('string');
+    const row = buildJudgeSweepBundle(hardenedRead({ env, readFile,
+      gh: () => JSON.stringify([pr({ mergeable: 'CONFLICTING', isDraft: false,
+        labels: [{ name: 'hold:fix' }] })]) })).prs[0];
+    expect(row.nextOwner).toBe('operator');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it('preserves fresh-origin effective hold settings despite different stale-checkout settings', () => {
+  const local = hardenedRead({ env: { WE_FIX_HOLD_LABEL: 'custom:fix' },
+    gh: () => JSON.stringify([pr({ mergeable: 'CONFLICTING', isDraft: false,
+      labels: [{ name: 'custom:fix' }] })]) });
+  const result = hardenedRead({ checkoutState: () => ({ behind: 2 }), readFresh: () => local,
+    readFile: () => { throw new Error('stale settings unreadable'); } });
+  expect(result.prs[0]).toEqual(local.prs[0]);
+  expect(buildJudgeSweepBundle(result).prs[0].nextOwner).toBe('nobody');
+});
+
+it.each(['platform', 'tool'])('a %s hold override preserves the worker default hold', layer => {
+  const dir = mkdtempSync(join(tmpdir(), 'hold-worker-'));
+  try {
+    const platformPath = join(dir, 'platform.json');
+    const env = { WE_PLATFORM_PREFERENCES_FILE: platformPath };
+    const readFile = path => JSON.stringify(String(path) === platformPath
+      ? (layer === 'platform' ? { fixHoldLabel: 'custom:fix' } : {})
+      : (layer === 'tool' ? { fix: { holdLabel: 'custom:fix' } } : {}));
+    const result = hardenedRead({ env, readFile, gh: () => JSON.stringify([pr({
+      mergeable: 'CONFLICTING', isDraft: false, labels: [{ name: 'hold:fix' }] })]) });
+    expect(result.prs[0].fixHoldLabel).toBe('custom:fix');
+    expect(buildJudgeSweepBundle(result).prs[0].nextOwner).toBe('nobody');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it.each([7, 'BOGUS', false, {}, []])('malformed merge evidence requires judgment and never counts as noAction (%j)', mergeable => {
+  const result = hardenedRead({ gh: () => JSON.stringify([pr({ mergeable, isDraft: false })]) });
+  const bundle = buildJudgeSweepBundle(result);
+  expect(bundle.prs[0].evidenceErrors).toContain('merge state unavailable; inspect PR mergeability');
+  expect(bundle.prs[0]).toMatchObject({ needsJudgment: true, nextOwner: 'judge',
+    reason: 'evidence-unavailable: inspect PR evidence and rerun' });
+  expect(bundle.counts).toEqual({ needsJudgment: 1, noAction: 0 });
 });

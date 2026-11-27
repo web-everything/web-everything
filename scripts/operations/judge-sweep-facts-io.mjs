@@ -60,26 +60,43 @@ export function resolveStallThresholds({ env = process.env, readFile = readFileS
   }).value;
 }
 
+const validFixHoldLabel = v => typeof v === 'string' && v.trim() === v && v.length > 0 && v.length <= 50
+  && !/[\u0000-\u001f\u007f-\u009f]/.test(v);
+
 /** Resolve the existing hold override once per observation, retaining provenance and refusing incomplete settings. */
 export function resolveFixHoldLabel({ env = process.env, readFile = readFileSync, log } = {}) {
-  const valid = v => typeof v === 'string' && v.trim() === v && v.length > 0 && v.length <= 50
-    && !/[\u0000-\u001f\u007f-\u009f]/.test(v);
+  const valid = validFixHoldLabel;
   const { prefs, errors } = readPlatformPreferences({ env, readFile });
   let tool;
   try { tool = JSON.parse(String(readFile(new URL('../settings/fix.json', import.meta.url), 'utf8')))?.fix?.holdLabel; }
   catch (error) { if (error.code !== 'ENOENT') errors.push('hold settings unreadable'); }
-  const resolved = cascadePolicy('fixHoldLabel', tool, { standard: FIX_HOLD_LABEL,
-    platform: prefs.fixHoldLabel, envValues: { '': env.WE_FIX_HOLD_LABEL }, valid, env, log });
+  // Validate the complete scalar before the cascade can flatten an object into valid string leaves.
+  const scalar = value => {
+    if (value === undefined) return undefined;
+    if (valid(value)) return value;
+    errors.push('hold label must be a scalar string');
+    return undefined;
+  };
+  const platform = scalar(prefs.fixHoldLabel);
+  const resolved = cascadePolicy('fixHoldLabel', scalar(tool), { standard: FIX_HOLD_LABEL,
+    platform, envValues: { '': env.WE_FIX_HOLD_LABEL }, valid, env, log });
   log?.(`judge-sweep fix hold label=${resolved.value} source=${resolved.sources['']}`);
-  return { ...resolved, error: errors.length || resolved.invalid.length
+  return { ...resolved, workerFixHoldLabel: env.WE_FIX_HOLD_LABEL || FIX_HOLD_LABEL, error: errors.length || resolved.invalid.length
     ? 'Inspect the effective fix hold label settings and rerun.' : null };
 }
 
 /** Apply the same ownership validation to in-place and fresh/resumed observations. */
-function validateConflictOwnership(pr, hold) {
+function validateConflictOwnership(pr, hold = { value: pr.fixHoldLabel,
+  error: validFixHoldLabel(pr.fixHoldLabel) ? null : 'Inspect the effective fix hold label settings and rerun.' }) {
   const conflictOwnershipError = hold.error || (!['MERGEABLE', 'CONFLICTING'].includes(pr.mergeable)
     ? 'Inspect PR mergeability and rerun; merge state is unknown or unreadable.' : null);
-  return { ...pr, fixHoldLabel: hold.value,
+  const evidenceErrors = [...pr.evidenceErrors];
+  if (pr.mergeable != null && !['MERGEABLE', 'CONFLICTING', 'UNKNOWN'].includes(pr.mergeable)
+    && !evidenceErrors.includes('merge state unavailable; inspect PR mergeability')) {
+    evidenceErrors.push('merge state unavailable; inspect PR mergeability');
+  }
+  return { ...pr, evidenceErrors, fixHoldLabel: hold.value,
+    ...(hold.workerFixHoldLabel ? { workerFixHoldLabel: hold.workerFixHoldLabel } : {}),
     ...(conflictOwnershipError ? { conflictOwnershipError } : {}),
   };
 }
@@ -230,7 +247,6 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
 } = {}) {
   return ({ repo = JUDGE_SWEEP_REPO, checkCoverage } = {}) => {
     if (repo.length > 200 || !/^[\w.-]+\/[\w.-]+$/.test(repo)) throw failure('repo must be owner/name (at most 200 characters)');
-    const hold = resolveFixHoldLabel({ env, readFile, log });
     // Evidence never depends on this checkout's age: behind origin/main means read from origin/main, else refuse.
     {
       let behind;
@@ -242,9 +258,10 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
           throw staleFailure(behind, `fresh origin/main read failed (${String(error?.message ?? error).slice(0, 200)})`);
         }
         if (!validFreshFacts(facts)) throw staleFailure(behind, 'fresh origin/main read malformed');
-        return { ...facts, prs: facts.prs.map(pr => validateConflictOwnership(pr, hold)) };
+        return { ...facts, prs: facts.prs.map(pr => validateConflictOwnership(pr)) };
       }
     }
+    const hold = resolveFixHoldLabel({ env, readFile, log });
     const start = now();
     const thresholds = readStallThresholds({ env, readFile, log });
     let calls = 0;
@@ -290,6 +307,9 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
       const fixerRunning = liveJobs.some(j => ['fix-run', 'ci-heal'].includes(j.kind));
       const owner = p.assignees[0]?.login ?? (liveJobs.length ? liveJobs[0].kind : null);
       const evidenceErrors = [...errors];
+      if (p.mergeable != null && !['MERGEABLE', 'CONFLICTING', 'UNKNOWN'].includes(p.mergeable)) {
+        evidenceErrors.push('merge state unavailable; inspect PR mergeability');
+      }
       const unscopedWorker = jobs.some(j => j.pr === p.number && !j.repo);
       if (unscopedWorker) evidenceErrors.push('worker repository unknown');
       const round = errors.includes('verdict ledger unreadable') ? null

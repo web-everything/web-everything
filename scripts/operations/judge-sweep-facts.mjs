@@ -89,7 +89,8 @@ function deriveResponsibility(pr, thresholds) {
     return result('orchestrator', 'Inspect the hold and assign the next responsible worker.');
   }
   // Empty-owner fallback only, after every guard above. Only an explicit CONFLICTING on a known non-draft PR counts.
-  if (pr.mergeable === 'CONFLICTING' && pr.isDraft === false && !labels.includes(pr.fixHoldLabel ?? 'hold:fix')) {
+  if (pr.mergeable === 'CONFLICTING' && pr.isDraft === false && !labels.includes(pr.fixHoldLabel ?? 'hold:fix')
+    && !labels.includes(pr.workerFixHoldLabel ?? 'hold:fix')) {
     return { ...result('fixer', 'Resolve the conflict.'), conflictFallback: true };
   }
   return result('nobody', 'Inspect the PR and assign its next responsible worker.');

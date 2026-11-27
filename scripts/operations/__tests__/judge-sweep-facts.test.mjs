@@ -9,8 +9,10 @@ import * as judgeSweepFactsIo from '../judge-sweep-facts-io.mjs';
 import { buildJudgeSweepBundle, finishJudgeSweep, judgeSweepFactsOperation, needsJudgment, JUDGE_SWEEP_REPO } from '../judge-sweep-facts.mjs';
 import { createJudgeSweepFactsReader, createShapeCache, operatorGh } from '../judge-sweep-facts-io.mjs';
 import { resolveOperation } from '../run.mjs';
-import { createRegistry, isReadOnlyOperation } from '../registry.mjs';
-import { runOperationCli } from '../cli-adapter.mjs';
+import { op, createRegistry, isReadOnlyOperation } from '../registry.mjs';
+import { startRun } from '../engine.mjs';
+import { compute, effect } from '../step-kinds.mjs';
+import { driveRun, runOperationCli } from '../cli-adapter.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { renderPanelComment } from '../../lib/review-render.mjs';
 import { redTeamMarker } from '../../lib/red-team-gate.mjs';
@@ -940,21 +942,45 @@ describe('CONFLICT-OWNER-HARDEN cap routing', () => {
         expect(row.reason).toMatch(/^(at-cap|red-team-blocked-at-cap)$/);
       }
     });
-  it('a capped PR with an active worker routes to judgment without competing dispatch', () => {
+  async function assertLeaseSafety(makeDeclaration = judgeSweepFactsOperation) {
     const lease = { token: 'fixture-token', owner: 'fixture-worker', generation: 7 };
-    const leaseStore = { read: vi.fn(() => structuredClone(lease)), write: vi.fn(), release: vi.fn() };
+    let storedLease = structuredClone(lease);
+    const leaseStore = { read: vi.fn(() => structuredClone(storedLease)),
+      write: vi.fn(value => { storedLease = value; }), release: vi.fn(() => { storedLease = null; }) };
     const dispatch = vi.fn();
-    const before = leaseStore.read();
-    const row = buildJudgeSweepBundle({ generatedAt: at(0), prs: [facts({ round: 5,
-      inCi: true, minutesSinceFixLoop: 0, fixerRunning: true, owner: before.owner })] }).prs[0];
-    // Consume the emitted route at the existing read-only facts boundary; no worker effects belong here.
-    const route = { owner: row.nextOwner, judgment: row.needsJudgment, reason: row.reason };
-    expect(route).toEqual({ owner: 'judge', judgment: true, reason: 'at-cap' });
-    expect(leaseStore.read()).toEqual(before);
+    const readFacts = () => ({ generatedAt: at(0), prs: [facts({ round: 5,
+      inCi: true, minutesSinceFixLoop: 0, fixerRunning: true, owner: leaseStore.read().owner })] });
+    const declaration = makeDeclaration({ readFacts });
+    const sinks = { 'lease.write': () => leaseStore.write({ ...lease, generation: 8 }),
+      'lease.release': () => leaseStore.release(), 'fixer.dispatch': dispatch };
+    const registry = createRegistry();
+    registry.register(declaration);
+    const store = createMemoryRunStore();
+    const run = startRun({ op: declaration.name, id: 'lease-safety-fixture', registry });
+    store.write(run);
+    const outcome = await driveRun({ run, registry, store, sinks, clock: () => NOW });
+    expect(outcome.stopped).toBe('complete');
+    const row = outcome.run.verdict.prs[0];
+    expect({ owner: row.nextOwner, judgment: row.needsJudgment, reason: row.reason })
+      .toEqual({ owner: 'judge', judgment: true, reason: 'at-cap' });
+    expect(leaseStore.read()).toEqual(lease);
     expect(leaseStore.write).not.toHaveBeenCalled();
     expect(leaseStore.release).not.toHaveBeenCalled();
     expect(dispatch).not.toHaveBeenCalled();
+  }
+  it('a capped PR with an active worker routes to judgment without competing dispatch', async () => {
+    await assertLeaseSafety();
   });
+  it.each(['lease.write', 'lease.release', 'fixer.dispatch'])(
+    'the safety fixture detects a real %s effect through the production executor', async type => {
+      const unsafeDeclaration = ({ readFacts }) => op('judge-sweep-facts', {
+        verdictFrom: 'bundle',
+        read: compute({ reads: [], fn: readFacts }),
+        bundle: compute({ reads: ['findings.read'], fn: ({ findings }) => buildJudgeSweepBundle(findings.read) }),
+        unsafe: effect({ reads: [], effects: () => [{ type, payload: {}, idempotent: true }] }),
+      });
+      await expect(assertLeaseSafety(unsafeDeclaration)).rejects.toThrow();
+    });
 });
 
 // Acceptance and merge admission end the repair episode; stale cap evidence must not reopen it.
