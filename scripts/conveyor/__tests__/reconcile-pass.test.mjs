@@ -1299,7 +1299,7 @@ describe('failed CI step timeout attribution', () => {
       if (!Object.hasOwn(data, path)) throw new Error(`Unexpected attribution fixture read: ${path}`);
       return typeof data[path] === 'string' ? data[path] : JSON.stringify(data[path]);
     });
-    return { data, pr, exec, collect: () => readTimeoutEvidence(pr, { repo, exec, ts: timeoutTs }) };
+    return { data, pr, exec, collect: () => readTimeoutEvidence(pr, { repo, exec, ts: timeoutTs, clock: () => Date.parse(at(50)) }) };
   }
 
   it('passing-step timeout followed by unrelated failed step is ineligible', () => {
@@ -1443,9 +1443,13 @@ it('xng7q1p immutable GitHub reads feed enrichment → planner without checkout-
     [`${prefix}/commits/${head}/check-runs?per_page=100&page=1&filter=latest`]: {
       total_count: 1, check_runs: [{status:'completed',conclusion:'failure',details_url:`https://github.com/${repo}/actions/runs/10/job/20`}] },
     [`${prefix}/commits/${head}/status`]: { total_count: 0 },
-    [`${prefix}/actions/jobs/20`]: {id:20,run_id:10,head_sha:head,run_attempt:1,status:'completed',conclusion:'failure'},
+    [`${prefix}/actions/jobs/20`]: {id:20,run_id:10,head_sha:head,run_attempt:1,status:'completed',conclusion:'failure',
+      steps: [{ number: 1, name: 'Unit tests', status: 'completed', conclusion: 'failure',
+        started_at: '2026-11-24T12:00:00Z', completed_at: '2026-11-24T12:00:10Z' }] },
     [`${prefix}/actions/runs/10`]: {id:10,head_sha:head,run_attempt:1,repository:{full_name:repo},path:'.github/workflows/ci.yml'},
-    [`${prefix}/actions/jobs/20/logs`]: log,
+    [`${prefix}/actions/jobs/20/logs`]: '2026-11-24T12:00:00Z Starting job\n'
+      + log.trimEnd().split('\n').map(line => `2026-11-24T12:00:05Z ${line}\n`).join('')
+      + '2026-11-24T12:00:10Z Complete job\n',
     [`${prefix}/git/trees/${head}?recursive=1`]: {truncated:false,tree:Object.keys(sources).map((path,i)=>({type:'blob',path,sha:`blob${i}`}))},
   };
   Object.values(sources).forEach((source, i) => { data[`${prefix}/git/blobs/blob${i}`] = {encoding:'base64',content:Buffer.from(source).toString('base64')}; });
@@ -1458,7 +1462,7 @@ it('xng7q1p immutable GitHub reads feed enrichment → planner without checkout-
   };
   const pr = { number:3415,headRefOid:head,state:'OPEN',labels:[],statusCheckRollup:[{
     name:'test',status:'COMPLETED',conclusion:'FAILURE',detailsUrl:`https://github.com/${repo}/actions/runs/10/job/20`}] };
-  const prs = enrichPrsWithTimeoutEvidence([pr], {repo,enabled:true,readBudget: () => ({ confirmed: 0, pending: false }),read:(p,o)=>readTimeoutEvidence(p,{...o,exec,ts:timeoutTs})});
+  const prs = enrichPrsWithTimeoutEvidence([pr], {repo,enabled:true,readBudget: () => ({ confirmed: 0, pending: false }),read:(p,o)=>readTimeoutEvidence(p,{...o,exec,ts:timeoutTs,clock:()=>Date.parse('2026-11-24T12:00:50Z')})});
   expect(timeoutPlanReconcile({prs,requiredChecks:['test']}).dispatch[0].kind).toBe('ci-timeout-rerun');
   expect(calls.filter((p)=>p===`${prefix}/pulls/3415`)).toHaveLength(2);
   data[`${prefix}/pulls/3415`].changed_files = 101;
@@ -1677,7 +1681,7 @@ it('xe8y12n real PR read shell enriches the reported missing-family shape from c
 // still planned. Every other path (a non-conflicting PR, a real read error, observed evidence) still refuses/reads.
 describe('conflicting head: missing required checks are expected (#3771)', () => {
   const real = async () => (await import('node:fs')).readFileSync(
-    (await import('node:path')).join(process.cwd(), 'scripts/conveyor/__tests__/fixtures/pr-3771-conflicting-no-ci.json'), 'utf8');
+    new NodeURL('./fixtures/pr-3771-conflicting-no-ci.json', import.meta.url), 'utf8');
   const livePr = async (patch = {}) => ({ ...JSON.parse(await real()), ...patch });
   const opts = (pr, readChecks) => ({ ...xxOptions(), readPrs: () => [pr], readChecks,
     enrichFixClaims: p => p, enrichTimeouts: p => p, enrichReferralHolds: p => p });
@@ -2471,11 +2475,11 @@ it('runs the file-based synchronous pool with real child processes and cleans it
   const { mkdtempSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const lockRoot = mkdtempSync(evidenceJoin(tmpdir(), 'timeout-pool-throttle-'));
-  const { spawn, execFileSync: realExec } = await vi.importActual('node:child_process');
-  const groupAlive = pid => realExec('ps', ['-axo', 'pgid=,stat='], { encoding: 'utf8' }).split('\n').some(line => {
-    const [group, state] = line.trim().split(/\s+/);
-    return Number(group) === pid && state && !state.startsWith('Z');
-  });
+  const { spawn } = await vi.importActual('node:child_process');
+  // This fixture launches only our leaf workers. Process-table enumeration is a
+  // separate liveness contract; inject it here rather than inspecting the host.
+  const groupAlive = vi.fn(() => false);
+  const workerPids = [];
   let folder;
   const launch = (node, args, opts) => {
     folder = evidenceJoin(args.at(-1), '..');
@@ -2484,14 +2488,18 @@ it('runs the file-based synchronous pool with real child processes and cleans it
       const { pr } = JSON.parse(readFileSync(input, 'utf8'));
       writeFileSync(output + '.tmp', JSON.stringify({ eligible: true, number: pr.number }));
       renameSync(output + '.tmp', output); ${keepAliveScript({ maxLifetimeMs: 10_000 })}`;
-    return spawn(process.execPath, ['--input-type=module', '-e', script, ...args.slice(-2)], opts);
+    const child = spawn(process.execPath, ['--input-type=module', '-e', script, ...args.slice(-2)], opts);
+    workerPids.push(child.pid);
+    return child;
   };
   try {
     expect(runTimeoutEvidencePool([{ number: 1 }, { number: 2 }, { number: 3 }], {
-      launch, groupAlive, concurrency: 2, deadlineMs: 3000,
+      launch, groupAlive, probe: () => true, concurrency: 2, deadlineMs: 3000,
       env: { ...process.env, WE_GH_THROTTLE_LOCK_ROOT: lockRoot, WE_GH_THROTTLE_CAP: '4' },
     })).toEqual([{ eligible: true, number: 1 }, { eligible: true, number: 2 }, { eligible: true, number: 3 }]);
     expect(evidenceExists(folder)).toBe(false);
+    expect(workerPids).toHaveLength(3);
+    expect(groupAlive.mock.calls).toEqual(workerPids.map(pid => [pid]));
   } finally { rmSync(lockRoot, { recursive: true, force: true }); }
 });
 
