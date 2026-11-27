@@ -26,8 +26,9 @@
  * `runWorker` takes every effect as an injectable (spawn, clock, record store, drafts sink, file reader, head probe),
  * so the tests run it against a fake child. The CLI at the bottom runs a JSON spec detached.
  */
-import { spawn } from 'node:child_process';
-import { appendFileSync, closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { appendFileSync, closeSync, constants, existsSync, fstatSync, fsyncSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -42,6 +43,118 @@ import { sanitizeSpawnEnv } from '../lib/gh-app-shim.mjs';
 import { withCodexUsage } from '../lib/codex-usage-ledger.mjs';
 import { spawnToCompletion } from '../lib/spawn-to-completion.mjs';
 import { markWorkerEnv } from './session-role.mjs';
+import { isLeaseStale } from '../lib/lane-lease.mjs';
+import { fenceUntrusted, FENCED_DATA_RULE } from '../lib/mandate-fence.mjs';
+
+// Opt-in milestone protocol. A checkpoint is evidence, never a completion record or a second admission path.
+const CHECKPOINT_MAX_BYTES = 64 * 1024;
+const repair = reason => new Error(`worker handoff incomplete: ${reason}; operator repair: inspect checkpoint, head and lease, then explicitly retry the task`);
+function checkpointGit(repo, args) {
+  return execFileSync('git', ['-C', repo, ...args], { encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024,
+    env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' },
+  }).trim();
+}
+
+export function workerCheckpointDescriptor(spec, io = {}) {
+  if (!spec?.contextHandoff?.runId || !spec.contextHandoff.leaseToken || !spec.cwd || !spec.specDir || !spec.sessionId || !isValidSessionSlug(spec.session)) throw repair('missing handoff identity');
+  const repo = resolve(spec.cwd);
+  const git = io.git ?? checkpointGit;
+  try {
+    const head = git(repo, ['rev-parse', 'HEAD']);
+    const ref = git(repo, ['symbolic-ref', '-q', 'HEAD']);
+    const gitDir = resolve(repo, git(repo, ['rev-parse', '--git-dir']));
+    if (!/^[a-f0-9]{40,64}$/.test(head) || !ref) throw repair('missing repository evidence');
+    return { v: 1, producer: 'we.worker-wrapper', repo, ref, head, gitDir, session: spec.session, sessionId: spec.sessionId,
+      runId: spec.contextHandoff.runId, leaseToken: spec.contextHandoff.leaseToken,
+      path: join(resolve(spec.specDir), `${spec.session}.checkpoint.json`) };
+  } catch { throw repair('repository evidence unreadable'); }
+}
+
+function validateCheckpointBinding(d, io = {}) {
+  const git = io.git ?? checkpointGit;
+  try {
+    if (git(d.repo, ['rev-parse', 'HEAD']) !== d.head || git(d.repo, ['symbolic-ref', '-q', 'HEAD']) !== d.ref) throw repair('head-changed');
+    if (resolve(d.repo, git(d.repo, ['rev-parse', '--git-dir'])) !== d.gitDir) throw repair('untrusted-input-path');
+    const lease = JSON.parse(readBoundedResultFile(join(d.gitDir, '.lane-lease'), CHECKPOINT_MAX_BYTES));
+    const now = (io.nowMs ?? Date.now)();
+    if (!Number.isFinite(now) || lease.holder !== d.leaseToken || Date.parse(lease.acquiredAt) > now || isLeaseStale(lease, now)) throw repair('lease stale or replaced');
+  } catch (e) { throw repair(`head/lease validation refused (${e.message})`); }
+}
+
+function validateCheckpoint(state, d) {
+  for (const key of ['v', 'producer', 'repo', 'ref', 'head', 'session', 'sessionId', 'runId', 'leaseToken']) {
+    if (state?.[key] !== d[key]) throw repair(`checkpoint ${key} mismatch`);
+  }
+  if (!Number.isSafeInteger(state.sequence) || state.sequence < 1 || typeof state.task !== 'string' || !state.task || typeof state.step !== 'string' || !state.step || typeof state.rollover !== 'boolean') throw repair('required evidence missing');
+  for (const key of ['completed', 'pending', 'decisions', 'artifacts']) if (!Array.isArray(state[key]) || !state[key].every(x => typeof x === 'string')) throw repair(`required evidence missing: ${key}`);
+  if (!Array.isArray(state.checks) || !state.checks.every(x => typeof x?.command === 'string' && typeof x.result === 'string')) throw repair('required evidence missing: checks');
+  return state;
+}
+
+export function readWorkerCheckpoint(descriptor, io = {}) {
+  validateCheckpointBinding(descriptor, io);
+  try { return validateCheckpoint(JSON.parse(readBoundedResultFile(descriptor.path, CHECKPOINT_MAX_BYTES)), descriptor); }
+  catch (e) { throw repair(`checkpoint refused (${e.message})`); }
+}
+
+function atomicHandoffWrite(path, value, renameFile = renameSync) {
+  const text = JSON.stringify(value);
+  if (Buffer.byteLength(text) > CHECKPOINT_MAX_BYTES) throw repair('oversized evidence');
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  try {
+    const fd = openSync(temporary, 'wx', 0o600);
+    try { writeFileSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
+    renameFile(temporary, path);
+    const dir = openSync(dirname(path), 'r');
+    try { fsyncSync(dir); } finally { closeSync(dir); }
+  } finally { rmSync(temporary, { force: true }); }
+}
+
+export function checkpointWorkerMilestone(milestone, io = {}) {
+  const descriptor = io.descriptor ?? JSON.parse(process.env.WE_WORKER_CHECKPOINT ?? 'null');
+  if (!descriptor) throw repair('missing checkpoint descriptor');
+  validateCheckpointBinding(descriptor, io);
+  let previous;
+  try {
+    const snapshot = JSON.parse(readBoundedResultFile(descriptor.path, CHECKPOINT_MAX_BYTES));
+    const expected = descriptor.previousSessionId && snapshot?.sessionId === descriptor.previousSessionId
+      ? { ...descriptor, sessionId: descriptor.previousSessionId } : descriptor;
+    previous = validateCheckpoint(snapshot, expected);
+  } catch (e) { if (e.code !== 'ENOENT') throw repair(`checkpoint refused (${e.message})`); }
+  if (!Number.isSafeInteger(milestone.sequence) || milestone.sequence <= (previous?.sequence ?? 0)) throw repair('duplicate or reordered sequence');
+  const { path: _path, gitDir: _gitDir, previousSessionId: _previous, ...identity } = descriptor;
+  const state = validateCheckpoint({ ...milestone, ...identity }, descriptor);
+  atomicHandoffWrite(descriptor.path, state, io.renameFile);
+  return state;
+}
+
+function handoffAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (e) { if (e.code === 'ESRCH') return false; throw repair('process liveness unknown'); }
+}
+
+export function claimWorkerSupervisor(spec, io = {}) {
+  const d = workerCheckpointDescriptor(spec, io);
+  validateCheckpointBinding(d, io);
+  const path = join(spec.specDir, `${spec.session}.handoff.json`);
+  const lock = `${path}.lock`;
+  try { mkdirSync(lock); } catch { throw repair('supervisor claim busy'); }
+  try {
+    let previous;
+    try { previous = JSON.parse(readBoundedResultFile(path, CHECKPOINT_MAX_BYTES)); } catch (e) { if (e.code !== 'ENOENT') throw repair('supervisor claim unreadable'); }
+    if (previous) {
+      if (previous.runId !== d.runId || previous.leaseToken !== d.leaseToken || !Number.isSafeInteger(previous.ownerPid) || previous.ownerPid <= 0) throw repair('supervisor claim identity unknown');
+      const alive = io.isAlive ?? handoffAlive;
+      if (alive(previous.ownerPid)) throw repair('supervisor still alive');
+      if (previous.phase === 'spawning') throw repair('ambiguous launch');
+      if (previous.childPid && alive(previous.childPid)) throw repair('child still alive');
+      if (!['claimed', 'running'].includes(previous.phase)) throw repair('supervisor already completed or unknown');
+      readWorkerCheckpoint(d, io);
+    }
+    const claim = { v: 1, runId: d.runId, leaseToken: d.leaseToken, token: randomUUID(), ownerPid: io.selfPid ?? process.pid, phase: 'claimed', childPid: null, recovered: Boolean(previous) };
+    atomicHandoffWrite(path, claim);
+    return claim;
+  } finally { rmSync(lock, { recursive: true }); }
+}
 
 /** The knob. `WE_WORKER_WRAPPER=on` routes a migrated launcher through this wrapper; anything else is the old path, byte for byte. */
 export const WORKER_WRAPPER_ENV = 'WE_WORKER_WRAPPER';
@@ -239,8 +352,17 @@ export async function runWorker(spec, io = {}) {
     stop.forward?.(sig);
   };
   for (const sig of OPERATOR_STOP_SIGNALS) stopSource.on(sig, onStop);
+  let handoff;
   try {
-    return await runWorkerOnce(spec, io, stop);
+    if (spec.contextHandoff) {
+      const descriptor = workerCheckpointDescriptor(spec, io);
+      const claim = claimWorkerSupervisor(spec, io);
+      handoff = { descriptor, claim, path: join(spec.specDir, `${spec.session}.handoff.json`) };
+      if (claim.recovered) throw repair('recovered supervisor requires explicit checkpoint continuation');
+    }
+    const result = await runWorkerOnce(spec, { ...io, handoff }, stop);
+    if (handoff) atomicHandoffWrite(handoff.path, { ...handoff.claim, phase: 'completed', childPid: null });
+    return result;
   } finally {
     for (const sig of OPERATOR_STOP_SIGNALS) stopSource.off(sig, onStop);
     // Our handler swallowed the signal, and runWorker can run in a long-lived process (the in-process build path): once the envelope is
@@ -303,7 +425,12 @@ async function runWorkerOnce(spec, io, stop) {
   // The job record: written the moment the child has a pid (the spawn seam below), before it can finish.
   let graceTimer = null;
   const spawnWithPid = (cmd, argv, opts) => {
+    if (io.handoff) atomicHandoffWrite(io.handoff.path, { ...io.handoff.claim, phase: 'spawning' });
     const child = spawnFn(cmd, argv, opts);
+    if (io.handoff) {
+      io.handoff.claim = { ...io.handoff.claim, phase: 'running', childPid: child?.pid ?? null };
+      atomicHandoffWrite(io.handoff.path, io.handoff.claim);
+    }
     // Opt-in smoke evidence: persist the first byte time and stderr while the worker is still running.
     if (spec.diagnosticsDir) {
       let first = true;
@@ -383,7 +510,7 @@ async function runWorkerOnce(spec, io, stop) {
       const launch = () => spawnToCompletionFn(spec.command, argv, {
         // EVERY launch path gets the same env hygiene (a static GH_TOKEN stripped, the worker marker set), not just the callers that
         // happen to pass a sanitising spawn: the detached CLI and any future launcher inherit it here.
-        cwd: spec.cwd, env: markWorkerEnv(sanitizeSpawnEnv(spec.env ?? process.env)), timeout: Math.max(1, deadlineMs - clock()), killSignal: 'SIGKILL',
+        cwd: spec.cwd, env: markWorkerEnv(sanitizeSpawnEnv({ ...(spec.env ?? process.env), ...(io.handoff ? { WE_WORKER_CHECKPOINT: JSON.stringify(io.handoff.descriptor) } : {}) })), timeout: Math.max(1, deadlineMs - clock()), killSignal: 'SIGKILL',
         stdio: ['ignore', 'pipe', 'pipe'], // stdin closed: codex hangs on an open pipe (S0)
       }, { spawnFn: spawnWithPid });
       const out = spec.launcher === 'codex-exec' ? await withCodexUsage({ model: spec.model ?? (argv.includes('-m') ? argv[argv.indexOf('-m') + 1] : null), effort: spec.effort ?? argv.find(a => a.startsWith('model_reasoning_effort='))?.split('=')[1], taskKind: spec.taskKind ?? spec.role, caller: 'worker-wrapper.mjs', repo: spec.repo, pr: spec.pr, card: spec.item, cwd: spec.cwd }, launch, { env: spec.env ?? process.env }) : await launch();
@@ -395,6 +522,36 @@ async function runWorkerOnce(spec, io, stop) {
     if (started.pid == null) withCompletionLock(spec.session, () => writeRecord(started, dir), { dir });
   };
   await run(spec.argv ?? []);
+
+  // The old process has exited before continuation is even considered. Never launch two lane writers.
+  if (io.handoff) {
+    let sequence = 0;
+    let rollovers = 0;
+    while (!failure && !isOperatorStop()) {
+      const checkpoint = readWorkerCheckpoint(io.handoff.descriptor, io);
+      if (checkpoint.sequence <= sequence) throw repair('duplicate or reordered sequence');
+      sequence = checkpoint.sequence;
+      if (!checkpoint.rollover) break;
+      if (++rollovers > MAX_AWAIT_RESUMES || clock() >= deadlineMs) throw repair('continuation budget exceeded');
+      const sessionId = randomUUID();
+      const argv = [...spec.argv];
+      if (argv.includes('--resume') || !argv.includes('--session-id')) throw repair('fresh session argv required');
+      argv[argv.indexOf('--session-id') + 1] = sessionId;
+      argv[argv.length - 1] = `${spec.argv.at(-1)}\nContinue the pending work using this checkpoint as evidence.\n${FENCED_DATA_RULE}\n${fenceUntrusted('material', JSON.stringify(checkpoint))}`;
+      // Keep the prior durable record until the fresh worker produces its next milestone.
+      const previousDescriptor = io.handoff.descriptor;
+      io.handoff.descriptor = { ...previousDescriptor, sessionId, previousSessionId: previousDescriptor.sessionId };
+      spec = { ...spec, sessionId };
+      started = { ...started, sessionId, pid: null };
+      stop.live = true;
+      await run(argv);
+      if (!failure && !isOperatorStop()) {
+        const raw = JSON.parse(readBoundedResultFile(previousDescriptor.path, CHECKPOINT_MAX_BYTES));
+        const latest = readWorkerCheckpoint(raw.sessionId === previousDescriptor.sessionId ? previousDescriptor : io.handoff.descriptor, io);
+        if (latest.sequence === sequence) break;
+      }
+    }
+  }
 
   // 117 S3b regression 2026-10-08: an ended print-mode turn leaves the wrapper alive for harness verification.
   // Set while the LAST turn ended awaiting a verdict that never reached this wrapper (see `verifyUnfinishedResult`).

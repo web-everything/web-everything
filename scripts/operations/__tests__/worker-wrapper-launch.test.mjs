@@ -81,7 +81,8 @@ describe('launchWrappedClaudeWorker', () => {
   it('passes the context handoff contract through the existing guarded launch seam', () => {
     const launch = vi.fn(() => ({ wrapperPid: 123 }));
     const contextHandoff = { runId: 'attempt-1', leaseToken: 'holder-1' };
-    const options = { role: 'fix', session: 'fix-12', bgArgv: ['--bg', 'TASK'], cwd: tmp(), env: {}, contextHandoff, launch };
+    const cwd = tmp();
+    const options = { role: 'fix', session: 'fix-12', sessionId: SESSION_ID, bgArgv: ['--bg', 'TASK'], cwd, specDir: cwd, env: {}, allowRealSentinel: false, contextHandoff, launch };
     const refused = launchWrappedClaudeWorker(options);
     expect(refused.refused).toBeTruthy();
     expect(launch).not.toHaveBeenCalled();

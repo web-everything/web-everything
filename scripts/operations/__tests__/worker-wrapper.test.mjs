@@ -7,8 +7,8 @@ import { EventEmitter } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import * as handoff from '../worker-wrapper.mjs';
+import { fileURLToPath, URL as NodeURL } from 'node:url';
+import * as handoffModule from '../worker-wrapper.mjs';
 import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -44,13 +44,21 @@ const read = (s) => tryReadCompletion(s.session, s.completionsDir);
 
 describe('worker context handoff', () => {
   const sessionId = '12345678-1234-4234-8234-123456789abc';
+  const nowMs = () => Date.parse('2026-11-26T12:00:00Z');
+  const handoff = {
+    ...handoffModule,
+    checkpointWorkerMilestone: (milestone, io) => handoffModule.checkpointWorkerMilestone(milestone, { nowMs, ...io }),
+    readWorkerCheckpoint: (descriptor, io) => handoffModule.readWorkerCheckpoint(descriptor, { nowMs, ...io }),
+    claimWorkerSupervisor: (s, io) => handoffModule.claimWorkerSupervisor(s, { nowMs, selfPid: 456, isAlive: pid => pid === 456, ...io }),
+  };
   function fixture() {
     const cwd = tmp();
-    execFileSync('git', ['init', '-q', cwd]);
-    execFileSync('git', ['-C', cwd, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '--allow-empty', '-qm', 'fixture']);
-    const lease = { holder: 'holder-1', acquiredAt: new Date().toISOString(), ttlMinutes: 60 };
+    const env = { HOME: cwd, TMPDIR: tmpdir(), GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_AUTHOR_DATE: '2026-11-26T12:00:00Z', GIT_COMMITTER_DATE: '2026-11-26T12:00:00Z' };
+    execFileSync('git', ['init', '-q', cwd], { env });
+    execFileSync('git', ['-C', cwd, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '--allow-empty', '-qm', 'fixture'], { env });
+    const lease = { holder: 'holder-1', acquiredAt: new Date(nowMs()).toISOString(), ttlMinutes: 60 };
     writeFileSync(join(cwd, '.git', '.lane-lease'), JSON.stringify(lease));
-    const s = spec({ cwd, sessionId, specDir: join(cwd, 'specs'), contextHandoff: { runId: 'attempt-1', leaseToken: 'holder-1' } });
+    const s = spec({ cwd, env, sessionId, specDir: join(cwd, 'specs'), contextHandoff: { runId: 'attempt-1', leaseToken: 'holder-1' } });
     mkdirSync(s.specDir);
     const descriptor = handoff.workerCheckpointDescriptor(s);
     const milestone = { task: '4001', step: 'tests', sequence: 1, completed: ['red'], pending: ['implement'], checks: [{ command: 'fixture check', result: 'failed' }], decisions: [], artifacts: ['evidence.json'], rollover: true };
@@ -60,18 +68,19 @@ describe('worker context handoff', () => {
   it('context rollover launches exactly one fresh worker from the latest durable milestone', async () => {
     const { s } = fixture();
     const script = join(s.cwd, 'worker.mjs');
-    const entry = fileURLToPath(new URL('../worker-wrapper.mjs', import.meta.url));
+    const entry = fileURLToPath(new NodeURL('../worker-wrapper.mjs', import.meta.url));
     writeFileSync(script, `import { checkpointWorkerMilestone } from ${JSON.stringify(entry)};
 const context = JSON.parse(process.env.WE_WORKER_CHECKPOINT);
 if (context.sessionId === ${JSON.stringify(sessionId)}) {
-  for (const sequence of [1, 2]) checkpointWorkerMilestone({ task: '4001', step: 'milestone-' + sequence, sequence, completed: ['work-' + sequence], pending: ['finish'], checks: [{ command: 'fixture', result: 'green' }], decisions: [], artifacts: [], rollover: sequence >= 2 });
+  for (const sequence of [1, 2]) checkpointWorkerMilestone({ task: '4001', step: 'milestone-' + sequence, sequence, completed: ['work-' + sequence], pending: ['finish'], checks: [{ command: 'fixture', result: 'green' }], decisions: [], artifacts: [], rollover: sequence >= 2 }, { nowMs: () => ${nowMs()} });
 } else {
   if (!process.argv.at(-1).includes('work-2')) throw Error('lost latest milestone');
 }
 process.stdout.write(${JSON.stringify(claudeStdout(DONE))});`);
     const writes = [];
     const result = await runWorker({ ...s, argv: [script, '--session-id', sessionId, 'Disposable task'] }, {
-      head: () => execFileSync('git', ['-C', s.cwd, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
+      nowMs, now: () => new Date(nowMs()).toISOString(), awaitingVerify: () => null, selfPid: 456,
+      head: () => execFileSync('git', ['-C', s.cwd, 'rev-parse', 'HEAD'], { encoding: 'utf8', env: s.env }).trim(),
       writeRecord: (rec, dir) => { writes.push(structuredClone(rec)); return writeCompletion(rec, dir); },
     });
     const starts = writes.filter(r => r.status === 'started');
@@ -81,6 +90,32 @@ process.stdout.write(${JSON.stringify(claudeStdout(DONE))});`);
     expect(result.envelope.outcome).toBe('done');
     expect(JSON.parse(readFileSync(join(s.specDir, `${s.session}.checkpoint.json`))).sequence).toBe(2);
     expect(() => handoff.claimWorkerSupervisor(s)).toThrow(/operator repair/);
+  });
+
+  it('continuation worker writes two successive milestones across the session transition', () => {
+    const cwd = tmp();
+    const gitDir = join(cwd, '.git');
+    mkdirSync(gitDir);
+    writeFileSync(join(gitDir, '.lane-lease'), JSON.stringify({ holder: 'holder-1', acquiredAt: new Date(nowMs()).toISOString(), ttlMinutes: 60 }));
+    const git = (repo, args) => {
+      expect(repo).toBe(cwd);
+      const responses = { 'rev-parse HEAD': 'a'.repeat(40), 'symbolic-ref -q HEAD': 'refs/heads/fixture', 'rev-parse --git-dir': gitDir };
+      if (!Object.hasOwn(responses, args.join(' '))) throw Error('unexpected git probe');
+      return responses[args.join(' ')];
+    };
+    const io = { git, nowMs };
+    const descriptor = handoff.workerCheckpointDescriptor({ cwd, specDir: cwd, session: 'build-fixture', sessionId, contextHandoff: { runId: 'attempt-1', leaseToken: 'holder-1' } }, io);
+    const milestone = { task: 'fixture', step: 'initial', sequence: 1, completed: [], pending: ['continue'], checks: [], decisions: [], artifacts: [], rollover: true };
+    handoff.checkpointWorkerMilestone(milestone, { ...io, descriptor });
+    const continuation = { ...descriptor, previousSessionId: sessionId, sessionId: '22345678-1234-4234-8234-123456789abc' };
+    for (const sequence of [2, 3]) {
+      handoff.checkpointWorkerMilestone({ ...milestone, sequence, step: `continued-${sequence}`, rollover: false }, { ...io, descriptor: continuation });
+      expect(handoff.readWorkerCheckpoint(continuation, io)).toMatchObject({ sessionId: continuation.sessionId, sequence, step: `continued-${sequence}` });
+    }
+    expect(() => handoff.checkpointWorkerMilestone({ ...milestone, sequence: 3 }, { ...io, descriptor: continuation })).toThrow(/sequence/);
+    const durable = JSON.parse(readFileSync(descriptor.path, 'utf8'));
+    writeFileSync(descriptor.path, JSON.stringify({ ...durable, sessionId: 'unrelated-session' }));
+    expect(() => handoff.checkpointWorkerMilestone({ ...milestone, sequence: 4 }, { ...io, descriptor: continuation })).toThrow(/sessionId.*operator repair/);
   });
 
   it('atomic rename failure preserves the previous durable milestone', () => {

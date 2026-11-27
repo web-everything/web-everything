@@ -135,7 +135,7 @@ export function requestWrappedResume({ session, prompt, specDir = defaultWorkerS
  * @returns {{handle: string, wrapperPid: number|null, sessionId: string, argv: string[]}}
  */
 export function launchWrappedClaudeWorker({
-  role, session, bgArgv, cwd, env = process.env, pr = null, item = null, model = null, route = null,
+  role, session, bgArgv, cwd, env = process.env, pr = null, item = null, model = null, route = null, contextHandoff,
   sessionId = randomUUID(), specDir = defaultWorkerSpecDir(), launch = launchDetached,
   allowRealSentinel = resolveSmokeRealWorker({ env }).allowSentinel,
 } = {}) {
@@ -160,6 +160,7 @@ export function launchWrappedClaudeWorker({
   const { wrapperPid } = launch({
     role, launcher: 'claude-p', session, command: 'claude', argv, cwd, env, timeoutMs: wrappedTimeoutMs(role, env),
     model, pr: pr == null ? null : String(pr), item: item == null || item === '' ? null : String(item), sessionId,
+    ...(contextHandoff ? { contextHandoff } : {}),
     legacyFromCompletion: true, preserveLegacyWords: true, route: { provider: route.provider, fallbackProvider: route.fallbackProvider ?? null, reason: route.reason ?? null },
   }, { specDir });
   return { handle: Number.isInteger(wrapperPid) ? `pid:${wrapperPid}` : null, wrapperPid: Number.isInteger(wrapperPid) ? wrapperPid : null, sessionId, argv };

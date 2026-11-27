@@ -328,6 +328,7 @@
     "scripts/operations/stale-state-io.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
     "scripts/operations/start-build.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
     "scripts/operations/sweep-orphan-backlog-cards.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":9},
+    "scripts/operations/worker-wrapper.mjs": {"status":"pending-migration","reason":"Checkpoint handoff repository evidence: seven unresolved sites comprise the checkpointGit execFileSync executor and six injected git calls reading HEAD, symbolic HEAD ref and git-dir during descriptor creation and binding validation. Current callers are read-only; dynamic repo/argv and injected helper calls require explicit review.","sites":7},
     "scripts/operations/urgent-sweep.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":4},
     "scripts/operations/urgent-verify.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":3},
     "scripts/pr-status.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":5},
