@@ -58,7 +58,7 @@ import {
   runConflictWatchCli,
 } from '../parked-pr-conflict-watch.mjs';
 import { buildOperatorAnswer } from '../stand-down-answer-core.mjs';
-import { CONFLICT_FIX_COMMENT_MARKER } from '../conflict-fix-round-count.mjs';
+import { CONFLICT_FIX_COMMENT_MARKER, conflictFixBudget } from '../conflict-fix-round-count.mjs';
 import {
   STAND_DOWN_MARKER, WATCHER_STAND_DOWN_ACTOR, SUPERSEDE_STAND_DOWN_MARKER, buildStandDownComment,
 } from '../stand-down.mjs';
@@ -188,10 +188,7 @@ describe('BLD-8110 watcher/reconcile target budget replay', () => {
     expect(out.events.slice(-3)).toEqual(['state', 'comments', 'state']);
   });
 
-  it.each(['BEHIND', 'DIRTY'])('stacked rebase holds ambiguous same-target history without a conflict label (%s)', mergeStateStatus => {
-    const root = mkdtempSync(join(tmpdir(), 'bld-8110-stacked-'));
-    const path = join(root, 'pr.json');
-    const cwd = vi.spyOn(process, 'cwd').mockReturnValue(root);
+  it.each(['BEHIND', 'DIRTY'])('stacked rebase refuses ambiguous history without a conflict label or CONFLICTING mergeability (%s)', mergeStateStatus => {
     const target = 'lane/fixture-base';
     const pr = {
       number: 8110, state: 'OPEN', headRefName: 'lane/fixture-stacked', headRefOid: sha('e'),
@@ -205,25 +202,29 @@ describe('BLD-8110 watcher/reconcile target budget replay', () => {
           + `<!-- conveyor-conflict-fix-target: ${target}@ddddddd -->`,
       })),
     };
-    try {
-      writeFileSync(path, JSON.stringify(pr));
-      const out = planReconcile({
-        repo: 'fixture/repo', prs: [JSON.parse(readFileSync(path, 'utf8'))], agents: [], now,
-        mainSha: sha('a'), requiredChecks: ['gate'], reviewTiming: { startAfter: 'ci-green' },
-        reviewLabelHeal: 'off', ciHealBudget: { cap: 3, resetOnFixHead: false },
-        ciHealBudgetRestore: { value: false }, verdictSettings: {}, codeqlOwnBudget: { value: false },
-        shadowDeps: { mode: 'off' }, operatorRulingExtraRounds: { value: 0 },
-        roundExtensionAnchor: { value: false },
-      });
-      expect(out.dispatch).toEqual([]);
-      expect(out.refusals).toMatchObject([{
-        kind: 'conflict-evidence-unreadable', phase: 'conflicted',
-        why: expect.stringMatching(/target history ambiguous.*person/),
-      }]);
-    } finally {
-      cwd.mockRestore();
-      rmSync(root, { recursive: true, force: true });
-    }
+    // Pin the entry path: the earlier label/mergeability guard cannot protect
+    // this PR, and a held budget must never be interpreted as available rounds.
+    expect(pr.labels).not.toContainEqual({ name: CONFLICT_LABEL });
+    expect(pr.mergeable).toBe('UNKNOWN');
+    expect(conflictFixBudget(pr.comments, {
+      currentRef: target, currentSha: pr.baseRefSha,
+    })).toMatchObject({
+      hold: expect.stringMatching(/target history ambiguous.*person/),
+      stale: null, total: null, exhausted: false,
+    });
+    const out = planReconcile({
+      repo: 'fixture/repo', prs: [pr], agents: [], now,
+      mainSha: sha('a'), requiredChecks: ['gate'], reviewTiming: { startAfter: 'ci-green' },
+      reviewLabelHeal: 'off', ciHealBudget: { cap: 3, resetOnFixHead: false },
+      ciHealBudgetRestore: { value: false }, verdictSettings: {}, codeqlOwnBudget: { value: false },
+      shadowDeps: { mode: 'off' }, operatorRulingExtraRounds: { value: 0 },
+      roundExtensionAnchor: { value: false },
+    });
+    expect(out.dispatch).toEqual([]);
+    expect(out.refusals).toMatchObject([{
+      kind: 'conflict-evidence-unreadable', phase: 'conflicted',
+      why: expect.stringMatching(/target history ambiguous.*person/),
+    }]);
   });
 
   it('lifetime ceiling still escalates', () => {

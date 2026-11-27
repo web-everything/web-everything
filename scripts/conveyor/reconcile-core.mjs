@@ -4047,6 +4047,12 @@ export function planReconcile({
       const baseRefName = pr?.baseRefName ?? null;
       const isStackedBase = Boolean(baseRefName) && baseRefName !== defaultBranch;
       if (isStackedBase) {
+        // BEHIND/DIRTY can enter this path without a conflict label or a
+        // CONFLICTING mergeable result. Ambiguous history still cannot grant a round.
+        if (conflictBudget.hold) {
+          refuse('conflict-evidence-unreadable', { ...withPhase, why: conflictBudget.hold });
+          continue;
+        }
         // #2787-live-incident — see {@link CONFLICT_FIX_ABSOLUTE_CEILING}'s own docblock: `currentRef` is this
         // PR's OWN stacked base (never `defaultBranch` here, by construction of `isStackedBase`); a round
         // resolved against an EARLIER tip of that same base (rebased since, or a wholly different base this PR
