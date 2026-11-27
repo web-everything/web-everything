@@ -82,14 +82,15 @@ describe('laneGuardDecision — Standards-owned paths', () => {
       { sessionRole: 'orchestrator' })).toBeNull();
   });
 
-  const runHook = (marker, file = target) => spawnSync(process.execPath, [path.join(here, '../guard-lane.mjs')], {
+  const runHook = (marker, file = target, optOut = false, toolName = 'Edit', root = weRoot) => spawnSync(process.execPath, [path.join(here, '../guard-lane.mjs')], {
     cwd: ws,
     env: {
-      HOME: ws, TMPDIR: ws, WE_HOOK_ROOT: weRoot,
+      HOME: ws, TMPDIR: ws, WE_HOOK_ROOT: root,
       WE_DAEMON_OVERLAY_DIR: path.join(ws, 'overlay-state'),
+      ...(optOut ? { LANE_GUARD_OFF: '1' } : {}),
       ...(marker === undefined ? {} : { WE_CONVEYOR_WORKER: marker }),
     },
-    input: JSON.stringify({ tool_input: { file_path: file } }),
+    input: JSON.stringify({ tool_name: toolName, tool_input: { file_path: file } }),
     encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024,
   });
 
@@ -130,6 +131,84 @@ describe('laneGuardDecision — Standards-owned paths', () => {
     expect(result.error).toBeUndefined();
     expect(result.status, result.stderr).toBe(0);
     expect(result.stderr).toBe('');
+  });
+
+  // These spellings alias the protected directories on the live macOS filesystem. Only the
+  // filesystem can tell us its equivalence rules; keep portable runs explicit about skipped aliases.
+  const unicodeAliases = [
+    path.join(ws, '.operations/handoff/\u017ftandards'),
+    path.join(ws, '.operations/handoff/standard\u017f'),
+  ];
+  describe.each(unicodeAliases)('filesystem alias %s', (alias) => {
+    it.skipIf(!existsSync(alias))('CLI rejects identical directory inodes, existing files and new descendants', () => {
+      const canonicalStat = statSync(standards);
+      const aliasStat = statSync(alias);
+      expect([aliasStat.dev, aliasStat.ino]).toEqual([canonicalStat.dev, canonicalStat.ino]);
+      for (const marker of ['1', '0']) {
+        for (const suffix of ['', 'drafts/core/authority/x.md', 'new/deep/schema.json']) {
+          const file = path.join(alias, suffix);
+          const result = runHook(marker, file);
+          expect(result.error).toBeUndefined();
+          expect(result.status, `${file}: ${result.stderr}`).toBe(2);
+          expect(result.stderr).toMatch(/Standards-owned/);
+        }
+      }
+    });
+  });
+
+  it('CLI rejects multiple missing descendants below a symlink to a Standards subdirectory', () => {
+    const alias = path.join(ws, 'authority-alias');
+    symlinkSync(path.dirname(target), alias);
+    const result = runHook('1', path.join(alias, 'new/deep/schema.json'));
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(2);
+    expect(result.stderr).toMatch(/Standards-owned/);
+  });
+
+  it('CLI fails closed with proposal guidance when target ancestry cannot be resolved', () => {
+    const loop = path.join(ws, 'loop');
+    symlinkSync(loop, loop);
+    const result = runHook('1', path.join(loop, 'new/schema.json'), true);
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(2);
+    expect(result.stderr).toContain('handoff/designs/<id>-standards-request.md');
+  });
+
+  it('CLI fails closed when the protected directory identity cannot be read', () => {
+    const unreadableWorkspace = path.join(ws, 'unreadable-workspace');
+    const unreadableStandards = path.join(unreadableWorkspace, '.operations/handoff/standards');
+    mkdirSync(path.dirname(unreadableStandards), { recursive: true });
+    symlinkSync(unreadableStandards, unreadableStandards);
+    const result = runHook('0', path.join(unreadableWorkspace, 'probe.md'), true, 'Write',
+      path.join(unreadableWorkspace, 'webeverything'));
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(2);
+    expect(result.stderr).toContain('handoff/designs/<id>-standards-request.md');
+  });
+
+  it.each(['1', '0'])('CLI keeps Standards ownership enforced with lane opt-out for marker %s', (marker) => {
+    for (const toolName of ['Edit', 'Write']) {
+      for (const file of [target, path.join(standards, 'new/deep/schema.json'),
+        ...unicodeAliases.filter(existsSync).map((alias) => path.join(alias, 'new/deep/schema.json'))]) {
+        const result = runHook(marker, file, true, toolName);
+        expect(result.error).toBeUndefined();
+        expect(result.status, `${toolName} ${file}: ${result.stderr}`).toBe(2);
+        expect(result.stderr).toContain('handoff/designs/<id>-standards-request.md');
+      }
+    }
+  });
+
+  it('CLI preserves the lane opt-out for primary edits and allows orchestrator and sibling paths', () => {
+    for (const [marker, file] of [
+      ['1', path.join(weRoot, 'probe.md')],
+      [undefined, target],
+      ['1', path.join(ws, '.operations/handoff/standards-other/probe.md')],
+    ]) {
+      const result = runHook(marker, file, true);
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stderr).toBe('');
+    }
   });
 });
 
