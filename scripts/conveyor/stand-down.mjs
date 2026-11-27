@@ -777,7 +777,9 @@ export function buildStandDownComment({ actor = 'conveyor fix agent', reason = '
 
 // ── IO SHELL (runs only as a CLI — the pure exports above stay side-effect-free on import) ────────────────────────
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname);
-if (IS_CLI) {
+// Keep CLI-only loads inside a function so the deps job's startup syntax scan
+// does not traverse the dispatch-claim runtime when consumers import the rules.
+async function main() {
   const argv = process.argv.slice(2);
   const flags = {};
   const positionals = [];
@@ -873,3 +875,5 @@ if (IS_CLI) {
   }
   process.stdout.write(JSON.stringify({ ok: true, pr, stoodDown: !concurrent && !loadHold && !redispatch, paused: concurrent, loadFlakeHold: loadHold || redispatch, redispatch, labeled, dispatchClaimReleased }) + '\n');
 }
+
+if (IS_CLI) await main();
