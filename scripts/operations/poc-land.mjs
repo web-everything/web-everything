@@ -61,6 +61,7 @@ import { gitRun } from '../lib/git-run.mjs';
 import { readRegistry, findPocBranch, normalizeBranchRef, branchesForRepo, DEFAULT_POC_REPO } from '../lib/poc-branches.mjs';
 import { withPocLandLock, localRepoSlug } from '../readiness/drain-lock.mjs';
 import { createChecksRunner } from './verify-io.mjs';
+import { withLaneLeaseMutation } from '../lib/lane-lease-lock.mjs';
 import { LEASE_FILENAME, renewedLease } from '../lib/lane-lease.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 
@@ -214,20 +215,22 @@ export function defaultRenewLease({ cwd, run = gitRun, now = () => new Date(), f
     const gd = run('git', ['rev-parse', '--absolute-git-dir'], { cwd });
     if (gd.status !== 0) return false;
     const file = join(String(gd.stdout).trim(), LEASE_FILENAME);
-    if (!existsSync(file)) return false;
-    const next = renewedLease(JSON.parse(readFileSync(file, 'utf8')), now().toISOString());
-    if (!next) return false;
-    // Atomic temp+rename, the same shape as `we:scripts/lane-pool.mjs#writeLeaseAtomic`: a plain overwrite killed
-    // between its truncate and its write leaves a torn lease, which every reader treats as NO lease — making this
-    // lane reclaimable mid-landing, the very incident this renewal exists to prevent.
-    const tmp = `${file}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
-    try {
-      fs.writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { flag: 'wx' });
-      fs.renameSync(tmp, file);
-    } finally {
-      fs.rmSync(tmp, { force: true });
-    }
-    return true;
+    return withLaneLeaseMutation(file, () => {
+      if (!existsSync(file)) return false;
+      const next = renewedLease(JSON.parse(readFileSync(file, 'utf8')), now().toISOString());
+      if (!next) return false;
+      // Atomic temp+rename, the same shape as `we:scripts/lane-pool.mjs#writeLeaseAtomic`: a plain overwrite killed
+      // between its truncate and its write leaves a torn lease, which every reader treats as NO lease — making this
+      // lane reclaimable mid-landing, the very incident this renewal exists to prevent.
+      const tmp = `${file}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
+      try {
+        fs.writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { flag: 'wx' });
+        fs.renameSync(tmp, file);
+      } finally {
+        fs.rmSync(tmp, { force: true });
+      }
+      return true;
+    });
   } catch { return false; }
 }
 

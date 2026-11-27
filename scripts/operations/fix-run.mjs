@@ -47,6 +47,7 @@ import { PR_BASE_MERGE_TARGET, recordBorrowOutcome, recordRoutedOutcome, consecu
 import { appendFixLoopRow, isInfraFixRunOutcome, FIX_RUN_OUTCOME } from '../conveyor/fix-loop-ledger.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { riskyLaneConfig, LANE_CONFIG_LIST_ARGS, laneGitConfigArgs, laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
+import { withLaneLeaseMutation } from '../lib/lane-lease-lock.mjs';
 import { LEASE_FILENAME, renewedLease } from '../lib/lane-lease.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { openOperatorSendBacks } from '../lib/operator-send-backs.mjs';
@@ -500,20 +501,22 @@ export function readLaneLease(lanePath) {
 export function defaultRenewLease({ lanePath, holder } = {}) {
   try {
     const file = join(lanePath, '.git', LEASE_FILENAME);
-    const fd = nodeFs.openSync(file, 'r+');
-    try {
-      const previous = readFileSync(fd);
-      const lease = JSON.parse(previous.toString('utf8'));
-      if (!holder || lease?.holder !== holder) return false;
-      const next = renewedLease(lease, new Date().toISOString());
-      if (!next) return false;
-      const json = Buffer.from(`${JSON.stringify(next, null, 2)}\n`);
-      const contents = Buffer.alloc(Math.max(previous.length, json.length), 0x20);
-      json.copy(contents);
-      return nodeFs.writeSync(fd, contents, 0, contents.length, 0) === contents.length;
-    } finally {
-      nodeFs.closeSync(fd);
-    }
+    return withLaneLeaseMutation(file, () => {
+      const fd = nodeFs.openSync(file, 'r+');
+      try {
+        const previous = readFileSync(fd);
+        const lease = JSON.parse(previous.toString('utf8'));
+        if (!holder || lease?.holder !== holder) return false;
+        const next = renewedLease(lease, new Date().toISOString());
+        if (!next) return false;
+        const json = Buffer.from(`${JSON.stringify(next, null, 2)}\n`);
+        const contents = Buffer.alloc(Math.max(previous.length, json.length), 0x20);
+        json.copy(contents);
+        return nodeFs.writeSync(fd, contents, 0, contents.length, 0) === contents.length;
+      } finally {
+        nodeFs.closeSync(fd);
+      }
+    });
   } catch { return false; }
 }
 

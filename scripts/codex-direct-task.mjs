@@ -718,7 +718,9 @@ export function detachedGateExecFn(bin, args, opts = {}) {
     const { timeout = DEFAULT_TIMEOUT_MS, maxBuffer = 50 * 1024 * 1024, closeGraceMs = GATE_CLOSE_GRACE_MS,
       ...spawnOpts } = opts;
     const child = nodeSpawn(bin, args, { ...spawnOpts, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
-    const output = { stdout: [], stderr: [] };
+    process.emit('lane-lease-worker-started', child.pid);
+    child.on('exit', () => process.emit('lane-lease-worker-stopped', child.pid));
+    const output ={ stdout: [], stderr: [] };
     const sizes = { stdout: 0, stderr: 0 };
     let failure;
     let timer;
@@ -1084,6 +1086,9 @@ export async function runCodexDirectExec({
       reject(new Error(`codex-direct-task: could not start \`${cli}\`: ${e.message}`));
       return;
     }
+    process.emit('lane-lease-worker-started', child.pid);
+    // `on`, not `once`: injected test doubles implement only `on`, and a child emits `exit` at most once.
+    child.on('exit', () => process.emit('lane-lease-worker-stopped', child.pid));
     let out = '';
     let err = '';
     let timer = null;
@@ -1769,6 +1774,17 @@ function repoRootFromCwd() {
   return execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8', timeout: GIT_STEP_TIMEOUT_MS }).trim();
 }
 
+/** RS-7179-1: keep the caller's lane lease(s) renewed for the whole run, stopped in `finally`. */
+export async function withLaneLeaseHeartbeat(cwds, fn, start) {
+  let stop = () => {};
+  // Loaded lazily: a static import widens this module's import graph for every transitive importer
+  // (merge-ai-prs in-process CLI harness runs hang on the second main call when it is static).
+  stop = await (start ?? (await import('./lib/lane-lease-heartbeat.mjs')).startLaneLeaseHeartbeat)({
+    cwds, onLost: () => process.kill(process.pid, 'SIGTERM'),
+  }) || stop;
+  try { await stop.ready; return await fn(); } finally { try { stop(); } catch { /* best-effort */ } }
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const flags = parseFlags(args);
@@ -1853,7 +1869,7 @@ async function main() {
 
   let report;
   try {
-    report = await codexDirectTask({
+    report = await withLaneLeaseHeartbeat([process.cwd(), dir], () => codexDirectTask({
       task,
       taskFile,
       dir,
@@ -1882,7 +1898,7 @@ async function main() {
       review: Boolean(flags.review),
       resumeThreadId,
       ...(flags['no-self-review'] ? { selfReview: false } : {}),
-    });
+    }));
   } catch (e) {
     console.error(`codex-direct-task: ${e.message}`);
     process.exitCode = 1;
