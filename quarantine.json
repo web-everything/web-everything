@@ -1,5 +1,132 @@
 {
   "version": 1,
-  "entries": [],
+  "entries": [
+    {
+      "test": "scripts/lib/__tests__/gh-throttle.points-bucket.test.mjs",
+      "brokenSha": "9430852340217b0bb78b5503053ece9eda46b5db",
+      "owner": "red-main-safety-net",
+      "reason": "1 soft timeout(s); measurements and policy sources in timeout.outcomes",
+      "addedAt": 1795759555052,
+      "expiresAt": 1795845955052,
+      "job": "test-shard (3)",
+      "timeout": {
+        "id": "timeout:45946139834:test-shard (3):scripts/lib/__tests__/gh-throttle.points-bucket.test.mjs",
+        "at": 1795759555052,
+        "run": 45946139834,
+        "head": "9430852340217b0bb78b5503053ece9eda46b5db",
+        "outcomes": [
+          {
+            "file": "scripts/lib/__tests__/gh-throttle.points-bucket.test.mjs",
+            "name": "old-timeout-execution-is-not-detectable-from-ledger",
+            "runnerLimitMs": 5000,
+            "truncated": true,
+            "class": "soft",
+            "measured": {
+              "file": "scripts/lib/__tests__/gh-throttle.points-bucket.test.mjs",
+              "name": "old-timeout-execution-is-not-detectable-from-ledger",
+              "runnerLimitMs": 5000,
+              "truncated": true,
+              "durationMs": 5000
+            },
+            "limits": {
+              "soft": "PT5S",
+              "hard": "PT10S",
+              "headroom": 0.1,
+              "escalation": {
+                "count": 2,
+                "window": "PT24H"
+              },
+              "release": {
+                "passes": 3
+              },
+              "runnerKillAtHard": false,
+              "softMs": 5000,
+              "hardMs": 10000,
+              "sources": {
+                "soft": {
+                  "policy": "https://everstandards.dev/ship/fixtures/ours/test-timeout-policy/company",
+                  "level": "company",
+                  "scope": "all"
+                },
+                "hard": {
+                  "policy": "https://everstandards.dev/ship/fixtures/ours/test-timeout-policy/company",
+                  "level": "company",
+                  "scope": "all"
+                },
+                "headroom": {
+                  "policy": "https://everstandards.dev/ship/fixtures/ours/test-timeout-policy/company",
+                  "level": "company",
+                  "scope": "all"
+                },
+                "escalation.count": {
+                  "policy": "https://everstandards.dev/ship/fixtures/ours/test-timeout-policy/company",
+                  "level": "company",
+                  "scope": "all"
+                },
+                "escalation.window": {
+                  "policy": "https://everstandards.dev/ship/fixtures/ours/test-timeout-policy/company",
+                  "level": "company",
+                  "scope": "all"
+                },
+                "release.passes": {
+                  "policy": "https://everstandards.dev/ship/fixtures/ours/test-timeout-policy/company",
+                  "level": "company",
+                  "scope": "all"
+                },
+                "runnerKillAtHard": {
+                  "policy": "https://everstandards.dev/ship/fixtures/ours/test-timeout-policy/company",
+                  "level": "company",
+                  "scope": "all"
+                }
+              }
+            },
+            "conformityLoss": "runner-kills-at-soft (G1)",
+            "verdict": {
+              "result": "unknown",
+              "reason": "https://everstandards.dev/ship/test-timeout-policy/v0.1/reasons/soft-timeout"
+            },
+            "outputs": [
+              {
+                "type": "quarantine"
+              },
+              {
+                "type": "alert"
+              },
+              {
+                "type": "fix-card",
+                "priority": "high"
+              }
+            ]
+          }
+        ],
+        "priority": "high",
+        "outputs": [
+          {
+            "type": "quarantine",
+            "ref": "timeout:45946139834:test-shard (3):scripts/lib/__tests__/gh-throttle.points-bucket.test.mjs",
+            "priority": "high"
+          },
+          {
+            "type": "alert",
+            "ref": "timeout:45946139834:test-shard (3):scripts/lib/__tests__/gh-throttle.points-bucket.test.mjs:alert",
+            "priority": "high"
+          },
+          {
+            "type": "fix-card",
+            "ref": "timeout:45946139834:test-shard (3):scripts/lib/__tests__/gh-throttle.points-bucket.test.mjs:fix-card",
+            "priority": "high"
+          }
+        ],
+        "release": {
+          "passesUnderSoft": 3
+        },
+        "note": "file-level skip quarantines every case in the file (G2); typed outputs use structured safety-net logs; fileCardPerEntry also records card-owed events"
+      },
+      "release": {
+        "passesUnderSoft": 3
+      },
+      "note": "file-level skip quarantines every case in the file (G2); typed outputs use structured safety-net logs; fileCardPerEntry also records card-owed events"
+    }
+  ],
   "mode": "quarantine"
 }
