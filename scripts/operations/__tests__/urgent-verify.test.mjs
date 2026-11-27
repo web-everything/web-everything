@@ -3,7 +3,8 @@ import { readFileSync } from 'node:fs';
 import yaml from 'js-yaml';
 import { ciUnitPlan, ciGatePlan, urgentMarker, urgentLedger, urgentSignature, urgentKeyPath, normalizeUrgentRepo, urgentFuiRepo } from '../urgent-verify-marker.mjs';
 import { createUrgentDeps, urgentVerify } from '../urgent-verify.mjs';
-import { admissionLockRoot, poolRootOf, runUnderAdmission } from '../../readiness/heavy-admission.mjs';
+import * as urgentRunner from '../urgent-verify.mjs';
+import { ADMISSION_DEFERRED_EXIT, admissionLockRoot, poolRootOf, runUnderAdmission } from '../../readiness/heavy-admission.mjs';
 import { resolveOperation } from '../run.mjs';
 import { parseOperationArgv } from '../cli-adapter.mjs';
 import { keepAliveScript } from '../../lib/test-keepalive.mjs';
@@ -223,13 +224,90 @@ describe('real adapter contract with injected filesystem and subprocesses', () =
     expect(spawnSync.mock.calls.some(([, args]) => args[0].includes('heavy-admission'))).toBe(false);
     expect(fs.appendFileSync).toHaveBeenCalledTimes(1);
   });
-  it('treats admission failure as red and appends once without retrying', async () => {
-    const workflow = readFileSync('.github/workflows/ci.yml', 'utf8'), packageText = readFileSync('package.json', 'utf8');
-    const fs = { readFileSync: p => p.endsWith('.key') ? key : p.endsWith('package.json') ? packageText : workflow, mkdirSync: vi.fn(), appendFileSync: vi.fn(), writeFileSync: vi.fn(), rmSync: vi.fn() };
-    const spawnSync = vi.fn((cmd, args, opts) => ({ status: args[0].includes('heavy-admission') ? 75 : 0, stdout: args[0] === 'status' ? '' : args[0] === 'rev-parse' ? sha : args[0] === 'remote' ? (opts.cwd.endsWith('/frontierui') ? urgentFuiRepo : marker.repo) : 'scripts/example.test.mjs\n' }));
-    expect(await urgentVerify({ sha }, createUrgentDeps({ fs, spawnSync }))).toMatchObject({ ok: false, marker: { result: 'red' } });
-    expect(spawnSync.mock.calls.filter(([, args]) => args[0].includes('heavy-admission'))).toHaveLength(1);
-    expect(fs.appendFileSync).toHaveBeenCalledTimes(1);
+  function admissionFixture({ status = 75, stderr = '⚠ heavy-command admission-deferred: no slot ...', wrapper = true, admissionDeferred } = {}) {
+    const parent = mkdtempSync(pjoin(tmpdir(), 'uv-defer-'));
+    tempParents.push(parent);
+    const cwd = pjoin(parent, 'fixture-lane'), home = pjoin(parent, 'home');
+    mkdirSync(cwd); mkdirSync(home);
+    const fs = { readFileSync: vi.fn(() => key), mkdirSync: vi.fn(), appendFileSync: vi.fn(), writeFileSync: vi.fn() };
+    const spawnSync = vi.fn(() => ({ status, stderr, stdout: '', admissionDeferred }));
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    const deps = createUrgentDeps({ cwd, home, fs, spawnSync, host: 'fixture-host', env: { PATH: '/fixture/bin', LANE_POOL_ROOT: pjoin(parent, 'pool') } });
+    const release = vi.fn(), cleanup = vi.fn();
+    Object.assign(deps, { clean: () => true, head: () => sha, repo: () => marker.repo,
+      now: () => new Date(now).toISOString(), host: 'fixture-host', plan: () => [],
+      guardSigning: () => ({ release, check: vi.fn() }),
+      'fetch-main-history': wrapper ? deps.standards : deps.repo });
+    return { fs, spawnSync, release, cleanup, clock, deps: { isolate: () => ({ deps, cleanup }) } };
+  }
+  it('records an admission deferral (exit 75) as deferred, never red, and appends nothing', async () => {
+    const t = admissionFixture({ admissionDeferred: true });
+    try {
+      const result = await urgentVerify({ sha }, t.deps);
+      expect(result).toMatchObject({ ok: false, deferred: true, detail: 'admission-deferred',
+        failure: { step: 'fetch-main-history', cmd: expect.stringContaining('heavy-admission.mjs'), stderrTail: expect.stringContaining('admission-deferred') },
+        fallback: 'No heavy slot was free; nothing ran. Retry urgent-verify when `heavy-admission.mjs queue-status` shows a free slot, or wait for passing CI.' });
+      expect(result.marker).toBeUndefined();
+      expect(t.fs.appendFileSync).not.toHaveBeenCalled();
+      expect(t.spawnSync).toHaveBeenCalledTimes(1);
+      expect(t.release).toHaveBeenCalled();
+      expect(t.cleanup).toHaveBeenCalledTimes(1);
+    } finally { t.clock.mockRestore(); }
+  });
+  it.each([
+    ['an exit 75 without the admission-deferred line stays red and appends once', { stderr: 'suite failed' }],
+    ['a non-wrapper exit 75 stays red and appends once', { wrapper: false }],
+    ['an admission refusal (126) stays red and appends once', { status: 126 }],
+  ])('%s', async (_name, options) => {
+    const t = admissionFixture(options);
+    try {
+      const result = await urgentVerify({ sha }, t.deps);
+      expect(result).toMatchObject({ ok: false, marker: { result: 'red' } });
+      expect(result.deferred).not.toBe(true);
+      expect(t.spawnSync).toHaveBeenCalledTimes(1);
+      expect(t.fs.appendFileSync).toHaveBeenCalledTimes(1);
+      expect(t.release).toHaveBeenCalled();
+      expect(t.cleanup).toHaveBeenCalledTimes(1);
+    } finally { t.clock.mockRestore(); }
+  });
+  it('records red when an executed command spoofs admission-deferred and exit 75 without wrapper evidence', async () => {
+    const t = admissionFixture();
+    try {
+      const result = await urgentVerify({ sha }, t.deps);
+      expect(result).toMatchObject({ ok: false, marker: { result: 'red' } });
+      expect(result.deferred).not.toBe(true);
+      expect(t.fs.appendFileSync).toHaveBeenCalledTimes(1);
+      expect(t.spawnSync).toHaveBeenCalledTimes(1);
+      expect(t.release).toHaveBeenCalled();
+      expect(t.cleanup).toHaveBeenCalledTimes(1);
+    } finally { t.clock.mockRestore(); }
+  });
+  it.each([true, false])('private wrapper evidence distinguishes real deferral from child stderr/exit spoofing (occupied=%s)', occupied => {
+    const root = realpathSync(mkdtempSync(pjoin(tmpdir(), 'uv-private-admission-')));
+    tempParents.push(root);
+    mkdirSync(pjoin(root, 'scripts/readiness'), { recursive: true });
+    const moduleUrl = new NodeURL('../../readiness/heavy-admission.mjs', import.meta.url).href;
+    writeFileSync(pjoin(root, 'scripts/readiness/heavy-admission.mjs'), `
+      import { main, admissionLockRoot, tryAcquireSlot } from ${JSON.stringify(moduleUrl)};
+      Date.now = () => ${now};
+      if (${occupied}) {
+        const held = tryAcquireSlot({ lockRoot: admissionLockRoot(process.cwd(), process.env), cap: 1,
+          owner: 'fixture-holder', pid: process.pid, nowMs: Date.now(), nowIso: new Date(Date.now()).toISOString() });
+        if (!held.ok) throw new Error('fixture did not acquire slot');
+      }
+      await main(['run', '--local', '--cap=1', '--kind=FULL', '--ceiling-ms=0', '--wait-ms=0',
+        '--require-admission', ...process.argv.filter(a => a.startsWith('--urgent-result-fd=')),
+        '--', process.execPath, '-e', ${JSON.stringify("const fs = require('node:fs'); let inherited = false; try { fs.writeSync(4, 'admission-deferred' + String.fromCharCode(10)); inherited = true; } catch {} if (inherited) process.exit(8); console.error('admission-deferred'); process.exit(75);")}],
+        { home: process.cwd(), hostAdmission: () => ({ admitted: true, reason: 'fixture host' }) });`);
+    const deps = createUrgentDeps({ cwd: root, home: root, maxMinutes: 0.1, nowMs: () => now, host: 'fixture-host',
+        env: { PATH: pjoin(root, 'empty-bin'), HOME: root, TMPDIR: root, LANE_POOL_ROOT: root,
+          WE_PLATFORM_PREFERENCES: pjoin(root, 'no-preferences') } });
+    let error;
+    try { deps.standards(); } catch (e) { error = e; }
+    expect(error).toMatchObject({ deferred: occupied, failure: { exit: 75, stderrTail: expect.stringContaining('admission-deferred') } });
+  });
+  it('the local deferred exit equals ADMISSION_DEFERRED_EXIT', () => {
+    expect(urgentRunner.ADMISSION_DEFERRED_EXIT).toBe(ADMISSION_DEFERRED_EXIT);
   });
 });
 
@@ -615,7 +693,7 @@ afterAll(() => { for (const p of tempParents.splice(0)) rmSync(p, { recursive: t
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join as pjoin } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, URL as NodeURL } from 'node:url';
 
 const git = (cwd, ...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, encoding: 'utf8', env: { PATH: process.env.PATH, HOME: process.env.HOME, GIT_CONFIG_NOSYSTEM: '1' } }).trim();
 function tempRepo() {
@@ -912,6 +990,9 @@ describe('urgent-verify red exits non-zero', () => {
     const green = await urgentVerify({ sha: t.head }, isoDeps(t, () => {}));
     expect(finish({ run: { verdict: red }, code: 0, lines: [] }).code).toBe(1);
     expect(finish({ run: { verdict: green }, code: 0, lines: [] }).code).toBe(0);
+  });
+  it('a deferred verdict exits 75', () => {
+    expect(finish({ run: { verdict: { ok: false, deferred: true } }, code: 0, lines: [] }).code).toBe(75);
   });
   it('a missing verdict never exits 0', () => {
     expect(finish({ run: {}, code: 0, lines: [] }).code).not.toBe(0);

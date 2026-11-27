@@ -3544,7 +3544,11 @@ export async function main(argv, { remoteExec, readTelemetry, targetExec, hostAd
     if (useContainer) runOpts.exec = (cmd, o) => execContainerized(cmd, { ...o, nodeModulesVolume: useNodeModulesVolume });
     // A bypass (CI pass-through, held re-entry, admission off) takes no slot and records no duration, so it needs no reason.
     if (!remoteDecided && !bypass) recordLocalReason({ lockRoot, reason: localReasonFor({ useContainer, forceLocal, bypass, decisionReason: localDecisionReason }), detail: localDecisionReason, cwd: repo ?? process.cwd(), argv: argv.slice(dashDashIdx + 1), env: process.env, clock: Date.now });
-    const { exitCode } = await runUnderAdmission(runOpts);
+    const { exitCode, admission } = await runUnderAdmission(runOpts);
+    // Private supervisor pipe, never inherited by executed commands. Stderr and
+    // exit 75 alone cannot distinguish a child failure from a queue deferral.
+    if (flags['urgent-result-fd'] === '4' && admission?.deferred === true && exitCode === ADMISSION_DEFERRED_EXIT)
+      writeFileSync(4, 'admission-deferred\n');
     if (reportLocalExecution) appendVerifyRemoteReport(process.env, { location: 'local-fallback', exitCode });
     process.exit(exitCode);
   }

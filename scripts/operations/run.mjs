@@ -668,7 +668,7 @@ export const OPERATIONS = Object.freeze({
     }),
     sinks: { 'urgent-verify.run': input => urgentVerify(input) },
     // A missing verdict is never success.
-    finish: ({ run, code, lines }) => run?.verdict ? { code: run.verdict.ok === true ? 0 : 1, lines: [JSON.stringify(run.verdict)] } : { code: code || 1, lines },
+    finish: ({ run, code, lines }) => run?.verdict ? { code: run.verdict.deferred === true ? 75 : run.verdict.ok === true ? 0 : 1, lines: [JSON.stringify(run.verdict)] } : { code: code || 1, lines },
   }),
   'urgent-sweep': () => ({
     declaration: op('urgent-sweep', {

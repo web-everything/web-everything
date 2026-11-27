@@ -56,6 +56,25 @@ it('register accepts the same exclusions and records the scope', () => {
   expect((entries.entries ?? entries).map((e) => e.agent)).toContain('stacked');
 });
 
+it('register excludes a fui PR by alias and otherwise reports its file occupied', () => {
+  const collect = ({ files }) => ({ files: files.split(','), nowMs: now(), unreadable: [], agents: [],
+    prs: [{ number: 55, repo: 'frontier-ui/frontierui', title: 'Fixture', url: 'u', files: ['blocks/x.ts'] }] });
+  const go = (extra) => {
+    let out = '', err = '';
+    const code = main(['register', '--agent=fui-build', '--files=fui:blocks/x.ts', '--json', ...extra],
+      { env, now, collect, stdout: { write: (s) => { out += s; } }, stderr: { write: (s) => { err += s; } } });
+    return { code, out, err };
+  };
+  const held = go([]);
+  expect(held.code).toBe(1);
+  expect(JSON.parse(held.out)).toMatchObject({ check: { status: 'occupied' } });
+  const excluded = go(['--exclude-pr=fui#55']);
+  expect(excluded.err).toBe('');
+  expect(excluded.code).toBe(0);
+  expect(JSON.parse(excluded.out)).toMatchObject({ check: { status: 'free' }, registered: { agent: 'fui-build', files: ['frontierui:blocks/x.ts'] } });
+  expect(readRegistry(env.WE_AGENT_SCOPES_PATH)).toMatchObject([{ agent: 'fui-build', files: ['frontierui:blocks/x.ts'] }]);
+});
+
 it('a malformed entry in the list is refused', () => {
   const r = run(['check', '--files=held.mjs', '--exclude-pr=4643,nope']);
   expect(r.code).toBe(2);
