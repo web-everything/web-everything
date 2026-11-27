@@ -34,22 +34,27 @@ askpass and SSH command variables removed and lane pins applied. `GIT_TEMPLATE_D
 removed locally before hardening: an inherited template can install a credential helper or hook
 in the new repository before its first fetch. The shared hardening helper is unchanged.
 
-The clone first uses `laneGitHardeningEnv` with `credentialPins: false` to remove inherited
-proxy/trace/CA routing variables, and sets `HOME` from the OS account lookup, never the
-provisioner's injectable primary-clone `home` or the caller's `HOME`. `XDG_CONFIG_HOME`,
-`GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` overrides are removed. This intermediate environment
-is never passed to a child: its indexed config is scrubbed and the full default lane pins are
-applied, including empty `credential.helper` and `core.askPass` resets. Scrubbing inherited
-config must never lift those restrictions. Terminal prompting remains disabled. The named
-regression `clone retains empty inherited credential restrictions after scrubbing hostile config`
-checks both resets with inherited indexed and parameter config present. A clone that cannot
-authenticate under these restrictions stays unavailable; the operator repairs it and restarts.
+The clone uses `laneGitHardeningEnv` with `credentialPins: false` to remove inherited
+command-scope config and credential routing variables and select the OS account home.
+It runs from the filesystem root, where no lane-local or worktree config can inject a helper.
+The provisioner's injected `home` is only for primary-reference discovery; it never selects
+the account configuration used by the transport. The root cwd extends the validated-primary
+permission to a cwd with no repository configuration.
 
-The clone's cwd is the filesystem root (`parse(resolve('/')).root`); its URL, destination,
-optional reference path and bounded supervisor path are absolute. The root has no repository
-local/worktree configuration to inject a helper. The final child environment retains the full
-credential restrictions even at this cwd. Global and system account configuration, including
-any trusted `init.templateDir`, remains part of the trust boundary subject to those pins.
+Before scrubbing, the clone captures only empty `credential.helper` and `core.askPass`
+resets from the parent's indexed config or quoted `GIT_CONFIG_PARAMETERS`. It restores
+exactly those resets after applying the account form. A parent restriction must never be
+lifted by scrubbing; nonempty inherited helpers and askpass programs are never copied.
+When the parent supplies neither reset, the trusted account's global/system helper remains
+available to authenticate private sibling clones, including the deployment's gh helper.
+Global and system account configuration, including trusted `init.templateDir`, remains part
+of the trust boundary, subject to all other lane pins and any inherited empty resets.
+
+Parent config parsing is bounded to 1024 entries and 64 KiB across indexed and quoted input.
+Malformed, incomplete or oversized evidence refuses cloning with `parent-git-config-invalid`;
+the operator repairs the inherited configuration and restarts the drain. Hermetic tests cover
+both empty resets, either reset alone, both quoted encodings, the unrestricted account-helper
+case, and refusal before the clone runner receives malformed or oversized config.
 
 The origin and shallow reads retain their repository cwd and use the full default lane pins,
 including empty `credential.helper` and `core.askPass` resets. These reads use no credential

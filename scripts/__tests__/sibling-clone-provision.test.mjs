@@ -53,8 +53,7 @@ function fixture() {
 function expectedGitEnv(options) {
   const base = scrubGitRepoEnv(process.env);
   delete base.GIT_TEMPLATE_DIR;
-  const hardened = laneGitHardeningEnv(base, options);
-  return options?.credentialPins === false ? laneGitHardeningEnv(scrubGitRepoEnv(hardened)) : hardened;
+  return laneGitHardeningEnv(base, options);
 }
 function expectedReadEnv() {
   return { ...Object.fromEntries(Object.keys(process.env).map(key => [key, undefined])), ...expectedGitEnv() };
@@ -126,7 +125,7 @@ describe('sibling clone git hardening', () => {
         expect(env).not.toHaveProperty(key);
       }
       expect(env.GIT_TEMPLATE_DIR).toBeUndefined();
-      const pins = LANE_GIT_CONFIG_PINS;
+      const pins = LANE_GIT_CONFIG_PINS.filter(([key]) => !['credential.helper', 'core.askPass'].includes(key));
       expect(env.GIT_CONFIG_COUNT).toBe(String(pins.length));
       expect(configPins(env)).toEqual(pins);
       expect(configPins(env)).toContainEqual(['core.hooksPath', '/dev/null']);
@@ -175,6 +174,68 @@ describe('sibling clone git hardening', () => {
       expect(env).not.toHaveProperty('GIT_ASKPASS');
       expect(env.GIT_TERMINAL_PROMPT).toBe('0');
     }
+  });
+
+  it('leaves the account global credential helper available when the parent sets no resets', () => {
+    const options = gitFixture();
+    const accountHome = userInfo().homedir;
+    mkdirSync(accountHome);
+    const globalConfig = '[credential]\n\thelper = !fixture-gh auth git-credential\n';
+    writeFileSync(join(accountHome, '.gitconfig'), globalConfig);
+    provision(options);
+    for (const [, , { env }] of options.run.mock.calls) {
+      expect(env.HOME).toBe(accountHome);
+      expect(readFileSync(join(env.HOME, '.gitconfig'), 'utf8')).toBe(globalConfig);
+      expect(configPins(env)).toEqual(LANE_GIT_CONFIG_PINS.filter(([key]) =>
+        key !== 'credential.helper' && key !== 'core.askPass'));
+      expect(env).not.toHaveProperty('GIT_CONFIG_GLOBAL');
+      expect(env).not.toHaveProperty('GIT_CONFIG_SYSTEM');
+    }
+  });
+
+  it.each(['indexed', 'parameters', 'legacy parameters'])('carries exactly the parent empty resets from %s', source => {
+    for (const keys of [['credential.helper'], ['core.askPass'], ['credential.helper', 'core.askPass']]) {
+      vi.mocked(gitRun).mockClear();
+      if (source === 'indexed') {
+        vi.stubEnv('GIT_CONFIG_COUNT', String(keys.length));
+        keys.forEach((key, index) => {
+          vi.stubEnv(`GIT_CONFIG_KEY_${index}`, key);
+          vi.stubEnv(`GIT_CONFIG_VALUE_${index}`, '');
+        });
+      } else {
+        vi.stubEnv('GIT_CONFIG_PARAMETERS', keys.map(key =>
+          source === 'parameters' ? `'${key}'=''` : `'${key}='`).join(' '));
+      }
+      const options = gitFixture();
+      provision(options);
+      for (const [, , { env }] of options.run.mock.calls) {
+        const resets = configPins(env).filter(([key]) => key === 'credential.helper' || key === 'core.askPass');
+        expect(resets).toEqual(keys.map(key => [key, '']));
+        expect(env).not.toHaveProperty('GIT_CONFIG_PARAMETERS');
+      }
+    }
+  });
+
+  it.each([
+    { GIT_CONFIG_COUNT: 'broken' },
+    { GIT_CONFIG_COUNT: '1025' },
+    { GIT_CONFIG_COUNT: '1\n', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: '' },
+    { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'credential.helper' },
+    { GIT_CONFIG_PARAMETERS: "'credential.helper'" },
+    { GIT_CONFIG_PARAMETERS: "'core.askPass'=" },
+    { GIT_CONFIG_PARAMETERS: "'credential.helper'='" },
+    { GIT_CONFIG_PARAMETERS: 'x'.repeat(65537) },
+  ])('refuses malformed or oversized parent config before cloning (%#)', parentEnv => {
+    for (const [key, value] of Object.entries(parentEnv)) vi.stubEnv(key, value);
+    const options = gitFixture();
+    const log = vi.fn();
+    const result = provisionMissingSiblingClones({ ...options, log });
+    expect(result.provisioned).toEqual([]);
+    expect(result.failed).toHaveLength(2);
+    for (const { reason } of result.failed) expect(reason).toMatch(/^parent-git-config-invalid:/);
+    expect(options.run).not.toHaveBeenCalled();
+    expect(gitRun).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('parent-git-config-invalid:'));
   });
 
   it.each([false, true])('argv is unchanged by the companion rewrites (reference: %s)', fullPrimary => {
@@ -479,7 +540,7 @@ describe('sibling clone audit boundaries', () => {
     expect(siblingCloneStatus({ ...options, read: undefined })[0].present).toBe(status === 0);
     expect(gitRun).toHaveBeenCalledTimes(1);
     expect(gitRun).toHaveBeenCalledWith('git', ['remote', 'get-url', 'origin'], {
-      cwd: dir, timeoutMs: 5_000, maxBuffer: 1024 * 1024, env: expectedReadEnv(),
+      cwd: dir, timeoutMs: 5000, maxBuffer: 1024 * 1024, env: expectedReadEnv(),
     });
   });
 
@@ -492,7 +553,7 @@ describe('sibling clone audit boundaries', () => {
     expect(options.run.mock.calls[0][1].includes('--reference')).toBe(status === 0);
     expect(gitRun).toHaveBeenCalledTimes(1);
     expect(gitRun).toHaveBeenCalledWith('git', ['rev-parse', '--is-shallow-repository'], {
-      cwd: primary, timeoutMs: 5_000, maxBuffer: 1024 * 1024, env: expectedReadEnv(),
+      cwd: primary, timeoutMs: 5000, maxBuffer: 1024 * 1024, env: expectedReadEnv(),
     });
   });
 

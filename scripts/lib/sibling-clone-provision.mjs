@@ -18,12 +18,76 @@ function templateFree(env) {
   return out;
 }
 
+const CREDENTIAL_RESET_KEYS = ['credential.helper', 'core.askPass'];
+const MAX_PARENT_CONFIG_ENTRIES = 1024;
+const MAX_PARENT_CONFIG_BYTES = 65536;
+
+function parentCredentialResets(env) {
+  const invalid = () => { throw new Error('parent-git-config-invalid: repair inherited git config and restart the drain'); };
+  const resets = new Set();
+  const retain = (key, value) => {
+    if (!key) invalid();
+    const canonical = CREDENTIAL_RESET_KEYS.find(candidate => candidate.toLowerCase() === key.toLowerCase());
+    if (canonical && value === null) invalid();
+    if (canonical && value === '') resets.add(canonical);
+  };
+  const rawCount = env.GIT_CONFIG_COUNT ?? '0';
+  if (!/^(0|[1-9][0-9]*)(?![\s\S])/.test(rawCount) || Number(rawCount) > MAX_PARENT_CONFIG_ENTRIES) invalid();
+  let bytes = 0;
+  for (let i = 0; i < Number(rawCount); i++) {
+    const key = env[`GIT_CONFIG_KEY_${i}`], value = env[`GIT_CONFIG_VALUE_${i}`];
+    if (typeof key !== 'string' || typeof value !== 'string') invalid();
+    bytes += Buffer.byteLength(key) + Buffer.byteLength(value);
+    if (bytes > MAX_PARENT_CONFIG_BYTES) invalid();
+    retain(key, value);
+  }
+  const parameters = env.GIT_CONFIG_PARAMETERS ?? '';
+  if (Buffer.byteLength(parameters) + bytes > MAX_PARENT_CONFIG_BYTES) invalid();
+  let pos = 0, entries = Number(rawCount);
+  const whitespace = char => char !== undefined && /[ \t\r\n\v\f]/.test(char);
+  // Git uses single-quoted words, with \\' and \\! between quoted segments.
+  // Accept both legacy 'key=value' and current 'key'='value' encodings.
+  const quoted = () => {
+    if (parameters[pos++] !== "'") invalid();
+    let word = '';
+    while (pos < parameters.length) {
+      const char = parameters[pos++];
+      if (char !== "'") { word += char; continue; }
+      if (parameters[pos] === '\\' && ["'", '!'].includes(parameters[pos + 1]) && parameters[pos + 2] === "'") {
+        word += parameters[pos + 1]; pos += 3; continue;
+      }
+      return word;
+    }
+    invalid();
+  };
+  while (pos < parameters.length) {
+    if (whitespace(parameters[pos])) { pos++; continue; }
+    if (++entries > MAX_PARENT_CONFIG_ENTRIES) invalid();
+    const word = quoted();
+    if (parameters[pos] === '=') {
+      pos++;
+      retain(word, parameters[pos] === "'" ? quoted() : null);
+    } else {
+      const equals = word.indexOf('=');
+      retain(equals < 0 ? word : word.slice(0, equals), equals < 0 ? null : word.slice(equals + 1));
+    }
+    if (pos < parameters.length && !whitespace(parameters[pos])) invalid();
+  }
+  return CREDENTIAL_RESET_KEYS.filter(key => resets.has(key));
+}
+
 function cloneGitEnv() {
-  // Reuse the account form's HOME/routing scrub, then restore ALL lane pins.
-  // The intermediate env must never reach a child: scrubbing inherited config
-  // must not lift a parent's empty credential.helper/core.askPass restrictions.
-  const accountEnv = laneGitHardeningEnv(templateFree(scrubGitRepoEnv(process.env)), { credentialPins: false });
-  return laneGitHardeningEnv(scrubGitRepoEnv(accountEnv));
+  // Capture only the parent's empty resets before the account form scrubs config.
+  // With no reset, private clones retain the trusted account's credential helper.
+  const resets = parentCredentialResets(process.env);
+  const env = laneGitHardeningEnv(templateFree(scrubGitRepoEnv(process.env)), { credentialPins: false });
+  let count = Number(env.GIT_CONFIG_COUNT);
+  for (const key of resets) {
+    env[`GIT_CONFIG_KEY_${count}`] = key;
+    env[`GIT_CONFIG_VALUE_${count++}`] = '';
+  }
+  env.GIT_CONFIG_COUNT = String(count);
+  return env;
 }
 
 /** Accept the shared keys, directory names and canonical/legacy slugs; refuse unknown repos. */
@@ -92,7 +156,7 @@ export function provisionMissingSiblingClones({ cwd = process.cwd(), run = execF
       const url = `https://github.com/${repo.slug}.git`;
       const runOptions = { stdio: ['ignore', 'ignore', 'inherit'],
         timeout: NETWORK_GIT_TIMEOUT_MS + BOUNDED_GIT_GRACE_MS, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
-        // A root cwd excludes lane-local config; credential execution remains disabled.
+        // A root cwd excludes lane-local config; parent credential resets still apply.
         env: cloneGitEnv(), cwd: NO_REPO_CWD };
       let fullPrimary = false;
       if (exists(join(primary, '.git'))) {
