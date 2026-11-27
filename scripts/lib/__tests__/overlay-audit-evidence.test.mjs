@@ -305,6 +305,9 @@ test('future-dated settings waiver is refused', () => {
     assert.equal(check({ ...undated, layer }).kind, 'waiver', `${layer} undated stays allowed`);
     for (const future of ['2999-01-01T00:00:00Z', '2999-01-01T00:00:00+05:00', '2999-01-01T00:00:00-05:00'])
       assert.equal(check({ ...waiver, layer, at: future }).ok, false, `${layer} ${future}`);
+    // A present `at` that cannot be placed in time cannot be ordered against a withdrawal either.
+    for (const unplaceable of ['bad', '+999999-01-01T00:00:00Z', 7, null, {}])
+      assert.equal(check({ ...waiver, layer, at: unplaceable }).ok, false, `${layer} ${JSON.stringify(unplaceable)}`);
   }
 });
 test('withdrawals and unreadable revocation ledgers revoke stored waivers', () => {
