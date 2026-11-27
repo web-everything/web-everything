@@ -16,6 +16,21 @@ Candidate verification rejects hidden index flags and compares actual regular
 file bytes and executable modes against HEAD, independently of porcelain status.
 Untracked `node_modules` remains dirty; only the verified ignored symlink is allowed.
 
+Ancestor `node_modules` stores above the owner, candidate, harness, shim-target
+checkout/snapshot or dependency-store owner disable reuse. Unreadable ancestor
+evidence also disables reuse. Operators run full smoke or inspect/remove the
+ancestor dependencies; these stores are never silently omitted from a reusable key.
+Non-empty `LD_PRELOAD` and `DYLD_INSERT_LIBRARIES` likewise force full smoke,
+including colon/space lists and relative names, rather than guessing loader resolution.
+
+A generated-comment marker never proves a wrapper's executable closure. The
+literal-import checks remain in force; an AST check additionally permits only
+inert string declarations and those checked literal imports. Wrappers with process
+logic (including the production generated gh wrapper) conservatively run full
+smoke. The marked-wrapper regression covers direct and computed spawn calls to
+an external script and refusal after its bytes change. The ancestor-store and
+native-preload regressions likewise change external bytes and retain refusal.
+
 All lock mutations share a short atomic directory mutex. Reclamation, heartbeat
 and release quarantine the observed directory and verify its inode and complete
 owner again before mutation. A replacement is restored intact. A held mutation

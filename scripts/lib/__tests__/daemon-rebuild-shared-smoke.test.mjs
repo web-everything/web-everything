@@ -25,8 +25,16 @@ const settings = Object.freeze({ enabled: true, passTtlMs: 7200000, followerMaxW
 let base, f;
 const write = (p, bytes = 'fixture') => { fs.mkdirSync(dirname(p), { recursive: true }); fs.writeFileSync(p, bytes); return p; };
 const denied = () => Object.assign(new Error('fixture EACCES'), { code: 'EACCES' });
+// Ancestor resolution probes must not depend on stores installed on the host.
+const fixtureFs = () => ({ ...fs, lstatSync: p => {
+  if (String(p).endsWith('/node_modules') && !String(p).startsWith(base + '/')) {
+    throw Object.assign(new Error('fixture absent ancestor'), { code: 'ENOENT' });
+  }
+  return fs.lstatSync(p);
+} });
 function ioFault(method, predicate, error = denied()) {
-  return { ...fs, [method]: (...args) => { if (predicate(...args)) throw error; return fs[method](...args); } };
+  const port = fixtureFs();
+  return { ...port, [method]: (...args) => { if (predicate(...args)) throw error; return port[method](...args); } };
 }
 function fixture() {
   const root = join(base, 'clone'), candidatePath = join(base, 'candidate'), runningRoot = join(base, 'harness');
@@ -64,7 +72,7 @@ function fixture() {
   });
   const alerts = [], logs = [];
   const alert = (name, detail) => alerts.push({ name, ...detail });
-  const options = { git, sha, root, candidatePath, runningRoot, runEnv: sharedRunEnv(env), now,
+  const options = { git, fs: fixtureFs(), sha, root, candidatePath, runningRoot, runEnv: sharedRunEnv(env), now,
     operatorOverrides: () => operator, operatorPreferences: () => platform, nodeVersion: 'v22.fixture', execPath: executable,
     findCheckout: p => [...repos.keys()].find(dir => p.startsWith(dir + '/')),
     log: line => logs.push(line) };
@@ -533,6 +541,59 @@ function realRepo(dir, files) {
 }
 
 describe('audit: shared evidence never bypasses current inputs or ownership', () => {
+  it('refuses marked wrappers that execute unbound external scripts', () => {
+    const { lines } = shim(), path = join(f.bins, 'gh');
+    expect(f.key()?.key).toMatch(/^[a-f0-9]{64}$/);
+    const external = write(join(base, 'external-wrapper.mjs'), 'process.exit(0);');
+    for (const call of [
+      `require('node:child_process').spawnSync(process.execPath, [${JSON.stringify(external)}]);`,
+      `const cp = require('node:child_process'); cp['spawn' + 'Sync'](process.execPath, [${JSON.stringify(external)}]);`,
+    ]) {
+      write(path, [...lines, call].join('\n'));
+      expect(f.key()).toBeNull();
+      write(external, 'process.exit(1);');
+      expect(f.key()).toBeNull();
+      expect(f.logs.at(-1)).toContain('runtime-shim-executable: run full smoke');
+    }
+  });
+  it('refuses ancestor node_modules including unreadable resolution evidence', () => {
+    expect(f.key()?.key).toMatch(/^[a-f0-9]{64}$/);
+    const dependency = join(base, 'node_modules/external/index.js');
+    write(dependency, 'module.exports = 1;');
+    expect(f.key()).toBeNull();
+    write(dependency, 'module.exports = 2;');
+    expect(f.key()).toBeNull();
+    expect(f.logs.at(-1)).toContain('ancestor-deps-unbound: run full smoke');
+    fs.rmSync(dirname(dirname(dependency)), { recursive: true });
+    expect(f.key({ fs: ioFault('lstatSync', p => p === join(base, 'node_modules')) })).toBeNull();
+    expect(f.logs.at(-1)).toContain('identity-unreadable: run full smoke');
+    const store = join(base, 'store/payload');
+    fs.mkdirSync(dirname(store));
+    fs.renameSync(f.deps, store);
+    fs.symlinkSync(store, f.deps);
+    expect(f.key()?.key).toMatch(/^[a-f0-9]{64}$/);
+    const sibling = write(join(base, 'store/node_modules/external/index.js'), 'module.exports = 1;');
+    expect(f.key()).toBeNull();
+    write(sibling, 'module.exports = 2;');
+    expect(f.key()).toBeNull();
+    expect(f.logs.at(-1)).toContain('ancestor-deps-unbound: run full smoke');
+  });
+  it('refuses native preload lists before and after individual library changes', () => {
+    expect(f.key()?.key).toMatch(/^[a-f0-9]{64}$/);
+    const a = write(join(base, 'a.so'), 'library one'), b = write(join(base, 'b.so'), 'library two');
+    for (const name of ['LD_PRELOAD', 'DYLD_INSERT_LIBRARIES']) {
+      for (const value of [`${a}:${b}`, `${a} ${b}`, a, 'relative.so', ':']) {
+        f.env[name] = value;
+        expect(f.key()).toBeNull();
+        write(b, 'changed library');
+        expect(f.key()).toBeNull();
+        expect(f.logs.at(-1)).toContain('env-native-preload-unbound: run full smoke');
+      }
+      f.env[name] = '';
+      expect(f.key()?.key).toMatch(/^[a-f0-9]{64}$/);
+      delete f.env[name];
+    }
+  });
   it('F1: refuses any non-empty NODE_PATH with env-node-path', () => {
     expect(f.key()?.key).toMatch(/^[a-f0-9]{64}$/);
     f.env.NODE_PATH = '';

@@ -4,6 +4,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { hostname, homedir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { parse } from 'acorn';
 import { operatorOverridesPath } from '../operator-override-reader.mjs';
 import { operatorPreferencesPath } from '../policy-cascade.mjs';
 export const RUNNING_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -86,10 +87,23 @@ export function sharedSmokeIdentity(o) {
       else fail('filesystem-type');
     }; visit('', 0); return h.digest('hex');
   };
-  const deps = p => { if (!stat(p)) return 'absent'; const real = fs.realpathSync(p); if (!fs.statSync(real).isDirectory()) fail('deps-not-directory'); if (!cache.has(real)) cache.set(real, walk(real)); return cache.get(real); };
+  // Node searches above both entry checkouts and real dependency stores. Unknown
+  // ancestor stores are outside this evidence model; preserve the full-smoke fallback.
+  const checkAncestors = (dir, ownStore) => {
+    for (let parent = dirname(fs.realpathSync(dir)); ; parent = dirname(parent)) {
+      check();
+      const p = join(parent, 'node_modules');
+      if (stat(p) && (!ownStore || fs.realpathSync(p) !== ownStore)) fail('ancestor-deps-unbound: run full smoke; inspect ancestor dependencies');
+      if (dirname(parent) === parent) break;
+    }
+  };
+  const deps = p => { if (!stat(p)) return 'absent'; const real = fs.realpathSync(p); if (!fs.statSync(real).isDirectory()) fail('deps-not-directory');
+    // Skip only the store already being hashed, including a symlink to it.
+    checkAncestors(real, real);
+    if (!cache.has(real)) cache.set(real, walk(real)); return cache.get(real); };
   const snapshotRoot = p => { const m = p.match(/^(.*\/\.snapshots\/code\/[a-f0-9]{40})(?:\/|$)/); return m?.[1]; };
   const state = (dir, withPath = false) => {
-    const real = fs.realpathSync(dir); if (stat(join(real, '.git'))) return checkoutState(real, { git, fs, withPath, runEnv, check, readFile: read });
+    const real = fs.realpathSync(dir); checkAncestors(real); if (stat(join(real, '.git'))) return checkoutState(real, { git, fs, withPath, runEnv, check, readFile: read });
     const snap = snapshotRoot(real); if (snap !== real || !stat(join(real, '.snapshot-complete'))?.isFile()) fail('harness-unknown');
     return ['snapshot', real.split('/').at(-1), walk(real, 'snapshot')];
   };
@@ -111,6 +125,7 @@ export function sharedSmokeIdentity(o) {
     const liveClone = runEnv.WE_SMOKE_LIVE_CLONE;
     if (typeof liveClone !== 'string' || !isAbsolute(liveClone)
       || fs.realpathSync(liveClone) !== fs.realpathSync(root)) fail('live-clone-mismatch: run full smoke; use the verified root');
+    checkAncestors(root); checkAncestors(candidatePath);
     if (!hex(sha, 40)) fail('sha-malformed'); const tree = rev(git, root, `${sha}^{tree}`, runEnv);
     if (rev(git, candidatePath, 'HEAD^{tree}', runEnv) !== tree) fail('candidate-tree-mismatch');
     const status = nul(gitRead(git, candidatePath, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching'], runEnv));
@@ -129,6 +144,7 @@ export function sharedSmokeIdentity(o) {
     const refresh = o.refresh, minted = refresh?.applied === true && refresh.before && refresh.after && refresh.before.GH_TOKEN !== refresh.after.GH_TOKEN && refresh.after.GH_TOKEN === runEnv.GH_TOKEN;
     const env = pack(Object.keys(runEnv).sort().filter(k => !SHARED_SMOKE_ENV_LOCATION.includes(k) && !(minted && SHARED_SMOKE_ENV_CREDENTIAL.includes(k))).map(k => {
       check(); const v = runEnv[k]; if (typeof v !== 'string') fail('env-value-invalid'); let file = '';
+      if (['LD_PRELOAD', 'DYLD_INSERT_LIBRARIES'].includes(k) && v !== '') fail('env-native-preload-unbound: run full smoke; remove native preloads to enable reuse');
       if (k === 'NODE_PATH' && v !== '') fail('env-node-path');
       if (/--(?:require|import|(?:experimental-)?loader)|(?:^|\s|["'])-r/.test(v)) fail('env-preload-unbound');
       if (isAbsolute(v)) { const st = maybe(() => fs.statSync(v)); if (st?.isFile()) { if (st.size > 4 * 1024 ** 2) fail('env-file-oversized: run full smoke; inspect input file'); file = digest(read(v)); } }
@@ -154,6 +170,21 @@ export function sharedSmokeIdentity(o) {
         for (const m of calls) {
           check(); let spec; try { spec = m[1][0] === '"' ? JSON.parse(m[1]) : m[1].slice(1, -1); } catch { fail('runtime-shim-import'); }
           if (!spec.startsWith('node:') && !urls.has(spec)) fail('runtime-shim-import');
+        }
+        // A marker is not authorship or a proof of a spawn target. Admit only
+        // inert declarations and already-checked literal imports. General wrappers,
+        // including generated wrappers with process logic, must run full smoke.
+        let program;
+        try { program = parse(text, { ecmaVersion: 2020, allowHashBang: true }); }
+        catch { fail('runtime-shim-executable: run full smoke; inspect wrapper code'); }
+        const literal = node => node?.type === 'Literal' && typeof node.value === 'string';
+        const inert = node => literal(node) || (node?.type === 'ImportExpression' && literal(node.source))
+          || (node?.type === 'CallExpression' && node.callee.type === 'Identifier' && node.callee.name === 'require'
+            && node.arguments.length === 1 && literal(node.arguments[0]));
+        if (!program.body.every(node => (node.type === 'ExpressionStatement' && literal(node.expression))
+          || (node.type === 'VariableDeclaration' && node.kind === 'const'
+            && node.declarations.every(d => d.id.type === 'Identifier' && inert(d.init))))) {
+          fail('runtime-shim-executable: run full smoke; inspect wrapper code');
         }
         bound.push([...targets].filter(([k]) => k !== 'CACHE_PATH').sort().map(([k, p]) => [k, bindTarget(p)]));
       }
