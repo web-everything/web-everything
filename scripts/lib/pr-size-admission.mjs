@@ -73,16 +73,24 @@ export function createGitReader(cwd, exec = execFileSync) {
   };
 }
 
+/** One deadline-bounded Git reader, shared by every bounded inspection in this file: each read gets
+ * only the time left of the whole budget, so a slow sequence of reads cannot outlast it.
+ */
+function boundedGit(git, { deadline, now = () => performance.now(), timedOut, prefix = [], limits = {} }) {
+  return (args, options = {}) => {
+    const timeout = Math.ceil(deadline - now());
+    if (timeout <= 0) throw new Error(timedOut);
+    return git([...prefix, ...args], { ...options, timeout, ...limits });
+  };
+}
+
 /** Read-only ancestry admission. Lane refs are local evidence, never proof of forge PR status.
  * A declared lane base excludes its ancestry; squash landings require patch evidence, not a PR title alone.
+ * `now` is injectable so the 15s inspection deadline can be tested with a fake clock.
  */
-export function checkSiblingBase({ git, ref, sha, base = 'main' }) {
-  const deadline = performance.now() + 15_000;
-  const read = (args, options = {}) => {
-    const timeout = Math.ceil(deadline - performance.now());
-    if (timeout <= 0) throw new Error('sibling history inspection timed out');
-    return git(args, { ...options, timeout, maxBuffer: 8 * 1024 * 1024 });
-  };
+export function checkSiblingBase({ git, ref, sha, base = 'main', now = () => performance.now() }) {
+  const read = boundedGit(git, { deadline: now() + 15_000, now, timedOut: 'sibling history inspection timed out',
+    limits: { maxBuffer: 8 * 1024 * 1024 } });
   const resolveCommit = value => commitSha(read(['rev-parse', '--verify', '--end-of-options', `${value}^{commit}`]));
   const list = text => text === '' ? [] : text.trimEnd().split('\n');
   const commits = (...revs) => {
@@ -129,7 +137,10 @@ export function checkSiblingBase({ git, ref, sha, base = 'main' }) {
       // Shared ancestry alone has no ownership direction. A local creation record
       // bounds this lane's own first-parent work, excluding the history it inherited.
       // Missing/expired records cannot safely establish that direction.
-      const history = list(read(['reflog', 'show', '--max-count=2049', '--format=%H%x00%gs', name, '--']));
+      // A fetched remote-tracking ref's reflog holds fetch updates, never 'branch: Created from'.
+      // Its creation record is the matching local lane's; with no local lane there is none, so it fails closed below.
+      const creationRef = name.startsWith('refs/remotes/origin/') ? `refs/heads/${lane}` : name;
+      const history = list(read(['reflog', 'show', '--max-count=2049', '--format=%H%x00%gs', creationRef, '--']));
       if (history.length > 2048) throw new Error('lane creation evidence exceeds 2048 reflog entries');
       const creation = /^([a-f0-9]{40})\0branch: Created from .+$/.exec(history.at(-1) || '');
       if (!creation) throw new Error(`missing lane creation evidence for ${lane}`);
@@ -177,12 +188,8 @@ function countBinaryDiffRows(text, { git, topLevel, base, sha }) {
   const rows = text.slice(0, -1).split('\0');
   let mergeBase;
   // Bound the entire fallback, including every tree/blob read, rather than each file alone.
-  const deadline = performance.now() + 60_000;
-  const read = (args, options = {}) => {
-    const timeout = Math.ceil(deadline - performance.now());
-    if (timeout <= 0) throw new Error('binary size read timed out');
-    return git(['--literal-pathspecs', '-C', topLevel, ...args], { ...options, timeout });
-  };
+  const read = boundedGit(git, { deadline: performance.now() + 60_000, timedOut: 'binary size read timed out',
+    prefix: ['--literal-pathspecs', '-C', topLevel] });
   const lines = (revision, path) => {
     const entry = read(['ls-tree', '-z', '--full-tree', revision, '--', path]);
     if (entry === '') return 0;

@@ -54,4 +54,38 @@ describe('sibling-base admission with injected publishing IO', () => {
     expect(git).not.toHaveBeenCalled();
     expect(f.spawn.mock.calls[0][1]).toContain(`--sha=${sha}`);
   });
+
+  it('skips sibling history on --dry-run: a refusing or throwing checker is never consulted', () => {
+    for (const siblingBase of [
+      vi.fn(() => ({ ok: false, reason: 'sibling-base', detail: 'carried lane' })),
+      vi.fn(() => { throw new Error('history unreadable'); }),
+    ]) {
+      const f = fixture({ siblingBase });
+      const result = f.run({ argv: ['--ref=lane/own', '--dry-run'] });
+      expect(result.outcome).not.toBe('refused');
+      expect(siblingBase).not.toHaveBeenCalled();
+      expect(f.spawn).toHaveBeenCalledOnce();
+      expect(f.spawn.mock.calls[0][1]).toContain('--dry-run');
+      expect(f.spawn.mock.calls[0][1]).not.toContain('--check');
+    }
+  });
+
+  it('does not read Git for the default history checker on --dry-run', () => {
+    const git = vi.fn(() => { throw new Error('dry-run must not read Git'); });
+    const f = fixture({ git });
+    expect(f.run({ argv: ['--ref=lane/own', '--dry-run'] }).outcome).not.toBe('refused');
+    expect(git).not.toHaveBeenCalled();
+  });
+
+  it('a sibling-base refusal survives an audited pre-PR-review bypass: only --check reaches pr-land', () => {
+    const siblingBase = vi.fn(() => ({ ok: false, reason: 'sibling-base', detail: 'Unmerged sibling lanes carried by this branch: lane/7357' }));
+    const prePrReview = () => ({ action: 'pass', bypass: { actor: 'nic', reason: 'hotfix', operatorInstruction: 'ship it' } });
+    const f = fixture({ siblingBase, prePrReview });
+    const result = f.run({ argv: ['--ref=lane/own'], skipPrePrReview: 'hotfix', actor: 'nic', operatorInstruction: 'ship it' });
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base' });
+    expect(result.blockers).toContainEqual(expect.objectContaining({ gate: 'sibling-base', reason: 'sibling-base' }));
+    expect(siblingBase).toHaveBeenCalledOnce();
+    expect(f.spawn).toHaveBeenCalledOnce();
+    expect(f.spawn.mock.calls[0][1]).toContain('--check');
+  });
 });

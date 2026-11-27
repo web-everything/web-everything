@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createPrLandRunner } from '../open-pr-io.mjs';
+import { checkSiblingBase } from '../../lib/pr-size-admission.mjs';
 
 const dirs = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -167,12 +168,144 @@ describe('open-pr sibling base', () => {
     expect(f.calls[0]).toContain('--check');
   });
 
-  it('fails closed on oversized lane evidence with a clean-lane fallback', () => {
+  it('fails closed when lane refs name objects that cannot be resolved (not a size limit)', () => {
     const f = fixture();
     const result = f.run('main', { git: (args, opts) => args[0] === 'for-each-ref'
       ? Array.from({ length: 257 }, (_, n) => `refs/heads/lane/${n} ${'a'.repeat(40)}\n`).join('')
       : f.git(args, opts) });
     expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base-unknown' });
+    expect(result.detail).toContain('Cannot establish sibling history');
     expect(result.detail).toMatch(/clean lane/i);
+  });
+});
+
+describe('open-pr sibling base: evidence bounds', () => {
+  it('refuses more than 2048 commits of own history, asking Git for at most 2049 rows', () => {
+    const f = fixture();
+    const requests = [];
+    const result = f.run('main', { git: (args, opts) => {
+      if (args[0] !== 'rev-list') return f.git(args, opts);
+      requests.push(args);
+      return Array.from({ length: 2049 }, (_, n) => `${n.toString(16).padStart(40, '0')}\n`).join('');
+    } });
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base-unknown' });
+    expect(result.detail).toContain('sibling history exceeds 2048 commits');
+    expect(result.detail).toMatch(/clean lane/i);
+    expect(requests[0]).toContain('--max-count=2049');
+  });
+
+  it('refuses more than 2048 reflog entries of lane creation evidence', () => {
+    const f = fixture();
+    const requests = [];
+    const result = f.run('main', { git: (args, opts) => {
+      if (args[0] !== 'reflog') return f.git(args, opts);
+      requests.push(args);
+      return Array.from({ length: 2049 }, (_, n) => `${n.toString(16).padStart(40, '0')}\0x\n`).join('');
+    } });
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base-unknown' });
+    expect(result.detail).toContain('lane creation evidence exceeds 2048 reflog entries');
+    expect(result.detail).toMatch(/clean lane/i);
+    expect(requests[0]).toContain('--max-count=2049');
+  });
+
+  it('times out after 15s of inspection and bounds every Git read by the remaining budget', () => {
+    const f = fixture();
+    let now = 1000;
+    const reads = [];
+    const git = (args, opts) => { reads.push(opts); now += 4000; return f.git(args, { ...opts, timeout: undefined }); };
+    const result = checkSiblingBase({ git, ref: 'lane/own', base: 'main', now: () => now });
+    expect(result).toMatchObject({ ok: false, reason: 'sibling-base-unknown' });
+    expect(result.detail).toContain('sibling history inspection timed out');
+    expect(reads.length).toBeGreaterThan(1);
+    for (const opts of reads) {
+      expect(opts.timeout).toBeGreaterThan(0);
+      expect(opts.timeout).toBeLessThanOrEqual(15_000);
+      expect(opts.maxBuffer).toBe(8 * 1024 * 1024);
+    }
+    expect(reads[1].timeout).toBeLessThan(reads[0].timeout);
+  });
+
+  it('refuses an unrecognised declared base instead of falling back to main', () => {
+    const result = fixture().run('release/x');
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base-unknown' });
+    expect(result.detail).toContain('unknown declared base');
+    expect(result.detail).toMatch(/clean lane/i);
+  });
+
+  it('refuses a declared lane parent that is not an ancestor of the head', () => {
+    const f = fixture();
+    f.git(['checkout', '-qb', 'lane/elsewhere', 'main']);
+    f.commit('elsewhere', 'unrelated parent work');
+    f.git(['checkout', 'lane/own']);
+    const result = f.run('lane/elsewhere');
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base-unknown' });
+    expect(result.detail).toContain('declared parent is not contained in this head');
+  });
+});
+
+describe('open-pr sibling base: landed-sibling evidence', () => {
+  const landSquashed = f => {
+    f.git(['checkout', 'main']);
+    f.git(['merge', '--squash', 'lane/7357']);
+    f.git(['commit', '-qm', 'land sibling (#7357)']);
+    f.git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
+    f.git(['checkout', 'lane/own']);
+  };
+
+  it('admits a sibling whose commits landed one by one (rebase-merge), judged per commit', () => {
+    const f = fixture();
+    f.git(['checkout', 'main']);
+    f.git(['cherry-pick', 'lane/7357~1', 'lane/7357']);
+    f.git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
+    f.git(['checkout', 'lane/own']);
+    expect(f.run()).toMatchObject({ outcome: 'opened' });
+  });
+
+  it('refuses a sibling when only some of its commits landed one by one', () => {
+    const f = fixture();
+    f.git(['checkout', 'main']);
+    f.git(['cherry-pick', 'lane/7357~1']);
+    f.git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
+    f.git(['checkout', 'lane/own']);
+    const result = f.run();
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base' });
+    expect(result.detail).toContain('lane/7357');
+  });
+
+  it('refuses an unlanded sibling despite a matching PR title on main (patch evidence, not the title)', () => {
+    const f = fixture();
+    f.git(['checkout', 'main']);
+    f.commit('unrelated', 'land sibling (#7357)');
+    f.git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
+    f.git(['checkout', 'lane/own']);
+    const result = f.run();
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base' });
+    expect(result.detail).toContain('lane/7357');
+    expect(f.calls).toHaveLength(1);
+    expect(f.calls[0]).toContain('--check');
+  });
+
+  it('admits squash-landed siblings with fetched remote-tracking refs (creation evidence from the local lane)', () => {
+    const f = fixture();
+    f.git(['update-ref', 'refs/remotes/origin/lane/7357', 'refs/heads/lane/7357']);
+    landSquashed(f);
+    expect(f.run()).toMatchObject({ outcome: 'opened' });
+  });
+
+  it('still refuses an unlanded sibling seen through both local and remote-tracking refs', () => {
+    const f = fixture();
+    f.git(['update-ref', 'refs/remotes/origin/lane/7357', 'refs/heads/lane/7357']);
+    const result = f.run();
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base' });
+    expect(result.detail).toContain('lane/7357');
+  });
+
+  it('fails closed for a remote-only sibling: a fetched ref has no local creation record', () => {
+    const f = fixture();
+    f.git(['update-ref', 'refs/remotes/origin/lane/7357', 'refs/heads/lane/7357']);
+    f.git(['branch', '-D', 'lane/7357']);
+    const result = f.run();
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base-unknown' });
+    expect(result.detail).toContain('missing lane creation evidence for lane/7357');
   });
 });
