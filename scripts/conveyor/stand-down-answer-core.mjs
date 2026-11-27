@@ -255,6 +255,7 @@ export function noCodeRearmWindowHonours(comments, answer, headRefOid) {
 export function noCodeRearmPlan({ comments, labels, headRefOid } = {}) {
   const result = (state, why, answerId = null) => ({ state, answerId, why });
   if (!Array.isArray(comments)) return result('held', 'comments unreadable');
+  if (comments.length > 2000) return result('held', 'thread exceeds 2000 comments; operator must inspect the complete thread before a fresh answer');
   let answerAt = -1, answer;
   for (let i = comments.length - 1; i >= 0; i--) {
     const candidate = parseOperatorAnswer(comments[i]);

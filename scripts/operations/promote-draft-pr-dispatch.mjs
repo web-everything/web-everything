@@ -147,11 +147,14 @@ export function defaultReadHeadCheckState({
 }
 
 /** Fresh draft hold labels, scoped to the target PR and repository; fail closed on unreadable data. */
-export function defaultReadPrLabels({ repoSlug, prNumber, runGh = runGhSync } = {}) {
-  const raw = runGh(['pr', 'view', String(prNumber), '--repo', repoSlug, '--json', 'labels'], {
+export function defaultReadPrLabels({ repoSlug, prNumber, expectHead, runGh = runGhSync } = {}) {
+  const raw = runGh(['pr', 'view', String(prNumber), '--repo', repoSlug, '--json', expectHead ? 'labels,headRefOid' : 'labels'], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'pr-labels', repo: repoSlug },
   });
   const envelope = JSON.parse(raw);
+  if (expectHead && envelope?.headRefOid !== expectHead) {
+    throw Error('head changed or unreadable; operator must inspect the current head before a fresh answer');
+  }
   return validatePrLabels(envelope?.labels);
 }
 
@@ -522,7 +525,7 @@ export function runReconcilePromoteDraftDispatch({
       let comments, labels;
       try {
         comments = readThread(prNumber, { repo: repoSlug, maxPages: 10 });
-        labels = validatePrLabels(readPrLabels({ repoSlug, prNumber })).map(l => typeof l === 'string' ? l : l.name);
+        labels = validatePrLabels(readPrLabels({ repoSlug, prNumber, expectHead: entry.expectHead })).map(l => typeof l === 'string' ? l : l.name);
         if (!Array.isArray(comments)) throw Error('comments unreadable');
       } catch (e) {
         refusals.push({ pr: prNumber, kind: 'rearm-no-code-unreadable', why: `${String(e?.message ?? e).split('\n')[0]}; operator must inspect the complete thread and labels before a fresh answer` });
