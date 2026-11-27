@@ -20,6 +20,7 @@ import { buildVerdictComment, buildRearmVerdictBinding, rearmVerdictKey, latestC
 import { parseLatestHumanClearedSha } from '../../lib/review-escalation.mjs';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../../lib/jury-core.mjs';
 import * as referralGate from '../../operations/record-referral-ruling.mjs';
+import * as orphanListing from '../orphan-fix-round.mjs';
 
 const BOT = { login: 'web-everything' };
 // Never-edited comments, as a live `gh pr view --json comments` read reports them; an unstamped automation-posted
@@ -33,6 +34,138 @@ const BEGIN = c('2026-10-10T15:03:55Z', `${FIX_BEGIN_MARKER}\n\n**Who:** \`fix-4
 const RESTACK = c('2026-10-10T15:21:28Z', '🔁 restack — merged `origin/lane/gh-merge-queue-gate` into this branch.');
 const END = c('2026-10-10T15:21:33Z', `${FIX_END_MARKER}\n\n\`fix-4715\` released the fix claim at \`124e242da\`.`);
 const pr4715 = (comments, extra = {}) => ({ number: 4715, labels: [{ name: 'review:changes' }, { name: 'review-round:1' }], headRefOid: HEAD, isDraft: false, comments, ...extra });
+
+describe('ORPHAN-LIST-INCOMPLETE listing boundary', () => {
+  const slug = 'web-everything/web-everything';
+  const rest = number => ({ number, labels: [{ name: 'review:changes' }], head: { sha: HEAD },
+    draft: false, body: '', created_at: '2026-10-09T22:42:48Z' });
+  const fixture = (count = 201) => {
+    let time = 0;
+    const prs = Array.from({ length: count }, (_, i) => rest(count - i));
+    const exec = vi.fn((_cmd, args) => {
+      const page = Number(new URLSearchParams(args[1].split('?')[1]).get('page'));
+      return JSON.stringify(prs.slice((page - 1) * 100, page * 100));
+    });
+    const readComments = vi.fn(async () => [VERDICT]);
+    const write = vi.fn(async () => ({ ok: true }));
+    const now = () => time;
+    const options = { repos: [{ key: 'we', slug }], env: {}, nowMs: NOW, now,
+      readComments, isOwned: async () => false, rearm: write, redispatch: write, escalate: write,
+      postComment: write, cardReadable: () => false, resolveProfile: () => ({ capabilities: { fix: true } }) };
+    return { exec, readComments, write, now, options, setTime: value => { time = value; } };
+  };
+
+  it.each(['page-cap', 'listing-deadline'])('a listing cut at the page cap or deadline reaches the daemon as incomplete (%s)', async reason => {
+    const f = fixture();
+    const exec = (...args) => {
+      const out = f.exec(...args);
+      if (reason === 'listing-deadline' && f.exec.mock.calls.length === 2) f.setTime(10);
+      return out;
+    };
+    const result = await runOrphanFixRoundPass({ ...f.options,
+      listBounced: (repo, input) => orphanListing.readBouncedListing(repo, {
+        ...input, exec, now: f.now, timeoutMs: 1000, deadlineAt: 10, maxPages: reason === 'page-cap' ? 2 : 10,
+      }) });
+    expect(result).toMatchObject({ complete: false, reason, handled: 0 });
+    expect(result.listings[slug]).toMatchObject({ complete: false, reason, items: expect.any(Array),
+      continuation: { repo: slug, page: 3, attempt: 1 } });
+    expect(result.listings[slug].items).toHaveLength(200);
+    expect(result.repoCursors[slug]).toEqual(expect.any(String));
+    expect(result.rows).toContainEqual(expect.objectContaining({ repo: slug, decision: 'error',
+      reason: expect.stringMatching(new RegExp(`${reason}.*retry.*operator`, 'i')) }));
+    expect(f.readComments).not.toHaveBeenCalled();
+    expect(f.write).not.toHaveBeenCalled();
+  });
+
+  it('requires a short terminal page after an exact-full page', () => {
+    const f = fixture(200);
+    const result = orphanListing.readBouncedListing(slug, { exec: f.exec, now: f.now, timeoutMs: 1000, maxPages: 3 });
+    expect(result).toMatchObject({ complete: true, reason: 'complete', continuation: null });
+    expect(result.items).toHaveLength(200);
+    expect(f.exec).toHaveBeenCalledTimes(3);
+  });
+
+  it.each(['throw', 'malformed', 'shape', 'duplicate', 'oversized'])('read-throws / malformed page refuses without losing partial rows (%s)', kind => {
+    const f = fixture();
+    const exec = vi.fn((...args) => {
+      if (exec.mock.calls.length === 1) return f.exec(...args);
+      if (kind === 'throw') throw new Error('HTTP 503');
+      if (kind === 'malformed') return '{';
+      if (kind === 'shape') return '[{"number":1}]';
+      if (kind === 'duplicate') return JSON.stringify([rest(201)]);
+      return JSON.stringify(Array.from({ length: 101 }, (_, i) => rest(101 - i)));
+    });
+    const result = orphanListing.readBouncedListing(slug, { exec, now: f.now, timeoutMs: 1000 });
+    expect(result).toMatchObject({ complete: false, reason: kind === 'throw' ? 'page-failure' : 'invalid-page',
+      continuation: { repo: slug, page: 2 } });
+    expect(result.items).toHaveLength(100);
+    expect(result.action).toMatch(/retry.*operator/i);
+    expect(exec).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([null, {}, { items: [] }, { items: [], complete: 'true' }])('required-evidence-missing: unknown legacy return cannot certify a scan (%j)', listing => {
+    const f = fixture();
+    return runOrphanFixRoundPass({ ...f.options, listBounced: () => listing }).then(result => {
+      expect(result).toMatchObject({ complete: false, reason: 'required-evidence-missing' });
+      expect(result.rows).toContainEqual(expect.objectContaining({ decision: 'error' }));
+      expect(f.write).not.toHaveBeenCalled();
+    });
+  });
+
+  it('deadline before listing makes no external call and retains retry evidence', () => {
+    const f = fixture();
+    const result = orphanListing.readBouncedListing(slug, { exec: f.exec, now: f.now, timeoutMs: 1000, deadlineAt: 0 });
+    expect(result).toMatchObject({ complete: false, reason: 'listing-deadline', continuation: { page: 1 } });
+    expect(f.exec).not.toHaveBeenCalled();
+  });
+
+  it('retains the processing cursor when a deadline cuts known rows, then completes without duplicate fix dispatch', async () => {
+    const f = fixture(3);
+    const dispatched = new Set();
+    const listBounced = (repo, input) => orphanListing.readBouncedListing(repo, { ...input, exec: f.exec, now: f.now, timeoutMs: 1000 });
+    const redispatch = vi.fn(async ({ pr }) => { dispatched.add(pr); f.setTime(10); return { ok: true }; });
+    const options = { ...f.options, listBounced, redispatch, deadlineAt: 10,
+      isOwned: async (_repo, pr) => dispatched.has(pr), readComments: async () => [VERDICT, END] };
+    const first = await runOrphanFixRoundPass(options);
+    expect(first).toMatchObject({ complete: false, reason: 'processing-deadline', repoCursors: { [slug]: 2 } });
+    f.setTime(0);
+    const second = await runOrphanFixRoundPass({ ...options, cursor: first.repoCursors });
+    f.setTime(0);
+    const third = await runOrphanFixRoundPass({ ...options, cursor: second.repoCursors });
+    f.setTime(0);
+    const last = await runOrphanFixRoundPass({ ...options, cursor: third.repoCursors });
+    expect(last).toMatchObject({ complete: true, reason: 'complete', repoCursors: null });
+    expect(redispatch.mock.calls.map(([row]) => row.pr)).toEqual([1, 2, 3]);
+  });
+
+  it('replays a capped prefix from live page one, retains its cursor across serialization, and recovers past 200 PRs', async () => {
+    const f = fixture();
+    const listBounced = (repo, input) => orphanListing.readBouncedListing(repo, {
+      ...input, exec: f.exec, now: f.now, timeoutMs: 1000, maxPages: 2 });
+    const first = await runOrphanFixRoundPass({ ...f.options, listBounced });
+    expect(first.complete).toBe(false);
+    const cursor = JSON.parse(JSON.stringify(first.repoCursors));
+    const last = await runOrphanFixRoundPass({ ...f.options, listBounced, cursor });
+    expect(last).toMatchObject({ complete: true, reason: 'complete', handled: 201, repoCursors: null });
+    expect(f.exec.mock.calls.map(([, args]) => Number(new URLSearchParams(args[1].split('?')[1]).get('page'))))
+      .toEqual([1, 2, 1, 2, 3]);
+    expect(f.write).not.toHaveBeenCalled();
+  });
+
+  it('persistent caps stop after three bounded attempts with an operator repair action', async () => {
+    const f = fixture(1000);
+    const listBounced = (repo, input) => orphanListing.readBouncedListing(repo, {
+      ...input, exec: f.exec, now: f.now, timeoutMs: 1000, maxPages: 1 });
+    const first = await runOrphanFixRoundPass({ ...f.options, listBounced });
+    const second = await runOrphanFixRoundPass({ ...f.options, listBounced, cursor: first.repoCursors });
+    const third = await runOrphanFixRoundPass({ ...f.options, listBounced, cursor: second.repoCursors });
+    const fourth = await runOrphanFixRoundPass({ ...f.options, listBounced, cursor: third.repoCursors });
+    expect(fourth).toMatchObject({ complete: false, reason: 'retry-exhausted' });
+    expect(fourth.rows[0].reason).toMatch(/operator.*(reset|repair|inspect)/i);
+    expect(f.exec).toHaveBeenCalledTimes(6);
+    expect(f.write).not.toHaveBeenCalled();
+  });
+});
 
 it('recovers a concurrent same-head send-back after the pinned re-arm marker and operator ruling (PR #5925)', async () => {
   const { default: scenario } = await import('../soak/breaks/pinned-rearm-orphan-marker.mjs');

@@ -1991,6 +1991,9 @@ export function runReconcileFixDispatch({
   replanFreshPr = runReconcilePass,
   // Pass-local guard: PR numbers, or a predicate over dispatch rows (also called with only prNumber).
   excludePrs = [],
+  // Optional explicit guard evidence from a listing/daemon pass. Legacy results with no affirmative
+  // completeness proof hold before reconciliation (which can itself write stand-down answers).
+  orphanScan,
   // R123 writes require caller permission, even when dispatch itself is stubbed (live smoke).
   // The production daemon forwards fix.standDownAutoProceed from the policy cascade (standard: true).
   allowStandDownAutoProceed = false,
@@ -2059,6 +2062,14 @@ export function runReconcileFixDispatch({
   // One line per step (name, optional pr, ms, startedAt): shows which sub-step makes a slow fix phase. Never fails a step.
   stepNow = Date.now, stepLog = (line) => console.error(line),
 } = {}) {
+  if (Object.hasOwn(arguments[0] ?? {}, 'orphanScan') && (orphanScan?.complete !== true
+    || orphanScan.reason !== 'complete' || !Array.isArray(orphanScan.rows))) {
+    const reason = typeof orphanScan?.reason === 'string' ? orphanScan.reason : 'required-evidence-missing';
+    const why = `orphan-cap guard incomplete: ${reason}; retry next pass; persistent failures require operator inspection and cursor repair`;
+    return { handled: 0, deferred: [], nextCursor: null, dispatched: [], orphanScanComplete: false, orphanScan,
+      refusals: [{ repo, prNumber: null, kind: 'orphan-guard-deferred', why }],
+      reconcileRefusals: 0, reconcileRefusalDetails: [] };
+  }
   let yieldedForAdoption = false;
   // Capacity episode timestamps remain numeric; the deadline clock stays live between PRs.
   if (typeof now === 'function') now = now();

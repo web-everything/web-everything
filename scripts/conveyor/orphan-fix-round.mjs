@@ -184,6 +184,74 @@ export function buildOrphanGuardComment({ decision, reason, prNumber }) {
 // ── IO shell ────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 const ghOpts = () => ({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', maxBuffer: 16 * 1024 * 1024 });
+const LISTING_CURSOR_PREFIX = 'orphan-list-v1:';
+const LISTING_ATTEMPTS = 3;
+const listingAction = 'retry next pass; after three attempts an operator must inspect the listing failure and reset the orphan listing cursor';
+const message = error => stripVTControlCharacters(String(error?.message ?? error)).replace(/[\p{Cc}\p{Cf}]/gu, ' ').slice(0, 300);
+
+/** Explicit listing boundary used by the daemon pass. Partial rows are diagnostic evidence only.
+ * Continuations replay page one with a bounded, increasing page budget: mutable REST page offsets
+ * cannot safely authorize effects from a saved prefix. No comments, claims or action verdicts are cached.
+ * Three unsuccessful attempts require operator repair/reset; every request shares the time/output bounds.
+ * The older defaultListBounced API below retains its array/throw contract for existing clients.
+ */
+export function readBouncedListing(slug, { exec = execFileSync, now = Date.now, deadlineAt = Infinity,
+  timeoutMs = resolveChildTimeoutMs(), maxPages = 100, continuation = null } = {}) {
+  const items = [];
+  let page = 1, attempt = 1;
+  const incomplete = (reason, detail = '') => ({ items, complete: false, reason, detail,
+    continuation: { repo: slug, page, attempt }, action: listingAction });
+  if (continuation !== null) {
+    if (continuation?.repo !== slug || !Number.isSafeInteger(continuation?.page) || continuation.page < 1
+      || !Number.isSafeInteger(continuation?.attempt) || continuation.attempt < 1 || continuation.attempt > LISTING_ATTEMPTS) {
+      return incomplete('invalid-continuation', 'operator must repair a malformed or cross-repo continuation');
+    }
+    attempt = continuation.attempt + 1;
+    if (attempt > LISTING_ATTEMPTS) {
+      attempt = LISTING_ATTEMPTS;
+      page = continuation.page;
+      return incomplete('retry-exhausted', 'operator must inspect the failure and reset the orphan listing cursor');
+    }
+  }
+  if (!Number.isSafeInteger(maxPages) || maxPages < 1 || maxPages > 100
+    || !Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 300_000
+    || !(Number.isFinite(deadlineAt) || deadlineAt === Infinity)) return incomplete('invalid-bound');
+  const start = now();
+  if (!Number.isFinite(start)) return incomplete('invalid-clock');
+  const until = Math.min(deadlineAt, start + timeoutMs);
+  let previous = Infinity;
+  for (; page <= maxPages * attempt; page++) {
+    const remaining = until - now();
+    if (!Number.isFinite(remaining) || remaining <= 0) return incomplete('listing-deadline');
+    let prs;
+    try {
+      const out = exec('gh', ['api', `repos/${slug}/pulls?state=open&sort=created&direction=desc&per_page=100&page=${page}`],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: Math.max(1, Math.ceil(remaining)),
+          killSignal: 'SIGKILL', maxBuffer: 16 * 1024 * 1024 });
+      try { prs = JSON.parse(String(out)); } catch (error) { return incomplete('invalid-page', message(error)); }
+    } catch (error) { return incomplete('page-failure', message(error)); }
+    if (!Array.isArray(prs) || prs.length > 100) return incomplete('invalid-page');
+    // Validate the whole page before retaining it. Duplicate/reordered pages signal a moving snapshot.
+    let last = previous;
+    for (const pr of prs) {
+      if (!Number.isSafeInteger(pr?.number) || pr.number <= 0 || pr.number >= last
+        || !Array.isArray(pr.labels) || pr.labels.some(l => typeof l?.name !== 'string')
+        || typeof pr.head?.sha !== 'string' || !pr.head.sha.length || typeof pr.draft !== 'boolean') {
+        return incomplete('invalid-page', 'missing required fields or duplicate-or-reordered-evidence');
+      }
+      last = pr.number;
+    }
+    previous = last;
+    items.push(...prs.filter(p => labelNames(p.labels).includes('review:changes')).map(p => ({
+      number: p.number, labels: p.labels, headRefOid: p.head.sha, isDraft: p.draft, body: p.body, createdAt: p.created_at,
+    })));
+    // A child that returns after the shared deadline cannot certify even a short terminal page.
+    if (now() >= until) return { ...incomplete('listing-deadline'), continuation: { repo: slug, page: page + 1, attempt } };
+    if (prs.length < 100) return { items, complete: true, reason: 'complete', continuation: null };
+  }
+  return incomplete('page-cap');
+}
+
 export function defaultListBounced(slug, { exec = execFileSync, deadlineAt = Infinity } = {}) {
   // Filtered here, not with `--label` (search-backed, rate-limited on its own budget — #no-label-search).
   const perPage = 100, bounced = [];
@@ -282,7 +350,10 @@ export function defaultPostComment({ slug, pr, body, exec = execFileSync }) {
  * ONE guard pass over every constellation repo. Never throws; one PR's failure never stops the rest.
  * Optional `settled` retains stable none verdicts between passes, keyed by `${slug}#${pr}` → {head, at}.
  * `cursor` is the per-repo map a previous pass returned as `repoCursors` (or a legacy single `{repo, pr}`).
- * @returns {Promise<{enabled:boolean, rows:Array<object>, handled:number, deferred:Array<object>, deferredSettled:Array<object>, newlySettled:Array<object>, nextCursor:object|null, repoCursors:object|null}>}
+ * Listing envelopes carry items/complete/reason/continuation; item-only array callbacks retain their historical
+ * full-list contract. Unknown envelope fields never certify a listing. Listing cursors are bounded JSON strings
+ * so the existing daemon cursor store can persist them without a new state file or scan-complete watermark.
+ * @returns {Promise<{enabled:boolean, complete:boolean, reason:string, listings:object, rows:Array<object>, handled:number, deferred:Array<object>, deferredSettled:Array<object>, newlySettled:Array<object>, nextCursor:object|null, repoCursors:object|null}>}
  */
 export async function runOrphanFixRoundPass({
   env = process.env,
@@ -295,7 +366,7 @@ export async function runOrphanFixRoundPass({
   settledTtlMs = 6 * 60 * 60 * 1000,
   reconcile,
   repos = Object.entries(CONSTELLATION_REPOS).map(([key, r]) => ({ key, slug: r.slug })),
-  listBounced = (slug) => defaultListBounced(slug, { deadlineAt }),
+  listBounced = (slug, input) => readBouncedListing(slug, { ...input, deadlineAt, now }),
   readComments = defaultReadComments,
   isOwned = defaultOwned,
   rearm = defaultRearm,
@@ -308,19 +379,41 @@ export async function runOrphanFixRoundPass({
 } = {}) {
   const enabled = orphanGuardEnabled(env);
   const rows = [], deferred = [], deferredSettled = [], newlySettled = [];
-  let handled = 0, redispatched = false, deferring = false;
+  let handled = 0, redispatched = false, deferring = false, processingReason = null;
+  const listings = {};
   // Each repo keeps its OWN resume point (PR #7330): a pass that reaches only some repos must not overwrite the
   // deferred progress of a repo it never listed. A legacy single `{repo, pr}` cursor migrates to one entry.
   const repoCursors = normalizeOrphanCursors(cursor);
   const resumeAt = (key, slug) => repoCursors[slug] ?? repoCursors[key];
   const listed = [], head = [], wrapped = [];
   for (const { key, slug } of repos) {
-    let prs;
-    try { prs = listBounced(slug); } catch (e) { rows.push({ repo: slug, decision: 'error', reason: `listing failed: ${String(e?.message ?? e).split('\n')[0]}` }); continue; }
+    let prs, listing;
+    const saved = resumeAt(key, slug);
+    try {
+      const continuation = typeof saved === 'string' ? JSON.parse(saved.slice(LISTING_CURSOR_PREFIX.length)) : null;
+      listing = await listBounced(slug, { continuation });
+      // Existing array callbacks explicitly supply a full list. Envelopes require affirmative evidence.
+      if (Array.isArray(listing)) listing = { items: listing, complete: true, reason: 'complete', continuation: null };
+      if (!listing || !Array.isArray(listing.items) || typeof listing.complete !== 'boolean'
+        || typeof listing.reason !== 'string' || (listing.complete && (listing.reason !== 'complete' || listing.continuation !== null))) {
+        listing = { items: [], complete: false, reason: 'required-evidence-missing', continuation: null, action: listingAction };
+      }
+      listings[slug] = listing;
+      if (!listing.complete) {
+        rows.push({ repo: slug, decision: 'error', reason: `listing failed: ${listing.reason}; ${listing.detail ?? ''}; ${listing.action ?? listingAction}` });
+        if (listing.continuation) repoCursors[slug] = LISTING_CURSOR_PREFIX + JSON.stringify({ ...listing.continuation,
+          ...(typeof saved === 'number' ? { pr: saved } : continuation?.pr ? { pr: continuation.pr } : {}) });
+        continue;
+      }
+      prs = listing.items;
+    } catch (e) {
+      listings[slug] = { items: [], complete: false, reason: 'page-failure', continuation: null, action: listingAction };
+      rows.push({ repo: slug, decision: 'error', reason: `listing failed: ${String(e?.message ?? e).split('\n')[0]}` }); continue;
+    }
     listed.push({ key, slug });
     // Repos run in the order the caller yields them (the daemon rotates that order fairly); each repo resumes at
     // its cursor, and the PRs before it run after every repo's resumed part so one large repo never starves the rest.
-    const at = resumeAt(key, slug);
+    const at = typeof saved === 'string' ? JSON.parse(saved.slice(LISTING_CURSOR_PREFIX.length)).pr : saved;
     const own = [...(prs ?? [])].sort((a, b) => a.number - b.number);
     for (const p of own) (at != null && p.number < at ? wrapped : head).push({ key, slug, p });
   }
@@ -344,6 +437,7 @@ export async function runOrphanFixRoundPass({
   for (const { key, slug, p, cachedAt } of ordered) {
     const cacheKey = `${slug}#${p.number}`;
     if (deferring || (handled > 0 && (now() >= deadlineAt || shouldYield?.()))) {
+      processingReason ??= now() >= deadlineAt ? 'processing-deadline' : 'processing-yield';
       deferring = true;
       (cachedAt === undefined ? deferred : deferredSettled).push({ repo: slug, pr: p.number });
       continue;
@@ -363,6 +457,7 @@ export async function runOrphanFixRoundPass({
         continue;
       }
       if (plan.decision === 'redispatch' && redispatched) {
+        processingReason ??= 'redispatch-cap';
         deferring = true;
         deferred.push({ repo: slug, pr: p.number });
         continue;
@@ -393,14 +488,18 @@ export async function runOrphanFixRoundPass({
   const nextRepoCursors = { ...repoCursors };
   for (const { key, slug } of listed) { delete nextRepoCursors[key]; delete nextRepoCursors[slug]; }
   for (const d of deferred) nextRepoCursors[d.repo] ??= d.pr;
-  return { enabled, rows, handled, deferred, deferredSettled, newlySettled, nextCursor: deferred[0] ?? null,
+  const failedListing = Object.values(listings).find(listing => !listing.complete);
+  const failedAction = rows.some(row => row.decision === 'error' || row.result?.startsWith('error:') || row.result?.startsWith('not-done:') || row.result?.includes('marker comment failed:'));
+  const reason = failedListing?.reason ?? processingReason ?? (failedAction ? 'processing-failure' : 'complete');
+  return { enabled, complete: reason === 'complete', reason, listings, rows, handled, deferred, deferredSettled, newlySettled, nextCursor: deferred[0] ?? null,
     repoCursors: Object.keys(nextRepoCursors).length ? nextRepoCursors : null };
 }
 
 /** Per-repo orphan cursors `{ <repo>: <pr> }`; accepts the legacy single `{ repo, pr }` cursor. Invalid → none. */
 export function normalizeOrphanCursors(cursor) {
   if (cursor === null || typeof cursor !== 'object' || Array.isArray(cursor)) return {};
-  const valid = ([repo, pr]) => typeof repo === 'string' && repo.length > 0 && Number.isSafeInteger(pr) && pr > 0;
+  const valid = ([repo, pr]) => typeof repo === 'string' && repo.length > 0
+    && ((Number.isSafeInteger(pr) && pr > 0) || (typeof pr === 'string' && pr.startsWith(LISTING_CURSOR_PREFIX) && pr.length <= 1024));
   const keys = Object.keys(cursor);
   if (keys.length === 2 && keys.includes('repo') && keys.includes('pr')) {
     return valid([cursor.repo, cursor.pr]) ? { [cursor.repo]: cursor.pr } : {};
