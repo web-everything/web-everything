@@ -926,8 +926,17 @@ export function reportMainRedMetrics(events, { from, to, now, warnings = [] } = 
     else if (!unique.has(e.key)) unique.set(e.key, e);
   }
   const rows = [...unique.values()].filter(e => e.at < to).sort((a, b) => a.at - b.at || a.seq - b.seq);
-  if (!rows.length || Math.min(...rows.map(e => e.kind === 'red' ? e.since : e.at)) > from)
+  if (!rows.length)
     warn('Incomplete range: history does not cover the requested start; recover archived evidence.');
+  const historyStarts = new Map();
+  for (const e of rows) {
+    const start = e.kind === 'red' ? e.since : e.at;
+    historyStarts.set(e.repo, Math.min(historyStarts.get(e.repo) ?? Infinity, start));
+  }
+  for (const [repo, start] of historyStarts) {
+    if (start > from)
+      warn(`Incomplete range: history does not cover the requested start for ${repo}; recover archived evidence.`);
+  }
   const episodes = new Map(); const intervals = new Map(); const signatures = new Map(); const queues = new Map();
   for (const e of rows) {
     const episode = `${e.repo}:${e.seq}`;
@@ -940,6 +949,8 @@ export function reportMainRedMetrics(events, { from, to, now, warnings = [] } = 
         continue;
       }
       if (!episodes.has(episode)) episodes.set(episode, { repo: e.repo, start: e.since, end: null });
+      else if (episodes.get(episode).start !== e.since)
+        warn('Incomplete episode origin: conflicting starts for an open episode; recover source evidence.');
     }
     if (e.kind === 'green') {
       const open = episodes.get(episode);

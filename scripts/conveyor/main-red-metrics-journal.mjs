@@ -84,10 +84,13 @@ export function readMainRedMetrics(dir, { limit = MAIN_RED_METRIC_LIMITS.events,
       try {
         const event = readMetricFile(path, read);
         if (!validMainRedMetric(event)) throw new Error('malformed event');
+        if (name !== `${event.key}.json`) throw new Error('filename/key mismatch');
         events.push(event);
       } catch (error) {
         warnings.push(error.message === 'oversized event'
           ? 'Incomplete oversized event; archive journal and recover source evidence.'
+          : error.message === 'filename/key mismatch'
+          ? 'Incomplete filename/key mismatch; archive journal and recover source evidence.'
           : 'Incomplete malformed/unreadable event; archive journal and recover source evidence.');
       }
     }

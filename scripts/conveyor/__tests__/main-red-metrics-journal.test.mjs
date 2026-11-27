@@ -13,6 +13,18 @@ const inJournal = async action => {
 };
 
 describe('red metrics journal acknowledgement', () => {
+  it('rejects persisted filename/key mismatches while retaining correctly named evidence', () => inJournal(dir => {
+    const e = metric();
+    expect(appendMainRedMetrics(dir, [e])).toEqual({ warnings: [] });
+    const misplaced = metric({ key: 'misplaced' });
+    writeFileSync(join(dir, 'main-red-metrics', 'different-key.json'), JSON.stringify(misplaced));
+    const replay = readMainRedMetrics(dir);
+    expect(replay.events).toEqual([e]);
+    expect(replay.warnings.join(' ')).toMatch(/Incomplete.*filename.*key.*archive.*recover/i);
+    expect(readdirSync(join(dir, 'main-red-metrics')).sort())
+      .toEqual(['different-key.json', `${e.key}.json`]);
+  }));
+
   it('refuses new journal events at capacity while acknowledging existing events', async () => {
     const { readdirSync } = await import('node:fs');
     const { appendMainRedMetrics } = await import('../main-red-metrics-journal.mjs');

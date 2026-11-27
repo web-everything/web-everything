@@ -171,6 +171,30 @@ describe('red metrics report', () => {
   const report = (events, from = 0, to = 90) => reportMainRedMetrics(events,
     { from: from * minute, to: to * minute, now: to * minute });
 
+  it('warns for a repository missing start coverage even when another repository covers it', () => {
+    const covered = event('red', 0);
+    const late = event('red', 2, { repo: 'other/repo', since: minute });
+    expect(report([covered], 0, 10).warnings).toEqual([]);
+    const mixed = report([covered, late], 0, 10);
+    expect(mixed.days).toEqual({ '1970-01-01': 19 });
+    expect(mixed.warnings.join(' ')).toMatch(/history does not cover.*other\/repo.*recover/i);
+    expect(report([covered, { ...late, since: 0 }], 0, 10).warnings).toEqual([]);
+  });
+
+  it('warns on conflicting open episode origins in either direction and preserves the first evidence', () => {
+    const check = (first, second, minutes) => {
+      const rows = [event('red', 2, { since: first }), event('red', 3, { since: second })];
+      const replay = report(rows, 0, 10);
+      expect(replay.days).toEqual({ '1970-01-01': minutes });
+      expect(replay.openEpisodes).toBe(1);
+      expect(replay.warnings.join(' ')).toMatch(/Incomplete episode origin:.*conflicting.*recover/i);
+      expect(report([rows[0], { ...rows[1], since: first }], 0, 10).warnings.join(' '))
+        .not.toMatch(/conflicting/);
+    };
+    check(minute, 0, 9);
+    check(0, minute, 10);
+  });
+
   it('red metrics report — a closed episode keeps its end across a later unknown then green', () => {
     const r = report([event('red', 30), event('green', 40), event('unknown', 60), event('green', 80)]);
     expect(r.days).toEqual({ '1970-01-01': 40 });
