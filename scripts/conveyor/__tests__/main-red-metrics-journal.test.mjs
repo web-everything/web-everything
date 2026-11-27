@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, readdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readdirSync, readFileSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { appendMainRedMetrics, readMainRedMetrics, metricRecovery } from '../main-red-metrics-journal.mjs';
@@ -104,6 +104,39 @@ describe('red metrics journal acknowledgement', () => {
     });
   });
 
+
+  it('creates exclusively and never overwrites a winner that appears between the check and the write', () => inJournal(dir => {
+    const event = metric();
+    const path = join(dir, 'main-red-metrics', `${event.key}.json`);
+    const winner = JSON.stringify({ ...event, seq: 99 });
+    const writeFile = vi.fn((target, text, options) => {
+      writeFileSync(target, winner); // the competing writer lands first
+      writeFileSync(target, text, options); // real write with the supplied options
+    });
+    expect(appendMainRedMetrics(dir, [event], { writeFile }).warnings).toEqual([metricRecovery]);
+    expect(writeFile).toHaveBeenCalledWith(path, JSON.stringify(event), expect.objectContaining({ flag: 'wx' }));
+    expect(readFileSync(path, 'utf8')).toBe(winner);
+  }));
+  it('counts each new write against the cap inside one batch', () => inJournal(dir => {
+    const first = metric({ key: 'first' }); const second = metric({ key: 'second' });
+    expect(appendMainRedMetrics(dir, [first, second], { limit: 1 }).warnings).toEqual([metricRecovery]);
+    expect(readdirSync(join(dir, 'main-red-metrics'))).toEqual(['first.json']);
+  }));
+  it.each([
+    ['a non-.json file', d => writeFileSync(join(d, 'main-red-metrics', 'note.txt'), JSON.stringify(metric()))],
+    ['a symlink to valid evidence', d => {
+      writeFileSync(join(d, 'target.json'), JSON.stringify(metric({ key: 'linked' })));
+      symlinkSync(join(d, 'target.json'), join(d, 'main-red-metrics', 'linked.json'));
+    }],
+  ])('refuses %s in the journal directory at read and append', (_label, plant) => inJournal(dir => {
+    const e = metric();
+    expect(appendMainRedMetrics(dir, [e]).warnings).toEqual([]);
+    plant(dir);
+    expect(readMainRedMetrics(dir)).toEqual({ events: [], warnings: [metricRecovery] });
+    const writeFile = vi.fn();
+    expect(appendMainRedMetrics(dir, [metric({ key: 'later' })], { writeFile }).warnings).toEqual([metricRecovery]);
+    expect(writeFile).not.toHaveBeenCalled();
+  }));
 
   it('acknowledges identical transitions with a later poll time and never rewrites evidence', () => inJournal(dir => {
     const e = metric();

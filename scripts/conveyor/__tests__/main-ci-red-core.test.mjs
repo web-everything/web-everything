@@ -111,6 +111,31 @@ describe('red metrics evidence', () => {
     expect(measureMainQueue({ enqueuedAt: 5000, startedAt: 4000 }).waitMs).toBeNull();
   });
 
+  it('keeps a valid wait and nulls service when completion precedes start', async () => {
+    const { measureMainQueue } = await import('../main-ci-red-core.mjs');
+    expect(measureMainQueue({ enqueuedAt: 1000, startedAt: 4000, completedAt: 3000 }))
+      .toEqual({ waitMs: 3000, serviceMs: null });
+  });
+
+  it('normalizes whitespace and slash direction before signing', async () => {
+    const { mainFailureSignature } = await import('../main-ci-red-core.mjs');
+    const base = mainFailureSignature({ job: 'x y', file: 'a/b', test: 't' });
+    expect(base).toMatch(/^v1:[a-f0-9]{64}$/);
+    expect(mainFailureSignature({ job: ' x  y ', file: 'a/b', test: 't' })).toBe(base);
+    expect(mainFailureSignature({ job: 'x\ty', file: 'a/b', test: 't' })).toBeNull(); // controls are refused, not collapsed
+    expect(mainFailureSignature({ job: 'x y', file: 'a\\b', test: 't' })).toBe(base);
+    expect(mainFailureSignature({ job: 'x y', file: '  a\\\\b ', test: 't' }))
+      .toBe(mainFailureSignature({ job: 'x y', file: 'a//b', test: 't' }));
+    expect(mainFailureSignature({ job: 'x y', file: 'a/c', test: 't' })).not.toBe(base);
+  });
+
+  it.each(['ghp_x', 'gho_x', 'ghu_x', 'ghs_x', 'ghr_x', 'github_pat_x', 'sk-a', 'SK-A1',
+    'password=x', 'secret: x', 'authorization=x', 'token :x', 'Authorization:x'])(
+  'refuses credential-shaped identifier %s in every field', async text => {
+    const { mainFailureSignature } = await import('../main-ci-red-core.mjs');
+    for (const field of ['job', 'file', 'test']) expect(mainFailureSignature({ [field]: text })).toBeNull();
+  });
+
   it('versions stable signatures from structured identifiers and refuses secret or oversized text', async () => {
     const { mainFailureSignature } = await import('../main-ci-red-core.mjs');
     const ids = { job: 'test-shard (3)', file: 'scripts/a.test.mjs', test: 'rejects routes' };
@@ -199,6 +224,31 @@ describe('red metrics report', () => {
     const r = report([event('red', 30), event('green', 40), event('unknown', 60), event('green', 80)]);
     expect(r.days).toEqual({ '1970-01-01': 40 });
     expect(r.openEpisodes).toBe(0);
+  });
+  it('red metrics report — an unknown observation never closes an open episode', () => {
+    const r = report([event('red', 10, { since: 10 * minute }), event('unknown', 20)]);
+    expect(r.days).toEqual({ '1970-01-01': 80 });
+    expect(r.openEpisodes).toBe(1);
+    expect(r.warnings.join(' ')).toMatch(/Unknown observation/);
+  });
+  it('red metrics report — unknown queue wait, orphan recovery and a future end warn', () => {
+    const unknownWait = report([event('red', 0, { queue: { waitMs: null, serviceMs: 200 } })]);
+    expect(unknownWait.queue.unknown).toBe(1);
+    expect(unknownWait.warnings.join(' ')).toMatch(/^Unknown queue wait: .*recover timestamps\.$/);
+    const orphan = report([event('green', 10, { seq: 2 })]);
+    expect(orphan.warnings).toContain('Incomplete range: recovery has no episode start; recover archived evidence.');
+    const future = reportMainRedMetrics([event('red', 0)], { from: 0, to: 20 * minute, now: 10 * minute });
+    expect(future.days).toEqual({});
+    expect(future.openEpisodes).toBe(0);
+    expect(future.warnings.join(' ')).toMatch(/Incomplete range: invalid range/);
+  });
+  it('retains the latest queue timings before to', () => {
+    const timed = (t, waitMs, serviceMs, changes = {}) => event('queue', t, { queue: { waitMs, serviceMs }, ...changes });
+    const rows = [timed(90, 999, 999), timed(5, 300, 400), event('red', 0, { queue: { waitMs: 100, serviceMs: 200 } }),
+      timed(3, 500, 600)];
+    const r = report(rows);
+    expect(r.queue.waitMs).toEqual([300]);
+    expect(r.queue.serviceMs).toEqual([400]);
   });
   it('red metrics report — repeated queue samples of one run give one queue sample and count each signature observation', () => {
     const r = report([event('red', 0, { signature: null }), ...[1, 2, 3].map(t => event('queue', t))]);
