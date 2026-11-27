@@ -113,6 +113,7 @@ export function findRawPushes(source, filename = 'scripts/source.mjs', commands)
     let i = 0;
     const valued = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--config-env', '--exec-path']);
     while (i < args.length) {
+      if (ts.isSpreadElement(args[i])) return null;
       const word = staticText(args[i]);
       if (word === undefined) return null;
       if (!word.startsWith('-')) break;
@@ -124,6 +125,8 @@ export function findRawPushes(source, filename = 'scripts/source.mjs', commands)
     if (!subcommand) return null;
     const command = [subcommand];
     for (; i < args.length; i++) {
+      // A spread can expand to flags (or to the subcommand itself): the command is unknown, never skipped.
+      if (ts.isSpreadElement(args[i])) return null;
       const word = staticText(args[i]);
       if (word === undefined || !word.startsWith('-')) break;
       command.push(word);

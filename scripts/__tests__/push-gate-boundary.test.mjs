@@ -97,6 +97,17 @@ it('command pins reject a raw git push even when the site count stays unchanged'
 });
 
 it.each([
+  "spawnSync('git', [...prefix, 'rev-parse', '--verify', ref]);",
+  "spawnSync('git', ['-C', dir, ...rest, 'rev-parse', '--verify', ref]);",
+  "spawnSync('git', [...args]);",
+  "spawnSync('git', ['rev-parse', ...flags, ref]);",
+  "spawnSync('git', ['rev-parse', '--verify', ...flags]);",
+])('command pins treat a spread operand as an unknown command (fail closed): %s', call => {
+  const entries = { [fixtureFile]: { ...pinned[fixtureFile], commands: [['rev-parse', '--verify']] } };
+  expect(() => admit({ [fixtureFile]: cp + call }, entries)).toThrow(/command/);
+});
+
+it.each([
   "spawnSync('git', ['rev-parse', '--verify', ref], {shell:true});",
   "spawnSync('git', ['rev-parse', '--verify', ref], {shell:'/bin/sh'});",
   "spawnSync('git', ['rev-parse', '--verify', ref], options);",

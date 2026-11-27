@@ -217,6 +217,23 @@ test('platform read errors block tool and store waivers', () => {
   }
 });
 
+test('an invalid or revoked higher-priority waiver shadows, never unlocks, the lower store waiver', () => {
+  const now = Date.parse('2026-11-12T00:00:00Z');
+  const toolWaiver = patch => ({ ref, sha, ruling: 'R12', findings: ['accepted'], ...patch });
+  const load = (tool, extra = {}) => loadAuditEvidence({ env: { HOME: '/fixture' }, now, fs: { readFileSync(path) {
+    if (String(path).endsWith('/scripts/settings/prototype-load.json')) return JSON.stringify({ ruledWeakened: [tool] });
+    if (String(path).endsWith('/ruled-weakened.jsonl')) return JSON.stringify(waiver) + '\n';
+    if (extra.revoke && String(path).endsWith('/waiver-requests.jsonl')) return JSON.stringify({ ref, sha, ruling: 'WITHDRAWN', at: '2026-11-11T00:00:00Z' }) + '\n';
+    throw Object.assign(Error('missing'), { code: 'ENOENT' });
+  } } });
+  // Control: a valid tool waiver for the same key is admitted and the store entry is shadowed by it.
+  assert.equal(load(toolWaiver({ at: '2026-11-10T00:00:00Z' })).waivers.filter(w => w.ruling === 'R12').length, 1);
+  // Invalid timestamp on the tool waiver: no waiver at all, the valid store waiver stays shadowed.
+  assert.deepEqual(load(toolWaiver({ at: 'invalid' })).waivers, []);
+  // Future timestamp is just as invalid.
+  assert.deepEqual(load(toolWaiver({ at: '2026-11-12T00:05:01Z' })).waivers, []);
+});
+
 test('waiver times are bounded by injectable now before evaluation and revocation', () => {
   const now = Date.parse('2026-11-12T00:00:00Z');
   const weak = { ...valid, head: sha, base, verdict: 'WEAKENED', findings: waiver.findings };

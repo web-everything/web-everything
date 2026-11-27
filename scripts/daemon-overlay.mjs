@@ -974,9 +974,14 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       if (check.ok) {
         process.stderr.write(`daemon-overlay: overlaySafety.auditEvidence=${auditEvidence} (source=${auditEvidenceSource})\n`);
         const sha = flags['expected-sha'] || check.candSha;
-        const evidence = auditEvidenceFor(sha, { ...loadAuditEvidence({ env, cwd: root }), ref: flags.ref,
-          covers: base => mainCovers(base, { cwd: root, env }) });
-        if (!evidence.ok) {
+        const options = { ...loadAuditEvidence({ env, cwd: root }), ref: flags.ref,
+          covers: base => mainCovers(base, { cwd: root, env }) };
+        // Same SHA set the loader audits: the candidate plus the existing registration's retained edge SHA.
+        const existing = overlayState.overlays.find(o => o?.ref === flags.ref);
+        const shas = [sha, ...(existing?.edgeResolution !== undefined ? [existing.edgeResolution?.sha] : [])];
+        for (const audited of shas) {
+          const evidence = auditEvidenceFor(audited, options);
+          if (evidence.ok) continue;
           const refuse = auditEvidence === 'refuse' || evidence.kind !== 'missing';
           process.stderr.write(`daemon-overlay: ${refuse ? 'REFUSED' : 'WARNING'} — ${flags.ref}: ${evidence.detail} (overlaySafety.auditEvidence=${auditEvidence}, source=${auditEvidenceSource}). Run codex-audit for this SHA or record a matching operator waiver.\n`);
           if (refuse) return { ...check, ok: false, reason: 'no-audit-evidence', detail: evidence.detail };

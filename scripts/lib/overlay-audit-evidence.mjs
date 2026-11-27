@@ -112,11 +112,12 @@ export function loadAuditEvidence({ env = process.env, fs = { readFileSync }, cw
       let tool;
       try { tool = JSON.parse(fs.readFileSync(prototypeSettingsPath, 'utf8'))?.ruledWeakened; }
       catch { /* Missing or unreadable tool settings supply no waivers. */ }
-      waivers = mergeRuledWeakened(platform.prefs.prototypeLoad?.ruledWeakened, tool, console.warn)
-        .filter(entry => (!Object.hasOwn(entry, 'at') || validTime(entry.at, now)) && !revoked(entry));
-      // Keep the loader's tool > platform > store precedence for the same ref/SHA/ruling.
-      const key = entry => JSON.stringify([entry.ref, entry.sha.toLowerCase(), entry.ruling]);
-      const seen = new Set(waivers.map(key));
+      const merged = mergeRuledWeakened(platform.prefs.prototypeLoad?.ruledWeakened, tool, console.warn);
+      // Keep the loader's tool > platform > store precedence for the same ref/SHA/ruling. Shadowing uses
+      // EVERY higher-priority entry, so an invalid or revoked one shadows the lower layer instead of unlocking it.
+      const key = entry => JSON.stringify([entry.ref, String(entry.sha).toLowerCase(), entry.ruling]);
+      const seen = new Set(merged.map(key));
+      waivers = merged.filter(entry => (!Object.hasOwn(entry, 'at') || validTime(entry.at, now)) && !revoked(entry));
       if (!store.error) waivers = [...waivers, ...store.entries.filter(entry => validTime(entry.at, now) && !revoked(entry) && !seen.has(key(entry)))];
     }
   } catch { waivers = []; waiverError = true; }

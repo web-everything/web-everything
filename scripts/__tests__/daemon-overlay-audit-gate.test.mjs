@@ -139,6 +139,23 @@ it('CLI and loader persist the audited candidate SHA, including re-registration'
   expect(readOverlays(clone)[0].auditedSha).toBe(fixture.sha);
 });
 
+it('CLI re-registration refuses an unaudited retained edge SHA and admits an audited one', async () => {
+  evidence();
+  addOverlay(clone, { ref });
+  const edge = 'e'.repeat(40);
+  recordEdgeResolution(clone, ref, { sha: edge, by: 'operator' });
+  expect(await cli()).toMatchObject({ code: 3, data: { conflictCheck: { reason: 'no-audit-evidence' } } });
+  expect(stderr).toContain('REFUSED');
+  expect(readOverlays(clone)[0].auditedSha).toBeUndefined();
+  // Audit the retained edge SHA too: the same CLI re-registration now passes.
+  const dir = join(home, 'workspace/.operations/coordination');
+  const line = head => JSON.stringify({ head, base, verdict: 'NOT WEAKENED', findings: [], questionHash: QUESTION_HASH, at: new Date().toISOString() });
+  writeFileSync(join(dir, 'audits.jsonl'), `${line(fixture.sha)}\n${line(edge)}\n`);
+  process.exitCode = 0; stdout = ''; stderr = '';
+  expect(await cli()).toMatchObject({ code: 0 });
+  expect(readOverlays(clone)[0].auditedSha).toBe(fixture.sha);
+});
+
 it('loader requires audit evidence for an existing registration edge SHA', async () => {
   evidence();
   addOverlay(clone, { ref });
