@@ -2,15 +2,19 @@ import { describe, expect, it } from 'vitest';
 import {
   clearHumanViaCli, R11_REASON, resolveDelegatedClearHumanMode, evaluateEligibility, runDelegatedClearHuman,
 } from '../delegated-clear-human.mjs';
+import { FALLBACK_REQUIRED_STATUS_CHECKS } from '../../lib/required-status-checks.mjs';
 
 const HEAD = 'a'.repeat(40);
+const greenRollup = () => FALLBACK_REQUIRED_STATUS_CHECKS.map((name) => ({ name, conclusion: 'SUCCESS' }));
 const pr = (over = {}) => ({
   number: 7, headRefOid: HEAD, headRefName: 'lane/x', baseRefName: 'main',
   labels: ['review:human', 'advisory:accepted', 'red-team:clear'].map((name) => ({ name })),
-  statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS' }, { name: 'merge-gate', conclusion: 'FAILURE' }],
+  statusCheckRollup: [...greenRollup(), { name: 'merge-gate', conclusion: 'FAILURE' }],
   ...over,
 });
 const deps = (over = {}) => ({
+  repo: 'web-everything/web-everything',
+  requiredChecks: FALLBACK_REQUIRED_STATUS_CHECKS,
   scoreNet: () => ({ scored: true, humanRequired: false, files: 3 }),
   redTeamClearAtHead: () => true,
   readLiveHead: () => HEAD,
@@ -50,7 +54,7 @@ describe('evaluateEligibility', () => {
     expect(evaluateEligibility(p, deps()).eligible).toBe(false);
   });
   it('ignores the review-gate hold check too', () => {
-    const p = pr({ statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS' }, { name: 'review-gate', conclusion: 'FAILURE' }] });
+    const p = pr({ statusCheckRollup: [...greenRollup(), { name: 'review-gate', conclusion: 'FAILURE' }] });
     expect(evaluateEligibility(p, deps()).eligible).toBe(true);
   });
   it('refuses when the net diff still scores humanRequired', () => {
@@ -62,6 +66,95 @@ describe('evaluateEligibility', () => {
   });
   it('refuses when red-team is not clear on the current head', () => {
     expect(evaluateEligibility(pr(), deps({ redTeamClearAtHead: () => false })).eligible).toBe(false);
+  });
+});
+
+describe('required checks present', () => {
+  it('review-gate alone cannot establish clear-human eligibility', () => {
+    const r = evaluateEligibility(pr({ statusCheckRollup: [{ name: 'review-gate', conclusion: 'SUCCESS' }] }), deps());
+    expect(r.eligible).toBe(false);
+    expect(r.failed).toContain('required check test missing');
+  });
+  it('hold rows only (merge-gate and review-gate) refuse', () => {
+    const r = evaluateEligibility(pr({ statusCheckRollup: [
+      { name: 'merge-gate', conclusion: 'FAILURE' }, { name: 'review-gate', conclusion: 'SUCCESS' },
+    ] }), deps());
+    expect(r.eligible).toBe(false);
+    expect(r.failed).toContain('required check test missing');
+  });
+  it.each(FALLBACK_REQUIRED_STATUS_CHECKS)('each missing required check refuses: %s', (name) => {
+    const r = evaluateEligibility(pr({ statusCheckRollup: greenRollup().filter((c) => c.name !== name) }), deps());
+    expect(r.eligible).toBe(false);
+    expect(r.failed).toContain(`required check ${name} missing`);
+  });
+  it('a review-gate row in any state equals its absence', () => {
+    for (const rollup of [greenRollup(), greenRollup().filter((c) => c.name !== 'test'), []]) {
+      const result = (statusCheckRollup) => {
+        const { eligible, failed } = evaluateEligibility(pr({ statusCheckRollup }), deps());
+        return { eligible, failed };
+      };
+      for (const conclusion of ['SUCCESS', 'FAILURE', 'NEUTRAL', 'SKIPPED', 'CANCELLED', null]) {
+        expect(result([...rollup, { name: 'review-gate', conclusion }])).toEqual(result(rollup));
+      }
+    }
+  });
+  it('a stale failure beside a newer success still refuses (accepted, ruling 4)', () => {
+    const r = evaluateEligibility(pr({ statusCheckRollup: [
+      { name: 'test', conclusion: 'FAILURE', completedAt: '2026-11-26T00:00:00Z' },
+      ...greenRollup().map((c) => ({ ...c, completedAt: '2026-11-27T00:00:00Z' })),
+    ] }), deps());
+    expect(r.eligible).toBe(false);
+    expect(r.failed).toContain('check test is FAILURE');
+  });
+  it('sibling repos use their own list', async () => {
+    for (const [repo, names, failed] of [
+      ['plateauapp/plateau-app', ['test', 'e2e'], []],
+      ['plateauapp/plateau-app', ['test'], ['required check e2e missing']],
+      ['frontier-ui/frontierui', ['test'], []],
+    ]) {
+      const events = []; const calls = [];
+      const out = await runDelegatedClearHuman({ ...deps(), repo, mode: 'shadow',
+        prs: [pr({ statusCheckRollup: names.map((name) => ({ name, conclusion: 'SUCCESS' })) })],
+        emit: async (e) => events.push(e), clearHuman: async (a) => calls.push(a) });
+      expect(out.refused).toEqual(failed.length ? [{ pr: 7, failed }] : []);
+      expect(out.wouldApprove).toEqual(failed.length ? [] : [7]);
+      expect(events).toHaveLength(failed.length ? 0 : 1);
+      expect(calls).toEqual([]);
+    }
+  });
+  it.each(['shadow', 'on'])('unknown repo refuses in %s mode', async (mode) => {
+    const events = []; const calls = [];
+    const out = await runDelegatedClearHuman({ ...deps(), repo: 'x/y', prs: [pr()], mode,
+      emit: async (e) => events.push(e), clearHuman: async (a) => calls.push(a) });
+    expect(out.refused).toEqual([{ pr: 7, failed: ['required check list invalid'] }]);
+    expect(out.wouldApprove).toEqual([]);
+    expect(out.cleared).toEqual([]);
+    expect(events).toEqual([]);
+    expect(calls).toEqual([]);
+  });
+  it.each([undefined, [], ['merge-gate'], ['Review-Gate'], 'test', [''], ['  '], [null]].map((value) => [value]))(
+    'invalid requiredChecks override refuses: %j', (requiredChecks) => {
+      const r = evaluateEligibility(pr(), deps({ requiredChecks }));
+      expect(r.eligible).toBe(false);
+      expect(r.failed).toContain('required check list invalid');
+    },
+  );
+  it('a valid requiredChecks override is honoured', () => {
+    const r = evaluateEligibility(pr({ statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS' }] }), deps({ requiredChecks: ['test'] }));
+    expect(r.eligible).toBe(true);
+    expect(r.failed).toEqual([]);
+  });
+  it('legacy status contexts count', () => {
+    const r = evaluateEligibility(pr({ statusCheckRollup: greenRollup().map((c) => (
+      c.name === 'smoke' ? { context: 'smoke', state: 'SUCCESS' } : c
+    )) }), deps());
+    expect(r.eligible).toBe(true);
+    expect(r.failed).toEqual([]);
+  });
+  it('a non-hold failure still refuses when all required checks pass', () => {
+    const r = evaluateEligibility(pr({ statusCheckRollup: [...greenRollup(), { name: 'extra', conclusion: 'FAILURE' }] }), deps());
+    expect(r.eligible).toBe(false);
+    expect(r.failed).toContain('check extra is FAILURE');
   });
 });
 
