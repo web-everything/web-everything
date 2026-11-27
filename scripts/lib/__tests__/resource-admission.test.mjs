@@ -1,7 +1,9 @@
 // @vitest-environment node
 /** @file Shadow admission regressions: CPU idle wins over misleading load average. */
-import { afterEach, expect, it } from 'vitest';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import * as heavyAdmission from '../../readiness/heavy-admission.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readSnapshot, RESOURCE_POLICY_STANDARD, resolveResourcePolicy, loadResourcePolicy, decideAdmission, admit, shadowAdmission, resourcePaths } from '../resource-admission.mjs';
@@ -170,4 +172,108 @@ it('snapshot reader closes the descriptor on malformed JSON and a raced nonregul
     expect(messages.join(' ')).toContain('fresh collector sample');
     if (!regular) expect(reads).toBe(0);
   }
+});
+
+describe('MEM-ADMIT-HARDEN real snapshot files', () => {
+  const limit = 262144;
+  const file = root => { mkdirSync(join(root, 'resource')); return join(root, 'resource/snapshot.json'); };
+  it('refuses oversized valid JSON and requests a fresh collector sample', () => {
+    const root = temp(); const log = vi.fn();
+    writeFileSync(file(root), JSON.stringify({ pad: 'x'.repeat(limit * 4 - 10) }));
+    expect(readSnapshot({ root, log })).toBeNull();
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/oversized.*request a fresh collector sample/));
+  });
+  it('refuses a symlink to a valid snapshot', () => {
+    const root = temp(); const target = join(root, 'target.json'); const log = vi.fn();
+    writeFileSync(target, '{}'); symlinkSync(target, file(root));
+    expect(readSnapshot({ root, log })).toBeNull();
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/regular file.*request a fresh collector sample/));
+  });
+  it('refuses a FIFO without blocking its child reader', () => {
+    const root = temp(); const path = file(root);
+    execFileSync('mkfifo', [path], { cwd: root, timeout: 5000 });
+    const moduleUrl = new URL('../resource-admission.mjs', import.meta.url).href;
+    const code = `import { readSnapshot } from ${JSON.stringify(moduleUrl)}; console.log(JSON.stringify(readSnapshot({ root: ${JSON.stringify(root)} })));`;
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', code], { cwd: root, timeout: 5000, encoding: 'utf8' });
+    expect(result.status, String(result.error ?? result.stderr)).toBe(0);
+    expect(result.stdout.trim()).toBe('null');
+  });
+  it('CONTROL parses valid JSON exactly at the 256 KiB limit', () => {
+    const root = temp(); writeFileSync(file(root), '{}' + ' '.repeat(limit - 2));
+    expect(readSnapshot({ root, log: vi.fn() })).toEqual({});
+  });
+  it('CONTROL missing file stays silent for log and onError', () => {
+    const log = vi.fn(); const onError = vi.fn();
+    expect(readSnapshot({ root: temp(), log, onError })).toBeNull();
+    expect(log).not.toHaveBeenCalled(); expect(onError).not.toHaveBeenCalled();
+  });
+  it.each([['build', 'hold'], ['light', 'admit']])('a refused snapshot keeps %s admission at %s as snapshot-missing', (kind, verdict) => {
+    const root = temp(); writeFileSync(file(root), '{');
+    const settings = vi.spyOn(heavyAdmission, 'loadMemoryPressureSettings').mockReturnValue({ warnMinFreePct: 20, warnSwapGrowthMb: 256 });
+    try {
+      expect(admit({ root, kind, nowMs: 100000, env: {}, policy: RESOURCE_POLICY_STANDARD }))
+        .toMatchObject({ verdict, unknown: true, reason: 'snapshot-missing' });
+    } finally { settings.mockRestore(); }
+  });
+});
+
+describe('MEM-ADMIT-HARDEN reader cleanup', () => {
+  const fakeIo = (text = '{}') => {
+    const data = Buffer.from(text);
+    return {
+      constants: { O_RDONLY: 0, O_NOFOLLOW: 2, O_NONBLOCK: 4 },
+      lstatSync: vi.fn(() => ({ isFile: () => true })), openSync: vi.fn(() => 7),
+      fstatSync: vi.fn(() => ({ isFile: () => true })), closeSync: vi.fn(),
+      readSync: vi.fn((_fd, buffer, offset, length, position) => data.copy(buffer, offset, position, Math.min(data.length, position + length))),
+    };
+  };
+  it('close failure on the success path is a logged refusal', () => {
+    const io = fakeIo(); const log = vi.fn(); const onError = vi.fn();
+    io.closeSync.mockImplementation(() => { throw Error('closed badly'); });
+    expect(readSnapshot({ root: temp(), io, log, onError })).toBeNull();
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/descriptor close failed.*request a fresh collector sample/));
+    expect(onError).toHaveBeenCalledWith(log.mock.calls[0][0]);
+    expect(io.closeSync).toHaveBeenCalledOnce();
+  });
+  it('close failure on the error path keeps both reasons', () => {
+    const io = fakeIo(' '.repeat(262145)); const log = vi.fn();
+    io.closeSync.mockImplementation(() => { throw Error('closed badly'); });
+    expect(readSnapshot({ root: temp(), io, log })).toBeNull();
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/oversized.*descriptor close failed.*request a fresh collector sample/));
+  });
+  it.each([
+    { O_RDONLY: 0, O_NOFOLLOW: undefined, O_NONBLOCK: 4 },
+    { O_RDONLY: 0, O_NOFOLLOW: 2, O_NONBLOCK: 0 },
+    { O_RDONLY: 0, O_NOFOLLOW: 2.5, O_NONBLOCK: 4 },
+  ])('missing or invalid open flags refuse before opening: %j', constants => {
+    const io = fakeIo(); io.constants = constants; const log = vi.fn();
+    expect(readSnapshot({ root: temp(), io, log })).toBeNull();
+    expect(io.openSync).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/open flags unsupported.*request a fresh collector sample/));
+  });
+  it('opens with all required flags after validating them', () => {
+    const root = temp(); const io = fakeIo();
+    expect(readSnapshot({ root, io, log: vi.fn() })).toEqual({});
+    expect(io.openSync).toHaveBeenCalledWith(join(root, 'resource/snapshot.json'), 6);
+  });
+  it('a throwing log cannot escape and onError still receives the refusal', () => {
+    const io = fakeIo('garbage'); const onError = vi.fn();
+    expect(readSnapshot({ root: temp(), io, onError, log: () => { throw Error('log unavailable'); } })).toBeNull();
+    expect(onError).toHaveBeenCalledWith(expect.stringContaining('request a fresh collector sample'));
+    expect(io.closeSync).toHaveBeenCalledOnce();
+  });
+  it('a throwing onError cannot suppress the refusal log', () => {
+    const io = fakeIo('garbage'); const log = vi.fn();
+    expect(readSnapshot({ root: temp(), io, log, onError: () => { throw Error('observer unavailable'); } })).toBeNull();
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('request a fresh collector sample'));
+  });
+  it.each(['lstatSync', 'openSync', 'fstatSync', 'readSync'])('refuses a timed-out %s without falling through', call => {
+    const io = fakeIo(); const log = vi.fn();
+    io[call].mockImplementation(() => { throw Object.assign(Error(`${call} timed out`), { code: 'ETIMEDOUT' }); });
+    expect(readSnapshot({ root: temp(), io, log })).toBeNull();
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/timed out.*request a fresh collector sample/));
+    expect(io.closeSync).toHaveBeenCalledTimes(['fstatSync', 'readSync'].includes(call) ? 1 : 0);
+    if (call === 'lstatSync') expect(io.openSync).not.toHaveBeenCalled();
+    if (call !== 'readSync') expect(io.readSync).not.toHaveBeenCalled();
+  });
 });

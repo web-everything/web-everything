@@ -7,9 +7,73 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { decideAdmission } from '../resource-policy.mjs';
 import { decideMemoryFloor } from '../memory-warn-corroboration.mjs';
+import { swapUsedMb } from '../resource-sampler.mjs';
+import { hostLoadAdmission } from '../host-load.mjs';
+import * as heavyAdmission from '../../readiness/heavy-admission.mjs';
 import { cpuIdlePctFromTimes, parseIoregDiskStats, diskFromDeltas, parsePsCpu, fseventsCpuPct, countAgentSessions, memoryPressureLevel, swapUsedPct, buildSnapshot, createSampler, resourcePaths, writeSnapshot, readSnapshot, appendResourceLog } from '../resource-sampler.mjs';
 const roots = [];
 const temp = () => { const root = mkdtempSync(join(tmpdir(), 'resource-')); roots.push(root); return root; };
+describe('MEM-ADMIT-HARDEN strict swap', () => {
+  const T = token => `total = 4096M used = ${token} free = 0M`;
+  it.each(['999Mgarbage', '10MB', '9007199254740992M', '.5M', '5.M'])('rejects used MB token %s', token => {
+    expect(swapUsedMb(T(token))).toBeNull();
+  });
+  it.each(['999Mgarbage', '10MB'])('rejects used percent token %s', token => {
+    expect(swapUsedPct(T(token))).toBeNull();
+  });
+  it.each([
+    'total = 4096M used = garbage used = 10M free = 0M',
+    'total = 4096M used = 10M used = garbage free = 0M',
+  ])('rejects duplicate used fields in either order: %s', text => {
+    expect(swapUsedMb(text)).toBeNull();
+    expect(swapUsedPct(text)).toBeNull();
+  });
+  it('rejects duplicate totals even when both values are valid', () => {
+    expect(swapUsedPct('total = 1M total = 4096M used = 10M free = 0M')).toBeNull();
+  });
+  it.each(['1.2.3M', 'InfinityM', '-1M', '1.00G'])('CONTROL rejects invalid used token %s', token => {
+    expect(swapUsedMb(T(token))).toBeNull();
+    expect(swapUsedPct(T(token))).toBeNull();
+  });
+  it('CONTROL preserves valid decimal, integer, safe-boundary and zero swap readings', () => {
+    const live = 'total = 27648.00M  used = 26500.00M  free = 1148.00M  (encrypted)';
+    expect(swapUsedMb(live)).toBe(26500);
+    expect(swapUsedPct(live)).toBeCloseTo(95.8, 1);
+    expect(swapUsedMb(T('100M'))).toBe(100);
+    expect(swapUsedPct(T('100M'))).toBe(2.4);
+    expect(swapUsedMb(T('9007199254740991M'))).toBe(Number.MAX_SAFE_INTEGER);
+    expect(swapUsedPct('total = 0.00M used = 0.00M free = 0.00M (encrypted)')).toBe(0);
+  });
+  it.each(['sampler records unknown swap', 'resource admission preserves healthy-free-memory admission', 'hostLoadAdmission refuses missing swap evidence'])
+  ('malformed swap with healthy free memory: %s', guarantee => {
+    const root = temp();
+    const policy = { settings: { host: { maxLoadPerCore: 2, minMemoryHeadroomMb: 2048,
+      capacity: { snapshotMaxFreshMs: 20000, snapshotClockSkewMs: 0, memoryMetric: 'free', memAvailableFloorMb: 2048 } } }, sources: {} };
+    const settings = vi.spyOn(hostSettings, 'loadHostOverloadSettings').mockReturnValue(policy);
+    const pressureSettings = vi.spyOn(heavyAdmission, 'loadMemoryPressureSettings').mockReturnValue({ warnMinFreePct: 20, warnSwapGrowthMb: 256 });
+    let tick = 0; let swap = T('999M');
+    try {
+      const sampler = createSampler({ checkoutRoot: root, now: () => tick, cpus: () => [cpu(100 + tick, 0)], loadavg: () => [0, 0, 0],
+        freemem: () => 4500 * 1048576, totalmem: () => 10000 * 1048576, readHeavySlots: () => ({ held: 0, cap: 1 }), countLanes: () => 0,
+        exec: (command, args) => {
+          if (command === 'sysctl') return args[1] === 'vm.swapusage' ? swap : '2';
+          if (command === 'ioreg') return ioreg;
+          if (command === 'ps') return '';
+          throw Error(`unexpected probe ${command}`);
+        } });
+      sampler.sample(); tick = 10000; swap = T('999Mgarbage');
+      const snap = sampler.sample();
+      if (guarantee.startsWith('sampler')) {
+        expect(snap.memory).toMatchObject({ freePct: 45, swapUsedMb: null, swapGrowthMb: null });
+        expect(snap.errors).toContainEqual({ probe: 'swapUsedPct', error: 'unrecognized swap usage' });
+      } else if (guarantee.startsWith('resource')) {
+        expect(decideAdmission({ kind: 'build', snapshot: snap, nowMs: tick })).toMatchObject({ verdict: 'admit', inputs: { swapGrowthMb: null } });
+      } else expect(hostLoadAdmission({ policy, interactive: false, env: {}, load: () => [0], cores: () => 8,
+        memoryReading: () => ({ source: 'memory-pressure', level: 'warn', mb: 0 }), readSnap: () => snap, now: () => tick }))
+        .toMatchObject({ admitted: false, reason: 'host memory pressure warn: warn corroboration unavailable; source=memory-pressure' });
+    } finally { settings.mockRestore(); pressureSettings.mockRestore(); }
+  });
+});
 afterEach(() => roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })));
 const cpu = (idle, user) => ({ times: { idle, user, nice: 0, sys: 0, irq: 0 } });
 const ioreg = `+-o AppleANS2 <class IOBlockStorageDriver, id 0x1, registered, active>

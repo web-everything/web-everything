@@ -4,6 +4,7 @@ import { decideMemoryPressure, decideMemoryFloor } from '../memory-warn-corrobor
 import { resolveHostOverloadSettings } from '../host-overload-settings.mjs';
 import * as hostOverloadSettings from '../host-overload-settings.mjs';
 import { createSampler } from '../resource-sampler.mjs';
+import * as memoryParsers from '../memory-available.mjs';
 
 // Live 2026-11-04 00:2x ET fixture: free 215784, inactive 1392455, speculative 41509, purgeable 1289, 16 KiB pages.
 const VM = `Mach Virtual Memory Statistics: (page size of 16384 bytes)
@@ -162,5 +163,44 @@ describe('MEM-ADMIT-HARDEN strict pages', () => {
     expect(parseVmStatAvailableBytes(vm)).toBeNull();
     expect(() => memoryAvailableMb({ platform: 'darwin', exec: () => vm,
       freemem: () => { throw Error('must not substitute'); } })).toThrow('vm_stat unreadable');
+  });
+  it.each([
+    'Pages free: 1.\nPages free: garbage.',
+    'Pages free: garbage.\nPages free: 1.',
+    'Pages free: 9007199254740993.',
+  ])('rejects duplicate or unsafe free pages: %s', free => {
+    expect(parseVmStatAvailableBytes(VM.replace(/Pages free:[^\n]*/, free))).toBeNull();
+  });
+  it.each(['page size of 16384 bytes', 'page size of 0 bytes', 'page size of 9007199254740993 bytes'])
+  ('rejects duplicated or invalid page size: %s', page => {
+    const vm = page === 'page size of 16384 bytes' ? `${VM}\n${page}` : VM.replace('page size of 16384 bytes', page);
+    expect(parseVmStatAvailableBytes(vm)).toBeNull();
+  });
+  it('keeps valid pages and absent optional pages, but refuses an unsafe byte total', () => {
+    expect(parseVmStatAvailableBytes(VM)).toBe((215784 + 1392455 + 41509 + 1289) * 16384);
+    expect(parseVmStatAvailableBytes(VM.replace(/^Pages (?:speculative|purgeable):[^\n]*\n/gm, '')))
+      .toBe((215784 + 1392455) * 16384);
+    expect(parseVmStatAvailableBytes(VM.replace(/Pages free:[^\n]*/, 'Pages free: 9007199254740991.'))).toBeNull();
+  });
+  it('NEW-API parseVmStatPages distinguishes absent, malformed, duplicate and safe values', () => {
+    expect(memoryParsers.parseVmStatPages('', 'free')).toBeUndefined();
+    for (const value of ['12garbage.', '-1.', '9007199254740993.', '1.\nPages free: 2.']) {
+      expect(memoryParsers.parseVmStatPages(`Pages free: ${value}`, 'free')).toBeNaN();
+    }
+    expect(memoryParsers.parseVmStatPages('Pages free: 0.', 'free')).toBe(0);
+    expect(memoryParsers.parseVmStatPages('Pages free: 9007199254740991', 'free')).toBe(Number.MAX_SAFE_INTEGER);
+  });
+  it('NEW-API parseSwapUsageMb applies the strict grammar to used, free and total', () => {
+    for (const field of ['used', 'free', 'total']) {
+      for (const token of ['999Mgarbage', '10MB', '1.2.3M', 'InfinityM', '-1M', '1G', '1K', '1', '.5M', '5.M', '9007199254740992M']) {
+        expect(memoryParsers.parseSwapUsageMb(`${field} = ${token}`, field)).toBeNull();
+      }
+      expect(memoryParsers.parseSwapUsageMb('', field)).toBeNull();
+      expect(memoryParsers.parseSwapUsageMb(`${field} = garbage ${field} = 10M`, field)).toBeNull();
+      expect(memoryParsers.parseSwapUsageMb(`${field} = 10M ${field} = garbage`, field)).toBeNull();
+      expect(memoryParsers.parseSwapUsageMb(`${field} = 26500.00M (encrypted)`, field)).toBe(26500);
+      expect(memoryParsers.parseSwapUsageMb(`${field} = 9007199254740991M`, field)).toBe(Number.MAX_SAFE_INTEGER);
+      expect(memoryParsers.parseSwapUsageMb(`${field} = 0.5M`, field)).toBe(0.5);
+    }
   });
 });
