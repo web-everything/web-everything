@@ -18,6 +18,14 @@ function templateFree(env) {
   return out;
 }
 
+function cloneGitEnv() {
+  // Reuse the account form's HOME/routing scrub, then restore ALL lane pins.
+  // The intermediate env must never reach a child: scrubbing inherited config
+  // must not lift a parent's empty credential.helper/core.askPass restrictions.
+  const accountEnv = laneGitHardeningEnv(templateFree(scrubGitRepoEnv(process.env)), { credentialPins: false });
+  return laneGitHardeningEnv(scrubGitRepoEnv(accountEnv));
+}
+
 /** Accept the shared keys, directory names and canonical/legacy slugs; refuse unknown repos. */
 export function resolveSiblingRepoName(slugOrName) {
   const key = repoKeyForSlug(slugOrName) ?? repoKeyForDir(slugOrName);
@@ -84,8 +92,8 @@ export function provisionMissingSiblingClones({ cwd = process.cwd(), run = execF
       const url = `https://github.com/${repo.slug}.git`;
       const runOptions = { stdio: ['ignore', 'ignore', 'inherit'],
         timeout: NETWORK_GIT_TIMEOUT_MS + BOUNDED_GIT_GRACE_MS, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
-        // Private clones need the account helper; a root cwd excludes lane-local credential config.
-        env: laneGitHardeningEnv(templateFree(scrubGitRepoEnv(process.env)), { credentialPins: false }), cwd: NO_REPO_CWD };
+        // A root cwd excludes lane-local config; credential execution remains disabled.
+        env: cloneGitEnv(), cwd: NO_REPO_CWD };
       let fullPrimary = false;
       if (exists(join(primary, '.git'))) {
         try { fullPrimary = shallow(primary).trim() === 'false'; } catch { /* unknown: plain clone */ }

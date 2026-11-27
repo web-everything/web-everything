@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
+import { parse as parseJavaScript } from 'acorn';
 import { basename, join, parse, resolve } from 'node:path';
 import { boundedGitCommand, BOUNDED_GIT_GRACE_MS } from '../lib/git-bounded.mjs';
 import { NETWORK_GIT_TIMEOUT_MS } from '../lib/bounded-child.mjs';
@@ -52,7 +53,8 @@ function fixture() {
 function expectedGitEnv(options) {
   const base = scrubGitRepoEnv(process.env);
   delete base.GIT_TEMPLATE_DIR;
-  return laneGitHardeningEnv(base, options);
+  const hardened = laneGitHardeningEnv(base, options);
+  return options?.credentialPins === false ? laneGitHardeningEnv(scrubGitRepoEnv(hardened)) : hardened;
 }
 function expectedReadEnv() {
   return { ...Object.fromEntries(Object.keys(process.env).map(key => [key, undefined])), ...expectedGitEnv() };
@@ -124,7 +126,7 @@ describe('sibling clone git hardening', () => {
         expect(env).not.toHaveProperty(key);
       }
       expect(env.GIT_TEMPLATE_DIR).toBeUndefined();
-      const pins = LANE_GIT_CONFIG_PINS.filter(([key]) => !['credential.helper', 'core.askPass'].includes(key));
+      const pins = LANE_GIT_CONFIG_PINS;
       expect(env.GIT_CONFIG_COUNT).toBe(String(pins.length));
       expect(configPins(env)).toEqual(pins);
       expect(configPins(env)).toContainEqual(['core.hooksPath', '/dev/null']);
@@ -153,6 +155,25 @@ describe('sibling clone git hardening', () => {
       expect(configPins(env)).toContainEqual(['credential.helper', '']);
       expect(env.HTTPS_PROXY).toBe('/evil');
       expect(env.GIT_TRACE_CURL).toBe('/evil');
+    }
+  });
+
+  it('clone retains empty inherited credential restrictions after scrubbing hostile config', () => {
+    hostileEnv();
+    vi.stubEnv('GIT_CONFIG_COUNT', '2');
+    vi.stubEnv('GIT_CONFIG_KEY_0', 'credential.helper');
+    vi.stubEnv('GIT_CONFIG_VALUE_0', '');
+    vi.stubEnv('GIT_CONFIG_KEY_1', 'core.askPass');
+    vi.stubEnv('GIT_CONFIG_VALUE_1', '');
+    vi.stubEnv('GIT_CONFIG_PARAMETERS', "'credential.helper'='' 'core.askPass'=''");
+    const options = gitFixture();
+    provision(options);
+    for (const [, , { env }] of options.run.mock.calls) {
+      expect(configPins(env)).toContainEqual(['credential.helper', '']);
+      expect(configPins(env)).toContainEqual(['core.askPass', '']);
+      expect(env).not.toHaveProperty('GIT_CONFIG_PARAMETERS');
+      expect(env).not.toHaveProperty('GIT_ASKPASS');
+      expect(env.GIT_TERMINAL_PROMPT).toBe('0');
     }
   });
 
@@ -351,8 +372,6 @@ describe('sibling clone provisioning', () => {
 });
 
 describe('main sibling provisioning lifecycle', () => {
-  // The in-process CLI loads the drain's full module graph, including on a cold transform cache.
-  const cliTimeoutMs = 30_000;
   async function startup({ dryRun = false, testMarker = null, mainCalls = 1, leaseRefused = false, failClone = false } = {}) {
     vi.doUnmock('../lib/git-run.mjs');
     vi.doMock('node:child_process', () => childProcessMock);
@@ -401,13 +420,13 @@ describe('main sibling provisioning lifecycle', () => {
     expect(provision).toHaveBeenCalledWith(expect.objectContaining({ dryRun: true }));
     expect(clone).not.toHaveBeenCalled();
     expect(result.stderr).toContain(`${testMarker}=1`);
-  }, cliTimeoutMs);
+  });
 
   it('forwards CLI dry-run to the real provisioner without invoking a clone runner', async () => {
     const { provision, clone } = await startup({ dryRun: true });
     expect(provision).toHaveBeenCalledWith(expect.objectContaining({ dryRun: true }));
     expect(clone).not.toHaveBeenCalled();
-  }, cliTimeoutMs);
+  });
 
   it.each([false, true])('provisions siblings only once across repeated main calls (clone failure: %s)', async failClone => {
     const { provision, clone, result } = await startup({ mainCalls: 2, failClone });
@@ -415,14 +434,39 @@ describe('main sibling provisioning lifecycle', () => {
     expect(provision).toHaveBeenCalledTimes(1);
     expect(provision).toHaveBeenCalledWith(expect.objectContaining({ dryRun: false }));
     expect(clone).toHaveBeenCalledTimes(2);
-  }, cliTimeoutMs);
+  });
 
   it('makes zero provisioning calls when the drain lease is refused', async () => {
     const { provision, clone, result } = await startup({ leaseRefused: true });
     expect(JSON.parse(result.stdout).skipped).toBe('drain-in-progress');
     expect(provision).not.toHaveBeenCalled();
     expect(clone).not.toHaveBeenCalled();
-  }, cliTimeoutMs);
+  });
+});
+
+it('keeps all six lifecycle cases on the default five-second timeout without overrides', () => {
+  const source = readFileSync(new URL('./sibling-clone-provision.test.mjs', import.meta.url), 'utf8');
+  const ast = parseJavaScript(source, { ecmaVersion: 2020, sourceType: 'module' });
+  const suite = ast.body.find(node => node.expression?.callee?.name === 'describe'
+    && node.expression.arguments[0]?.value === 'main sibling provisioning lifecycle');
+  expect(suite).toBeDefined();
+  const registrations = suite.expression.arguments[1].body.body
+    .filter(node => node.expression?.type === 'CallExpression').map(node => node.expression);
+  expect(registrations).toHaveLength(4);
+  let cases = 0;
+  for (const registration of registrations) {
+    expect(registration.arguments).toHaveLength(2);
+    const each = registration.callee;
+    if (each.type === 'CallExpression') {
+      expect(each.callee.object.name).toBe('it');
+      expect(each.callee.property.name).toBe('each');
+      cases += each.arguments[0].elements.length;
+    } else {
+      expect(each.name).toBe('it');
+      cases++;
+    }
+  }
+  expect(cases).toBe(6);
 });
 
 

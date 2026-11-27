@@ -23,6 +23,9 @@ CLI harness. They assert zero clones for marked test CLIs and explicit dry runs,
 provision call across repeated main calls without resetting modules, and zero calls on lease
 refusal. Their injected clone runner and private parent exercise production mode safely by
 omitting the marker. The throwing-logger test pins continued processing of both siblings.
+All six lifecycle cases retain Vitest's default five-second timeout. The named regression
+`keeps all six lifecycle cases on the default five-second timeout without overrides` parses
+their registrations and refuses timeout overrides while checking that all six remain registered.
 
 ### Git environment and credential policy
 
@@ -31,21 +34,22 @@ askpass and SSH command variables removed and lane pins applied. `GIT_TEMPLATE_D
 removed locally before hardening: an inherited template can install a credential helper or hook
 in the new repository before its first fetch. The shared hardening helper is unchanged.
 
-The clone alone uses `laneGitHardeningEnv` with `credentialPins: false`, removes inherited
+The clone first uses `laneGitHardeningEnv` with `credentialPins: false` to remove inherited
 proxy/trace/CA routing variables, and sets `HOME` from the OS account lookup, never the
 provisioner's injectable primary-clone `home` or the caller's `HOME`. `XDG_CONFIG_HOME`,
-`GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` overrides are removed. This permits trusted account
-global **and system** Git configuration to authenticate the private sibling repositories; the
-deployment uses the account's `gh auth git-credential` helper. No credential-helper or askpass
-reset is added for this call, while terminal prompting remains disabled and every other lane
-pin remains active.
+`GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` overrides are removed. This intermediate environment
+is never passed to a child: its indexed config is scrubbed and the full default lane pins are
+applied, including empty `credential.helper` and `core.askPass` resets. Scrubbing inherited
+config must never lift those restrictions. Terminal prompting remains disabled. The named
+regression `clone retains empty inherited credential restrictions after scrubbing hostile config`
+checks both resets with inherited indexed and parameter config present. A clone that cannot
+authenticate under these restrictions stays unavailable; the operator repairs it and restarts.
 
 The clone's cwd is the filesystem root (`parse(resolve('/')).root`); its URL, destination,
 optional reference path and bounded supervisor path are absolute. The root has no repository
-local/worktree configuration to inject a helper. This deliberately extends the shared helper's
-documented validated-primary-checkout permission to a **no-repository cwd**, following the
-salvage-push precedent; it does not permit that form inside a lane. Global and system account
-configuration, including any trusted `init.templateDir`, remains part of the trust boundary.
+local/worktree configuration to inject a helper. The final child environment retains the full
+credential restrictions even at this cwd. Global and system account configuration, including
+any trusted `init.templateDir`, remains part of the trust boundary subject to those pins.
 
 The origin and shallow reads retain their repository cwd and use the full default lane pins,
 including empty `credential.helper` and `core.askPass` resets. These reads use no credential
