@@ -183,6 +183,89 @@ process.stdout.write(${JSON.stringify(claudeStdout(DONE))});`);
   });
 });
 
+describe('handoff audit regressions (hermetic)', () => {
+  const instant = Date.parse('2026-11-26T12:00:00Z');
+  function fixture() {
+    const root = tmp(), gitDir = join(root, 'git'), specDir = join(root, 'specs');
+    mkdirSync(gitDir); mkdirSync(specDir);
+    const lease = { holder: 'fixture-holder', acquiredAt: new Date(instant).toISOString(), ttlMinutes: 60 };
+    const leasePath = join(gitDir, '.lane-lease');
+    writeFileSync(leasePath, JSON.stringify(lease));
+    const git = vi.fn((_repo, args) => {
+      const answers = { 'rev-parse HEAD': 'a'.repeat(40), 'symbolic-ref -q HEAD': 'refs/heads/fixture', 'rev-parse --git-dir': gitDir };
+      if (!Object.hasOwn(answers, args.join(' '))) throw Error('unexpected probe');
+      return answers[args.join(' ')];
+    });
+    const s = spec({ cwd: root, env: { HOME: root }, specDir, session: 'fixture-worker', sessionId: 'fixture-initial',
+      argv: ['--session-id', 'fixture-initial', 'fixture task'], contextHandoff: { runId: 'fixture-run', leaseToken: lease.holder } });
+    const child = Object.assign(new EventEmitter(), { pid: 900, kill: vi.fn(), stdout: new EventEmitter(), stderr: new EventEmitter() });
+    const writes = [], calls = [];
+    const io = { git, nowMs: () => instant, now: () => new Date(instant).toISOString(), head: () => 'a'.repeat(40),
+      selfPid: 800, isAlive: () => false, stopSource: new EventEmitter(), awaitingVerify: vi.fn(() => null),
+      writeRecord: rec => writes.push(rec), writeDraft: vi.fn(), spawnFn: () => child };
+    io.spawnToCompletionFn = async (_cmd, _args, opts, { spawnFn }) => {
+      const descriptor = JSON.parse(opts.env.WE_WORKER_CHECKPOINT);
+      const launched = spawnFn('fixture', [], opts);
+      calls.push(descriptor);
+      if (calls.length === 1) handoffModule.checkpointWorkerMilestone({ task: 'fixture', step: 'milestone', sequence: 1,
+        completed: [], pending: ['continue'], decisions: [], artifacts: [], checks: [], rollover: true }, { ...io, descriptor });
+      launched.emit('exit', 0);
+      return { stdout: claudeStdout(DONE), stderr: '' };
+    };
+    return { s, io, child, calls, writes, lease, leasePath, claimPath: join(specDir, s.session + '.handoff.json') };
+  }
+  it('kills the spawned worker when persisting its handoff PID fails', async () => {
+    const f = fixture();
+    f.io.spawnFn = () => { rmSync(f.claimPath); mkdirSync(f.claimPath); return f.child; };
+    await expect(runWorker(f.s, f.io)).rejects.toThrow();
+    expect(f.child.kill).toHaveBeenCalledWith('SIGKILL');
+    expect(f.calls).toHaveLength(0);
+  });
+  it('checks the previous session verification before replacing its identity', async () => {
+    const f = fixture();
+    f.io.awaitingVerify = vi.fn(id => id === f.s.sessionId ? { awaiting: true, record: { requestedAt: 'fixture' } } : null);
+    await expect(runWorker(f.s, f.io)).rejects.toThrow(/verification.*operator repair/);
+    expect(f.calls).toHaveLength(1);
+    expect(f.io.awaitingVerify).toHaveBeenCalledWith(f.s.sessionId);
+  });
+  it.each(['malformed', 'blocked'])('validates %s results before launching a continuation', async kind => {
+    const f = fixture(), launch = f.io.spawnToCompletionFn;
+    f.io.spawnToCompletionFn = async (...args) => {
+      const out = await launch(...args);
+      return f.calls.length === 1 ? { ...out, stdout: kind === 'malformed' ? '{' : claudeStdout(BLOCKED('tooling-defect')) } : out;
+    };
+    const out = await runWorker(f.s, f.io);
+    expect(f.calls).toHaveLength(1);
+    expect(out.result.outcome).not.toBe('done');
+  });
+  it('refuses completion without a fresh continuation milestone', async () => {
+    const f = fixture();
+    await expect(runWorker(f.s, f.io)).rejects.toThrow(/fresh.*milestone.*operator repair/);
+    expect(f.calls).toHaveLength(2);
+    expect(f.writes.some(r => r.status === 'done')).toBe(false);
+  });
+  it.each([null, false, 0, ''])('refuses existing malformed claim %j', value => {
+    const f = fixture();
+    writeFileSync(f.claimPath, JSON.stringify(value));
+    expect(() => handoffModule.claimWorkerSupervisor(f.s, f.io)).toThrow(/claim.*operator repair/);
+    expect(JSON.parse(readFileSync(f.claimPath))).toEqual(value);
+  });
+  it.each(['future renewal', 'reserved missing acquisition'])('refuses invalid lease timestamp: %s', kind => {
+    const f = fixture();
+    const lease = kind === 'future renewal' ? { ...f.lease, acquiredAt: '2000-01-01T00:00:00Z', renewedAt: new Date(instant + 60_000).toISOString() }
+      : { holder: f.lease.holder, reserved: true };
+    writeFileSync(f.leasePath, JSON.stringify(lease));
+    expect(() => handoffModule.claimWorkerSupervisor(f.s, f.io)).toThrow(/lease.*operator repair/);
+  });
+  it('repository probe accepts only fixed read commands and refuses push', () => {
+    const execute = vi.fn(() => 'fixture\n');
+    expect(handoffModule.checkpointGit('fixture-repo', ['rev-parse', 'HEAD'], execute)).toBe('fixture');
+    expect(execute.mock.calls[0].slice(0, 2)).toEqual(['git', ['rev-parse', 'HEAD']]);
+    expect(() => handoffModule.checkpointGit('fixture-repo', ['push', 'origin', 'HEAD'], execute)).toThrow(/read-only/);
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('runWorker: the job record and the result channels', () => {
   it('captures opt-in smoke stderr and first output from a real child', async () => {
     const diagnosticsDir = tmp();
