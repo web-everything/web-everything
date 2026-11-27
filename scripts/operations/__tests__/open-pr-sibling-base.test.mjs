@@ -259,7 +259,12 @@ describe('open-pr sibling base: landed-sibling evidence', () => {
     // Control: before landing, the sibling is a live candidate and is refused.
     expect(f.run('main', { git })).toMatchObject({ outcome: 'refused', reason: 'sibling-base' });
     f.git(['checkout', 'main']);
-    f.git(['cherry-pick', 'lane/7357~1', 'lane/7357']);
+    // Copies with their own messages: a plain cherry-pick in the same second reproduces the SAME commit
+    // object, which would make the sibling an ancestor of main rather than a landed copy.
+    for (const [rev, message] of [['lane/7357~1', 'rebased first (#7357)'], ['lane/7357', 'rebased second (#7357)']]) {
+      f.git(['cherry-pick', '-n', rev]);
+      f.git(['commit', '-qm', message]);
+    }
     f.git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
     f.git(['checkout', 'lane/own']);
     // Main holds two single-file commits, never the whole two-file sibling patch: only per-commit equivalence clears it.
@@ -344,7 +349,8 @@ describe('open-pr sibling base: landed-sibling evidence', () => {
   it('refuses a sibling when only some of its commits landed one by one', () => {
     const f = fixture();
     f.git(['checkout', 'main']);
-    f.git(['cherry-pick', 'lane/7357~1']);
+    f.git(['cherry-pick', '-n', 'lane/7357~1']);
+    f.git(['commit', '-qm', 'rebased first (#7357)']);
     f.git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
     f.git(['checkout', 'lane/own']);
     const result = f.run();
