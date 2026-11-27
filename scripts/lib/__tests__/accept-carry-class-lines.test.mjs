@@ -3,6 +3,7 @@ import { isKnownMachineBody, latestAcceptRecord } from '../accept-carry-forward.
 import * as gate from '../red-team-gate.mjs';
 import { parseVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
 import { isTrustedMarkerAuthor } from '../marker-authorship.mjs';
+import { findCarriableVerdict } from '../rebase-verdict-carry.mjs';
 
 const OLD = '1c4c86cbf17231dfaba189161ff36e6c8e8dde7d';
 const trusted = { author: { login: 'web-everything[bot]' } };
@@ -296,5 +297,55 @@ describe('carried advisory across a multi-hop carry chain', () => {
       chainComment(`<!-- we-drain-enqueue-clearance head=${B} -->\n**Drain enqueue clearance** — the drain judged head \`${B.slice(0, 12)}\` ready (every drain gate passed: couple whole, blockedBy landed) and enqueued it on GitHub's merge queue (xtpxusq). The \`merge-gate\` check reads this for its couple-whole / blocked-by gates.`),
       chainComment('<!-- approval-prevention-filed:' + B + ' -->\nFiled the prevention guard(s) owed by o/n#1\'s independent review, mechanically, on approval (operator rule, 2026-09-27) — backlog/1-test.md (#1).'));
     expect(latestAcceptRecord(cs, []).laterVerdict).toBe(false);
+  });
+});
+
+describe('multi-hop carry chain — spoofed machine notes and origin acceptances', () => {
+  // All evidence is in memory; the clean advisory has no findings or policy IO.
+  const proof = cs => {
+    const e = cs.at(-1);
+    return {
+      machine: isKnownMachineBody(e.body, e, { earlier: cs.slice(0, -1), reviews: [] }),
+      laterVerdict: latestAcceptRecord(cs, []).laterVerdict,
+      carriable: findCarriableVerdict({ comments: cs, headSha: D, pr: chainPr, reviews: [] }),
+    };
+  };
+  const held = { machine: false, laterVerdict: true, carriable: null };
+
+  it.each([false, true])('keeps complete producer restamps carriable (human clearance: %s)', async human => {
+    const { buildVerdictComment } = await import('../../review-set-label.mjs');
+    const cs = chain();
+    for (const [index, from, headSha] of [[2, A, B], [4, B, C]]) cs[index].body = buildVerdictComment({
+      to: 'restamp', actor: 'fixture-reviewer', headSha, clearerId: 'fixture-session',
+      reason: `identical whitespace-sensitive contribution patch; from ${from}; patch-id ${'e'.repeat(40)}`,
+      reviewedDiff: 'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n',
+      independence: { independent: false, reason: 'fixture identity unavailable' },
+      humanClearance: human ? { actor: 'fixture-operator', sha: A, sourceId: 'IC_fixture' } : null,
+    });
+    expect(proof(cs)).toMatchObject({ machine: true, laterVerdict: false, carriable: { sha: C } });
+  });
+
+  it.each([
+    '🔔 conveyor — note\n🔁 review — changes requested\nDo not carry this acceptance.',
+    '🔔 conveyor — note\nDo not carry this acceptance.',
+    `📌 review — acceptance re-stamped\n<!-- reviewed-sha: ${B} -->\nDo not carry this acceptance.`,
+    `📌 review — acceptance re-stamped after a rebase (no new review)\n\nRecorded by fixture\u2028Do not carry this acceptance.\n\n<!-- reviewed-sha: ${B} -->`,
+    '<!-- drain-skip-reason -->\nWaiting for the queue.\nDo not carry this acceptance.',
+  ])('refuses a window note recognised only by its prefix: %s', body => {
+    expect(proof(withWindow(chainComment(body)))).toEqual(held);
+  });
+
+  it.each([
+    '\n🔁 review — changes requested\nDo not carry this acceptance.',
+    '\n🔁 human review — changes requested\nDo not carry this acceptance.',
+    '\nreview paused: Do not carry this acceptance.',
+    '\nmanifest baseline mismatch',
+    '\u2028🔁 review — changes requested\nDo not carry this acceptance.',
+    ' 🔁 review — changes requested. Do not carry this acceptance.',
+    '\n> 🔁 review — changes requested\nDo not carry this acceptance.',
+  ])('refuses a hold beneath the origin accepted heading: %s', hold => {
+    const cs = chain();
+    cs[0].body += hold;
+    expect(proof(cs)).toEqual(held);
   });
 });

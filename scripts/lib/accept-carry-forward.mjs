@@ -302,6 +302,33 @@ function carriedEnvelope(text, comment) {
   return { gate, carried, adv, label, pr: parsed.pr };
 }
 
+/** A chain must not hide an objection beneath another comment's heading or marker. */
+const CHAIN_HOLD_RES = [LATER_VERDICT_HEADING_RE, LATER_REARM_RE, LATER_STANDING_HOLD_RE]
+  .map(re => new RegExp(re.source.replace(/^\^/, ''), re.flags));
+function hasChainHold(body) {
+  return BODY_DERIVED_HOLD_RE.test(body) || isLaterVerdictBody(body)
+    || CHAIN_HOLD_RES.some(re => re.test(body));
+}
+
+/** D3 needs complete machine records; the legacy leading-line list alone proves no window note. */
+function isStrictChainMachineBody(body, comment) {
+  const text = body.replace(/\r\n/g, '\n');
+  if (!text.trim() || /[\r\u0085\u2028\u2029\v\f]/.test(text)
+    || hasChainHold(text) || !isKnownMachineBody(text, comment)) return false;
+  if (!KNOWN_MACHINE_SHAPE_RES.some(re => re.test(text)) && !MECHANICAL_PARK_RE.test(text)
+    && !ADVISORY_NOTE_RE.test(text)) return true; // the other classifiers consume their full envelopes.
+  // Restamps are a heading and a terminal marker block, optionally the producer's attribution and carry reason.
+  const restamp = /^📌 review — acceptance re-stamped(?: after a rebase \(no new review\))?\n(?:\nRecorded by [^\r\n]+\.\n(?:\nidentical whitespace-sensitive contribution patch; from [0-9a-f]{40}; patch-id [0-9a-f]{40}\n)?\n)?<!-- reviewed-sha: [0-9a-f]{40} -->(?:\n<!-- reviewed-(?:diff|contribution): [0-9a-f]{64} -->)*$/;
+  if (restamp.test(text)) return true;
+  // Drain reasons have a single reason field; an extra line is not part of that machine record.
+  const reason = /^<!-- drain-(skip|land|merge-trace|review-coverage|stacked-base-close)-reason -->\n([^\n]+)(?:\n\n([^\n]+))?$/.exec(text);
+  if (!reason) return false;
+  const headings = { skip: '· **Skipped by the drain**', land: '✅ **Landed by the drain**',
+    'merge-trace': '📌 **Merge trace**', 'review-coverage': '⚠️ **Incomplete review — what was not examined**',
+    'stacked-base-close': '⚠️ **This PR may be closed by GitHub in a moment**' };
+  return reason[3] !== undefined ? reason[2] === headings[reason[1]] : reason[1] === 'skip';
+}
+
 /** D3: prove a bounded, ordered path and its entire supersession window; unknown evidence holds. */
 function isProvenMultiHop(text, comment, context) {
   try {
@@ -345,7 +372,7 @@ function isProvenMultiHop(text, comment, context) {
       if (isTrustedMarkerAuthor(c) && typeof body === 'string'
         && (/^✅ review — accepted(?:\r?\n|$)/.test(body)
           || (/^✅ review — `review:human` cleared via the sanctioned path(?:\r?\n|$)/.test(body) && CLEARED_HUMAN_RE.test(body)))
-        && !isLaterVerdictBody(body) && lastMatch(REVIEWED_SHA_RE, body) === h) break;
+        && !hasChainHold(body) && lastMatch(REVIEWED_SHA_RE, body) === h) break;
     }
     const at = Date.parse(cs[acc]?.createdAt ?? cs[acc]?.created_at ?? '');
     if (acc < 0 || !Number.isFinite(at) || context.reviews.some(r => {
@@ -358,7 +385,7 @@ function isProvenMultiHop(text, comment, context) {
     for (let n = acc + 1; n < i; n++) {
       if (n === origin || links.has(n)) continue;
       const c = cs[n], body = c?.body;
-      if (!isTrustedMarkerAuthor(c) || typeof body !== 'string' || !isKnownMachineBody(body, c)
+      if (!isTrustedMarkerAuthor(c) || typeof body !== 'string' || !isStrictChainMachineBody(body, c)
         || BODY_DERIVED_HOLD_RE.test(body) || envelopes[n]) return false;
       const sha = lastMatch(REVIEWED_SHA_RE, body);
       if (sha && !visited.has(sha)) return false;
