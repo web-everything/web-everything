@@ -32,6 +32,7 @@ import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { isHumanOperatorComment } from '../lib/operator-identity.mjs';
 import { parseOperatorAnswer } from './stand-down-answer-core.mjs';
 import { standDownComments } from './stand-down.mjs';
+import { parseNoCodeOwedStandDown } from './fix-procedure.mjs';
 import { REARM_COMMENT_MARKER, SAME_HEAD_WAKE_TRAILER, isFixRoundRearmComment } from './rearm-round-count.mjs';
 
 // we:scripts/conveyor/rearm-review.mjs — re-export the shared narrowing helper on this module's surface so the
@@ -280,7 +281,12 @@ export function rearmWindow(comments) {
     capBlocked: capBlockedId !== null && capBlockedId === standDownIds.at(-1) };
 }
 
-export function decideEmptyFixRound({ comments, liveHead } = {}) {
+export function decideEmptyFixRound({ comments, liveHead, noCodeBinding } = {}) {
+  if (noCodeBinding !== undefined) {
+    const matches = Array.isArray(comments) ? comments.filter(c => parseNoCodeOwedStandDown(c, noCodeBinding)) : [];
+    return matches.length === 1 && liveHead === noCodeBinding?.head
+      ? { empty: false, noCodeResume: true } : { empty: true };
+  }
   const live = String(liveHead ?? '').trim().toLowerCase();
   if (!/^[0-9a-f]{7,40}$/.test(live) || !Array.isArray(comments)) return { empty: false };
   const { claims, reviewedHead, resumeHead } = rearmWindow(comments);

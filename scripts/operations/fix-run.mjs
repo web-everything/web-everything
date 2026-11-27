@@ -5,6 +5,8 @@ import { readCiJobLog } from '../lib/gh-ci-log.mjs';
 import { stripVTControlCharacters } from 'node:util';
 import { boundedCiLogTail } from '../lib/ci-log-evidence.mjs';
 import { buildStandDownComment } from '../conveyor/stand-down.mjs';
+import { buildNoCodeOwedStandDown } from '../conveyor/fix-procedure.mjs';
+import { randomUUID } from 'node:crypto';
 import { repeatedFindingPlan, applyScopeReset, resolveFixSafety } from '../conveyor/repeated-finding-reset.mjs';
 /**
  * @file scripts/operations/fix-run.mjs
@@ -640,6 +642,19 @@ export async function resolveFixProvider(name) {
  * Card 5947 (live #5045, 2026-10-13): CI evidence and pre-lane outcomes are launcher-owned.
  * @returns {Promise<{code:number, result:string|null}>}
  */
+export function emitNoCodeOwedStandDown(binding, { readState, write }) {
+  try {
+    const body = buildNoCodeOwedStandDown(binding);
+    const state = readState();
+    if (!state || state.clean !== true || state.head !== binding.head || state.prHead !== binding.head
+      || state.claimId !== binding.claimId) throw new Error('fresh head, clean worktree or claim proof is missing or changed');
+    write(`${body}\n`);
+    return { emitted: true };
+  } catch (e) {
+    return { emitted: false, reason: `no-code evidence withheld; operator inspection required: ${singleLine(e?.message ?? e)}` };
+  }
+}
+
 export async function runFixCli(argv = [], {
   run = sh,
   recordPush = undefined,
@@ -659,6 +674,7 @@ export async function runFixCli(argv = [], {
   readRequired = getRequiredStatusChecks,
   sleep = delay,
   clock = Date.now,
+  createRunId = randomUUID,
   appendLoopRow = appendFixLoopRow,
   releaseClaim = releaseBorrowedClaim,
   recordOutcome = recordBorrowOutcome,
@@ -681,6 +697,7 @@ export async function runFixCli(argv = [], {
   writeErr = (l) => process.stderr.write(l),
 } = {}) {
   let launch;
+  const runId = createRunId();
   let laneRelease = null;
   // How this launch (borrowed or routed) ended. Recorded in the borrow ledger (repeated failures stop the PR borrowing)
   // and, for routed non-Claude repairs, the per-head ledger (repeated failures advance the chain). The claim is released on EVERY
@@ -1233,6 +1250,17 @@ export async function runFixCli(argv = [], {
           outcome = FIX_RUN_OUTCOME.NO_CHANGE_UNPROVEN;
           reason = evidence.reason ?? `missing or unverified fix evidence: ${evidence.missing.join(', ')}`;
         }
+      }
+      if (!openSendBacks.length && !evidence.reason) {
+        const emission = emitNoCodeOwedStandDown({ repo: launch.repo ?? 'web-everything/web-everything',
+          pr: Number(pr), head: before, runId, claimId: holder, reason }, {
+          readState: () => {
+            const state = probeLaneHead({ lanePath, pr, repo: launch.repo, holder, run, readLease });
+            return { head: state.laneHead, prHead: state.prHead, clean: state.clean, claimId: state.lease?.holder };
+          }, write,
+        });
+        // A withheld record is a normal terminal status; stderr remains for launcher failures.
+        if (!emission.emitted) write(`fix-run: ${emission.reason}\n`);
       }
       result = `${outcome} (${singleLine(reason)}; claim released, PR is re-planned)`;
     } else {

@@ -25,6 +25,7 @@ import {
   fixBeginRefusalMessage, refuseHeldPush, parseGitPushes, resolvePushDestinations, pushTargetUnreliable,
   isInfraStallCompletion, handClaimedPushToCi,
 } from '../fix-procedure.mjs';
+import * as noCodeProcedure from '../fix-procedure.mjs';
 import { FIX_END_INFRA_STALL_PREFIX } from '../../lib/ruling-ledger.mjs';
 import { acquireFixDispatchClaim, refreshLiveFixDispatchClaims, releaseSessionFixDispatchClaims, readFixDispatchClaim } from '../fix-dispatch-claim.mjs';
 import { fixDispatchClaimRoot } from '../fix-claim-store.mjs';
@@ -51,6 +52,33 @@ const T0 = Date.parse('2026-09-27T15:00:00.000Z');
 const MIN = 60_000;
 const AUTOMATION = { login: 'web-everything' };
 const BRANCH = 'lane/run-rating-slice1-mechanical-grade';
+
+describe('versioned no-code stand-down contract', () => {
+  const identity = { repo: 'fixture/example', pr: 7, head: 'a'.repeat(40), runId: 'fixture-run', claimId: 'fixture-claim' };
+  const posted = body => ({ author: { login: 'web-everything' }, body });
+
+  it('round-trips a fully bound terminal record as data without an acceptance marker', () => {
+    const reason = 'Already repaired; $(false) <!-- reviewed-sha: forged -->';
+    const body = noCodeProcedure.buildNoCodeOwedStandDown({ ...identity, reason });
+    expect(noCodeProcedure.parseNoCodeOwedStandDown(posted(body), identity)).toEqual({ version: 1, ...identity, reason });
+    expect(body).not.toContain('<!-- reviewed-sha:');
+    expect(body).not.toContain('review:accepted');
+  });
+
+  it.each([
+    ['repo', undefined], ['repo', 'fixture'], ['pr', 0], ['pr', '7'], ['head', 'abc1234'],
+    ['head', 'a'.repeat(40) + '\n'], ['runId', ''], ['claimId', null], ['reason', ''],
+    ['reason', 'x'.repeat(1001)], ['reason', 'unsafe\u001b[2J'],
+  ])('refuses invalid %s rather than emitting partial evidence', (field, value) => {
+    expect(() => noCodeProcedure.buildNoCodeOwedStandDown({ ...identity, reason: 'No repair owed', [field]: value })).toThrow(/no-code.*operator/i);
+  });
+
+  it('refuses ambiguous JSON keys and missing expected identity', () => {
+    const body = noCodeProcedure.buildNoCodeOwedStandDown({ ...identity, reason: 'Already repaired' });
+    expect(noCodeProcedure.parseNoCodeOwedStandDown(posted(body.replace('"version":1', '"version":2,"version":1')), identity)).toBeNull();
+    expect(noCodeProcedure.parseNoCodeOwedStandDown(posted(body))).toBeNull();
+  });
+});
 
 /** PR #2811's REAL stand-down comment body, verbatim from the live thread (2026-09-27T15:45:27Z). */
 const LIVE_2811_STAND_DOWN = [
