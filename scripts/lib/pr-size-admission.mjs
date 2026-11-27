@@ -168,16 +168,27 @@ export function checkSiblingBase({ git, ref, sha, base = 'main', now = () => per
     };
     const patch = (from, to) => patchId(read(['diff', '--no-ext-diff', '--no-textconv', '--binary', from, to, '--']));
     const landedPatches = new Set(landed.map(commit => patch(`${commit}^`, commit)).filter(Boolean));
-    const siblings = [];
-    for (const { lane, tip } of candidates) {
-      const start = commitSha(read(['merge-base', tip, main]));
+    // A range has landed when its whole patch landed (squash) or every commit's patch landed (rebase-merge).
+    const rangeLanded = (range, start, tip) => {
+      if (!range.length) return false;
       const combined = patch(start, tip);
-      if (combined && landedPatches.has(combined)) continue;
-      const individual = commits(tip, `^${main}`);
-      if (individual.length && individual.every(commit => {
+      if (combined && landedPatches.has(combined)) return true;
+      return range.every(commit => {
         const id = patch(`${commit}^`, commit);
         return id && landedPatches.has(id);
-      })) continue;
+      });
+    };
+    const siblings = [];
+    const unique = [...new Map(candidates.map(candidate => [`${candidate.lane}\0${candidate.tip}`, candidate])).values()];
+    for (const { lane, tip } of unique) {
+      // The sibling's whole history first: a lane whose PR carried its parent's commits lands them together.
+      if (rangeLanded(commits(tip, `^${main}`), commitSha(read(['merge-base', tip, main])), tip)) continue;
+      // Otherwise judge only the lane's own commits, with every other carried sibling's history set aside:
+      // a stack of PRs that each landed separately must not be refused for the parent's unmatched commits.
+      // The parents are judged in their own turn, so excluding them here never clears them.
+      const own = commits('--topo-order', tip, `^${main}`,
+        ...unique.filter(other => other.tip !== tip).map(other => `^${other.tip}`));
+      if (rangeLanded(own, `${own.at(-1)}^`, tip)) continue;
       siblings.push(lane);
     }
     return siblings.length ? { ok: false, reason: 'sibling-base', detail: `Unmerged sibling lanes carried by this branch: ${[...new Set(siblings)].sort().join(', ')}` } : { ok: true };

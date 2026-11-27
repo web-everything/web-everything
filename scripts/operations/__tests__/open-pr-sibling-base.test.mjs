@@ -254,11 +254,91 @@ describe('open-pr sibling base: landed-sibling evidence', () => {
 
   it('admits a sibling whose commits landed one by one (rebase-merge), judged per commit', () => {
     const f = fixture();
+    const patchIds = [];
+    const git = (args, opts) => { if (args[0] === 'patch-id') patchIds.push(args); return f.git(args, opts); };
+    // Control: before landing, the sibling is a live candidate and is refused.
+    expect(f.run('main', { git })).toMatchObject({ outcome: 'refused', reason: 'sibling-base' });
     f.git(['checkout', 'main']);
     f.git(['cherry-pick', 'lane/7357~1', 'lane/7357']);
     f.git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
     f.git(['checkout', 'lane/own']);
-    expect(f.run()).toMatchObject({ outcome: 'opened' });
+    // Main holds two single-file commits, never the whole two-file sibling patch: only per-commit equivalence clears it.
+    patchIds.length = 0;
+    expect(f.run('main', { git })).toMatchObject({ outcome: 'opened' });
+    expect(patchIds.length).toBeGreaterThanOrEqual(5);
+  });
+
+  it('refuses one-by-one copies on main whose content differs from the sibling commits', () => {
+    const f = fixture();
+    f.git(['checkout', 'main']);
+    f.commit('one', 'different first');
+    f.commit('two', 'different second');
+    f.git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
+    f.git(['checkout', 'lane/own']);
+    const result = f.run();
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base' });
+    expect(result.detail).toContain('lane/7357');
+  });
+
+  describe('a stack of PRs that each landed separately', () => {
+    const stack = () => {
+      const f = fixture();
+      f.git(['checkout', '-qb', 'lane/7358', 'lane/7357']);
+      f.commit('child', 'child sibling change');
+      f.git(['branch', '-f', 'lane/own', 'lane/7358']);
+      f.git(['checkout', 'lane/own']);
+      f.commit('own2', 'own change on the stack');
+      const squash = lane => {
+        f.git(['checkout', 'main']);
+        f.git(['merge', '--squash', lane]);
+        f.git(['commit', '-qm', `land ${lane}`]);
+        f.git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
+      };
+      return { f, squash };
+    };
+
+    it('admits the stack once the parent and the child each landed as their own squash', () => {
+      const { f, squash } = stack();
+      expect(f.run()).toMatchObject({ outcome: 'refused', reason: 'sibling-base' });
+      squash('lane/7357');
+      squash('lane/7358');
+      f.git(['checkout', 'lane/own']);
+      expect(f.run()).toMatchObject({ outcome: 'opened' });
+    });
+
+    it('still names the child when only the parent landed', () => {
+      const { f, squash } = stack();
+      squash('lane/7357');
+      f.git(['checkout', 'lane/own']);
+      const result = f.run();
+      expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base' });
+      expect(result.detail).toContain('lane/7358');
+      expect(result.detail).not.toContain('lane/7357');
+    });
+  });
+
+  it('only reads: repository state is unchanged and only read-only Git verbs run', () => {
+    const f = fixture();
+    f.git(['checkout', 'main']);
+    f.git(['merge', '--squash', 'lane/7357']);
+    f.git(['commit', '-qm', 'land sibling (#7357)']);
+    f.git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
+    f.git(['checkout', 'lane/own']);
+    const snapshot = () => [
+      ['for-each-ref', '--format=%(refname) %(objectname)'], ['reflog', 'show', '--all'],
+      ['status', '--porcelain=v2', '--branch'], ['rev-parse', 'HEAD'], ['count-objects', '-v'],
+    ].map(args => f.git(args)).join('\n--\n');
+    const before = snapshot();
+    const verbs = new Set();
+    const git = (args, opts) => { verbs.add(args[0] === 'reflog' ? `reflog ${args[1]}` : args[0]); return f.git(args, opts); };
+    expect(f.run('main', { git })).toMatchObject({ outcome: 'opened' });
+    expect(f.run('release/x', { git })).toMatchObject({ outcome: 'refused' });
+    expect(f.run('lane/7357', { git })).toMatchObject({ outcome: 'opened' });
+    expect(snapshot()).toBe(before);
+    expect(verbs).toContain('patch-id');
+    for (const verb of verbs) {
+      expect(['rev-parse', 'rev-list', 'for-each-ref', 'merge-base', 'reflog show', 'diff', 'patch-id']).toContain(verb);
+    }
   });
 
   it('refuses a sibling when only some of its commits landed one by one', () => {
