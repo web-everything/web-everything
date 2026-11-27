@@ -719,10 +719,19 @@ export async function smokeAndAdopt({
         moved: false, reason: 'ready-recorded', readyRecorded: true, target: p.finalSha, plan: p, alerts: [...prepAlerts, ...alertsList],
       };
     }
-    const fin = await withWriteLock(root, () => finalizeRebuild({
-      root, env, log, run, stateOpts, now, plan: p, prevHead, lease, onAdopted,
-      auditedTip: makeAuditedTipGate(env), // unaudited-tip: evidence revoked during the smoke must not be adopted
-    }), finalizeLockOpts);
+    const fin = await withWriteLock(root, () => {
+      // F5: adoption over a failed smoke is re-checked UNDER the write lock — a tightening veto (legacy env zero, a settings
+      // flip, an unreadable setting) that lands after the ready record was written must stop the adoption (fail closed).
+      if (overFailedSmoke === true && resolveAdoptNotWorse(env).enabled !== true) return { vetoed: true };
+      return finalizeRebuild({
+        root, env, log, run, stateOpts, now, plan: p, prevHead, lease, onAdopted,
+        auditedTip: makeAuditedTipGate(env), // unaudited-tip: evidence revoked during the smoke must not be adopted
+      });
+    }, finalizeLockOpts);
+    if (fin.ok && fin.value?.vetoed === true) {
+      clearReadyCandidate(root, stEnv); // never leave the vetoed build adoptable
+      return { moved: false, reason: 'adopt-not-worse-vetoed', vetoed: true, plan: p, alerts: [...prepAlerts, ...alertsList] };
+    }
     if (!fin.ok) {
       if (fin.reason === 'tick-in-progress') {
         log.error?.(`daemon-rebuild: could not take the write lock to finalize ${p.finalSha} after a passing smoke (reader ${fin.heldBy ?? '?'} still ticking) — kept as the ready candidate; the next write-lock holder adopts it without re-smoking`);
@@ -1053,7 +1062,8 @@ export async function smokeAndAdopt({
   const cFailed = c.smokeResult ? failedRows(c.smokeResult) : null;
   const harnessBroken = !!(cFailed && failsSameChecks(failedA, cFailed));
   if (harnessBroken || (!c.reused && matchesHarnessHold(failedA, cFailed))) {
-    if (harnessBroken && !c.reused && resolveAdoptNotWorse(env).enabled === true) {
+    // F5: the rebuild JOB (`readyOnly`) never records adoption-ready evidence for a failed candidate — it holds on last-good.
+    if (harnessBroken && !c.reused && !readyOnly && resolveAdoptNotWorse(env).enabled === true) {
       // xhiqxz3 — "no worse" on the ordinary smoke says nothing about the worker launch: prove that first.
       if (aSuspects.length) {
         const d = await dispatchOnly(plan.finalSha, aSuspects);
@@ -1066,7 +1076,8 @@ export async function smokeAndAdopt({
         message: 'last-good failed every check the candidate failed — adopting the candidate as no worse so a candidate harness fix can arrive',
       });
       const fin = await finalize(plan, undefined, undefined, a.smokeResult, { overFailedSmoke: true });
-      return { ...fin, reason: fin.adopted ? 'harness-broken-adopted-not-worse' : fin.reason };
+      if (!fin.vetoed) return { ...fin, reason: fin.adopted ? 'harness-broken-adopted-not-worse' : fin.reason };
+      // vetoed under the lock: fall through to the ordinary harness-broken hold
     }
     const prevAttempts = priorRejected?.harnessBroken ? (priorRejected.attempts || 1) : 0;
     const attempts = prevAttempts + 1;
