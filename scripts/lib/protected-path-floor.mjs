@@ -258,6 +258,8 @@ export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|r
  * user fails the test.
  */
 export const LOCK_USERS = Object.freeze([
+  // Main-red alert publication serializes durable deduplication with withFileLock.
+  'scripts/conveyor/health-watch-main-red.mjs',
   // The fast review pass owns both its singleton lease and the ordinary dispatch lease.
   'scripts/lib/review-fast-pass-cli.mjs',
   // Remote discovery imports the remote-exec lock holder for its execution adapter.
