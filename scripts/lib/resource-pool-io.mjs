@@ -3,7 +3,8 @@ import * as fs from 'node:fs';
 import { readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { basename, join } from 'node:path';
-import { POOL_DEFAULTS, validClasses, budgetFromSnapshot } from './resource-pool.mjs';
+import { POOL_DEFAULTS, validClasses, budgetFromSnapshot, grantDecision, summarize, digestLine } from './resource-pool.mjs';
+import { appendResourceLog, admit } from './resource-admission.mjs';
 import { readPoolLaneStatus, poolLaneLeased } from './resource-pool-lanes.mjs';
 import { admissionLockRoot, loadAdmissionPolicy, resolveSlotSpan, slotPath } from '../readiness/heavy-admission.mjs';
 import { EXEMPT_DISPATCH_KINDS, PREPARE_DISPATCH_KINDS } from '../readiness/heavy-queue-projection.mjs';
@@ -301,4 +302,68 @@ export function readPoolSource(source, { paths, coord, env = process.env, nowMs 
     } else throw Error('unknown source');
     return { source, ok: true, holders, budget, snapshot, expiredRedTeamRows };
   } catch (e) { return { source, ok: false, holders: [], expiredRedTeamRows, error: `${clean(e.message)}; inspect source and rerun` }; }
+}
+
+/** Even a thrown null or a throwing message getter is failed evidence. */
+function errorText(e) {
+  try { return clean(String(e?.message ?? e)); }
+  catch { return 'unprintable error'; }
+}
+export function collectResourcePool({ env = process.env, nowMs = Date.now(), coord = resolveCoordinationRoot({ env }),
+  settings = loadPoolSettings({ env }), paths = poolSourcePaths({ env, coord }), readSource = readPoolSource,
+  legacy = admit, host = hostname() } = {}) {
+  const sources = Object.entries(SOURCES).map(([source, description]) => {
+    let result;
+    try { result = readSource(source, { paths, coord, env, nowMs }); }
+    catch (e) { result = { source, ok: false, holders: [], error: errorText(e) }; }
+    if (result?.source !== source || !Array.isArray(result?.holders) || typeof result?.ok !== 'boolean'
+      || result.unknown || result.holders.unknown
+      || result.holders.some(h => !h || h.source !== source || ![2, 3].includes(h.class) || ![1, 2].includes(h.size))
+      || (source === 'snapshot' && result.ok && (result.budget?.unknown !== false
+        || !Number.isInteger(result.budget.units) || result.budget.units < 0 || result.budget.units > 30))) result = { ok: false, holders: [], error: 'invalid source result' };
+    return { ...result, source, description, path: paths[source] ?? (source === 'workers' ? 'lane lease files / heavy-admission' : 'ps process inventory') };
+  });
+  // Claims bridge dispatch to worker startup: overlap across sources describes one job.
+  // Preserve each source's multiplicity: retain the largest per-source count for a job.
+  // Missing job identity stays separately counted; never guess from a lane or display ID.
+  // An explicit repo scopes a jobId; identical IDs from different repos are distinct jobs.
+  const jobs = new Map();
+  const holders = sources.flatMap(s => {
+    const sourceJobs = new Map();
+    return (s.ok ? s.holders : []).filter(holder => {
+      // Preserve refusal flags for grantDecision, even behind a healthy duplicate.
+      if (holder.unknown || holder.sourceOk === false) return true;
+      if (holder.kind !== 'fix' || typeof holder.jobId !== 'string' || !holder.jobId) return true;
+      const jobKey = JSON.stringify([holder.repo ?? null, holder.jobId]);
+      const count = (sourceJobs.get(jobKey) ?? 0) + 1;
+      sourceJobs.set(jobKey, count);
+      if (count <= (jobs.get(jobKey) ?? 0)) return false;
+      jobs.set(jobKey, count);
+      return true;
+    });
+  });
+  const unknown = !!settings.unknown || sources.some(s => !s.ok)
+    || sources.find(s => s.source === 'snapshot')?.budget?.unknown !== false;
+  const budgets = { 'studio.units': sources.find(s => s.source === 'snapshot')?.budget?.units };
+  const rows = [['review', 2, 1], ['redTeam', 2, 1], ['fix', 3, 2]].map(([kind, priority, size]) => {
+    const pool = grantDecision({ budget: budgets['studio.units'], held: holders, class: priority, size,
+      classes: settings.value.classes, builderFloor: settings.value.builderFloor, unknown });
+    let old;
+    try { old = legacy({ kind: kind === 'redTeam' ? 'review' : kind, env, nowMs, root: coord }); } catch { /* comparison unknown */ }
+    return { ts: new Date(nowMs).toISOString(), host, resource: 'studio.units', kind, class: priority,
+      poolDecision: pool.decision, legacyDecision: old?.unknown || !old ? 'unknown' : old.verdict === 'admit' ? 'grant' : 'hold',
+      legacySource: 'resource-admission.admit (resource check only; dispatch caps excluded)',
+      unknown: unknown || pool.unknown, reason: pool.reason };
+  });
+  const report = { mode: settings.value.mode, configuredMode: settings.configuredMode,
+    unknown: unknown || rows.some(row => row.unknown), holders, sources, settings,
+    budgets, summary: summarize(holders), rows, builderFloor: settings.value.builderFloor,
+    scope: 'S1a partial inventory: C2 review rounds/red-team, C3 fix/ci-heal claims and live workers', shrink: null };
+  report.digest = digestLine(report);
+  return report;
+}
+export function appendShadowRows(rows, { env = process.env, coord = resolveCoordinationRoot({ env }), mode = 'shadow', append = appendResourceLog } = {}) {
+  if (mode === 'off') return false;
+  try { for (const row of rows) if (append(join(coord, 'resource', 'pool-shadow.jsonl'), row) === false) return false; return true; }
+  catch { return false; }
 }
