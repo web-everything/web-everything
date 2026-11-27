@@ -3,7 +3,14 @@
  * re-arming, the next round was a restack that by design never touched labels, and the PR then sat `review:changes`
  * with no owner. These fixtures are that thread's real comment shapes.
  */
-import { describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync, rmSync, openSync, readSync, closeSync } from 'node:fs';
+import { hostname, tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createHash } from 'node:crypto';
+import * as atomicJson from '../../lib/atomic-json-file.mjs';
+import * as processIdentity from '../../lib/pid-alive.mjs';
+import { acquireLockDir, lockDirFor, readLockEntry } from '../../readiness/file-locks.mjs';
 import {
   planOrphanFixRound, runOrphanFixRoundPass, formatOrphanFixRoundLines, buildOrphanGuardComment, verdictReviewedHead,
   ORPHAN_GUARD_MARKER, CHANGES_VERDICT_PREFIX, DEFAULT_ORPHAN_GRACE_MS, defaultListBounced, defaultRearm, defaultRedispatch,
@@ -21,6 +28,42 @@ import { parseLatestHumanClearedSha } from '../../lib/review-escalation.mjs';
 import { buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../../lib/jury-core.mjs';
 import * as referralGate from '../../operations/record-referral-ruling.mjs';
 
+const sandbox = await vi.hoisted(async () => {
+  // Native named imports can be cached before a Vitest module mock. Replace the
+  // underlying export before importing the guard, and restore it after this file.
+  const os = (await import('node:os')).default;
+  const { syncBuiltinESMExports } = await import('node:module');
+  const original = os.hostname;
+  os.hostname = () => 'fixture-host';
+  syncBuiltinESMExports();
+  return { root: process.env.TMPDIR, dispatch: null,
+    restoreHost: () => { os.hostname = original; syncBuiltinESMExports(); } };
+});
+afterAll(() => sandbox.restoreHost());
+vi.mock('../reconcile-fix-dispatch.mjs', () => ({ runReconcileFixDispatch: vi.fn(() => {
+  if (sandbox.dispatch instanceof Error) throw sandbox.dispatch;
+  return sandbox.dispatch;
+}) }));
+vi.mock('../reconcile-pass.mjs', () => ({ runReconcilePass: vi.fn(() => ({ dispatch: [], refusals: [] })) }));
+vi.mock('../net-scope.mjs', () => ({ applyNetScopeToReconcile: result => result }));
+vi.mock('../../operations/coordination-root.mjs', () => ({
+  COORDINATION_ROOT_ENV: 'WE_COORDINATION_ROOT', resolveCoordinationRoot: () => `${sandbox.root}/coordination`,
+}));
+vi.mock('../../lib/pid-alive.mjs', async original => ({ ...await original(),
+  pidNamespace: () => 'fixture-namespace',
+  pidIdentityStamp: () => ({ runnerStart: 'fixture-start', runnerArgv: 'fixture-runner' }),
+  pidIdentity: vi.fn(() => ({ alive: null, reason: 'injected-unknown' })),
+}));
+
+// Isolate even pre-existing IO-shell fixtures now that dispatch accounting is durable.
+beforeEach(() => {
+  sandbox.root = mkdtempSync(join(tmpdir(), 'orphan-round-'));
+  sandbox.dispatch = null;
+});
+afterEach(() => {
+  rmSync(sandbox.root, { recursive: true, force: true });
+});
+
 const BOT = { login: 'web-everything' };
 // Never-edited comments, as a live `gh pr view --json comments` read reports them; an unstamped automation-posted
 // operator ruling needs that proof to clear (PR #6529).
@@ -33,6 +76,183 @@ const BEGIN = c('2026-10-10T15:03:55Z', `${FIX_BEGIN_MARKER}\n\n**Who:** \`fix-4
 const RESTACK = c('2026-10-10T15:21:28Z', '🔁 restack — merged `origin/lane/gh-merge-queue-gate` into this branch.');
 const END = c('2026-10-10T15:21:33Z', `${FIX_END_MARKER}\n\n\`fix-4715\` released the fix claim at \`124e242da\`.`);
 const pr4715 = (comments, extra = {}) => ({ number: 4715, labels: [{ name: 'review:changes' }, { name: 'review-round:1' }], headRefOid: HEAD, isDraft: false, comments, ...extra });
+
+describe('durable orphan redispatch attempts', () => {
+  let attemptRoot;
+  beforeEach(() => {
+    attemptRoot = join(sandbox.root, 'attempts');
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+  const history = () => [VERDICT, BEGIN, END];
+  const setup = (extra = {}) => ({
+    env: { WE_COORDINATION_ROOT: join(sandbox.root, 'coordination') }, attemptRoot,
+    repos: [{ key: 'we', slug: 'web-everything/web-everything' }], nowMs: NOW, now: () => NOW,
+    listBounced: () => [pr4715([])], readComments: async () => history(), isOwned: async () => false,
+    resolveProfile: () => ({ capabilities: { fix: true } }), cardReadable: () => false,
+    reconcile: () => ({ dispatch: [], refusals: [] }), redispatch: defaultRedispatch,
+    rearm: vi.fn(async () => ({ ok: true })), escalate: vi.fn(async () => ({ ok: true })),
+    postComment: vi.fn(async () => { throw new Error('marker\u0007\u001b[31m unavailable ' + 'x'.repeat(2200)); }),
+    ...extra,
+  });
+  const ledgers = () => readdirSync(attemptRoot).filter(name => name.endsWith('.json'))
+    .map(name => ({ path: join(attemptRoot, name), ...JSON.parse(readFileSync(join(attemptRoot, name), 'utf8')) }));
+  const noLane = extra => ({ dispatched: [], refusals: [{ pr: 4715, kind: 'no-lane' }], launchUncertain: [], ...extra });
+  const seed = (options, value) => {
+    const verdict = latestChangesVerdict(history());
+    const round = rearmVerdictKey(verdict) ?? createHash('sha256').update(JSON.stringify([Date.parse(verdict.createdAt), verdict.body])).digest('hex');
+    const resource = `orphan-redispatch:web-everything/web-everything:4715:${round}`;
+    mkdirSync(attemptRoot, { recursive: true });
+    const path = join(attemptRoot, `${createHash('sha256').update(resource).digest('hex')}.json`);
+    if (value !== undefined) writeFileSync(path, value);
+    return { path, resource, options };
+  };
+
+  it('a full lane pool keeps a never-launched attempt retryable', async () => {
+    const options = setup();
+    sandbox.dispatch = noLane();
+    expect((await runOrphanFixRoundPass(options)).rows[0].result).toMatch(/^not-done:/);
+    expect(ledgers()).toMatchObject([{ pending: false, confirmed: 0 }]);
+    expect(options.escalate).not.toHaveBeenCalled();
+    sandbox.dispatch = { dispatched: [{ pr: 4715 }], refusals: [], launchUncertain: [] };
+    expect((await runOrphanFixRoundPass(options)).rows[0].result).toMatch(/^re-dispatched/);
+    expect(ledgers()).toMatchObject([{ pending: false, confirmed: 1 }]);
+  });
+  it('caps redispatch at two across restarts when every marker post fails', async () => {
+    const redispatch = vi.fn(async () => ({ ok: true }));
+    for (let pass = 0; pass < 3; pass++) {
+      const options = setup({ redispatch });
+      const result = await runOrphanFixRoundPass(options);
+      expect(result.rows[0].result).toMatch(pass < 2 ? /^re-dispatched/ : /^escalated/);
+      expect(options.escalate).toHaveBeenCalledTimes(pass < 2 ? 0 : 1);
+    }
+    expect(redispatch).toHaveBeenCalledTimes(2);
+    expect(ledgers()).toMatchObject([{ pending: false, confirmed: 2 }]);
+    expect(ledgers()[0].markerError.length).toBeLessThanOrEqual(2000);
+    expect(ledgers()[0].markerError).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
+  });
+  it.each([
+    ['no-lane after an unconfirmed resume holds for a person', [4715]],
+    ['missing launchUncertain field holds', undefined],
+    ...[[null], [{}], ['7'], ['invalid'], [1.5], [0], [-1], null, 'invalid'].map(value => [`malformed launchUncertain (${JSON.stringify(value)}) holds`, value]),
+  ])('%s', async (_name, launchUncertain) => {
+    const options = setup();
+    sandbox.dispatch = noLane({ launchUncertain });
+    await runOrphanFixRoundPass(options);
+    expect(ledgers()).toMatchObject([{ pending: true, confirmed: 0 }]);
+    await runOrphanFixRoundPass(options);
+    expect(options.escalate).toHaveBeenCalledOnce();
+    expect(fixDispatch.runReconcileFixDispatch).toHaveBeenCalled();
+  });
+  it('planner-only refusal (reconcileRefusalDetails) stays retryable', async () => {
+    sandbox.dispatch = noLane({ refusals: [{ pr: 9, kind: 'unrelated-secret' }],
+      reconcileRefusalDetails: [{ prNumber: 4715, kind: 'planner-held' }, { prNumber: 9, kind: 'unrelated-secret' }] });
+    const options = setup();
+    const result = await runOrphanFixRoundPass(options);
+    expect(result.rows[0].result).toContain('planner-held');
+    expect(result.rows[0].result).not.toContain('unrelated-secret');
+    expect(ledgers()).toMatchObject([{ pending: false, confirmed: 0 }]);
+    expect(options.escalate).not.toHaveBeenCalled();
+  });
+  it('dispatcher throw leaves the reservation pending', async () => {
+    sandbox.dispatch = new Error('dispatcher timeout');
+    const options = setup();
+    await runOrphanFixRoundPass(options);
+    expect(ledgers()).toMatchObject([{ pending: true, confirmed: 0 }]);
+    await runOrphanFixRoundPass(options);
+    expect(options.escalate).toHaveBeenCalledOnce();
+  });
+  it.each(['unreadable', 'oversized', 'corrupt', 'invalid'])('%s ledger launches nothing', async kind => {
+    const redispatch = vi.fn(async () => ({ ok: true }));
+    const options = setup({ redispatch, ...(kind === 'unreadable' ? { attemptFs: {
+      openSync: () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); }, readSync, closeSync,
+    } } : {}) });
+    seed(options, kind === 'oversized' ? ' '.repeat(65537) : kind === 'corrupt' ? '{' : '{}');
+    expect((await runOrphanFixRoundPass(options)).rows[0].result).toMatch(/^escalated:.*human inspection/);
+    expect(redispatch).not.toHaveBeenCalled();
+    expect(options.escalate).toHaveBeenCalledOnce();
+  });
+  it('concurrent passes reserve one attempt; the busy pass defers without escalating', async () => {
+    let finish, entered;
+    const ready = new Promise(resolve => { entered = resolve; });
+    const blocked = new Promise(resolve => { finish = resolve; });
+    const options = setup({ redispatch: vi.fn(async () => { entered(); return blocked; }) });
+    const first = runOrphanFixRoundPass(options);
+    await ready;
+    try {
+      const second = await runOrphanFixRoundPass(options);
+      expect(second.rows[0]).toMatchObject({ decision: 'defer', result: 'deferred: active attempt claim' });
+      expect(second.deferred).toEqual([{ repo: 'web-everything/web-everything', pr: 4715 }]);
+      expect(options.escalate).not.toHaveBeenCalled();
+      expect(options.redispatch).toHaveBeenCalledOnce();
+    } finally { finish({ ok: true }); await first; }
+    expect(ledgers()).toMatchObject([{ pending: false, confirmed: 1 }]);
+  });
+  it('same-pid claim with an unknown token holds', async () => {
+    const options = setup({ redispatch: vi.fn() });
+    const { resource } = seed(options);
+    expect(acquireLockDir(attemptRoot, resource, { owner: resource, path: resource, pid: process.pid,
+      heartbeatAt: new Date(NOW).toISOString(),
+      meta: { token: 'unknown', host: 'fixture-host', namespace: 'fixture-namespace' } })).toBe(true);
+    expect(readLockEntry(attemptRoot, resource)?.meta?.token).toBe('unknown');
+    const result = await runOrphanFixRoundPass(options);
+    expect(result.rows[0].result).toMatch(/^escalated: ambiguous attempt claim/);
+    expect(options.redispatch).not.toHaveBeenCalled();
+  });
+  it.each([true, null, false])('other-pid claim defers only with proven identity (%s)', async alive => {
+    const options = setup({ redispatch: vi.fn() });
+    const { resource } = seed(options);
+    vi.spyOn(processIdentity, 'pidIdentity').mockReturnValue({ alive });
+    expect(hostname()).toBe('fixture-host');
+    expect(processIdentity.pidNamespace()).toBe('fixture-namespace');
+    expect(acquireLockDir(attemptRoot, resource, { owner: resource, path: resource, pid: 999999,
+      heartbeatAt: new Date(NOW).toISOString(),
+      meta: { host: 'fixture-host', namespace: 'fixture-namespace', runnerStart: 'fixture-start', runnerArgv: 'fixture-runner' } })).toBe(true);
+    const result = await runOrphanFixRoundPass(options);
+    expect(readLockEntry(attemptRoot, resource)?.pid).toBe(999999);
+    expect(processIdentity.pidIdentity).toHaveBeenCalledWith(999999, { expectStart: 'fixture-start', expectArgv: 'fixture-runner' });
+    expect(result.rows[0].decision).toBe(alive === true ? 'defer' : 'escalate');
+    expect(options.redispatch).not.toHaveBeenCalled();
+    expect(readdirSync(lockDirFor(attemptRoot, resource))).toContain('lock.json');
+  });
+  it('reservation write failure launches nothing', async () => {
+    vi.spyOn(atomicJson, 'writeJsonAtomic').mockImplementation(() => { throw new Error('ENOSPC'); });
+    const options = setup({ redispatch: vi.fn() });
+    expect((await runOrphanFixRoundPass(options)).rows[0].result).toContain('unreadable attempt ledger: ENOSPC');
+    expect(options.redispatch).not.toHaveBeenCalled();
+    expect(options.escalate).toHaveBeenCalledOnce();
+  });
+  it.each(['read', 'close'])('a %s ENOENT is not proof of a missing ledger', async failure => {
+    const options = setup({ redispatch: vi.fn(async () => ({ ok: true })), attemptFs: {
+      openSync, readSync: (...args) => {
+        if (failure === 'read') throw Object.assign(new Error('read failed'), { code: 'ENOENT' });
+        return readSync(...args);
+      }, closeSync: fd => {
+        closeSync(fd);
+        if (failure === 'close') throw Object.assign(new Error('close failed'), { code: 'ENOENT' });
+      },
+    } });
+    seed(options, '{}');
+    expect((await runOrphanFixRoundPass(options)).rows[0].result).toMatch(/^escalated: unreadable attempt ledger/);
+    expect(options.redispatch).not.toHaveBeenCalled();
+  });
+  it('new trusted verdict resets only its own budget', async () => {
+    const options = setup({ redispatch: vi.fn(async () => ({ ok: true })) });
+    await runOrphanFixRoundPass(options);
+    await runOrphanFixRoundPass(options);
+    const newer = { ...VERDICT, id: 'IC_new', createdAt: '2026-10-10T15:00:00Z' };
+    const result = await runOrphanFixRoundPass({ ...options, readComments: async () => [...history(), newer, END] });
+    expect(result.rows[0].result).toMatch(/^re-dispatched/);
+    expect(ledgers().map(record => record.confirmed).sort()).toEqual([1, 2]);
+  });
+  it('identical legacy verdicts share one ledger', async () => {
+    const options = setup({ redispatch: vi.fn(async () => ({ ok: true })) });
+    await runOrphanFixRoundPass(options);
+    await runOrphanFixRoundPass({ ...options, readComments: async () => [VERDICT, { ...VERDICT }, BEGIN, END] });
+    expect(ledgers()).toMatchObject([{ confirmed: 2 }]);
+  });
+});
 
 it('recovers a concurrent same-head send-back after the pinned re-arm marker and operator ruling (PR #5925)', async () => {
   const { default: scenario } = await import('../soak/breaks/pinned-rearm-orphan-marker.mjs');

@@ -1858,14 +1858,16 @@ export function dispatchFix(planned, {
     // call ran, or a launch that failed in a way that cannot have started a session. A launch timeout (the CLI
     // killed mid-spawn) is indeterminate: the session may be live, so the marker stands and the bound holds. Best
     // effort: if the void cannot be posted the marker stands (the conservative side of the bound).
-    const wrapperRefused = e?.notApplied === true && e.code === 'WORKER_LAUNCH_REFUSED';
+    if (!e || typeof e !== 'object') e = new Error(String(e));
+    const wrapperRefused = e.notApplied === true && e.code === 'WORKER_LAUNCH_REFUSED';
+    e.launchNotStarted = !launchAttempted || wrapperRefused || launchProvedNotStarted(e);
     if (takeoverMarked && (!launchAttempted || wrapperRefused || launchProvedNotStarted(e))) {
       try { postTakeoverVoidMark({ repo, pr: planned.pr, head: planned.headRefOid }); } catch { /* the bound stays spent */ }
     }
     // #x0jphk5 — nothing was actually spawned: release so a legitimate retry for this same PR is never blocked
     // by our own failed attempt.
     releaseClaim({ repo, pr: planned.pr, kind: 'fix', owner: claimOwner, lockRoot: claimRoot });
-    if (pushHoldRefused) return pushHoldRefused;
+    if (pushHoldRefused) return { ...pushHoldRefused, notStarted: !launchAttempted };
     // #3850 — the CLI's own stderr proves no agent started AND names a fault the dispatcher can heal (trust
     // the scratch root). Re-grant now and surface it as a transient environment fault, never a dispatch failure.
     // Grants the REAL session dir (`grantDispatchTrust` collapses it to the scratch root under the default policy,
@@ -1873,8 +1875,8 @@ export function dispatchFix(planned, {
     // made) nothing was healed, so it is NOT relabelled transient — the raw error surfaces as before.
     if (spawnCwd && isTrustRefusal(e)) {
       try { healTrust(spawnCwd); } catch { /* grantDispatchTrust never throws; belt-and-suspenders */ }
-      throw new Error(`${DISPATCH_ENV_FAULT_PREFIX} workspace not trusted (claude --bg refused the scratch cwd) — `
-        + 'the dispatch scratch cwd was re-granted; no agent started, retrying next pass');
+      throw Object.assign(new Error(`${DISPATCH_ENV_FAULT_PREFIX} workspace not trusted (claude --bg refused the scratch cwd) — `
+        + 'the dispatch scratch cwd was re-granted; no agent started, retrying next pass'), { launchNotStarted: true });
     }
     throw e;
   }
@@ -1957,7 +1959,7 @@ export function classifyEnvFaultRefusals(refusals) {
  * @param {Function} [o.notifyQueueCapOperator] - #4229: injectable, defaults to the real
  *   `we:scripts/conveyor/branch-sync.mjs#notifyDesktopChecked`.
  * @param {number} [o.now] - pass timestamp in milliseconds, defaults to Date.now().
- * @returns {{dispatched:Array<object>, refusals:Array<object>, reconcileRefusals:number,
+ * @returns {{dispatched:Array<object>, refusals:Array<object>, launchUncertain:number[], reconcileRefusals:number,
  *   reconcileRefusalDetails:Array<object>}} `reconcileRefusals` stays the bare count this function has always
  *   returned (asserted by `we:scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs`). `reconcileRefusalDetails`
  *   is ADDITIVE (#x0mn6x0, epic #4075/#3383) — see `we:scripts/operations/ci-heal-pr-dispatch.mjs
@@ -1967,6 +1969,9 @@ export function classifyEnvFaultRefusals(refusals) {
  *   holds THIS function's own per-entry refusals (`no-scope`/`no-lane`/`dispatch-failed`/`unsupported-repo`)
  *   for PRs the plan DID offer. Handing up `reconciled.refusals` itself is what lets the daemon's own onTick
  *   print the reconcile layer's real reason instead of discarding it to a count.
+ *   `launchUncertain` lists PRs whose resume or dispatch may have started an unconfirmed session.
+ *   Only positive dispatcher proof of no launch frees a caller's durable attempt reservation;
+ *   missing or malformed proof must hold for human inspection, independently of refusal kinds.
  */
 export function runReconcileFixDispatch({
   shadowDeps,
@@ -2065,6 +2070,10 @@ export function runReconcileFixDispatch({
   // One line per step (name, optional pr, ms, startedAt): shows which sub-step makes a slow fix phase. Never fails a step.
   stepNow = Date.now, stepLog = (line) => console.error(line),
 } = {}) {
+  const launchUncertain = new Set();
+  const cleanDecline = attempt => attempt !== null && typeof attempt === 'object' && !Array.isArray(attempt)
+    && attempt.resumed === false && (attempt.resumeAttempt == null || (typeof attempt.resumeAttempt === 'object'
+      && !Array.isArray(attempt.resumeAttempt) && attempt.resumeAttempt.attempted === false && attempt.resumeAttempt.refused !== 'error'));
   let yieldedForAdoption = false;
   // Capacity episode timestamps remain numeric; the deadline clock stays live between PRs.
   if (typeof now === 'function') now = now();
@@ -2098,7 +2107,7 @@ export function runReconcileFixDispatch({
   if (reconciledRaw?.deferred === true) {
     const readDeferred = String(reconciledRaw.message ?? reconciledRaw.reason ?? 'deferred').split('\n')[0];
     console.error(`reconcile-fix-dispatch: open-PR read deferred — owed unknown, skipping this tick: ${readDeferred}`);
-    return { handled: 0, deferred: [], nextCursor: null, dispatched: [], refusals: [], readDeferred, reconcileRefusals: 0, reconcileRefusalDetails: [] };
+    return { handled: 0, deferred: [], nextCursor: null, dispatched: [], refusals: [], launchUncertain: [], readDeferred, reconcileRefusals: 0, reconcileRefusalDetails: [] };
   }
   let reconciled = reconciledRaw;
   // Only a bounced no-findings refusal can spend this bounded recovery read. The normal
@@ -2190,7 +2199,7 @@ export function runReconcileFixDispatch({
     const refusals = [...guardRefusals, ...fixRefusals, ...ciHealRefusals];
     const reviews = readUnsupported({ path: unsupportedPath }).filter((row) => row.repo === repoKey && row.action === 'review');
     recordUnsupported({ repo: repoKey, rows: [...reviews, ...fixRefusals, ...ciHealRefusals], path: unsupportedPath });
-    return { handled: fixRefusals.length, deferred: [], nextCursor: null, dispatched: [], refusals, reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals };
+    return { handled: fixRefusals.length, deferred: [], nextCursor: null, dispatched: [], refusals, launchUncertain: [], reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals };
   }
   // `fix` IS supported here — still durably record any ci-heal refusals (a separate capability, possibly still
   // off), preserving prior `review` rows exactly as above.
@@ -2520,15 +2529,17 @@ export function runReconcileFixDispatch({
       try {
         attempt = fixStep('resume', () => tryResume(entry, { root, repo: repoKey }), entry.pr);
       } catch (e) {
+        launchUncertain.add(Number(entry.pr));
         refusals.push({ pr: entry.pr, kind: 'dispatch-failed', why: describeDispatchFailure(e) });
         continue;
       }
-      if (attempt.resumed) {
+      if (attempt?.resumed === true) {
         console.error(`reconcile-fix-dispatch: PR #${entry.pr} ${formatFixExecutorLog(executorDecision ?? { executor: 'claude', reason: 'resuming existing session', source: 'default' })}`);
         dispatched.push(attempt.result);
         continue; // no lane ever popped for this entry
       }
-      resumeAttempt = attempt.resumeAttempt;
+      if (!cleanDecline(attempt)) launchUncertain.add(Number(entry.pr));
+      resumeAttempt = attempt?.resumeAttempt;
     }
     // Card xrbu1bp — round N>1 of an ordinary fix: resume the previous round's own session first (lane-free, like the
     // conflict resume above). A declined or failed resume falls through to the cold start with the history brief; a
@@ -2540,11 +2551,12 @@ export function runReconcileFixDispatch({
       } catch (e) {
         attempt = { resumed: false, resumeAttempt: { attempted: false, roundResume: true, refused: 'error', why: describeDispatchFailure(e) } };
       }
-      if (attempt?.resumed) {
+      if (attempt?.resumed === true) {
         console.error(`reconcile-fix-dispatch: PR #${entry.pr} ${formatFixExecutorLog(executorDecision ?? { executor: 'claude', reason: 'resuming existing session', source: 'default' })}`);
         dispatched.push(attempt.result);
         continue; // no lane ever popped for this entry
       }
+      if (!cleanDecline(attempt)) launchUncertain.add(Number(entry.pr));
       if (attempt?.resumeAttempt) {
         resumeAttempt = attempt.resumeAttempt;
         console.error(`reconcile-fix-dispatch: PR #${entry.pr} round ${roundOf(entry)} cold start (no resume: ${attempt.resumeAttempt.refused ?? (attempt.resumeAttempt.forked ? 'forked' : 'unconfirmed')}${attempt.resumeAttempt.why ? ` — ${attempt.resumeAttempt.why}` : ''})`);
@@ -2573,6 +2585,7 @@ export function runReconcileFixDispatch({
         continue;
       }
       if (result?.refused) {
+        if (result.notStarted !== true) launchUncertain.add(Number(entry.pr));
         lanes.unshift(lane);
         refusals.push({ pr: entry.pr, kind: result.outcome, why: result.reason });
         continue;
@@ -2588,12 +2601,13 @@ export function runReconcileFixDispatch({
       }
       if (entry.overlapExempt && !entry.restack) markRebaseExemptUsed(entry, exemptRebaseHeads); // card xd1tvd0 — one per head
     } catch (e) {
+      if (e?.launchNotStarted !== true) launchUncertain.add(Number(entry.pr));
       refusals.push({ pr: entry.pr, kind: 'dispatch-failed', why: describeDispatchFailure(e) });
     }
   }
 
   if (restackMemoryChanged && writeStacks) writeStacks(root, nextRemembered(stacks));
-  return { ...(yieldedForAdoption ? { yieldedForAdoption: true } : {}), handled, deferred, nextCursor: deferred[0] ?? null, dispatched, refusals: classifyEnvFaultRefusals(refusals), scopeRanks: scopeFilter.ranks, ...(priorityShadowResult ? { priorityShadow: priorityShadowResult } : {}), ...(terminalHoldsReleased.length ? { terminalHoldsReleased } : {}), reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals };
+  return { ...(yieldedForAdoption ? { yieldedForAdoption: true } : {}), handled, deferred, nextCursor: deferred[0] ?? null, dispatched, launchUncertain: [...launchUncertain], refusals: classifyEnvFaultRefusals(refusals), scopeRanks: scopeFilter.ranks, ...(priorityShadowResult ? { priorityShadow: priorityShadowResult } : {}), ...(terminalHoldsReleased.length ? { terminalHoldsReleased } : {}), reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals };
 }
 
 /** Card xkyw1x4 — a `queueAdmission` option may be a queue BUDGET already (`createQueueBudget`'s object — the
