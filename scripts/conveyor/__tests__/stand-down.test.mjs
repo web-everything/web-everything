@@ -737,7 +737,10 @@ node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo=
 const FIXTURE_HEAD = 'abcdef0123456789abcdef0123456789abcdef01';
 const FIXTURE_TIME = '2026-11-27T12:00:00Z';
 const EXIT_REASONS = Object.keys(BASELINE_EXITS);
-const SHELLS = ['/bin/bash', '/bin/zsh'];
+// Linux CI runners ship no /bin/zsh (spawnSync ENOENT); the zsh leg runs wherever it is installed (macOS
+// operator hosts, where the brief's blocks actually execute). bash must always be present.
+const SHELLS = ['/bin/bash', '/bin/zsh'].filter(shell => existsSync(shell));
+if (!SHELLS.includes('/bin/bash')) throw new Error('/bin/bash is required for the exit-block fixtures');
 const BRIEF_PATH = 'skills-src/conveyor/fix-agent-brief.md';
 
 function terminalExit(source, reason) {
