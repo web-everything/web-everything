@@ -93,6 +93,44 @@ const FALLBACK_PRETOOLUSE = Object.freeze([
   { matcher: 'Bash', hooks: [{ type: 'command', command: 'node scripts/guard-bash.mjs' }] },
 ]);
 
+export const shellPath = (p) => /^[A-Za-z0-9_./,:@%+=-]+$/.test(p) ? `"${p}"` : "'" + p.replaceAll("'", "'\\''") + "'";
+const plain = (v) => v !== null && typeof v === 'object' && Object.getPrototypeOf(v) === Object.prototype;
+const groupsOf = (v) => (Array.isArray(v) ? v : []).filter(g => plain(g) && Array.isArray(g.hooks) && (!('matcher' in g) || typeof g.matcher === 'string'));
+const groupWith = (g, hooks) => ({ ...(typeof g.matcher === 'string' ? { matcher: g.matcher } : {}), hooks });
+const FALLBACK_BROADCAST = Object.freeze({
+  UserPromptSubmit: [{ hooks: [{ type: 'command', command: 'node scripts/broadcast-inject.mjs' }] }],
+  PostToolUse: [{ hooks: [{ type: 'command', command: 'node scripts/broadcast-inject.mjs' }] }],
+});
+/** Pure exact allowlist; unknown read status carries nothing. */
+export function dispatchBroadcastHooks({ repo, repoRoot } = {}) {
+  const source = repo?.status === 'unreadable' ? FALLBACK_BROADCAST : repo?.status === 'ok' ? repo.hooks : {};
+  return Object.fromEntries(Object.keys(FALLBACK_BROADCAST).map(event => [event, groupsOf(source?.[event]).flatMap(g => {
+    const hooks = g.hooks.filter(h => plain(h) && h.type === 'command' && h.command === 'node scripts/broadcast-inject.mjs')
+      .map(() => ({ type: 'command', command: `node ${shellPath(join(repoRoot, 'scripts', 'broadcast-inject.mjs'))}` }));
+    return hooks.length ? [groupWith(g, hooks)] : [];
+  })]));
+}
+// Local hook fields are arbitrary JSON. Sort their keys without consuming a call frame per
+// level: unrelated deeply nested metadata must not prevent installation of the deny guards.
+const canonical = v => {
+  const container = value => Array.isArray(value) || plain(value);
+  const copy = value => Array.isArray(value) ? value.slice()
+    : Object.fromEntries(Object.keys(value).sort().map(key => [key, value[key]]));
+  if (!container(v)) return v;
+  const result = copy(v);
+  const pending = [result];
+  while (pending.length) {
+    const node = pending.pop();
+    for (const key of Object.keys(node)) {
+      if (!container(node[key])) continue;
+      node[key] = copy(node[key]);
+      pending.push(node[key]);
+    }
+  }
+  return result;
+};
+const hookIdentity = (g, h) => JSON.stringify([g.matcher ?? '', canonical(h)]);
+
 /**
  * xl5reby — the repo root whose `scripts/` the dispatched workers' guard hooks point at. Derived from THIS file's
  * location. A lane clone is not a stable home (the guards derive the constellation primaries from their own
@@ -115,8 +153,8 @@ export function resolveGuardRepoRoot({ fileUrl = import.meta.url, exists = (p) =
 /**
  * xl5reby — the repo's PreToolUse guard hooks. Legacy direct script paths become absolute because a worker
  * starts in a scratch directory with no `scripts/`. Pinned launcher commands retain their own path resolution. PURE.
- * Only PreToolUse is carried: those are the deny guards. SessionStart/Stop/PostToolUse hooks do bookkeeping with
- * side effects meant for interactive sessions and stay out. Pinned launcher commands are carried unchanged;
+ * This selector carries only PreToolUse deny guards; broadcast operator control is selected separately.
+ * Session bootstrap/reaping and other bookkeeping stay out. Pinned launcher commands are carried unchanged;
  * their script argument resolves inside the pinned clone. Other unrecognized commands are skipped. Legacy guards
  * locate the primaries and the lane from their OWN location and the event payload, never from the process cwd.
  * @param {{preToolUse?: Array, repoRoot: string}} o
@@ -125,29 +163,34 @@ export function resolveGuardRepoRoot({ fileUrl = import.meta.url, exists = (p) =
 export function dispatchGuardHooks({ preToolUse, repoRoot }) {
   const groups = Array.isArray(preToolUse) && preToolUse.length ? preToolUse : FALLBACK_PRETOOLUSE;
   const out = [];
-  for (const g of groups) {
+  for (const g of groupsOf(groups)) {
     const hooks = [];
-    for (const h of g?.hooks ?? []) {
+    for (const h of g.hooks.filter(plain)) {
       if (h?.type === 'command' && pinnedHookScript(h.command)) {
         hooks.push({ ...h });
         continue;
       }
       const m = h?.type === 'command' && typeof h.command === 'string' ? /^node (scripts\/\S+)(.*)$/.exec(h.command) : null;
-      if (m) hooks.push({ type: 'command', command: `node "${join(repoRoot, m[1])}"${m[2]}` });
+      if (m) hooks.push({ type: 'command', command: `node ${shellPath(join(repoRoot, m[1]))}${m[2]}` });
     }
     if (hooks.length) out.push({ ...(g.matcher !== undefined ? { matcher: g.matcher } : {}), hooks });
   }
-  return out;
+  return out.length ? out : dispatchGuardHooks({ preToolUse: FALLBACK_PRETOOLUSE, repoRoot });
 }
 
 /**
- * xl5reby — THE SAFETY GAP: a dispatched worker starts in `.operations/dispatch/<id>`, which has no repo
- * `.claude/settings.json`, so the repo's PreToolUse guards (guard-bash, guard-lane, ...) never ran for it.
- * This merges them (pinned commands or legacy absolute paths) into the worker's OWN `<cwd>/.claude/settings.local.json`. Why this file
- * and not `--settings` or user-level hooks: the local settings file is read fresh from the start directory on
- * every task (the `--settings` JSON is skipped when the CLI hands out a pre-warmed spare session, see the
- * header), and it is scoped to this one worker, so nothing leaks to the operator's other sessions. ADDITIVE and
- * IDEMPOTENT (a command already present is not added twice); never throws.
+ * Dispatched-worker hook contract
+ * 1. Literal path. Every constructed hook path (legacy rewrite, PreToolUse fallback, broadcast) passes through
+ * shellPath: safe-charset paths are double-quoted, all others single-quoted, so checkout names cannot become
+ * shell syntax. Repo-authored pinned commands and trailing text `${m[2]}` are carried unchanged and exempt.
+ * 2. Broadcast selection. Only exact `node scripts/broadcast-inject.mjs` on UserPromptSubmit and PostToolUse
+ * is carried, without options, in groups of only {matcher?: string, hooks}. All other group fields are discarded.
+ * Fallback applies only to unreadable/unparseable repo settings; readable files without registration carry nothing.
+ * Broadcast is operator control; bootstrap-session, session-reaper and other bookkeeping remain excluded.
+ * 3. Guard-preserving merge. Repo/local input is sanitized so the merge cannot throw; matcher plus canonical
+ * hook JSON identifies copies, so a differing copy never displaces a wanted deny guard. PreToolUse falls back
+ * to Bash and Edit/Write guards whenever the repo yields none. Only the worker's local file receives hooks;
+ * never --settings (avoids double execution). Other events and top-level keys survive; merge is idempotent.
  * @param {{cwd: string, repoRoot?: string, readFile?: Function, writeFile?: Function, mkdir?: Function}} o
  * @returns {{ok: boolean, path?: string, count?: number, reason?: string}}
  */
@@ -158,23 +201,32 @@ export function ensureDispatchGuardHooks({
   const dir = join(cwd, '.claude');
   const path = join(dir, 'settings.local.json');
   try {
-    let repoPre = null;
-    try { repoPre = JSON.parse(readFile(join(repoRoot, '.claude', 'settings.json'), 'utf8'))?.hooks?.PreToolUse ?? null; } catch { repoPre = null; }
-    const wanted = dispatchGuardHooks({ preToolUse: repoPre, repoRoot });
+    let repo;
+    try {
+      const parsed = JSON.parse(readFile(join(repoRoot, '.claude', 'settings.json'), 'utf8'));
+      repo = { status: 'ok', hooks: plain(parsed) && plain(parsed.hooks) ? parsed.hooks : {} };
+    } catch { repo = { status: 'unreadable', hooks: null }; }
+    const wanted = { PreToolUse: dispatchGuardHooks({ preToolUse: repo.hooks?.PreToolUse, repoRoot }), ...dispatchBroadcastHooks({ repo, repoRoot }) };
     mkdir(dir, { recursive: true });
     let existing;
     try { existing = JSON.parse(readFile(path, 'utf8')); } catch { existing = null; }
     if (!existing || typeof existing !== 'object' || Array.isArray(existing)) existing = {};
     const hooks = existing.hooks && typeof existing.hooks === 'object' && !Array.isArray(existing.hooks) ? { ...existing.hooks } : {};
-    const pre = Array.isArray(hooks.PreToolUse) ? hooks.PreToolUse.map((g) => ({ ...g, hooks: [...(g?.hooks ?? [])] })) : [];
-    const have = new Set(pre.flatMap((g) => (g.hooks ?? []).map((h) => `${g.matcher ?? ''}\u0000${h.command}`)));
-    for (const g of wanted) {
-      const fresh = g.hooks.filter((h) => !have.has(`${g.matcher ?? ''}\u0000${h.command}`));
-      if (fresh.length) pre.push({ ...(g.matcher !== undefined ? { matcher: g.matcher } : {}), hooks: fresh });
+    for (const [event, groups] of Object.entries(wanted)) {
+      const local = groupsOf(hooks[event]).map(g => ({ ...g, hooks: g.hooks.filter(h => plain(h) && typeof h.type === 'string') })).filter(g => g.hooks.length);
+      const have = new Set(local.flatMap(g => g.hooks.map(h => hookIdentity(g, h))));
+      for (const g of groups) {
+        const fresh = g.hooks.filter(h => {
+          const key = hookIdentity(g, h);
+          if (have.has(key)) return false;
+          have.add(key); return true;
+        });
+        if (fresh.length) local.push(groupWith(g, fresh));
+      }
+      hooks[event] = local;
     }
-    hooks.PreToolUse = pre;
     writeFile(path, `${JSON.stringify({ ...existing, hooks }, null, 2)}\n`, 'utf8');
-    return { ok: true, path, count: wanted.reduce((n, g) => n + g.hooks.length, 0) };
+    return { ok: true, path, count: Object.values(wanted).flat().reduce((n, g) => n + g.hooks.length, 0) };
   } catch (e) {
     return { ok: false, reason: 'write-failed', error: String((e && e.message) || e) };
   }
