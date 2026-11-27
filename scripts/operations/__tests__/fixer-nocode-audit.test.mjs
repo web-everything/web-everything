@@ -63,7 +63,7 @@ function launcher({ comments = [verdict], message = 'Unable to repair the reques
     expect([root, lane]).toContain(opts.cwd);
     if (cmd === 'gh' && args.includes('view')) {
       return JSON.stringify({ title: 'Fixture', body: '', headRefOid: HEAD,
-        labels: [{ name: 'review:changes' }], reviews: [], ...snapshot });
+        labels: [{ name: 'review:changes' }], reviews: [] });
     }
     if (cmd === 'node' && args.includes('acquire')) return JSON.stringify({ path: lane, holder: binding.claimId });
     if (cmd === 'node' && args.includes('release')) return '';
