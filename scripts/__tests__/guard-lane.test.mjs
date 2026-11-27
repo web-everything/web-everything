@@ -17,6 +17,77 @@ import { daemonCloneRoots, classifyOverlayRecord, pruneStaleOverlayRecords } fro
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
+describe('laneGuardDecision — Standards-owned paths', () => {
+  const ws = mkdtempSync(path.join(realpathSync(tmpdir()), 'guard-standards-'));
+  afterAll(() => rmSync(ws, { recursive: true, force: true }));
+  const weRoot = path.join(ws, 'webeverything');
+  const standards = path.join(ws, '.operations/handoff/standards');
+  const target = path.join(standards, 'drafts/core/authority/x.md');
+  mkdirSync(weRoot, { recursive: true });
+  mkdirSync(path.dirname(target), { recursive: true });
+
+  it('a worker-marked session is refused an edit under .operations/handoff/standards/drafts', () => {
+    expect(laneGuardDecision(target, weRoot, { sessionRole: 'worker' })).toMatch(/Standards-owned/);
+  });
+
+  it('fails closed for an unknown session role and names the proposal route', () => {
+    expect(laneGuardDecision(target, weRoot, { sessionRole: 'unknown' }))
+      .toContain('standards/ is Standards-owned: propose the change in handoff/designs/<id>-standards-request.md, never edit it');
+  });
+
+  it('allows the orchestrator/Standards session', () => {
+    expect(laneGuardDecision(target, weRoot, { sessionRole: 'orchestrator' })).toBeNull();
+  });
+
+  it('preserves callers that omit sessionRole', () => {
+    expect(laneGuardDecision(target, weRoot)).toBeNull();
+  });
+
+  it.each(['designs', 'build-queue', 'standards-other'])('allows workers in the sibling %s directory', (dir) => {
+    expect(laneGuardDecision(path.join(ws, '.operations/handoff', dir, 'x.md'), weRoot,
+      { sessionRole: 'worker' })).toBeNull();
+  });
+
+  it('protects the full standards subtree and its root from a lane launch root', () => {
+    const laneRoot = path.join(ws, '.lanes/web-everything/lane-7');
+    for (const file of [standards, path.join(standards, 'core/x.md')]) {
+      expect(laneGuardDecision(file, laneRoot, { sessionRole: 'worker' })).toMatch(/Standards-owned/);
+    }
+  });
+
+  it('refuses a worker editing through a symlink into standards', () => {
+    const alias = path.join(ws, 'standards-alias');
+    symlinkSync(standards, alias);
+    expect(laneGuardDecision(resolveReal(path.join(alias, 'drafts/core/authority/x.md')), weRoot,
+      { sessionRole: 'worker' })).toMatch(/Standards-owned/);
+  });
+
+  const runHook = (marker) => spawnSync(process.execPath, [path.join(here, '../guard-lane.mjs')], {
+    cwd: ws,
+    env: {
+      HOME: ws, TMPDIR: ws, WE_HOOK_ROOT: weRoot,
+      WE_DAEMON_OVERLAY_DIR: path.join(ws, 'overlay-state'),
+      ...(marker === undefined ? {} : { WE_CONVEYOR_WORKER: marker }),
+    },
+    input: JSON.stringify({ tool_input: { file_path: target } }),
+    encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024,
+  });
+
+  it.each(['1', '0'])('CLI exits 2 with Standards-owned guidance for marker %s', (marker) => {
+    const result = runHook(marker);
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(2);
+    expect(result.stderr).toMatch(/Standards-owned/);
+  });
+
+  it('CLI allows the unmarked orchestrator/Standards session', () => {
+    const result = runHook(undefined);
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toBe('');
+  });
+});
+
 // A fake constellation: <workspace>/{webeverything,frontierui} primaries + a <workspace>/.lanes/ clone.
 const WORKSPACE = '/ws';
 const WE_ROOT = path.join(WORKSPACE, 'webeverything');

@@ -97,6 +97,7 @@ import { laneRootFromCwd, readLaneLease } from './guard-bash.mjs';
 // can never disagree about which paths are a resident daemon's OWN clone (same reuse discipline as the
 // lease pair above).
 import { daemonCloneRoots, isDaemonCloneRealpath } from './lib/daemon-clone-registry.mjs';
+import { classifySession } from './operations/session-role.mjs';
 
 const PRIMARY_REPOS = ['webeverything', 'web-everything', 'frontierui', 'plateau-app'];
 const SEP = path.sep;
@@ -144,16 +145,17 @@ export function workspaceRootOf(weRoot) {
  * Kept separate from the stdin/exit-code wrapper so it is unit-testable (mirrors guard-git-push.mjs).
  * @param {string} real  the target's resolved real path (symlinks already followed by the caller)
  * @param {string} weRoot  this guard's repo root (`<workspace>/<repo>`); `<workspace>` is its parent
- * @param {{lease?: object|null, mySessionId?: string|null, daemonCloneRoots?: string[]}} [ctx]  #2997 — the LIVE
+ * @param {{lease?: object|null, mySessionId?: string|null, daemonCloneRoots?: string[], sessionRole?: string|null}} [ctx]  #2997 — the LIVE
  *   lease of the lane clone `real` sits in (null when the target is not in a lane, or the lane holds no live
  *   lease), plus this caller's durable session id. Liveness needs a clock and the lease needs an fs read, so
  *   BOTH are collected by the CLI wrapper and injected here — keeping this function pure and unit-testable,
  *   exactly as `guard-bash.mjs#reason` takes `foreignLiveLease` rather than reading the marker itself.
  *   `daemonCloneRoots` (#xpt9fvd) is the same shape: `daemon-clone-registry.mjs#daemonCloneRoots`'s output,
  *   collected once by the CLI wrapper (it does its own fs reads) and injected here as plain strings.
+ *   `sessionRole` is classified by the CLI; null preserves callers that do not supply a role.
  * @returns {string|null}
  */
-export function laneGuardDecision(real, weRoot, { lease = null, mySessionId = null, daemonCloneRoots: daemonRoots = [] } = {}) {
+export function laneGuardDecision(real, weRoot, { lease = null, mySessionId = null, daemonCloneRoots: daemonRoots = [], sessionRole = null } = {}) {
   if (!real) return null; // no path to judge (never block)
   const workspace = workspaceRootOf(weRoot);
   const primaries = PRIMARY_REPOS.map((r) => path.join(workspace, r) + SEP);
@@ -177,6 +179,12 @@ export function laneGuardDecision(real, weRoot, { lease = null, mySessionId = nu
       `Or use \`node scripts/lib/daemon-rebuild.mjs\` / \`node scripts/lib/daemon-load-overlay.mjs --clone=<path>\` ` +
       `for the other sanctioned rebuild routes — both run from a lane, targeting the daemon clone by \`--clone=\`.`
     );
+  }
+
+  const standardsRoot = path.join(workspace, '.operations', 'handoff', 'standards');
+  if ((sessionRole === 'worker' || sessionRole === 'unknown')
+      && (real + SEP).startsWith(standardsRoot + SEP)) {
+    return 'edit BLOCKED — standards/ is Standards-owned: propose the change in handoff/designs/<id>-standards-request.md, never edit it';
   }
 
   // A lane clone lives under `<workspace>/.lanes/…` — never under a primary root — so a primary-root prefix
@@ -255,7 +263,8 @@ if (process.argv[1] && realpathSyncSafe(process.argv[1]) === realpathSyncSafe(fi
         // list, `isDaemonCloneRealpath` then answers false for everything) rather than wedging the agent.
         let daemonRoots = [];
         try { daemonRoots = daemonCloneRoots(workspaceRootOf(weRoot)); } catch { /* fail-open */ }
-        const msg = laneGuardDecision(real, weRoot, { lease, mySessionId, daemonCloneRoots: daemonRoots });
+        const msg = laneGuardDecision(real, weRoot, { lease, mySessionId, daemonCloneRoots: daemonRoots,
+          sessionRole: classifySession(process.env).role });
         if (msg) { process.stderr.write('guard-lane: ' + msg + '\n'); process.exit(2); }
       }
     }
