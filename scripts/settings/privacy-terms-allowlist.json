@@ -2306,6 +2306,54 @@
       "matchSha256": "717fb9d9da045d004e2fc317d12ceb3e8028b4d0a41011a3fb9dca118f323064",
       "lineSha256": "c38f6530e64420de46c9367a8a65512a14aa80a25ca18b472f2024892619b2d2",
       "reason": "Policy excerpt quotes a synthetic test identity; exact match and source line only."
+    },
+    {
+      "path": "scripts/operations/__tests__/host-credential-cutover-inventory.test.mjs",
+      "pattern": "account-id",
+      "matchText": "app_id: 2",
+      "matchSha256": "22423ebcf8167430ec454d9be455cc0646979c63aa0bfc2ca34b5783d4eb3926",
+      "lineSha256": "a7b46bfb46f40abdb2adb8c196332e2d9e060afcab8b79fdebdc41bcfcbf8caf",
+      "reason": "R972 synthetic GitHub App ID exercises inventory decisions; exemption requires the exact fixture path, match and source line."
+    },
+    {
+      "path": "scripts/operations/__tests__/host-credential-cutover-inventory.test.mjs",
+      "pattern": "account-id",
+      "matchText": "app_id: 2",
+      "matchSha256": "22423ebcf8167430ec454d9be455cc0646979c63aa0bfc2ca34b5783d4eb3926",
+      "lineSha256": "43ae31e1bd1e1e8829c60cd47dae08bacd2a779ebefe5a09d97ec9ed210bc52c",
+      "reason": "R972 synthetic GitHub App ID exercises inventory decisions; exemption requires the exact fixture path, match and source line."
+    },
+    {
+      "path": "scripts/operations/__tests__/host-credential-cutover-inventory.test.mjs",
+      "pattern": "account-id",
+      "matchText": "app_id: 2",
+      "matchSha256": "22423ebcf8167430ec454d9be455cc0646979c63aa0bfc2ca34b5783d4eb3926",
+      "lineSha256": "0304fd55f37aa95aebd7ea5aa37f03813cbcf319fe0133edcb00e43165c5999f",
+      "reason": "R972 synthetic GitHub App ID exercises inventory decisions; exemption requires the exact fixture path, match and source line."
+    },
+    {
+      "path": "scripts/operations/__tests__/host-credential-cutover-inventory.test.mjs",
+      "pattern": "account-id",
+      "matchText": "app_id: 2",
+      "matchSha256": "22423ebcf8167430ec454d9be455cc0646979c63aa0bfc2ca34b5783d4eb3926",
+      "lineSha256": "a91c390a6486448569fcc6ad1b864ed5148b8c4403f73b5eb473084a7499ff4f",
+      "reason": "R972 synthetic GitHub App ID exercises inventory decisions; exemption requires the exact fixture path, match and source line."
+    },
+    {
+      "path": "scripts/operations/__tests__/host-credential-cutover-inventory.test.mjs",
+      "pattern": "account-id",
+      "matchText": "app_id: 2",
+      "matchSha256": "22423ebcf8167430ec454d9be455cc0646979c63aa0bfc2ca34b5783d4eb3926",
+      "lineSha256": "84badebbe4547db8bdc02d3a85a486233d1ee9c276e4ae9cf98beed351d1ba7b",
+      "reason": "R972 synthetic GitHub App ID exercises inventory decisions; exemption requires the exact fixture path, match and source line."
+    },
+    {
+      "path": "scripts/operations/__tests__/host-credential-cutover-inventory.test.mjs",
+      "pattern": "account-id",
+      "matchText": "app_id: 2",
+      "matchSha256": "22423ebcf8167430ec454d9be455cc0646979c63aa0bfc2ca34b5783d4eb3926",
+      "lineSha256": "8d29d03b2375859a29714ae601d7942eee76ada2796371204bfc7d65f420c452",
+      "reason": "R972 synthetic GitHub App ID exercises inventory decisions; exemption requires the exact fixture path, match and source line."
     }
   ]
 }
