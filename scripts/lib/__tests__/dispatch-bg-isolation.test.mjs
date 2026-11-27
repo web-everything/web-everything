@@ -164,7 +164,7 @@ describe('xl5reby dispatched worker effective settings include the repo guard ho
   it('the absolute broadcast command runs from scratch with empty stdin event', () => {
     broadcastFixture(({ root, REPO: fixtureRepo, cwd, isolate, settings }) => {
       // Copy only the executable under test; all runtime state lives in this fixture.
-      copyFileSync(new URL('../../broadcast-inject.mjs', import.meta.url), join(fixtureRepo, 'scripts/broadcast-inject.mjs'));
+      copyFileSync(join(REPO, 'scripts/broadcast-inject.mjs'), join(fixtureRepo, 'scripts/broadcast-inject.mjs'));
       isolate();
       const command = settings().hooks.UserPromptSubmit?.[0].hooks[0].command;
       expect(command).toBe(`node "${fixtureRepo}/scripts/broadcast-inject.mjs"`);

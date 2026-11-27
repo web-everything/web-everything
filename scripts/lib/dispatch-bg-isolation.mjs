@@ -140,10 +140,32 @@ export function dispatchGuardHooks({ preToolUse, repoRoot }) {
   return out;
 }
 
+/** Operator broadcasts are the only non-deny hooks carried into scratch workers. PURE.
+ * Preserve group/hook options, but accept only the exact broadcast executable, never arbitrary
+ * bookkeeping commands or extra shell text. Missing/unreadable settings retain both control events;
+ * an explicitly configured empty event remains empty.
+ * @param {{hooks?: object, repoRoot: string}} o
+ * @returns {{UserPromptSubmit: Array, PostToolUse: Array}}
+ */
+export function dispatchBroadcastHooks({ hooks, repoRoot }) {
+  const command = 'node scripts/broadcast-inject.mjs';
+  return Object.fromEntries(['UserPromptSubmit', 'PostToolUse'].map((event) => {
+    const groups = Array.isArray(hooks?.[event]) ? hooks[event]
+      : [{ hooks: [{ type: 'command', command }] }];
+    return [event, groups.flatMap((group) => {
+      const selected = (Array.isArray(group?.hooks) ? group.hooks : [])
+        .filter((hook) => hook?.type === 'command' && hook.command === command)
+        .map((hook) => ({ ...hook, command: `node "${join(repoRoot, 'scripts/broadcast-inject.mjs')}"` }));
+      return selected.length ? [{ ...group, hooks: selected }] : [];
+    })];
+  }));
+}
+
 /**
  * xl5reby — THE SAFETY GAP: a dispatched worker starts in `.operations/dispatch/<id>`, which has no repo
  * `.claude/settings.json`, so the repo's PreToolUse guards (guard-bash, guard-lane, ...) never ran for it.
- * This merges them (pinned commands or legacy absolute paths) into the worker's OWN `<cwd>/.claude/settings.local.json`. Why this file
+ * This merges them (pinned commands or legacy absolute paths), plus the allowlisted operator broadcast
+ * hooks on UserPromptSubmit/PostToolUse, into the worker's OWN `<cwd>/.claude/settings.local.json`. Why this file
  * and not `--settings` or user-level hooks: the local settings file is read fresh from the start directory on
  * every task (the `--settings` JSON is skipped when the CLI hands out a pre-warmed spare session, see the
  * header), and it is scoped to this one worker, so nothing leaks to the operator's other sessions. ADDITIVE and
@@ -158,23 +180,33 @@ export function ensureDispatchGuardHooks({
   const dir = join(cwd, '.claude');
   const path = join(dir, 'settings.local.json');
   try {
-    let repoPre = null;
-    try { repoPre = JSON.parse(readFile(join(repoRoot, '.claude', 'settings.json'), 'utf8'))?.hooks?.PreToolUse ?? null; } catch { repoPre = null; }
-    const wanted = dispatchGuardHooks({ preToolUse: repoPre, repoRoot });
+    let repoHooks = null;
+    try { repoHooks = JSON.parse(readFile(join(repoRoot, '.claude', 'settings.json'), 'utf8'))?.hooks ?? null; } catch { repoHooks = null; }
+    const wanted = {
+      PreToolUse: dispatchGuardHooks({ preToolUse: repoHooks?.PreToolUse, repoRoot }),
+      ...dispatchBroadcastHooks({ hooks: repoHooks, repoRoot }),
+    };
     mkdir(dir, { recursive: true });
     let existing;
     try { existing = JSON.parse(readFile(path, 'utf8')); } catch { existing = null; }
     if (!existing || typeof existing !== 'object' || Array.isArray(existing)) existing = {};
     const hooks = existing.hooks && typeof existing.hooks === 'object' && !Array.isArray(existing.hooks) ? { ...existing.hooks } : {};
-    const pre = Array.isArray(hooks.PreToolUse) ? hooks.PreToolUse.map((g) => ({ ...g, hooks: [...(g?.hooks ?? [])] })) : [];
-    const have = new Set(pre.flatMap((g) => (g.hooks ?? []).map((h) => `${g.matcher ?? ''}\u0000${h.command}`)));
-    for (const g of wanted) {
-      const fresh = g.hooks.filter((h) => !have.has(`${g.matcher ?? ''}\u0000${h.command}`));
-      if (fresh.length) pre.push({ ...(g.matcher !== undefined ? { matcher: g.matcher } : {}), hooks: fresh });
+    for (const [event, groups] of Object.entries(wanted)) {
+      const merged = Array.isArray(hooks[event]) ? hooks[event].map((g) => ({ ...g, hooks: [...(g?.hooks ?? [])] })) : [];
+      const have = new Set(merged.flatMap((g) => (g.hooks ?? []).map((h) => `${g.matcher ?? ''}\u0000${h.command}`)));
+      for (const g of groups) {
+        const fresh = g.hooks.filter((h) => {
+          const key = `${g.matcher ?? ''}\u0000${h.command}`;
+          if (have.has(key)) return false;
+          have.add(key);
+          return true;
+        });
+        if (fresh.length) merged.push({ ...g, hooks: fresh });
+      }
+      hooks[event] = merged;
     }
-    hooks.PreToolUse = pre;
     writeFile(path, `${JSON.stringify({ ...existing, hooks }, null, 2)}\n`, 'utf8');
-    return { ok: true, path, count: wanted.reduce((n, g) => n + g.hooks.length, 0) };
+    return { ok: true, path, count: Object.values(wanted).flat().reduce((n, g) => n + g.hooks.length, 0) };
   } catch (e) {
     return { ok: false, reason: 'write-failed', error: String((e && e.message) || e) };
   }
