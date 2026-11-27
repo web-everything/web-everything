@@ -692,6 +692,26 @@ describe('urgent missing-object acquisition', () => {
     expect(t.calls.filter(c => c.args.includes('fetch')).map(c => c.args.at(-1))).toEqual([sha, 'refs/heads/fix/urgent']);
     expect(t.calls.some(c => c.args.includes('FETCH_HEAD^{commit}'))).toBe(true);
   });
+  it.each([
+    ['torn historical line', '{"ref":"lane/old"\n', '\n'],
+    ['torn final line', '\n', '\n{"ref":"lane/torn"'],
+    ['malformed lines and CRLF blanks', 'not-json\r\n\r\n', '\r\n \r\n{oops\r\n'],
+  ])('uses the matching fix-ready record despite %s', async (_, before, after) => {
+    const ledger = before + JSON.stringify({ sha, ref: 'lane/urgent' }) + after;
+    const t = await run({ rawRefused: true, ledger });
+    expect(t.result).toMatchObject({ ok: true, marker: { sha, result: 'green' } });
+    expect(t.calls.filter(c => c.args.includes('fetch')).map(c => c.args.at(-1))).toEqual([sha, 'refs/heads/lane/urgent']);
+    expect(t.calls.some(c => c.args.includes('FETCH_HEAD^{commit}'))).toBe(true);
+    expect(t.calls.some(c => c.args[0] === 'checkout')).toBe(true);
+    expect(leftovers(t.parent)).toEqual([]);
+  });
+  it('keeps the latest matching record across malformed lines', async () => {
+    const ledger = [JSON.stringify({ sha, ref: 'lane/old' }), '{"ref":"lane/torn"',
+      JSON.stringify({ sha, ref: 'lane/urgent' }), '{oops'].join('\n');
+    const t = await run({ rawRefused: true, ledger });
+    expect(t.result.ok).toBe(true);
+    expect(t.calls.filter(c => c.args.includes('fetch')).map(c => c.args.at(-1))).toEqual([sha, 'refs/heads/lane/urgent']);
+  });
   it('keeps available objects local and deterministic', async () => {
     const t = await run({ available: true });
     expect(t.result.ok).toBe(true);
@@ -705,6 +725,9 @@ describe('urgent missing-object acquisition', () => {
     ['moved branch', { rawRefused: true, tip: 'b'.repeat(40) }, 'fetched-sha-mismatch'],
     ['invalid ref', { rawRefused: true, ref: 'fix/../evil' }, 'fix-ready-ref-invalid'],
     ['missing record', { rawRefused: true, ledger: '' }, 'fix-ready-record-missing'],
+    ['only malformed records', { rawRefused: true, ledger: '{"ref":"lane/old"\n{oops\n' }, 'fix-ready-record-missing'],
+    ['malformed and nonmatching records', { rawRefused: true, ledger: '{oops\n' + JSON.stringify({ sha: 'b'.repeat(40), ref: 'lane/other' }) }, 'fix-ready-record-missing'],
+    ['invalid latest ref after torn line', { rawRefused: true, ledger: [JSON.stringify({ sha, ref: 'lane/old' }), '{oops', JSON.stringify({ sha, ref: 'lane/../evil' })].join('\n') }, 'fix-ready-ref-invalid'],
     ['oversized ledger', { rawRefused: true, ledger: 'x'.repeat(1024 * 1024 + 1) }, 'fix-ready-ledger-too-large'],
   ])('fails closed for %s, cleans the isolate and writes no marker', async (_, options, reason) => {
     const t = await run(options);

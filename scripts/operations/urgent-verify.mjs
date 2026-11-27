@@ -5,7 +5,7 @@ import { spawnSync as realSpawn } from 'node:child_process';
 import { hostname, homedir, tmpdir } from 'node:os';
 import { join, dirname, resolve, delimiter } from 'node:path';
 import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
-import { safeRegistrationRef } from './prototype-load.mjs';
+import { jsonLines, safeRegistrationRef } from './prototype-load.mjs';
 import { ciUnitPlan, ciGatePlan, urgentLedger, urgentKeyPath, urgentSignature, normalizeUrgentRepo, urgentFuiRepo, canonicalFuiRepo } from './urgent-verify-marker.mjs';
 
 const worktreePrefix = '.urgent-verify-';
@@ -209,7 +209,8 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
               if (size === bytes.length) throw new Error('fix-ready-ledger-too-large: repair the ledger and retry or wait for CI');
               text = bytes.subarray(0, size).toString('utf8');
             } finally { fs.closeSync(fd); }
-            const records = text.split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
+            // The writer preserves torn appends as malformed lines; match prototype-load's reader.
+            const records = jsonLines(text);
             const record = records.filter(r => r?.sha === sha).at(-1);
             if (!record) throw new Error('fix-ready-record-missing');
             if (!safeRegistrationRef(record.ref) || record.ref.startsWith('refs/')) throw new Error('fix-ready-ref-invalid');
