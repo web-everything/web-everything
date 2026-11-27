@@ -41,6 +41,7 @@ export const CASCADE_LAYERS = Object.freeze(['standard', 'platform', 'company', 
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const UNSAFE = new Set(['__proto__', 'constructor', 'prototype']);
+const OPERATOR_ONLY = new Set(['findingClasses', 'routingOverrides']);
 
 function mergeLeaves(base, over) {
   const out = { ...base };
@@ -148,17 +149,35 @@ export function resolveCascade({ standard, platform, company, org, team, repo, t
   const isSafety = leaf => safetyLeaves.includes(leaf) || classify(policy, leaf) === 'safety';
   // Historical five-layer settings remain reader-owned. Once owner layers/confirmations are supplied,
   // every ancestor participates; callers migrate persisted settings by supplying their owner confirmations.
-  const ownerAware = confirmations !== undefined || [company, org, team, repo, operator].some(v => v !== undefined);
+  const ownerAware = safetyLeaves.length > 0 || confirmations !== undefined || [company, org, team, repo, operator].some(v => v !== undefined);
+  // Stop at safety boundaries, including objects and empty objects at scalar guard paths.
+  const candidates = (v, path = [], out = new Map()) => {
+    if (isSafety(path.join('.')) || !isObj(v) || OPERATOR_ONLY.has(path[0])) {
+      if (v !== undefined) out.set(path.join(SEP), { path, v });
+    } else for (const [k, value] of Object.entries(v)) {
+      if (!UNSAFE.has(k)) candidates(value, [...path, k], out);
+    }
+    return out;
+  };
   const remember = (key, entry) => history.set(key, [...(history.get(key) ?? []), entry]);
   const apply = (name, layer) => {
     if (layer === undefined || layer === null) return;
-    for (const [key, { path, v }] of leaves(layer)) {
+    for (const [key, { path, v }] of candidates(layer)) {
       const leaf = path.join('.');
-      if (path[0] === 'findingClasses' && name !== 'operator') {
-        log(`policy-cascade: ignoring ${name} findingClasses; only the operator-owned preferences file may set it`);
+      if ((OPERATOR_ONLY.has(policy?.split('.')[0]) || OPERATOR_ONLY.has(path[0])) && name !== 'operator') {
+        invalid.push(`${name}${at(path)}: operator-only policy; only the operator-owned preferences file may set it`);
+        log(`policy-cascade: ignoring ${name} operator-only policy; only the operator-owned preferences file may set it`);
         continue;
       }
       if (!check(path, v)) { invalid.push(`${name}${at(path)}=${JSON.stringify(v)}`); continue; }
+      const capacity = CAPACITY_LEAVES[`${policy}.${leaf}`];
+      if (name === 'operator' && capacity) {
+        const from = history.get(key)?.at(-1)?.v;
+        if (!Number.isFinite(v) || (from !== undefined && isLoosening(capacity.direction === 'cap' ? 'min' : 'max', from, v))) {
+          invalid.push(`operator${at(path)}: capacity preferences may only tighten`);
+          continue;
+        }
+      }
       if (ownerAware && isSafety(leaf)) {
         const entry = directionFor(policy, leaf);
         if (entry && isLoosening(entry, v, v)) {
@@ -194,7 +213,7 @@ export function resolveCascade({ standard, platform, company, org, team, repo, t
       // Unknown safety semantics refuse; unclassified non-safety preferences retain their legacy shadow notice.
       const refused = [];
       // An object under a classed leaf is judged as one value (it cannot be a safe boolean/list); else leaf by leaf.
-      const probes = isObj(v) && classify(policy, path.join('.')) === 'unclassed' ? [...leaves(v).values()].map(l => l.path) : [[]];
+      const probes = [...candidates(v, path).values()].map(l => l.path.slice(path.length));
       for (const rel of probes) {
         const full = [...path, ...rel];
         const leaf = full.join('.');
@@ -264,11 +283,11 @@ export function resolveCascade({ standard, platform, company, org, team, repo, t
   for (const [layer, reason] of Object.entries(layerErrors)) {
     invalid.push(`${layer}: ${reason}; repair layer before safety resolution`);
     for (const [key, entry] of eff) if (isSafety(entry.path.join('.'))) {
-      eff.set(key, { ...entry, v: undefined, layer: `unresolved:${layer}` });
+      eff.set(key, { ...entry, v: typeof defaults.get(key)?.v === 'boolean' ? defaults.get(key).v : undefined, layer: `unresolved:${layer}` });
     }
     for (const leaf of safetyLeaves) {
       const path = leaf ? leaf.split('.') : [];
-      eff.set(path.join(SEP), { path, v: undefined, layer: `unresolved:${layer}` });
+      eff.set(path.join(SEP), { path, v: typeof defaults.get(path.join(SEP))?.v === 'boolean' ? defaults.get(path.join(SEP)).v : undefined, layer: `unresolved:${layer}` });
     }
   }
   const sources = {};
@@ -364,7 +383,7 @@ export function cascadePolicy(policy, tool, { standard, envValues, valid, platfo
     if (result.errors.length) layerErrors.platform = result.errors.join('; ');
   }
   tool = layers.tool;
-  if (policy === 'findingClasses') {
+  if (OPERATOR_ONLY.has(policy.split('.')[0])) {
     if (tool != null || Object.values(envValues ?? {}).some(v => v !== undefined))
       console.error('policy-cascade: ignoring tool/env findingClasses; only the operator-owned preferences file may set it');
     tool = undefined;
@@ -377,8 +396,16 @@ export function cascadePolicy(policy, tool, { standard, envValues, valid, platfo
   const resolved = resolveCascade({ ...shared, standard, envValues });
   logCascadeSources(policy, resolved, { env, ...(log ? { log } : {}) });
   // `layered`: platform under tool only (no standard, no env) — the drop-in replacement for a reader's tool block.
-  const layered = resolveCascade({ standard: operatorOverride === null && capacityLeaves.length ? standard : undefined,
-    ...shared }).value;
+  const layeredResult = resolveCascade({ ...shared, standard });
+  // Preserve the compatibility view's omission of ordinary reader defaults while resolving safety against them.
+  let layered = layeredResult.value;
+  for (const { path } of leaves(standard).values()) {
+    const leaf = path.join('.');
+    if (layeredResult.sources[leaf] !== 'standard' || classify(policy, leaf) === 'safety' || safetyLeaves?.includes(leaf)
+      || (operatorOverride === null && capacityLeaves.length)) continue;
+    if (path.length && isObj(layered)) deleteLeaf(layered, path);
+    else if (!path.length) layered = undefined;
+  }
   return { ...resolved, platform: plat, layered };
 }
 

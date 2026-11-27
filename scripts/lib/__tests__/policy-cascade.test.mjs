@@ -649,3 +649,64 @@ it.each([
     expect(r.platform).toEqual(leaf === '' ? undefined : {});
     expect(r.invalid.join(' ')).toMatch(/unclassified safety; repair direction/);
   });
+
+
+describe('SD15 audit safety regressions', () => {
+  const quiet = () => {};
+  it('broken or partial layer evidence retains the standard referral guard', () => {
+    for (const layer of ['platform', 'company', 'org', 'team', 'repo', 'tool', 'operator']) {
+      const r = resolveCascade({ policy: 'review', standard: { unattendedAcceptRequiresCleanReferrals: true },
+        company: { unattendedAcceptRequiresCleanReferrals: false }, confirmations: { company: { unattendedAcceptRequiresCleanReferrals: ['standard'] } },
+        layerErrors: { [layer]: 'incomplete evidence' }, log: quiet });
+      expect(r.value.unattendedAcceptRequiresCleanReferrals).toBe(true);
+      expect(r.sources.unattendedAcceptRequiresCleanReferrals).toBe(`unresolved:${layer}`);
+      expect(r.invalid.join(' ')).toMatch(/repair layer/);
+    }
+  });
+  it('owner files cannot confer operator-only policy authority', () => {
+    for (const policy of ['findingClasses', 'routingOverrides']) {
+      for (const layer of ['company', 'org', 'team', 'repo']) {
+        const path = file({ [policy]: { probe: 'allow' } });
+        const r = cascadePolicy(policy, undefined, { standard: {}, platform: {}, env: {}, operatorOverride: {},
+          ownerFiles: { [layer]: path }, readFile: readFileSync, log: quiet });
+        expect(r.value).toEqual({});
+        expect(r.layered).toEqual({});
+        expect(r.invalid.join(' ')).toMatch(/operator-only/);
+      }
+    }
+  });
+  it('layered retains the same standard safety baseline as value', () => {
+    const r = cascadePolicy('ciUnitRerun', {}, { standard: { maxFiles: 2 }, company: { maxFiles: 10 },
+      platform: {}, env: {}, operatorOverride: {}, log: quiet });
+    expect(r.value.maxFiles).toBe(2);
+    expect(r.layered.maxFiles).toBe(2);
+  });
+  it('declared safety activates owner checks without explicit owner blocks', () => {
+    const r = resolveCascade({ policy: 'futureGate', standard: { required: true }, safetyLeaves: ['required'],
+      tool: { required: false }, log: quiet });
+    expect(r.value.required).toBe(true);
+    expect(r.sources.required).toBe('standard');
+    expect(r.invalid.join(' ')).toMatch(/tool.required.*unclassified.*repair/);
+  });
+  it('owner safety checks reject object replacement at every depth without a validator', () => {
+    for (const replacement of [{ bypass: true }, {}, { nested: { bypass: true } }]) {
+      for (const policy of ['ciUnitRerun', 'futureGate']) {
+        const r = resolveCascade({ policy, standard: { enabled: false }, company: { enabled: replacement },
+          ...(policy === 'futureGate' ? { safetyLeaves: ['enabled'] } : {}), log: quiet });
+        expect(r.value.enabled).toBe(false);
+        expect(r.sources.enabled).toBe('standard');
+        expect(r.invalid.join(' ')).toMatch(/company.enabled.*(incomparable|unclassified).*repair/);
+      }
+    }
+  });
+  it('personal capacity preferences only tighten environment limits', () => {
+    for (const preference of [3, 1]) {
+      const operatorPath = file({ reviewConcurrency: { maxLiveReviewRounds: preference } });
+      const r = cascadePolicy('reviewConcurrency', {}, { standard: { maxLiveReviewRounds: 3 }, envValues: { maxLiveReviewRounds: 1 },
+        env: {}, platformPaths: [], operatorPath, readFile: readFileSync, operatorOverride: {}, log: quiet });
+      expect(r.value.maxLiveReviewRounds).toBe(1);
+      expect(r.sources.maxLiveReviewRounds).toBe(preference === 1 ? 'operator' : 'env');
+      if (preference > 1) expect(r.invalid.join(' ')).toMatch(/operator.*capacity.*tighten/);
+    }
+  });
+});
