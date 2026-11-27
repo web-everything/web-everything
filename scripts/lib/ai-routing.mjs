@@ -139,7 +139,7 @@ export function resolveAiRouting({ env = process.env, tool = readSettings().aiRo
     }
     resolved = next;
   }
-  if (session) resolveSessions(resolved, { env, routing, routingPlatform, available, resume, operatorOverride, log });
+  if (session) resolveSessions(resolved, { env, routing, routingPlatform, available, resume, operatorOverride, log, valid });
   for (const detail of resolved.invalid) diagnostic(detail, log);
   // Values and provenance describe the same retained snapshot.
   resolved.leafValues = {};
@@ -164,7 +164,7 @@ export function aiRoutingInputs(role, resolved) {
  * evidence/tier routers. Legacy explicit role pins win over the shared order; persisted
  * resume identities win over both and are never re-aliased. No orchestrator model is read.
  */
-function resolveSessions(resolved, { env, routing, routingPlatform, available, resume, operatorOverride, log }) {
+function resolveSessions(resolved, { env, routing, routingPlatform, available, resume, operatorOverride, log, valid }) {
   const standard = { providerOrder: ['codex', 'claude'] };
   const policy = cascadePolicy('routing', routing ?? readSettings().routing, {
     standard, platform: routingPlatform, env, operatorOverride,
@@ -176,8 +176,8 @@ function resolveSessions(resolved, { env, routing, routingPlatform, available, r
   });
   resolved.session = true;
   resolved.sessionRoles = [];
-  const orderInvalid = policy.invalid.some(detail => detail.includes('providerOrder'));
-  if (orderInvalid) resolved.invalid.push('routing.providerOrder invalid; restore a distinct codex/claude providerOrder (at most two providers) or ask the operator to repair policy');
+  const orderInvalid = policy.invalid.length > 0;
+  if (orderInvalid) resolved.invalid.push(`routing.providerOrder invalid (${policy.invalid.join('; ')}); restore a distinct codex/claude providerOrder (at most two providers) or ask the operator to repair policy`);
   resolved.sources['routing.providerOrder'] = policy.sources.providerOrder;
   // Conservative routine tiers: helper alone can use a small model. Preparation keeps
   // Astra and review/judge roles retain full-capability models and high effort.
@@ -191,6 +191,11 @@ function resolveSessions(resolved, { env, routing, routingPlatform, available, r
         || typeof persisted.model !== 'string' || persisted.model === 'inherit')) {
         throw new TypeError('resume requires explicit provider and model');
       }
+      if (persisted && (!valid[`${role}.coordinator`](persisted)
+        || typeof persisted.effort !== 'string' || persisted.effort === 'inherit')) {
+        throw new TypeError(role === 'fix' ? 'resume violates fix coordinator account-only validator'
+          : 'resume has invalid coordinator fields or lacks explicit effort');
+      }
       if (orderInvalid && !persisted) throw new TypeError('invalid providerOrder');
       const pinned = old.provider !== 'inherit';
       const provider = persisted?.provider ?? (pinned ? old.provider : policy.value.providerOrder.find(p => available.includes(p)));
@@ -203,9 +208,13 @@ function resolveSessions(resolved, { env, routing, routingPlatform, available, r
       if (security.has(role) && /luna|haiku|flash/.test(canonical)) throw new TypeError('security floor excludes small models');
       if (!persisted && !available.includes(provider)) throw new TypeError('pinned provider unavailable');
       const coordinator = persisted ? structuredClone(persisted) : { provider, model: canonical,
-        effort: old.effort !== 'inherit' ? old.effort : security.has(role) ? 'high' : role === 'helper' ? 'low' : 'medium' };
-      checkCombination(coordinator);
-      if (!persisted) coordinator.account = old.account;
+        effort: old.effort !== 'inherit' ? old.effort : security.has(role) ? 'high' : role === 'helper' ? 'low' : 'medium',
+        account: old.account };
+      if (!valid[`${role}.coordinator`](coordinator)) {
+        throw new TypeError(role === 'fix' ? 'fix coordinator account-only validator forbids session overrides'
+          : 'invalid coordinator fields');
+      }
+      checkCoordinator(coordinator);
       resolved.value[role].coordinator = coordinator;
       for (const key of Object.keys(coordinator)) resolved.sources[`${role}.coordinator.${key}`] = persisted ? 'resume'
         : pinned ? resolved.sources[`${role}.coordinator.${key}`] ?? 'standard' : policy.sources.providerOrder;

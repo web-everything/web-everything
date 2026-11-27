@@ -42,6 +42,42 @@ it('registered ai-routing collector returns all ten roles, settings, sources and
 const sessionFixture = extra => ({ env: {}, platform: {}, tool: {}, accountMap: { accounts: {} },
   log: false, operatorOverride: {}, session: true, routing: { providerOrder: ['codex', 'claude'] }, routingPlatform: {}, ...extra });
 
+it('session construction refuses fix coordinator overrides rejected by the account-only validator', () => {
+  for (const resume of [{}, { fix: { provider: 'claude', model: 'sonnet', effort: 'high' } }]) {
+    const resolved = routing.resolveAiRouting(sessionFixture({ resume }));
+    expect(() => routing.aiRoutingInputs('fix', resolved)).toThrow(/missing route/);
+    expect(resolved.invalid).toContainEqual(expect.stringMatching(/fix:.*account-only/));
+  }
+});
+
+it('resumed coordinators refuse invalid fields and inherited effort with recovery diagnostics', () => {
+  const route = { provider: 'claude', model: 'sonnet', effort: 'high' };
+  for (const patch of [{ account: 'unknown' }, { extra: true }, { effort: null }, { effort: 'inherit' }]) {
+    const resolved = routing.resolveAiRouting(sessionFixture({ resume: { helper: { ...route, ...patch } } }));
+    expect(() => routing.aiRoutingInputs('helper', resolved)).toThrow(/missing route/);
+    expect(resolved.invalid).toContainEqual(expect.stringMatching(/helper:.*resume.*restore/));
+  }
+});
+
+it('session combination validation includes legacy accounts before admitting a route', () => {
+  const accountMap = { accounts: { team: {} } };
+  const tool = { helper: { coordinator: { account: 'team' } } };
+  const resolved = routing.resolveAiRouting(sessionFixture({ accountMap, tool }));
+  expect(() => routing.aiRoutingInputs('helper', resolved)).toThrow(/missing route/);
+  expect(resolved.invalid).toContainEqual(expect.stringMatching(/helper:.*account requires native Claude/));
+  const native = routing.resolveAiRouting(sessionFixture({ accountMap, tool, routing: { providerOrder: ['claude'] } }));
+  expect(routing.aiRoutingInputs('helper', native).coordinator.provider).toBe('claude');
+  expect(native.value.helper.coordinator.account).toBe('team');
+});
+
+it('malformed routing blocks refuse instead of silently selecting the default provider order', () => {
+  for (const options of [{ routing: 42 }, { routing: [] }, { routingPlatform: 42 }]) {
+    const resolved = routing.resolveAiRouting(sessionFixture(options));
+    expect(() => routing.aiRoutingInputs('helper', resolved)).toThrow(/missing route/);
+    expect(resolved.invalid).toContainEqual(expect.stringMatching(/routing.*invalid.*restore/));
+  }
+});
+
 it('every routine session resolves an explicit model from one providerOrder policy', () => {
   for (const order of [['codex', 'claude'], ['claude', 'codex']]) {
     const resolved = routing.resolveAiRouting(sessionFixture({ routing: { providerOrder: order } }));

@@ -31,7 +31,7 @@ export function planRoutingOverride(input, policy = DEFAULT_ROUTING_POLICY) {
 export function createRoutingOverrideLogger({ log = event => console.error(JSON.stringify(event)) } = {}) {
   const previous = new Map();
   return event => {
-    const signature = JSON.stringify([event.provider, event.model, event.effort ?? null, event.source]);
+    const signature = JSON.stringify([event.provider, event.model, event.effort ?? null, event.source, event.cleared ?? false]);
     if (previous.get(event.key) === signature) return;
     try {
       log(structuredClone(event));
