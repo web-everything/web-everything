@@ -13,7 +13,7 @@ function fixture(remote={}) {
   const root=mkdtempSync(join(process.env.TMPDIR,'slot-units-'));roots.push(root);
   let now=Date.now();
   const telemetry={sampledAtET:easternTimestamp(now),cores:32,loadPerCore:0.1,memFreePct:90,activeRuns:0,recent:[]};
-  const f={argv:['npm','run','test:unit'],env:{},cwd:root,lockRoot:join(root,'heavy'),
+  const f={targetExec:async()=>({code:0}),argv:['npm','run','test:unit'],env:{},cwd:root,lockRoot:join(root,'heavy'),
     policy:resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always',maxConcurrent:4,...remote}}}),
     readTelemetry:async()=>({...telemetry,sampledAtET:easternTimestamp(now)}),
     clock:()=>now,sleep:vi.fn(async ms=>{now+=ms;}),hostOverloaded:()=>false,log:vi.fn(),

@@ -60,7 +60,7 @@ function expectDecision(result, remote) {
 
 function fixture({ remote = {}, load = 4, result = { mode: 'remote', code: 0 } } = {}) {
   const root=mkdtempSync(join(process.env.TMPDIR,'admission-remote-'));testRoots.push(root);
-  return {lockRoot:join(root,'heavy'),readTelemetry:healthyRead,
+  return {lockRoot:join(root,'heavy'),targetExec:async()=>({code:0}), readTelemetry:healthyRead,
     argv: [...argv], policy: policyFor(remote), cwd: 'fixture-checkout',
     loadPerCore: vi.fn(() => load), remoteExec: vi.fn(async () => result), log: vi.fn(),
   };
@@ -94,7 +94,7 @@ describe('remote dispatch location', () => {
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
     expect(locationLines(f.log)).toEqual(['heavy-admission: location=remote host=mesa-01\n']);
     expect(events[events.indexOf('dispatch')-1]).toBe(locationLines(f.log)[0]);
-    expect(f.targetExec).not.toHaveBeenCalled();
+    expect(f.targetExec).toHaveBeenCalledTimes(1);
   });
   it('busy-wait re-dispatch keeps one location=remote line', async () => {
     const f=dispatchFixture();
@@ -386,7 +386,7 @@ describe('remote admission policy', () => {
       throw Object.assign(new Error('local command exit'), { status: 17 });
     });
     try {
-      await expect(main(['run', `--repo=${root}`, '--', ...argv], { home: root, remoteExec, readTelemetry: healthyRead }))
+      await expect(main(['run', `--repo=${root}`, '--', ...argv], { home: root, remoteExec, targetExec:async()=>({code:0}), readTelemetry: healthyRead }))
         .rejects.toBe(exited);
       expect(remoteExec).toHaveBeenCalledTimes(1);
       expect(execSync).toHaveBeenCalledTimes(1);
@@ -420,7 +420,7 @@ describe('remote admission policy', () => {
     vi.mocked(execSync).mockImplementation(()=>{throw Object.assign(new Error('local command exit'),{status:17});});
     try {
       await expect(main(['run',`--repo=${root}`,'--',...command],{
-        home:root, readTelemetry:healthyRead,
+        home:root, targetExec:async()=>({code:0}), readTelemetry:healthyRead,
         remoteExec:async options=>adaptLegacyRemoteResult(await runRemote({...options,exec:transport,fs:{mkdtemp:stage}})),
       })).rejects.toBe(exited);
       expect(execSync).toHaveBeenCalledTimes(1);
@@ -478,7 +478,7 @@ describe('remote admission policy', () => {
       CI: '', WE_HEAVY_ADMISSION: 'on', WE_HEAVY_ADMISSION_HELD: '', WE_HEAVY_ADMISSION_CONTAINER: '', WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES: '', WE_VERIFY_REMOTE_REPORT: join(root, 'verify-report.jsonl'),...gateEnv })) vi.stubEnv(key, value);
     try {
       const remoteExec = vi.fn(async () => ({ mode: 'remote', code: 23, run: 'run-123456' }));
-      await expect(main(['run', `--repo=${root}`, '--', ...command], { home: root, remoteExec, readTelemetry:healthyRead })).rejects.toBe(exited);
+      await expect(main(['run', `--repo=${root}`, '--', ...command], { home: root, remoteExec, targetExec:async()=>({code:0}), readTelemetry:healthyRead })).rejects.toBe(exited);
       expect(remoteExec).toHaveBeenCalledWith(expect.objectContaining({ argv:expected, cwd: root, signal: expect.any(AbortSignal) }));
       expect(exit).toHaveBeenCalledWith(23);
       expect(JSON.parse(readFileSync(join(root, 'verify-report.jsonl'), 'utf8'))).toEqual({ location: 'remote', receiptId: 'run-123456', exitCode: 23 });
@@ -536,7 +536,7 @@ describe('remote admission policy', () => {
     });
     try {
       const remoteExec = vi.fn(async () => ({ mode: 'remote', code: 23, run: 'run-123456' }));
-      await expect(main(['run', `--repo=${root}`, ...flags, '--', ...argv], { home: root, remoteExec, readTelemetry:healthyRead })).rejects.toBe(exited);
+      await expect(main(['run', `--repo=${root}`, ...flags, '--', ...argv], { home: root, remoteExec, targetExec:async()=>({code:0}), readTelemetry:healthyRead })).rejects.toBe(exited);
       expect(remoteExec).not.toHaveBeenCalled();
       expect(localExec).toHaveBeenCalledTimes(1);
       expect(localExec).toHaveBeenCalledWith(argv.map(shellQuoteWord).join(' '), expect.objectContaining({
@@ -966,7 +966,7 @@ describe('runWithRemoteDecision', () => {
       try {
         const result = await runWithRemoteDecision({
           argv: ['npm', 'run', 'test:unit', '--', 'a.test.mjs'], cwd, env: {},
-          lockRoot:join(cwd,'heavy'),readTelemetry:healthyRead,
+          lockRoot:join(cwd,'heavy'),targetExec:async()=>({code:0}), readTelemetry:healthyRead,
           policy: policyFor({ mode: 'always' }), loadPerCore: () => 0, log,
           remoteExec: (options) => runRemote({ ...options, exec, listFiles: async () => files }),
         });

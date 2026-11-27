@@ -100,7 +100,7 @@ describe('admission wait ledger', () => {
   it.each([false, true])('records one remote slot admission (busy=%s) in the shared ledger', async busy => {
     const root = temp(), lockRoot = join(root, 'heavy'), remoteRoot = join(root, 'remote'); let time = T;
     if (busy) expect(tryAcquireSlot({ lockRoot: remoteRoot, cap: 1, owner: 'holder', nowMs: T, nowIso: new Date(T).toISOString() }).ok).toBe(true);
-    const result = await runWithRemoteDecision({ argv: ['npx', 'vitest', 'run', 'a.test.mjs'], cwd: root, lockRoot, env: {},
+    const result = await runWithRemoteDecision({targetExec:async()=>({code:0}), argv: ['npx', 'vitest', 'run', 'a.test.mjs'], cwd: root, lockRoot, env: {},
       policy: resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode: 'always', maxConcurrent: 1 } } }),
       clock: () => time, loadPerCore: () => 0, hostOverloaded: () => false, log: () => {},
       sleep: async ms => { time += ms; releaseOwnedSlot({ lockRoot: remoteRoot, cap: 1, owner: 'holder' }); },

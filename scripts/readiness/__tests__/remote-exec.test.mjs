@@ -63,7 +63,7 @@ const runRemoteCli = options => {
   auxiliary.push(home);
   mkdirSync(join(home, '.claude'));
   writeFileSync(join(home, '.claude', 'platform-preferences.json'), '{}');
-  return remoteCliMain({ home, ...options });
+  return remoteCliMain({ home, targetExec:async()=>({code:0}), ...options });
 };
 beforeEach(() => {
   // Task scratch must stay under the launcher-provided TMPDIR.
@@ -829,7 +829,7 @@ describe('standards input parity', () => {
       return result;
     });
     const log = vi.fn();
-    expect(await runWithRemoteDecision({argv:f.argv,cwd,env:{},lockRoot:f.lockRoot,log,loadPerCore:()=>0,
+    expect(await runWithRemoteDecision({targetExec:async()=>({code:0}),argv:f.argv,cwd,env:{},lockRoot:f.lockRoot,log,loadPerCore:()=>0,
       policy:resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always'}}}),
       remoteExec:async () => {
         const result = await runRemote(f);
@@ -1299,7 +1299,7 @@ describe('runRemote', () => {
     const options = {...f, fs:{...filesystem, mkdtemp:stage}};
     expect(await runRemote(options)).toEqual({mode:'not-started', terminated:true, reason:'command-not-allowed',detail:expect.any(String)});
     const log = vi.fn();
-    const decision = await runWithRemoteDecision({
+    const decision = await runWithRemoteDecision({targetExec:async()=>({code:0}),
       ...f, log, policy:resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always'}}}),
       remoteExec:async () => adaptLegacyRemoteResult(await runRemote(options)),
     });
@@ -1331,7 +1331,7 @@ describe('runRemote', () => {
       phase:'rejected',reason:'git-head-unavailable',siblings:false,started:false})});
     f.argv=['npm','run','check:standards'];
     const log=vi.fn();
-    expect(await runWithRemoteDecision({argv:f.argv,cwd,env:{},lockRoot:join(cwd,'heavy'),log,loadPerCore:()=>0,
+    expect(await runWithRemoteDecision({targetExec:async()=>({code:0}),argv:f.argv,cwd,env:{},lockRoot:join(cwd,'heavy'),log,loadPerCore:()=>0,
       policy:resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always'}}}),
       remoteExec:async options=>runRemote({...f,...options}),
     })).toEqual({handled:false});
@@ -1545,7 +1545,7 @@ describe('runRemote', () => {
     f.exec = vi.fn(async call => call.file === 'git' && call.args.includes('-i')
       ? {code:0, stdout:Buffer.from('scripts/__tests__/ignored.test.mjs\0')}
       : exec(call));
-    const result = await runWithRemoteDecision({
+    const result = await runWithRemoteDecision({targetExec:async()=>({code:0}),
       argv:f.argv, cwd, env:{}, lockRoot:join(cwd,'heavy'), log:vi.fn(), loadPerCore:() => 0,
       policy:resolveAdmissionPolicy({platform:{remote:{enabled:true, mode:'always'}}}),
       remoteExec:async options => adaptLegacyRemoteResult(await runRemote({...f, ...options})),
@@ -1588,7 +1588,7 @@ describe('runRemote', () => {
     expect(await runRemote(f)).toEqual({mode:'not-started', terminated:true, reason:'unshipped-scan-file', detail:name});
     expect(callsOf(f.exec).some(call => isPrepare(call) || call.file === 'rsync' || isRun(call))).toBe(false);
     const log = vi.fn();
-    expect(await runWithRemoteDecision({
+    expect(await runWithRemoteDecision({targetExec:async()=>({code:0}),
       argv:f.argv, cwd, env:f.env, lockRoot:f.lockRoot, log, loadPerCore:() => 0,
       policy:resolveAdmissionPolicy({platform:{remote:{enabled:true, mode:'always'}}}),
       remoteExec:async options => adaptLegacyRemoteResult(await runRemote({...f, ...options})),

@@ -1317,7 +1317,7 @@ export async function runWithRemoteDecision({
   };
   let root = '/srv/forge-exec';
   const hosts = policy.settings.remote.hosts ?? DEFAULT_REMOTE_HOSTS;
-  const customTargets = !isDefaultRemoteHosts(hosts);
+  const defaultTargets = isDefaultRemoteHosts(hosts);
   const externalClient = policy.settings.remote.clientPath != null || remoteClientOverride != null;
   const remoteRoot = join(dirname(lockRoot), 'remote');
   const localFallback = (reason, detail = null) => {
@@ -1346,29 +1346,28 @@ export async function runWithRemoteDecision({
   let targetMissing = false;
   const skipped = [];
   let decision;
-  if (customTargets) {
-    decision = route(true);
-    if (decision.remote) {
-      const denied = confinement();
-      if (denied) {
-        onDecision?.(decision);
-        log(`heavy-admission: remote (${decision.reason})\n`);
-        return localFallback('confined-local', `${denied} ${oneLine(basename(remoteRoot))}`);
-      }
-      const {peekRemoteBreaker,checkRemoteHealth} = await import('./forge-remote-health.mjs');
-      const target = await pickRemoteTarget({hosts,exec:targetExec,cwd,sshOptions,onSkip:entry=>skipped.push(entry),
-        breaker:alias=>peekRemoteBreaker({root:remoteRoot,host:alias,clock}),
-        admit:({alias})=>checkRemoteHealth({root:remoteRoot,settings:policy.settings.remote,clock,readTelemetry,host:alias})});
-      targetMissing = !target;
-      if (target) {
-        host = target.alias; root = target.root;
-        log(`heavy-admission: remote.hosts=${JSON.stringify(hosts)} (${policy.sources['remote.hosts'] ?? 'standard'}); selected=${host} skipped=${JSON.stringify(target.skipped)}\n`);
-        decision = route(readCapability({root:remoteRoot,host,clock,unknownOk:!externalClient}));
-      } else decision = {remote:false,reason:'no-healthy-remote'};
+  // Default hosts share the executable probe; preserve the existing single-host health/log lifecycle.
+  decision = route(defaultTargets ? readCapability({root:remoteRoot,host:host ?? hosts[0].alias,clock,unknownOk:!externalClient}) : true);
+  if (decision.remote) {
+    const denied = confinement();
+    if (denied) {
+      onDecision?.(decision);
+      log(`heavy-admission: remote (${decision.reason})\n`);
+      return localFallback('confined-local', `${denied} ${oneLine(basename(remoteRoot))}`);
     }
-  } else {
-    host ??= hosts[0].alias; root = hosts[0].root;
-    decision = route(readCapability({root:remoteRoot,host,clock,unknownOk:!externalClient}));
+    const targetHealth = defaultTargets ? null : await import('./forge-remote-health.mjs');
+    const targetHosts = defaultTargets ? [{...hosts[0],alias:host ?? hosts[0].alias}] : hosts;
+    const target = await pickRemoteTarget({hosts:targetHosts,exec:targetExec,cwd,sshOptions,onSkip:entry=>skipped.push(entry),
+      ...(!defaultTargets ? {
+        breaker:alias=>targetHealth.peekRemoteBreaker({root:remoteRoot,host:alias,clock}),
+        admit:({alias})=>targetHealth.checkRemoteHealth({root:remoteRoot,settings:policy.settings.remote,clock,readTelemetry,host:alias}),
+      } : {})});
+    targetMissing = !target;
+    if (target) {
+      host = target.alias; root = target.root;
+      if (!defaultTargets) log(`heavy-admission: remote.hosts=${JSON.stringify(hosts)} (${policy.sources['remote.hosts'] ?? 'standard'}); selected=${host} skipped=${JSON.stringify(target.skipped)}\n`);
+      if (!defaultTargets) decision = route(readCapability({root:remoteRoot,host,clock,unknownOk:!externalClient}));
+    } else decision = {remote:false,reason:'no-healthy-remote'};
   }
   onDecision?.(decision);
   log(`heavy-admission: ${decision.remote ? 'remote' : 'local'} (${decision.reason})\n`);
@@ -3286,7 +3285,7 @@ function parseFlags(argv) {
 }
 
 // @test-only-export-ok: exercise CLI routing through the real decision before slot acquisition.
-export async function main(argv, { remoteExec, readTelemetry, hostAdmission, home } = {}) {
+export async function main(argv, { remoteExec, readTelemetry, targetExec, hostAdmission, home } = {}) {
   // `run`'s command tail lives after a literal `--` and must never be parsed as this CLI's OWN flags (a
   // `--coverage` meant for the wrapped command would otherwise be read as a flag of THIS script).
   const dashDashIdx = argv.indexOf('--');
@@ -3502,7 +3501,7 @@ export async function main(argv, { remoteExec, readTelemetry, hostAdmission, hom
       const remoteStartedAt = Date.now();
       const result = await runWithRemoteDecision({
         argv: remoteArgv, policy, cwd: repo ?? process.cwd(),
-        env: process.env, remoteExec, readTelemetry, lockRoot, remoteClientOverride,
+        env: process.env, remoteExec, readTelemetry, targetExec, lockRoot, remoteClientOverride,
         onDecision: decision => { reportLocalExecution ||= decision.remote; remoteDecided = decision.remote; localDecisionReason = decision.reason; },
         timeoutMs: runCeilingMs > 0 ? runCeilingMs : classifyAdmissionCommandKind(command, process.env) === 'files' ? resolveFastRunTimeoutMs(process.env) : ceilingMs,
       });

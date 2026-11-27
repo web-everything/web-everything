@@ -315,7 +315,7 @@ describe('R593 client and routing', () => {
         maxConcurrent: 8, backoffMs: 120000, backoffFailures: 3, maxLoadPerCore: 0.8, minFreeRamPct: 15, transport: 'git-bundle' } } });
       const run = async (clientPath) => {
         const decisions = []; const calls = [];
-        await runWithRemoteDecision({ argv: ['npx', 'vitest', 'run', 'git.test.mjs'], policy: policyFor(clientPath), cwd, env: {}, lockRoot, loadPerCore: () => 4,
+        await runWithRemoteDecision({targetExec:async()=>({code:0}), argv: ['npx', 'vitest', 'run', 'git.test.mjs'], policy: policyFor(clientPath), cwd, env: {}, lockRoot, loadPerCore: () => 4,
           hostOverloaded: () => false, log: () => {}, onDecision: d => decisions.push(d),
           remoteExec: async (o) => { calls.push(o); return { mode: 'not-started', terminated: true, reason: 'forge-runner-too-old' }; } });
         return { decisions, calls };
@@ -793,7 +793,7 @@ describe('R857 advisory bundle credential policy',()=>{
         const policy=resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always',transport:'git-bundle'}}});
         const readTelemetry=async()=>({sampledAtET:(await import('../forge-exec-run.mjs')).easternTimestamp(Date.now()),
           cores:8,loadPerCore:0.1,memFreePct:90,activeRuns:0,recent:[]});
-        expect(await runWithRemoteDecision({argv:options.argv,cwd:lane,env:{},policy,lockRoot,readTelemetry,log:()=>{},
+        expect(await runWithRemoteDecision({targetExec:async()=>({code:0}),argv:options.argv,cwd:lane,env:{},policy,lockRoot,readTelemetry,log:()=>{},
           remoteExec:request=>runRemote({...options,...request})})).toEqual({handled:true,exitCode:0,remoteResult:expect.objectContaining({mode:"remote",code:0})});
         const rows=(await fs.readFile(join(lockRoot,'remote-fallbacks.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);
         expect(rows).toEqual([expect.objectContaining({reason:'credential-warn',detail:'note-00.md: high-entropy-key'})]);

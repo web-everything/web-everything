@@ -18,7 +18,7 @@ const policy = resolveAdmissionPolicy({platform: {remote: {enabled: true, mode: 
 const marker = (root) => join(root, 'remote', 'slot-0.unconfirmed');
 const fixture = (remoteExec) => {
   const root = scratch();
-  return {argv: ['npx', 'vitest', 'run', 'a.test.mjs'], policy, cwd: root, env: {WE_HEAVY_SIGNAL_CANCEL_WAIT_MS: '200'},
+  return {targetExec:async()=>({code:0}),argv: ['npx', 'vitest', 'run', 'a.test.mjs'], policy, cwd: root, env: {WE_HEAVY_SIGNAL_CANCEL_WAIT_MS: '200'},
     lockRoot: join(root, 'heavy'), clock: () => now, readTelemetry: async () => sample(), remoteExec, log: vi.fn(), hostOverloaded: () => false};
 };
 const waitsForAbort = (result) => ({signal}) => new Promise((resolve) => signal.addEventListener('abort', () => resolve(result), {once: true}));
@@ -70,7 +70,7 @@ import {join} from 'node:path';
 import {resolveAdmissionPolicy, runWithRemoteDecision} from ${JSON.stringify(pathToFileURL(join(process.cwd(), 'scripts/readiness/heavy-admission.mjs')).href)};
 const root = ${JSON.stringify(root)};
 const policy = resolveAdmissionPolicy({platform: {remote: {enabled: true, mode: 'always'}}});
-const result = await runWithRemoteDecision({argv: ['npx','vitest','run','a.test.mjs'], policy, cwd: root, env: {}, lockRoot: join(root,'heavy'),
+const result = await runWithRemoteDecision({targetExec:async()=>({code:0}),argv: ['npx','vitest','run','a.test.mjs'], policy, cwd: root, env: {}, lockRoot: join(root,'heavy'),
   clock: () => ${now}, readTelemetry: async () => (${JSON.stringify(sample())}), log: () => {}, hostOverloaded: () => false,
   remoteExec: ({signal}) => { process.stdout.write('ready\\n'); return new Promise((resolve) => signal.addEventListener('abort', () => resolve({mode:'cancelled', terminated:true}), {once:true})); }});
 process.exit(result.exitCode);
