@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 
 export const S1A_OPERATOR = 'chalbert';
 export const ORGS = Object.freeze(['web-everything', 'plateauapp', 'frontier-ui', 'longshoreai']);
-export const SECRET_RE = /gh[opsur]_[A-Za-z0-9]{8,}|github_pat_|-----BEGIN|x-access-token|[Aa]uthorization:|[Bb]earer /;
+export const SECRET_RE = /gh[opsur]_[A-Za-z0-9]{8,}|github_pat_|-{5}BEGIN|x-access-token|[Aa]uthorization:|[Bb]earer /;
 const SCHEMA = 'hca-inventory/1';
 const FATALS = ['READER-NOT-OPERATOR', 'READER-SCOPE', 'AUTH-FAILED', 'SECRET-DETECTED', 'SELF-SCHEMA'];
 const REASONS = ['UNREAD', 'RATE-LIMITED', 'MALFORMED', 'REDACTED-FIELD', 'UNKNOWN', 'UNSTABLE', 'ORG-UNLISTED', 'COHORT'];
