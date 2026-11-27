@@ -7,7 +7,7 @@ const sha = 'a'.repeat(40);
 import { fakeGh, fakeGit } from './merge-ai-prs-fake-ports.mjs';
 
 export function createPrestageWorld(runCommand) {
-  return async function world(fn, { slug = 'fixture/prestage' } = {}) {
+  return async function world(fn, { slug = 'fixture/prestage', overlapYield = false } = {}) {
     const root = mkdtempSync(join(tmpdir(), 'prestage-cli-'));
     const dir = join(root, 'local');
     try {
@@ -20,6 +20,10 @@ export function createPrestageWorld(runCommand) {
       for (const [name, body] of [['gh', fakeGh], ['git', fakeGit]]) writeFileSync(join(bin, name), body, { mode: 0o755 });
       const fixture = join(dir, 'pr.json'), log = join(dir, 'calls.jsonl'), settings = join(dir, 'settings.json'), coord = join(dir, 'coord'), ledger = join(dir, 'ledger');
       writeFileSync(settings, JSON.stringify({ mergeDelivery: { strategy: 'github-merge-queue' } }));
+      const preferences = join(dir,'preferences.json');
+      writeFileSync(preferences,'{}');
+      mkdirSync(join(dir, 'scripts'));
+      writeFileSync(join(dir, 'scripts', 'drain-overlap-yield-config.json'), JSON.stringify({ enabled:true, windowMinutes:45 }));
       const pr = { number: 42, id: 'PR_NODE', title: 'Update readme', body: 'Update the readme.', state: 'OPEN', isDraft: false,
         headRefOid: sha, headRefName: 'lane/readme', baseRefName: 'main', mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED',
         labels: [{name:'review:accepted'},{name:'ready-to-merge'}], files: [{path:'README.md',changeType:'MODIFIED'}],
@@ -28,10 +32,11 @@ export function createPrestageWorld(runCommand) {
         comments: [{author:{login:'chalbert'},body:'<!-- reviewed-sha: '+sha+' -->',createdAt:new Date().toISOString()}], reviews: [] };
       const run = async (green = false, { rebaseDrop = false, numbering = false, thisRepo = true, args = [], shadowMode = 'off', defaultBranch = 'main', failDefaultBranch = false } = {}) => {
         writeFileSync(fixture, JSON.stringify(pr)); writeFileSync(log, '');
-        const r = await runCommand([ ...(thisRepo ? ['--this-repo'] : []),'--label=ready-to-merge','--only=42', '--json', ...args,
-          '--no-drain-lease','--no-red-main-freeze',...(!rebaseDrop ? ['--no-rebase-drop'] : []),'--no-heal-collision','--no-overlap-yield',
+        const r = await runCommand([ ...(thisRepo ? ['--this-repo'] : []),'--label=ready-to-merge',...(!overlapYield ? ['--only=42'] : []), '--json', ...args,
+          '--no-drain-lease','--no-red-main-freeze',...(!rebaseDrop ? ['--no-rebase-drop'] : []),'--no-heal-collision',...(overlapYield ? ['--overlap-yield','--overlap-yield-window=45'] : ['--no-overlap-yield']),
           ...(green ? ['--from-green-event'] : [])], { cwd:dir,encoding:'utf8',timeout:120_000, // a loaded host can push one real drain run past 30s
           env: { ...process.env, ...daemonAppEnv(dir), PATH:bin+':'+process.env.PATH, PRESTAGE_PR:fixture,PRESTAGE_LOG:log, PRESTAGE_REPO:slug,
+            ...(overlapYield ? { WE_PLATFORM_PREFERENCES_FILE:preferences } : {}),
             PRESTAGE_DEFAULT_BRANCH:defaultBranch, PRESTAGE_FAIL_BRANCH:failDefaultBranch ? '1' : '0',
             ...(failDefaultBranch ? { WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS:'1' } : {}),
             WE_COORDINATION_ROOT:coord, WE_ASYNC_DRAIN:shadowMode, LANE_POOL_ROOT:dir, WE_MERGE_DELIVERY_SETTINGS_FILE:settings,

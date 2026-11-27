@@ -357,6 +357,7 @@ export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync, prepar
     let decision;
     try { decision = sameHeadAdmission(); } catch { /* Unreadable admission retains the hold below. */ }
     if (decision?.hold !== false) return { ok: false, held: true, reason: 'mq-same-head-failed',
+      cause: decision?.cause === 'head-failed' ? 'head-failed' : 'unknown',
       error: decision?.line || 'mq-same-head-failed: unreadable fresh merge-queue admission; inspect timeline before retrying' };
   }
   try {

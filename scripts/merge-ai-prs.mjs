@@ -255,7 +255,7 @@ export { mapWithConcurrency } from './lib/drain-concurrency.mjs';
 import { runLedgerShadow, formatShadowLine } from './lib/drain-ledger-shadow.mjs'; // #5444 — ledger gate in SHADOW beside the labels; journals, never decides
 import { drainReviewGateFact, readDrainLedgerSnapshot, recordDrainLedgerFacts } from './lib/drain-ledger-facts.mjs';
 import { computeOverlapContext, parseOverlapYieldOverrides, isExemptItem, overlapRowKey, readyToMergeLabelTimeMs } from './conveyor/land-overlap-yield.mjs'; // + readyToMergeLabelTimeMs: the drain order's ready-at (same cached label read) // #4308 — the land-time overlap-yield planner (see planLabelDrain's own `overlapContext` param)
-import { filterEnqueueableOverlapRows, resolveOverlapYieldOnlyToEnqueueableSetting, formatOverlapYieldOnlyToEnqueueableSetting, resolveOverlapYieldRequiresLandableSetting, formatOverlapYieldRequiresLandableSetting } from './conveyor/overlap-yield-enqueueable.mjs';
+import { confirmedHeldTargetKey, filterEnqueueableOverlapRows, resolveOverlapYieldOnlyToEnqueueableSetting, formatOverlapYieldOnlyToEnqueueableSetting, resolveOverlapYieldRequiresLandableSetting, formatOverlapYieldRequiresLandableSetting } from './conveyor/overlap-yield-enqueueable.mjs';
 import { rankByDeliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIORITY_MODES } from './lib/delivery-priority.mjs'; // drain order (2026-10-10): the shared P0-P4 class rule
 import { readDeliveryPrioritySettings } from './conveyor/delivery-priority-shadow.mjs'; // drain order: the shared aging/cap settings (platform preference `deliveryPriority`)
 import { execFileSyncThrottled } from './lib/gh-throttle.mjs'; // drain order: the operator-override labeler read
@@ -2724,7 +2724,7 @@ const OVERLAP_FILES_PAGE_CAP = 100;
  * {@link overlapRowKey} on an ALREADY-normalized row — never re-inline the `${repo||''}#${num}` template.
  * @returns {{candidateRows:object[], openPrRows:object[]}}
  */
-export function buildOverlapRows({ candidates, verdicts, openPrContext, mergedPrKeys = new Set(), localSlug = null, requiredCheck = 'test' } = {}) {
+export function buildOverlapRows({ candidates, verdicts, openPrContext, mergedPrKeys = new Set(), localSlug = null, requiredCheck = 'test', heldTargets = new Set() } = {}) {
   const verdictByKey = new Map();
   for (const v of (Array.isArray(verdicts) ? verdicts : [])) verdictByKey.set(overlapRowKey({ repo: v.repo || localSlug, number: v.num }), v);
   const rowsByKey = new Map();
@@ -2759,7 +2759,7 @@ export function buildOverlapRows({ candidates, verdicts, openPrContext, mergedPr
     if (!base) continue; // no raw listing row — should not happen for a candidate drawn from this same listing
     candidateRows.push({ ...base, exempt: isExemptItem(c.item) });
   }
-  return { candidateRows, openPrRows: filterEnqueueableOverlapRows({ openPrRows, verdicts, localSlug, enabled: resolveOverlapYieldOnlyToEnqueueableSetting({ argv, env: process.env }).value, requiresLandable: resolveOverlapYieldRequiresLandableSetting({ argv, env: process.env }).value }) };
+  return { candidateRows, openPrRows: filterEnqueueableOverlapRows({ openPrRows, verdicts, localSlug, heldTargets, enabled: resolveOverlapYieldOnlyToEnqueueableSetting({ argv, env: process.env }).value, requiresLandable: resolveOverlapYieldRequiresLandableSetting({ argv, env: process.env }).value }) };
 }
 
 const overlapNetDiffCache = new Map();
@@ -5285,7 +5285,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       log: line => process.stderr.write(`${line}\n`) });
     // The visible reason (decline/accept text with the deciding main run id) replaces the bare hold line.
     const shown = { line: guard.reason ?? guard.line };
-    if (guard.hold) return { enqueued: false, kind: 'mq-same-head-failed', reason: shown.line };
+    if (guard.hold) return { enqueued: false, kind: 'mq-same-head-failed', reason: shown.line,
+      cause: guard.cause === 'head-failed' ? 'head-failed' : 'unknown' };
     const result = mergeStrategy.enqueue(c, sha, { ...options,
       // The early queued bypass authorizes bookkeeping only. If membership disappears during the
       // strategy's other checks, require fresh timeline admission immediately before any mutation.
@@ -7364,9 +7365,11 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     lastDrainOrderLog = sig;
     process.stderr.write(`${lines.join('\n')}\n`);
   };
-  const overlapRows0 = buildOverlapRows({ candidates: verdicts, verdicts, openPrContext, mergedPrKeys: new Set(), localSlug, requiredCheck: REQUIRED });
+  const overlapHeldTargets = new Set();
+  const overlapRows0 = buildOverlapRows({ candidates: verdicts, verdicts, openPrContext, mergedPrKeys: new Set(), localSlug, requiredCheck: REQUIRED, heldTargets: overlapHeldTargets });
   const overlapNet0 = refineOverlapRowsToNetDiff({ ...overlapRows0, localSlug, readFiles: readOverlapNetDiff });
   const overlapCtx0 = computeOverlapContext({ candidateRows: overlapNet0.candidateRows, openPrRows: overlapNet0.openPrRows, overrides: overlapYieldOverrides });
+  let previousOverlapContext = overlapCtx0;
   logOverlapYields(overlapCtx0);
   const preparedPass = planDrainPass({
     verdicts,
@@ -7396,9 +7399,20 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     // (openPrContext.prsByRepo is a pass-START snapshot and would otherwise still show a landed PR as open —
     // the same staleness #3004 documents elsewhere in this cascade).
     const mergedPrKeys = new Set(merged.map((m) => overlapRowKey({ repo: m.repo || localSlug, number: m.num })));
-    const rows = buildOverlapRows({ candidates: cands, verdicts, openPrContext, mergedPrKeys, localSlug, requiredCheck: REQUIRED });
+    const rows = buildOverlapRows({ candidates: cands, verdicts, openPrContext, mergedPrKeys, localSlug, requiredCheck: REQUIRED, heldTargets: overlapHeldTargets });
     const netRows = refineOverlapRowsToNetDiff({ ...rows, localSlug, readFiles: readOverlapNetDiff });
     const octx = computeOverlapContext({ candidateRows: netRows.candidateRows, openPrRows: netRows.openPrRows, overrides: overlapYieldOverrides });
+    // Log actual waiter relief after filtering, so a disabled landable policy or a
+    // mismatched listed head cannot claim a release. Each old wait disappears once.
+    for (const [key, wait] of previousOverlapContext.waits) {
+      const target = overlapRows0.openPrRows.find(row => row.number === wait.yieldTo && row.repo === wait.repo);
+      if (target && overlapHeldTargets.has(`${overlapRowKey(target)}@${target.headSha}`)
+        && netRows.candidateRows.some(row => overlapRowKey(row) === key)
+        && octx.waits.get(key)?.yieldTo !== wait.yieldTo) {
+        process.stderr.write(`overlap-yield released: ${key} no longer yields to #${wait.yieldTo} (mq-same-head-failed head-failed at ${target.headSha.slice(0, 12)})\n`);
+      }
+    }
+    previousOverlapContext = octx;
     logOverlapYields(octx);
     const p = planLabelDrain(cands, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems: orderExtraOpenItems, ...contextProofFields(openPrContext), strictAbsentHashDependencies: onlyPr != null, isWeRepo: isLocalRepo, overlapContext: octx.waits, overlapSkips: octx.skips, overlapLocalSlug: localSlug, readyOrder: readyOrderCtx() });
     logDrainOrder(p);
@@ -7645,6 +7659,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     const sameCand = (a, b) => a.num === b.num && a.repo === b.repo;
     let staleLandedOpenItems = [];
     for (;;) {
+      const sizeAtIterationStart = overlapHeldTargets.size;
+      const outcomesAtIterationStart = enqueueOutcomes.length;
       // #3004 — RE-DERIVE the negative counter-evidence immediately before every re-plan, from `verdicts`' carriers
       // against the pass-start open-ref snapshot MINUS the refs actually merged so far. This is the only wiring
       // that reaches a live plan: `planDrainPass`'s plan is consumed by the DRY-RUN report, while the live cascade
@@ -7980,7 +7996,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
             try { asyncShadow?.recordActual({ repo: c.repo || localSlug, num: c.num, headSha: traceHeadSha }); } catch { /* timing only */ }
           }
           if (landLock.result?.enqueued === false) {
-            recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: landLock.result.kind || 'batching-deferred', reason: landLock.result.reason, healthSmell: !!landLock.result.healthSmell });
+            recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: landLock.result.kind || 'batching-deferred', reason: landLock.result.reason, cause: landLock.result.cause, headSha: traceHeadSha, healthSmell: !!landLock.result.healthSmell });
             if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} not enqueued: ${landLock.result.kind || 'batching-deferred'}: ${landLock.result.reason || 'admission deferred'} — retried next pass\n`);
           }
           if (mergeStrategy.enqueues(c.repo)) { const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; } // xtpxusq — queued, not merged: keeps blocking dependents until GitHub merges it
@@ -8045,7 +8061,13 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       }
         },
       });
-      if (!progressed) break; // every ready candidate failed → stop (dependents stay deferred)
+      // Only outcomes recorded this iteration may grant pass-local relief. Held
+      // candidates are already skip, so each key is learned at most once (at most 2N iterations).
+      for (const outcome of enqueueOutcomes.slice(outcomesAtIterationStart)) {
+        const key = confirmedHeldTargetKey(outcome, localSlug);
+        if (key) overlapHeldTargets.add(key);
+      }
+      if (!progressed && overlapHeldTargets.size === sizeAtIterationStart) break; // no new relief; dependents stay deferred
     }
     // required-workflows refusal (ruleset 24930207): one refresh, then await fresh workflow runs.
     if (requiredWorkflowsRefusals.length) {
