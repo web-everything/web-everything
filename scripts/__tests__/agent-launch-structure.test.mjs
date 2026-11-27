@@ -1,5 +1,10 @@
 /** Literal-call lint tripwire only, NOT the security boundary. Same-file aliases over-approximate names
- * (shadowing is ignored); dynamic commands and cross-file re-exports remain out of scope.
+ * (shadowing is ignored); same-file string bindings over-approximate scope and ignore reassignment.
+ * Unresolved forms include imported constants, member commands, fallback/ternary expressions,
+ * interpolated templates, parenthesized arguments, plain reassignment, bare identifier aliases
+ * (const run = spawn), cross-file re-exports and wrapper callees (spawnToCompletion).
+ * The walk only scans .mjs, skips .test.mjs/.spec.mjs, and skips __tests__, tests, fixtures,
+ * node_modules and .git directories.
  * @repo-scanning-test scope=full — complete literal launch counts under scripts and symlinked skills.
  */
 import { describe, expect, it } from 'vitest';
@@ -12,9 +17,13 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '../..');
 function literalLaunches(source) {
   const found = [];
   const aliases = new Set();
+  const bindings = [];
+  const strings = new Map();
   const primitive = /^(?:spawn|exec|execFile|fork)(?:Sync|Fn)?$/;
   const file = ts.createSourceFile('source.mjs', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
   function collect(node) {
+    if ((ts.isVariableDeclaration(node) || ts.isParameter(node) || ts.isBindingElement(node))
+      && ts.isIdentifier(node.name) && node.initializer) bindings.push([node.name.text, node.initializer]);
     if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)
       && ['node:child_process', 'child_process'].includes(node.moduleSpecifier.text)) {
       const bindings = node.importClause?.namedBindings;
@@ -40,6 +49,17 @@ function literalLaunches(source) {
     ts.forEachChild(node, collect);
   }
   collect(file);
+  let changed;
+  do {
+    changed = false;
+    for (const [name, initializer] of bindings) {
+      const values = ts.isStringLiteralLike(initializer) ? [initializer.text]
+        : ts.isIdentifier(initializer) ? strings.get(initializer.text) ?? [] : [];
+      if (!strings.has(name)) strings.set(name, new Set());
+      const target = strings.get(name);
+      for (const value of values) if (!target.has(value)) { target.add(value); changed = true; }
+    }
+  } while (changed);
   function visit(node) {
     if (ts.isCallExpression(node)) {
       const callee = node.expression;
@@ -47,8 +67,12 @@ function literalLaunches(source) {
         : ts.isElementAccessExpression(callee) && ts.isStringLiteral(callee.argumentExpression)
           ? callee.argumentExpression.text : callee.getText();
       const arg = node.arguments[0];
-      if ((primitive.test(name) || (ts.isIdentifier(callee) && aliases.has(callee.text))) && arg && ts.isStringLiteralLike(arg)
-        && /^(?:claude|codex)(?: |$)/.test(arg.text)) found.push(arg.text);
+      if ((primitive.test(name) || (ts.isIdentifier(callee) && aliases.has(callee.text))) && arg) {
+        const values = ts.isStringLiteralLike(arg) ? [arg.text]
+          : ts.isIdentifier(arg) ? strings.get(arg.text) ?? [] : [];
+        const command = [...values].find(value => /^(?:claude|codex)(?: |$)/.test(value));
+        if (command !== undefined) found.push(command);
+      }
     }
     ts.forEachChild(node, visit);
   }
@@ -105,6 +129,45 @@ describe('literal agent process call tripwire', () => {
         const s = cp.spawnOther; s('${command}');
       `)).toHaveLength(0);
     }
+  });
+  it('resolves a same-file string constant or defaulted parameter as the launched command', () => {
+    expect(literalLaunches("export const CODEX_CLI = 'codex'; function run({ spawnFn = x, cli = CODEX_CLI } = {}) { spawnFn(cli, []); } const C = 'claude -p'; spawn(C);")).toHaveLength(2);
+    for (const source of [
+      "function f(bin = 'codex') { execFile(bin, []); }",
+      "let L = 'codex'; fork(L);",
+      "const A = 'codex'; const B = A; function g(c = B) { spawn(c); }",
+      "function h({ cli = LATE } = {}) { spawnFn(cli); } const LATE = 'codex';",
+      "const cli = 'git'; function k({ cli = 'codex' } = {}) { spawn(cli); }",
+      "function g(c = B) { spawn(c); } const B = A; const A = 'codex';",
+      "function k({ cli = 'codex' } = {}) { spawn(cli); } const cli = 'git';",
+      "var a = b; var b = a; var a = 'codex'; spawn(b);",
+      "var V = 'codex'; execFile(V, []);",
+      "import { spawn as run } from 'node:child_process'; const C = 'codex'; run(C);",
+    ]) expect(literalLaunches(source), source).toHaveLength(1);
+    expect(literalLaunches("const c = 'codex'; function f({ c = 'claude -p' } = {}) { spawn(c); }")).toEqual(['codex']);
+    expect(literalLaunches("var { cli = 'codex' } = opts; const [ bin = 'claude' ] = list; spawn(cli); spawn(bin);")).toHaveLength(2);
+  });
+  it('leaves unresolved and non-agent bindings uncounted (documented gaps)', () => {
+    for (const source of [
+      "const G = 'git'; spawn(G)", "spawn(unknownVar)", "const C = 'codex'; log(C)",
+      "const N = 'codexx'; spawn(N)", "const a = b; const b = a; spawn(a)",
+      "spawn(opts.cli)", "import { CODEX_CLI } from './x.mjs'; spawn(CODEX_CLI)",
+      "spawn(a ?? 'codex')", "spawn(x ? 'codex' : 'git')",
+      "spawn(`${'codex'}`); const t = `codex ${y}`; spawn(t);",
+      "let r; r = 'codex'; spawn(r)",
+      "spawnToCompletion('claude', []); const W = 'codex'; spawnToCompletion(W, []);",
+      "const run = spawn; run('codex')", "spawn(('codex'))",
+    ]) expect(literalLaunches(source), source).toEqual([]);
+  });
+  it('resolves a long reversed chain with many collisions quickly', () => {
+    const source = [
+      'function f(c = A200) { spawn(c); spawn(cli); }',
+      ...Array.from({ length: 200 }, (_, i) => `const A${i + 1} = A${i}; const cli = 'v${i}';`),
+      "const A0 = 'codex';",
+    ].join('\n');
+    const start = performance.now();
+    expect(literalLaunches(source)).toEqual(['codex']);
+    expect(performance.now() - start).toBeLessThan(250);
   });
   it('rejects one extra launch in an approved file, while preserving the existing site', () => {
     const existing = "spawn('claude', []);";

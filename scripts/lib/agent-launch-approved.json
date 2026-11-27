@@ -1,4 +1,5 @@
 {
+  "scripts/codex-direct-task.mjs": 1,
   "scripts/conveyor/claude-auth-health.mjs": 1,
   "scripts/conveyor/driver-watchdog.mjs": 1,
   "scripts/conveyor/health-watch.mjs": 1,
@@ -11,6 +12,7 @@
   "scripts/conveyor/stuck-prs.mjs": 1,
   "scripts/lane-whois.mjs": 1,
   "scripts/lib/claude-sessions.mjs": 1,
+  "scripts/lib/codex-judge-spawn.mjs": 1,
   "scripts/lib/lane-salvage.mjs": 1,
   "scripts/lib/pr-state-io.mjs": 1,
   "scripts/lib/review-precedents-io.mjs": 1,
