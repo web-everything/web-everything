@@ -281,6 +281,20 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
       fs.mkdirSync(dirname(path), { recursive: true });
       fs.appendFileSync(path, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 });
     },
+    invalidatePriorGreen: (sha, failure) => {
+      let ledger;
+      try { ledger = String(fs.readFileSync(urgentLedger(home), 'utf8')); }
+      catch (e) { if (e.code === 'ENOENT') return; } // Unknown evidence must be superseded too.
+      if (ledger !== undefined) {
+        let records;
+        try { records = ledger.split(/\r?\n/).filter(l => l.trim()).map(l => JSON.parse(l)); }
+        catch { return; } // The gate already refuses a malformed ledger in its entirety.
+        if (records.filter(r => r?.sha === sha).at(-1)?.result !== 'green') return;
+      }
+      const record = { sha, result: 'deferred', finishedAt: self.now(), failure };
+      record.sig = urgentSignature(record, self.readKey());
+      self.append(record);
+    },
     // Signing state is off limits while checkout code runs. The key file and the ledger are locked (mode 000 / 400)
     // and fingerprinted; any change after a step means red. Restored by release() before the parent signs and appends.
     // Residual (same uid): a step could chmod the key back and read it; it cannot change it undetected.
@@ -331,8 +345,12 @@ export async function urgentVerify({ sha }, deps = createUrgentDeps({ isolated: 
       if (finalFui.sha !== fuiSha || finalFui.repo !== fuiRepo) throw new Error('FUI sibling changed');
     } catch (e) {
       failure = { step: currentStep, message: String(e?.message ?? e), ...(e?.failure ?? {}) };
-      if (e?.deferred === true) return { ok: false, deferred: true, detail: 'admission-deferred', failure,
-        fallback: 'No heavy slot was free; nothing ran. Retry urgent-verify when `heavy-admission.mjs queue-status` shows a free slot, or wait for passing CI.' };
+      if (e?.deferred === true) {
+        guard?.release();
+        deps.invalidatePriorGreen?.(sha, failure);
+        return { ok: false, deferred: true, detail: 'admission-deferred', failure,
+          fallback: 'No heavy slot was free; nothing ran. Retry urgent-verify when `heavy-admission.mjs queue-status` shows a free slot, or wait for passing CI.' };
+      }
       result = 'red';
       console.error(`urgent-verify RED at step ${failure.step}: ${failure.message}${failure.stderrTail ? `\n${failure.stderrTail}` : ''}`);
     }
