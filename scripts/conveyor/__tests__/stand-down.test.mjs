@@ -16,7 +16,8 @@
  *   invisible.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { readFileSync, mkdtempSync, writeFileSync, rmSync, mkdirSync, existsSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
@@ -29,9 +30,13 @@ import {
 } from '../stand-down.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { CI_HEAL_COMMENT_MARKER } from '../ci-heal-mark.mjs';
+import { runStandDownAnswer } from '../stand-down-answer.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const BRIEF = resolve(HERE, '../../../skills-src/conveyor/fix-agent-brief.md');
+// Load the raw asset through Vitest: its related-test analyser tries to parse a static .md import as JS.
+const { default: briefSource } = await vi.importActual('../../../skills-src/conveyor/fix-agent-brief.md?raw');
+const { default: standDownSource } = await vi.importActual('../stand-down.mjs?raw');
 
 // #3383 — every counter now also requires a TRUSTED author (`we:scripts/lib/marker-authorship.mjs`). This is the
 // real automation login, confirmed live (`web-everything/web-everything#2578`/`#2602`/`#2607`); fixtures below that
@@ -704,4 +709,274 @@ describe('out-of-diff timeout stand-down is a re-armable load-flake hold (#6469)
   it('a bare timeout with no unrelated/other-tests-pass evidence stays terminal', () => {
     expect(isLoadOnlyRedStandDown(mk("foo.test.mjs 'x' timed out at 15000ms"))).toBe(false);
   });
+});
+
+
+// Pinned from 0df17aa8b956de8a8aab80e8951d49ea58600cb5; no git read at test time.
+const BASELINE_EXITS = {
+  'needs-judgment': String.raw`
+node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=needs-judgment \
+  --finding-refs="$(cat -- "$FINDING_REFS_FILE")" \
+  --detail="<one line — what you could not decide>"
+node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=escalated-needs-judgment
+node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
+`,
+  conflict: String.raw`
+node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=conflict \
+  --detail="<one line — what made the overlap unsafe to resolve automatically>"
+node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=escalated-conflict
+node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
+`,
+  'gate-red': String.raw`
+node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=gate-red \
+  --detail="<one line — which check stayed red>"
+node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=gate-red
+node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
+`,
+};
+const FIXTURE_HEAD = 'abcdef0123456789abcdef0123456789abcdef01';
+const FIXTURE_TIME = '2026-11-27T12:00:00Z';
+const EXIT_REASONS = Object.keys(BASELINE_EXITS);
+const SHELLS = ['/bin/bash', '/bin/zsh'];
+const BRIEF_PATH = 'skills-src/conveyor/fix-agent-brief.md';
+
+function terminalExit(source, reason) {
+  const blocks = [...source.matchAll(/```bash\n([\s\S]*?)```/g)]
+    .map(m => m[1]).filter(block => block.includes('conveyor/stand-down.mjs')
+      && block.includes(`--reason=${reason} `));
+  expect(blocks, reason).toHaveLength(1);
+  return blocks[0];
+}
+
+// Raw imports are source dependencies. All new test filesystem reads use the injected temporary root.
+function withExitFixture(run, { source = briefSource, head = FIXTURE_HEAD, gitStatus = 0, mode = 'normal' } = {}) {
+  const root = mkdtempSync(resolve(tmpdir(), 'stand-down-head-'));
+  const put = (path, text, executable = false) => {
+    const dest = resolve(root, path);
+    mkdirSync(dirname(dest), { recursive: true });
+    writeFileSync(dest, text, executable ? { mode: 0o755 } : undefined);
+    return dest;
+  };
+  const nodeShim = body => `#!${process.execPath}\n${body}\n`;
+  put('package.json', '{"type":"module"}');
+  const log = resolve(root, 'calls.jsonl');
+  const pids = resolve(root, 'pids');
+  const gitLog = resolve(root, 'git.jsonl');
+  const brief = put(BRIEF_PATH, source);
+  const refs = put('finding-refs.json', '[{"runId":"fixture-run","key":"fixture-key"}]');
+  const recorder = `
+    import { appendFileSync } from 'node:fs';
+    appendFileSync(process.env.FIXTURE_CALLS, JSON.stringify({
+      script: process.argv[1].split('/').at(-1), args: process.argv.slice(2)
+    }) + '\\n');
+  `;
+  for (const script of ['conveyor/stand-down.mjs', 'operations/completion-cli.mjs', 'conveyor/fix-procedure.mjs']) {
+    put(`scripts/${script}`, recorder);
+  }
+  put('bin/node', nodeShim(`
+    import { spawnSync } from 'node:child_process';
+    const r = spawnSync(${JSON.stringify(process.execPath)}, process.argv.slice(2), {
+      env: process.env, cwd: process.env.FIXTURE_ROOT, encoding: 'utf8', timeout: 2000, maxBuffer: 65536
+    });
+    if (r.error) throw r.error;
+    process.stdout.write(r.stdout); process.stderr.write(r.stderr); process.exit(r.status ?? 99);
+  `), true);
+  put('bin/date', nodeShim(`process.stdout.write(${JSON.stringify(FIXTURE_TIME + '\n')});`), true);
+  put('bin/mktemp', nodeShim(`
+    import { writeFileSync } from 'node:fs';
+    const file = process.env.FIXTURE_ROOT + '/lookup-output';
+    writeFileSync(file, '', { flag: 'wx', mode: 0o600 });
+    process.stdout.write(file + '\\n');
+  `), true);
+  for (const command of ['gh', 'pgrep', 'ps', 'launchctl']) {
+    put(`bin/${command}`, nodeShim(`throw new Error('unexpected external command: ${command}');`), true);
+  }
+  put('bin/git', `#!/bin/sh
+ test "$*" = "ls-remote --exit-code origin refs/heads/lane/fixture-head" || exit 97
+ test "$GIT_TERMINAL_PROMPT" = 0 || exit 98
+ printf '%s\\n' "$*" >> "$FIXTURE_GIT_LOG"
+ ${mode === 'normal' ? '' : `echo "$$" >> "$FIXTURE_PIDS"
+ sleep 600 &
+ child=$!
+ echo "$child" >> "$FIXTURE_PIDS"
+ ${mode === 'hang' ? 'wait "$child"' : ''}`}
+ ${head ? `printf '%s\\trefs/heads/x\\n' '${head}'` : ''}
+ exit ${gitStatus}
+ `, true);
+  put('home/.keep', '');
+  const env = {
+    PATH: `${resolve(root, 'bin')}:/usr/bin:/bin`, HOME: resolve(root, 'home'),
+    ZDOTDIR: resolve(root, 'empty-zdotdir'), TMPDIR: root, LC_ALL: 'C',
+    FIXTURE_ROOT: root, FIXTURE_CALLS: log, FIXTURE_PIDS: pids, FIXTURE_GIT_LOG: gitLog,
+    FINDING_REFS_FILE: refs,
+  };
+  const execute = (block, shell, flags = '-e') => {
+    writeFileSync(log, '');
+    const bindings = { WE_ROOT: root, PR_NUM: '123', REPO: 'fixture/repo', SESSION_SLUG: 'fixture-session', LANE_REF: 'lane/fixture-head' };
+    const rendered = block.replace(/\{\{(\w+)\}\}/g, (_, name) => {
+      if (!(name in bindings)) throw new Error(`unbound placeholder ${name}`);
+      return bindings[name];
+    });
+    const start = performance.now();
+    const result = spawnSync(shell, ['-f', flags, '-c', rendered], {
+      cwd: root, env, encoding: 'utf8', timeout: 8000, maxBuffer: 65536, killSignal: 'SIGKILL',
+    });
+    if (result.error) throw result.error;
+    return { ...result, elapsed: performance.now() - start,
+      calls: readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse) };
+  };
+  try {
+    return run({ root, put, execute, env, source: readFileSync(brief, 'utf8'), pids, gitLog });
+  } finally {
+    // Inspect/clean only PIDs this fixture created; never scan host processes.
+    if (existsSync(pids)) {
+      for (const pid of readFileSync(pids, 'utf8').trim().split('\n').map(Number)) {
+        try { process.kill(pid, 'SIGKILL'); } catch (e) { if (e.code !== 'ESRCH') throw e; }
+      }
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+
+describe('STANDDOWN-HEAD-TRAILER fix-brief contract', () => {
+  it.each(EXIT_REASONS)('SH6 %s uses the bounded R1 lookup and conditionally passes --head', reason => {
+    withExitFixture(({ source }) => {
+      const block = terminalExit(source, reason);
+      expect(block).toContain('HEAD_SHA="$(set +e; LSF="$(mktemp)";');
+      expect(block).toContain('GIT_TERMINAL_PROMPT=0 perl');
+      expect(block).toContain('git ls-remote --exit-code origin "refs/heads/{{LANE_REF}}" >"$LSF"');
+      expect(block).toContain('for _ in $(seq 1 40)');
+      expect(block).toContain('sleep 0.5');
+      expect(block).toContain('kill -KILL -- "-$LSP"');
+      expect(block).toContain("grep -Eqx '[0-9a-f]{40}'");
+      expect(block).toContain('|| HEAD_SHA=""');
+      expect(block.match(/node "[^\n]*stand-down\.mjs"[^\n]*/)?.[0])
+        .toContain('${HEAD_SHA:+--head="$HEAD_SHA"}');
+    });
+  });
+  it('SH9 has no runnable stand-down suggestion outside the five command blocks', () => {
+    withExitFixture(({ source }) => {
+      const blocks = [...source.matchAll(/```bash\n([\s\S]*?)```/g)]
+        .filter(m => m[1].includes('conveyor/stand-down.mjs'));
+      expect(blocks).toHaveLength(5);
+      const prose = blocks.reduce((text, block) => text.replace(block[0], ''), source);
+      expect(prose.split('\n').filter(line => /stand-down\.mjs"?\s+\{\{PR_NUM\}\}/.test(line))).toEqual([]);
+    });
+  });
+  for (const shell of SHELLS) {
+    for (const reason of EXIT_REASONS) {
+      it(`SH11a ${reason} passes the looked-up head under ${shell} -e`, () => {
+        withExitFixture(({ execute, source, gitLog }) => {
+          const baseline = execute(BASELINE_EXITS[reason], shell);
+          const result = execute(terminalExit(source, reason), shell);
+          expect(baseline.status, baseline.stderr).toBe(0);
+          expect(result.status, result.stderr).toBe(0);
+          expect(result.calls).toHaveLength(3);
+          expect(result.calls[0].args, result.stderr).toContain(`--head=${FIXTURE_HEAD}`);
+          expect(result.calls.map(call => ({ ...call, args: call.args.filter(a => !a.startsWith('--head=')) }))).toEqual(baseline.calls);
+          expect(readFileSync(gitLog, 'utf8').trim().split('\n')).toEqual(['ls-remote --exit-code origin refs/heads/lane/fixture-head']);
+          expect(result.stderr).toContain(`HEAD-LOOKUP rc=0 head=${FIXTURE_HEAD} at=${FIXTURE_TIME}`);
+        });
+      });
+      it.each([
+        ['exit 2', '', 2], ['empty output', '', 0], ['not hex', 'nothex', 0],
+        ['exit 128 with a head', FIXTURE_HEAD, 128], ['uppercase', FIXTURE_HEAD.toUpperCase(), 0],
+        ['39 hex', 'a'.repeat(39), 0], ['41 hex', 'a'.repeat(41), 0],
+      ])(`SH11b ${reason} preserves baseline calls under ${shell} -e for %s`, (_label, head, gitStatus) => {
+        withExitFixture(({ execute, source }) => {
+          const baseline = execute(BASELINE_EXITS[reason], shell);
+          const result = execute(terminalExit(source, reason), shell);
+          expect(baseline.status, baseline.stderr).toBe(0);
+          expect(result.status, result.stderr).toBe(0);
+          expect(result.calls).toEqual(baseline.calls);
+          expect(result.calls.map(c => c.script)).toEqual(['stand-down.mjs', 'completion-cli.mjs', 'fix-procedure.mjs']);
+          expect(result.calls[0].args.some(a => a.startsWith('--head='))).toBe(false);
+        }, { head, gitStatus });
+      });
+      it.each(['hang', 'stdout-child'])(`SH11c ${reason} exit block runs stand-down, completion and fix-end when ls-remote hangs (${shell}, %s)`, mode => {
+        withExitFixture(({ execute, source, pids }) => {
+          const block = terminalExit(source, reason);
+          expect(block).toContain('for _ in $(seq 1 40)');
+          const baseline = execute(BASELINE_EXITS[reason], shell);
+          const result = execute(block.replace('for _ in $(seq 1 40)', 'for _ in $(seq 1 6)'), shell);
+          expect(result.status, result.stderr).toBe(0);
+          expect(existsSync(pids), result.stderr).toBe(true);
+          const recorded = readFileSync(pids, 'utf8').trim().split('\n').map(Number);
+          expect(recorded).toHaveLength(2);
+          for (const pid of recorded) {
+            expect(() => process.kill(pid, 0), `fixture descendant ${pid} survived`).toThrowError(expect.objectContaining({ code: 'ESRCH' }));
+          }
+          expect(result.elapsed).toBeLessThan(mode === 'hang' ? 6000 : 3000);
+          const expected = structuredClone(baseline.calls);
+          if (mode !== 'hang') expected[0].args.splice(4, 0, `--head=${FIXTURE_HEAD}`);
+          expect(result.calls).toEqual(expected);
+          expect(result.stderr).toContain(mode === 'hang'
+            ? 'HEAD-LOOKUP rc=124 head=none' : `HEAD-LOOKUP rc=0 head=${FIXTURE_HEAD}`);
+        }, { mode });
+      }, 10000);
+    }
+  }
+  it.each(EXIT_REASONS)('SH11a %s also survives bash -eu', reason => {
+    withExitFixture(({ execute, source }) => {
+      const result = execute(terminalExit(source, reason), '/bin/bash', '-eu');
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.calls[0].args).toContain(`--head=${FIXTURE_HEAD}`);
+      expect(result.calls.map(c => c.script)).toEqual(['stand-down.mjs', 'completion-cli.mjs', 'fix-procedure.mjs']);
+    });
+  });
+});
+
+it('SH5 CLI posts once with the supplied full head at the end of the trailer', () => {
+  withExitFixture(({ root, put, env }) => {
+    // Exercise actual CLI source with explicit ports, including repo identity and claim release.
+    const cli = put('scripts/conveyor/stand-down.mjs', standDownSource);
+    put('scripts/lib/constellation-repos.mjs', "export const repoKeyForSlug = slug => slug === 'fixture/repo' ? 'fixture' : null;");
+    put('scripts/lib/bounded-child.mjs', 'export const resolveChildTimeoutMs = () => 2000;');
+    put('scripts/lib/marker-authorship.mjs', "export const isTrustedMarkerAuthor = c => c?.author?.login === 'fixture-bot';");
+    put('scripts/lib/github-app-identity.mjs', "export const readBotLogins = () => ['fixture-bot'];");
+    put('scripts/lib/policy-cascade.mjs', "export const cascadePolicy = () => { throw new Error('unexpected settings read'); };");
+    put('scripts/conveyor/fix-dispatch-claim.mjs', 'export const releaseSessionFixDispatchClaims = () => ({ released: [] });');
+    const driver = put('driver.mjs', `
+      import child from 'node:child_process';
+      import { syncBuiltinESMExports } from 'node:module';
+      import { appendFileSync } from 'node:fs';
+      child.execFileSync = (cmd, args) => {
+        if (cmd !== 'gh') throw new Error('unexpected command: ' + cmd);
+        appendFileSync(process.env.FIXTURE_CALLS, JSON.stringify(args) + '\\n');
+        return '';
+      };
+      syncBuiltinESMExports();
+      process.argv = [process.execPath, ${JSON.stringify(cli)}, '123', '--repo=fixture/repo',
+        '--who=s', '--reason=needs-judgment', '--head=${FIXTURE_HEAD}'];
+      await import(${JSON.stringify(cli)});
+    `);
+    const result = spawnSync(process.execPath, [driver], { cwd: root, env, encoding: 'utf8', timeout: 5000, maxBuffer: 65536 });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    const calls = readFileSync(env.FIXTURE_CALLS, 'utf8').trim().split('\n').map(JSON.parse);
+    const posts = calls.filter(args => args[0] === 'pr' && args[1] === 'comment');
+    expect(posts).toHaveLength(1);
+    expect(posts[0][posts[0].indexOf('--body') + 1]).toMatch(new RegExp(`head=${FIXTURE_HEAD} -->$`));
+  });
+});
+
+it.each(['on', 'off'])('SH12/SH12b moved head with lapseOnNewHead=%s still refuses a no-code preview', lapseOnNewHead => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date(FIXTURE_TIME));
+  try {
+    const live = 'b'.repeat(40);
+    const trusted = (body, id) => ({ body, id, author: { login: 'web-everything' }, createdAt: FIXTURE_TIME });
+    const stop = trusted(buildStandDownComment({ reason: 'needs-judgment', head: FIXTURE_HEAD }), 'stop');
+    expect(standDownLapse(stop, live, { lapseOnNewHead })).toEqual(lapseOnNewHead === 'on'
+      ? { fromHead: FIXTURE_HEAD, toHead: live, reason: 'needs-judgment' } : null);
+    const begin = trusted(`🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/fixture-head\` at \`${FIXTURE_HEAD}\`\n<!-- fix-claim who=fixture-session -->`, 'begin');
+    const gh = vi.fn(args => {
+      expect(args).toEqual(['pr', 'view', '123', '--repo=fixture/repo', '--json', 'comments,labels,commits,headRefOid']);
+      return JSON.stringify({ comments: [begin, stop], labels: [], commits: [], headRefOid: live });
+    });
+    expect(() => runStandDownAnswer(['123', '--repo=fixture/repo', '--actor=fixture-operator',
+      '--channel=probe', '--reason=fixture', '--disposition=rearm-review', '--no-code-owed', '--preview'], { gh })).toThrow('head moved');
+    expect(gh).toHaveBeenCalledTimes(1);
+  } finally { vi.useRealTimers(); }
 });
