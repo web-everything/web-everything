@@ -414,7 +414,7 @@ export async function runOrphanFixRoundPass({
     listed.push({ key, slug });
     // Repos run in the order the caller yields them (the daemon rotates that order fairly); each repo resumes at
     // its cursor, and the PRs before it run after every repo's resumed part so one large repo never starves the rest.
-    const at = typeof saved === 'string' ? JSON.parse(saved.slice(LISTING_CURSOR_PREFIX.length)).pr : saved;
+    const at = typeof saved === 'string' ? JSON.parse(saved.slice(LISTING_CURSOR_PREFIX.length))?.pr : saved;
     const own = [...(prs ?? [])].sort((a, b) => a.number - b.number);
     for (const p of own) (at != null && p.number < at ? wrapped : head).push({ key, slug, p });
   }
@@ -499,8 +499,16 @@ export async function runOrphanFixRoundPass({
 /** Per-repo orphan cursors `{ <repo>: <pr> }`; accepts the legacy single `{ repo, pr }` cursor. Invalid → none. */
 export function normalizeOrphanCursors(cursor) {
   if (cursor === null || typeof cursor !== 'object' || Array.isArray(cursor)) return {};
-  const valid = ([repo, pr]) => typeof repo === 'string' && repo.length > 0
-    && ((Number.isSafeInteger(pr) && pr > 0) || (typeof pr === 'string' && pr.startsWith(LISTING_CURSOR_PREFIX) && pr.length <= 1024));
+  const valid = ([repo, pr]) => {
+    if (typeof repo !== 'string' || repo.length === 0) return false;
+    if (typeof pr !== 'string') return Number.isSafeInteger(pr) && pr > 0;
+    if (!pr.startsWith(LISTING_CURSOR_PREFIX) || pr.length > 1024) return false;
+    try {
+      const decoded = JSON.parse(pr.slice(LISTING_CURSOR_PREFIX.length));
+      return decoded !== null && typeof decoded === 'object' && !Array.isArray(decoded)
+        && (decoded.pr === undefined || (Number.isSafeInteger(decoded.pr) && decoded.pr > 0));
+    } catch { return false; }
+  };
   const keys = Object.keys(cursor);
   if (keys.length === 2 && keys.includes('repo') && keys.includes('pr')) {
     return valid([cursor.repo, cursor.pr]) ? { [cursor.repo]: cursor.pr } : {};

@@ -77,6 +77,23 @@ describe('ORPHAN-LIST-INCOMPLETE listing boundary', () => {
     expect(f.write).not.toHaveBeenCalled();
   });
 
+  it('discards orphan-list-v1:null and completes a fresh scan without aborting the pass', async () => {
+    const f = fixture(2);
+    const cursor = { [slug]: 'orphan-list-v1:null' };
+    const listBounced = vi.fn((repo, input) => orphanListing.readBouncedListing(repo, {
+      ...input, exec: f.exec, now: f.now, timeoutMs: 1000,
+    }));
+    const isOwned = vi.fn(async () => true);
+    const result = await runOrphanFixRoundPass({ ...f.options, cursor, listBounced, isOwned });
+    expect(orphanListing.normalizeOrphanCursors(cursor)).toEqual({});
+    expect(listBounced).toHaveBeenCalledTimes(1);
+    expect(listBounced).toHaveBeenCalledWith(slug, { continuation: null });
+    expect(result).toMatchObject({ complete: true, reason: 'complete', handled: 2, rows: [], repoCursors: null });
+    expect(isOwned.mock.calls).toEqual([['we', 1], ['we', 2]]);
+    expect(f.readComments).not.toHaveBeenCalled();
+    expect(f.write).not.toHaveBeenCalled();
+  });
+
   it('requires a short terminal page after an exact-full page', () => {
     const f = fixture(200);
     const result = orphanListing.readBouncedListing(slug, { exec: f.exec, now: f.now, timeoutMs: 1000, maxPages: 3 });
