@@ -558,6 +558,27 @@ describe('drain merge strategy — drain-direct (default) is unchanged', () => {
 });
 
 describe('drain merge strategy — github-merge-queue', () => {
+  it.each(['head-failed','unknown','missing','invalid','throws','null'])(
+    'forwards the fresh same-head admission cause fail-closed (%s)', cause => {
+      const root = mkdtempSync(join(tmpdir(),'same-head-boundary-'));
+      try {
+        writeFileSync(join(root,'preferences.json'),'{}');
+        const h = harness({strategy:'github-merge-queue',now:() => 1_800_000_000_000,
+          env:{HOME:root,WE_PLATFORM_PREFERENCES_FILE:join(root,'preferences.json')},
+          strategyExtra:{cwd:root,cardGroupHold:() => null,readGrantScope:() => null}});
+        const sameHeadAdmission = vi.fn(() => {
+          if (cause === 'throws') throw new Error('fixture unreadable admission');
+          if (cause === 'null') return null;
+          return {hold:true,line:'fixture hold',...(cause === 'missing' ? {} : {cause:cause === 'invalid' ? 'HEAD-FAILED' : cause})};
+        });
+        const result = h.s.enqueue({num:42},HEAD,{comments:[],sameHeadAdmission});
+        expect(result).toMatchObject({enqueued:false,kind:'mq-same-head-failed'});
+        expect(result.cause).toBe(cause === 'head-failed' ? 'head-failed' : 'unknown');
+        expect(sameHeadAdmission).toHaveBeenCalledTimes(1);
+        expect(h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
+        expect(h.state()).toBeNull();
+      } finally { rmSync(root,{recursive:true,force:true}); }
+    });
   it('a fresh same-head admission hold records no enqueue success or retry backoff', () => {
     const h = harness({ strategy: 'github-merge-queue' });
     const reason = `mq-same-head-failed: #42 head ${HEAD} — failed_checks`;

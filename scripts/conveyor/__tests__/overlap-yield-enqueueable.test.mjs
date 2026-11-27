@@ -20,6 +20,59 @@ function waits(rows) {
 
 afterEach(() => vi.unstubAllEnvs());
 
+describe('confirmed same-head overlap holds', () => {
+  const headSha = 'a'.repeat(40);
+  const row = Object.freeze({ number:42, repo, headSha, requiredCheckGreen:true, labels:['ready-to-merge'] });
+  const outcome = { num:42, repo:null, headSha, outcome:'not-enqueued', kind:'mq-same-head-failed', cause:'head-failed' };
+  it('a target held mq-same-head-failed with cause head-failed on its listed head is not a yield target', async () => {
+    const { filterEnqueueableOverlapRows } = await load();
+    const headSha = 'a'.repeat(40);
+    const row = { number:42, repo, headSha, requiredCheckGreen:true, labels:['ready-to-merge'] };
+    expect(filterEnqueueableOverlapRows({ openPrRows:[row], localSlug:repo,
+      heldTargets:new Set([`${repo}#42@${headSha}`]) })).toEqual([]);
+  });
+
+  it('confirmedHeldTargetKey normalizes the local repository and binds the exact head', async () => {
+    const { confirmedHeldTargetKey } = await load();
+    expect(confirmedHeldTargetKey(outcome, repo)).toBe(`${repo}#42@${headSha}`);
+  });
+
+  it.each([
+    ['unknown cause', {cause:'unknown'}], ['missing cause', {cause:undefined}],
+    ['uppercase cause', {cause:'HEAD-FAILED'}], ['unrecognized cause', {cause:'real'}],
+    ['another head', {headSha:'b'.repeat(40)}], ['another repository', {repo:'other/repo'}],
+  ])('keeps the yield target for %s', async (_name, changes) => {
+    const { confirmedHeldTargetKey, filterEnqueueableOverlapRows } = await load();
+    const key = confirmedHeldTargetKey({...outcome, ...changes}, repo);
+    expect(filterEnqueueableOverlapRows({openPrRows:[row],localSlug:repo,heldTargets:new Set(key ? [key] : [])})).toEqual([row]);
+  });
+
+  it.each([
+    {outcome:'enqueued'}, {kind:'other'}, {headSha:'a'.repeat(39)}, {headSha:'g'.repeat(40)},
+    {headSha:headSha+'\n'}, {cause:undefined,reason:'same head failed_checks'},
+  ])('refuses unconfirmed held keys without parsing reason text: %j', async changes => {
+    const { confirmedHeldTargetKey } = await load();
+    expect(confirmedHeldTargetKey({...outcome,...changes},repo)).toBeNull();
+  });
+
+  it('ignores confirmed holds when requiresLandable is off', async () => {
+    const { filterEnqueueableOverlapRows } = await load();
+    expect(filterEnqueueableOverlapRows({openPrRows:[row],localSlug:repo,requiresLandable:false,
+      heldTargets:new Set([`${repo}#42@${headSha}`])})).toEqual([row]);
+  });
+
+  it('buildOverlapRows threads holds without removing candidates or changing verdicts', () => {
+    vi.stubEnv(landableEnv,'1');
+    const input = fixture('merge');
+    input.openPrContext.prsByRepo.get(null)[1].headRefOid = headSha;
+    const before = structuredClone(input.verdicts);
+    const rows = buildOverlapRows({...input,heldTargets:new Set([`${repo}#5461@${headSha}`])});
+    expect(waits(rows).size).toBe(0);
+    expect(rows.candidateRows).toHaveLength(2);
+    expect(input.verdicts).toEqual(before);
+  });
+});
+
 describe('enqueueable overlap targets through buildOverlapRows', () => {
   it.each([
     ['skip', 'red-team-pending'], ['skip', 'carry-refused'], ['skip', 'checks-pending'],

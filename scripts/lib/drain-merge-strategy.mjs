@@ -690,7 +690,12 @@ export function createDrainMergeStrategy({
         },
         ...(preparedAdmission ? { preparedSurface: prepared.preparedSurface } : {}) });
       if (!r.ok) {
-        if (r.reason === 'mq-same-head-failed') return { enqueued: false, kind: 'mq-same-head-failed', reason: r.error };
+        if (r.reason === 'mq-same-head-failed') {
+          // Preserve the strategy's historical enumerable result shape; the drain explicitly
+          // records this typed metadata, just as it records mqSameHeadGuard's metadata.
+          return Object.defineProperty({ enqueued: false, kind: 'mq-same-head-failed', reason: r.error },
+            'cause', { value: r.cause === 'head-failed' ? 'head-failed' : 'unknown' });
+        }
         if (r.humanOnly) {
           void appendDaemonEvent({ kind: 'needs-you', repo: slugOf(c.repo), pr: c.num, daemon: 'drain',
             detail: `Operator must re-approve the current head or queue it: ${r.licenseReason || r.error}` }, { env }).catch(() => {});
