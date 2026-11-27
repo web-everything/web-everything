@@ -75,6 +75,26 @@ afterEach(() => {
 });
 
 const marker = () => join(dir, '.git', '.lane-verify');
+// Keep the real settings loader/validation, but give an empty checkout its own tool policy.
+// Production deliberately resolves settings from the verifier root, never the target cwd.
+function withoutFixtureGuardsEnv() {
+  const settings = join(dir, '.git', 'verify-settings.json');
+  writeFileSync(settings, JSON.stringify({
+    ...JSON.parse(readFileSync(resolve(process.cwd(), 'scripts/verify-settings.json'), 'utf8')),
+    alwaysRunTests: [],
+  }));
+  const url = pathToFileURL(resolve(process.cwd(), 'scripts/lib/verify-settings.mjs')).href;
+  const original = JSON.stringify(url + '?fixture-original');
+  const source = `export * from ${original}; import { loadVerifySettingsFile as load } from ${original};
+export function loadVerifySettingsFile(path = ${JSON.stringify(settings)}, options) { return load(path, options); }`;
+  const loader = join(dir, '.git', 'verify-settings-loader.mjs');
+  writeFileSync(loader, `export async function load(url, context, next) {
+    if (url === ${JSON.stringify(url)}) return { format: 'module', shortCircuit: true, source: ${JSON.stringify(source)} };
+    return next(url, context);
+  }`);
+  const preload = 'data:text/javascript,' + encodeURIComponent(`import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)});`);
+  return { NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --import=${preload}`.trim() };
+}
 /** The env a child verify-lane should see: this test run may itself be inside a verify gate, whose own admission,
  *  selection and standards variables would otherwise leak into the child processes and change what they decide. */
 const GATE_ONLY_ENV = /^(WE_HEAVY_|WE_VERIFY_|VERIFY_|WE_BUILD_FINAL_|WE_LOAD_|WE_QUEUE_|WE_REQUIRE_VERIFIED$|WE_LAND_UNVERIFIED$|WE_FORGE_|FORGE_)/;
@@ -1792,8 +1812,11 @@ export async function load(url, context, nextLoad) {
 
   it.each(['test:unit', 'test'])('idle-host full fallback runs standards after a red %s with retries off', script => {
     const f = fixture({ standardsExit: 1 });
-    const r = f.invoke([], { ...idleFallbackEnv({ standardsExit: 1, scripts: { [script]: 'true' } }),
-      WE_VERIFY_ALWAYS_RUN_TESTS: '' });
+    const fallback = idleFallbackEnv({ standardsExit: 1, scripts: { [script]: 'true' } });
+    // This scenario tests standards after a full-unit red, with no named guard phase.
+    delete fallback.WE_VERIFY_ALWAYS_RUN_TESTS;
+    const r = f.invoke([], { ...fallback,
+      NODE_OPTIONS: `${fallback.NODE_OPTIONS} ${withoutFixtureGuardsEnv().NODE_OPTIONS}` });
     expect(r.code, r.stderr).toBe(2);
     expect(f.calls().map(call => call.args)).toEqual([
       ['vitest', 'run', '--reporter=default', '--reporter=json',
@@ -2519,7 +2542,7 @@ describe('full build gate default', () => {
     execFileSync('git', ['branch', 'origin/main'], { cwd: dir });
     writeFileSync(join(dir, 'notes.md'), 'known narrow diff\n');
     // This empty fixture checkout has no repo-wide guard suites.
-    const env = { ...gateScrubbedEnv(), WE_BUILD_FINAL_GATE: finalGate, WE_VERIFY_ALWAYS_RUN_TESTS: '' };
+    const env = { ...gateScrubbedEnv(), ...withoutFixtureGuardsEnv(), WE_BUILD_FINAL_GATE: finalGate };
     const r = spawnSync('node', [VERIFY_LANE, 'run', '--json'], { cwd: dir, encoding: 'utf8', env, timeout: 60_000 });
     expect(r.status, r.stderr).toBe(0);
     expect(r.stderr).toContain(`finalGate="${finalGate}" (env)`);

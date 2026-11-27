@@ -724,7 +724,8 @@ process.exit(again?0:1);`);
           WE_VERIFY_RUN_ALL_PHASES: '1', WE_FORGE_GATE_DISPATCH: '1',
           ...(watchdogKill ? { WE_VERIFY_PHASE_TIMEOUT_MS: '2000' } : {}), ROUTING_LOCAL_BEHAVIOR: localBehavior,
           ROUTING_PHASES: laterPhases ? '1' : '0',
-          ...(laterPhases ? { WE_VERIFY_PHASE_ADMISSION: phaseAdmission ? '1' : '0', WE_VERIFY_ALWAYS_RUN_TESTS: '' } : {}),
+          // phasePlan above supplies the complete fixture plan without named guards.
+          ...(laterPhases ? { WE_VERIFY_PHASE_ADMISSION: phaseAdmission ? '1' : '0' } : {}),
           WE_BUILD_FINAL_GATE: 'related', WE_BUILD_FINAL_GATE_STANDARDS: 'selected', WE_VERIFY_SLOT_HEARTBEAT_MS: '1000' },
       });
       expect(result.error, result.stderr).toBeUndefined();
