@@ -2,13 +2,15 @@
  * @description Slice 2 of the automatic PR stall sweep: settings + kill switch, the shadow pass and its audit log, the
  *   rate limits, and the hard rule that shadow mode makes ZERO GitHub writes.
  */
+import * as redTeamPolicy from '../../lib/red-team-gate.mjs';
+import * as roundJudgePolicy from '../round-judge-shadow.mjs';
 import { AUTOMATION_LOGINS } from '../../lib/marker-authorship.mjs';
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import fs from 'node:fs';
 import { mkdtempSync, rmSync, readFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { resolveStallSweepSettings, runStallSweep, planStallActions, stallSweepDir, strictGh, strictDrainText, STALL_SWEEP_DEFAULTS } from '../pr-stall-sweep.mjs';
+import { readAuditHistory, resolveStallSweepSettings, runStallSweep, planStallActions, stallSweepDir, strictGh, strictDrainText, STALL_SWEEP_DEFAULTS } from '../pr-stall-sweep.mjs';
 import { resetCascadeLogForTest } from '../../lib/policy-cascade.mjs';
 import { judgeRound } from '../../lib/round-judge.mjs';
 import { createPrSweepReader } from '../../operations/pr-sweep-io.mjs';
@@ -1328,5 +1330,131 @@ describe('R804 restart-only live acceptance', () => {
     const { dispatchRestart } = await run({ dir });
     expect(dispatchRestart).toHaveBeenCalledTimes(1);
     expect(lines(dir).filter(r => r.phase === 'did' && r.ts === new Date(NOW).toISOString())).toMatchObject([{ key, prHead }]);
+  });
+});
+
+
+describe('audit history repair digest (BLD-8039)', () => {
+  beforeEach(() => {
+    vi.spyOn(redTeamPolicy, 'readConfirmedBreaks').mockReturnValue({ value: {}, source: 'fixture' });
+    vi.spyOn(roundJudgePolicy, 'resolveRoundJudgeMode').mockReturnValue({ maxGrants: 20, line: 'fixture' });
+  });
+  afterEach(() => vi.restoreAllMocks());
+  const prHead = `${REPO}#11@${HEAD}`;
+  const valid = { phase: 'pass', ts: old };
+  const seed = (dir, rows) => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, '2026-09.jsonl'), rows.map(r => typeof r === 'string' ? r : JSON.stringify(r)).join('\n') + '\n');
+  };
+  const fixtureRead = gh => () => ({ ...reader(gh)({ stalledAfter: 45 }), stalledAfterSource: 'fixture' });
+  const fixture = (rows = [valid, '{"phase":', valid], suffix = '') => {
+    const dir = auditDir() + suffix;
+    seed(dir, rows);
+    const root = join(dir, '..');
+    const opts = { now: NOW, env: {}, feedPath: join(root, 'feed.jsonl'), stateDir: join(root, 'digest'),
+      traceStateDir: join(root, 'trace'), notify: () => ({ ok: true }), enqueue: () => {}, drain: () => {} };
+    const dispatchRestart = vi.fn();
+    const run = async ({ prs = [PRS[0]], ...patch } = {}) => {
+      const { gh } = fakeGh({ prs });
+      const out = await runStallSweep({ now: NOW, env: {}, force: true, settings: shadow(), dir, gh,
+        read: fixtureRead(gh), log: () => {}, judge: () => null, readRedTeamStatus: () => null,
+        readStatusAt: () => NOW, probe: { host: 'fixture', namespace: 'fixture', isAlive: () => false, readPidStart: () => 'fixture' },
+        dispatchRestart, ...patch });
+      return { out, digest: publishStalledDigest(out, opts) };
+    };
+    return { dir, opts, run, dispatchRestart };
+  };
+  const repair = out => out.items.filter(i => i.lane === 'operator');
+  const actionable = digest => expect(digest.lines.join('\n')).toMatch(/audit history incomplete.*operator must.*repair.*rerun/i);
+
+  it('torn audit line preserves valid history and emits actionable incomplete digest', async () => {
+    const f = fixture();
+    expect(readAuditHistory(f.dir)).toEqual({ records: [valid, valid], complete: false, issues: ['2026-09.jsonl:2: invalid JSON'] });
+    const { out, digest } = await f.run({ prs: [{ ...PRS[0], labels: [{ name: 'red-team:pending' }] }],
+      settings: shadow({ maxRedTeamRestartsPerHead: 0, actionModes: { 'restart-red-team': 'on' } }) });
+    expect(out.incomplete).toBe(true);
+    actionable(digest);
+    expect(repair(out).map(i => i.action)).toEqual(['repair-audit-history']);
+    expect(f.dispatchRestart).not.toHaveBeenCalled();
+    expect(out.records.some(r => ['intent', 'did', 'would-do'].includes(r.phase))).toBe(false);
+  });
+  it('malformed interior row keeps history incomplete', () => {
+    const f = fixture([valid, {}, valid]);
+    expect(readAuditHistory(f.dir)).toEqual({ records: [valid, valid], complete: false, issues: ['2026-09.jsonl:2: invalid audit record'] });
+  });
+  it('repair item replaces an independently made operator item on the same head', async () => {
+    const f = fixture();
+    const overCap = fakeGh({ prs: [{ ...PRS[0], labels: [{ name: 'status:at-round-limit' }] }], changedFiles: 3001 });
+    const run = () => f.run({ gh: overCap.gh, read: fixtureRead(overCap.gh) });
+    const first = await run();
+    expect(repair(first.out)).toHaveLength(1);
+    expect(repair(first.out)[0]).toMatchObject({ repo: REPO, pr: 11, head: HEAD, prHead,
+      action: 'repair-audit-history', key: `${prHead}:audit-history-incomplete`, evidence: ['2026-09.jsonl:2: invalid JSON'] });
+    actionable(first.digest);
+    seed(f.dir, [valid, valid, valid]);
+    const recovered = await run();
+    expect(repair(recovered.out)).toHaveLength(1);
+    expect(repair(recovered.out)[0].fileList.state).toBe('file-list-over-cap');
+    expect(recovered.out.items.some(i => i.action === 'repair-audit-history')).toBe(false);
+  });
+  it('more than 20 corrupt rows report an omitted count and persist the operator repair record', async () => {
+    const f = fixture(Array(25).fill('{"phase":'));
+    const history = readAuditHistory(f.dir);
+    expect(history.issues).toEqual([...Array.from({ length: 20 }, (_, n) => `2026-09.jsonl:${n + 1}: invalid JSON`),
+      '5 additional corrupt rows; inspect full audit']);
+    const { out, digest } = await f.run();
+    actionable(digest);
+    expect(out.errors.join('; ')).toContain('5 additional corrupt rows; inspect full audit');
+    expect(lines(f.dir)).toContainEqual(expect.objectContaining({ phase: 'operator', action: 'repair-audit-history' }));
+  });
+  it('blank audit rows preserve physical diagnostic line numbers', () => {
+    const f = fixture(['', '', valid, '', ' \t', '{torn', valid]);
+    expect(readAuditHistory(f.dir)).toEqual({ records: [valid, valid], complete: false, issues: ['2026-09.jsonl:6: invalid JSON'] });
+  });
+  it('location strips control characters from repair guidance', async () => {
+    const f = fixture(['{torn'], 'control\n\r\t\x1b\x7f\x85path');
+    const { out } = await f.run();
+    const error = out.errors.find(e => e.startsWith('audit history incomplete:'));
+    expect(error).toContain(f.dir.replace(/[\x00-\x1f\x7f-\x9f]/g, ''));
+    expect(error).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
+  });
+  it('repaired history retains lifetime cap', async () => {
+    const spent = { ts: '2026-01-01T00:00:00Z', phase: 'would-do', prHead, key: `${prHead}:old`, action: 'ask-review-daemon' };
+    const f = fixture([spent, '{torn', valid]);
+    expect((await f.run()).out.incomplete).toBe(true);
+    seed(f.dir, [spent, valid, valid]);
+    const { out, digest } = await f.run();
+    expect(out.incomplete).toBe(false);
+    expect(out.act).toEqual([]);
+    expect(out.held).toContainEqual(expect.objectContaining({ held: 'per-PR-head cap' }));
+    expect(repair(out)).toEqual([]);
+    expect(digest.errors).toEqual([]);
+    expect(unacknowledged({ path: f.opts.feedPath })).toEqual([]);
+  });
+  it('two heads get two correctly addressed repair entries', async () => {
+    const f = fixture();
+    const { digest } = await f.run({ prs: PRS });
+    actionable(digest);
+    expect(unacknowledged({ path: f.opts.feedPath })).toHaveLength(2);
+    expect(JSON.parse(readFileSync(sidecarsOf(f.opts.feedPath).state, 'utf8')).openKeys).toEqual([
+      `${prHead}:stalled`, `${REPO}#12@${PRS[1].headRefOid}:stalled`]);
+  });
+  it('missing directory is complete empty history; failed listing and unreadable month are incomplete', () => {
+    const dir = auditDir();
+    expect(readAuditHistory(dir)).toEqual({ records: [], complete: true, issues: [] });
+    writeFileSync(dir, 'not a directory');
+    expect(readAuditHistory(dir)).toEqual({ records: [], complete: false, issues: ['audit directory: unreadable listing'] });
+    rmSync(dir); mkdirSync(join(dir, '2026-09.jsonl'), { recursive: true });
+    expect(readAuditHistory(dir)).toEqual({ records: [], complete: false, issues: ['2026-09.jsonl: unreadable audit file'] });
+  });
+  it('existing operator-queue report entry suppresses the stalled repair entry', async () => {
+    const f = fixture();
+    const sidecar = sidecarsOf(f.opts.feedPath).state;
+    mkdirSync(join(sidecar, '..'), { recursive: true });
+    writeFileSync(sidecar, JSON.stringify({ openKeys: [`${prHead}:needs-you`] }));
+    const { out, digest } = await f.run();
+    expect(out.errors.join('; ')).toMatch(/audit history incomplete/);
+    expect(digest.lines).toEqual([]);
+    expect(out.records).toContainEqual(expect.objectContaining({ phase: 'operator', action: 'repair-audit-history' }));
   });
 });
