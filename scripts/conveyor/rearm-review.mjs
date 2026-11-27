@@ -96,21 +96,32 @@ export function countRearmComments(comments) {
  * @param {{currentLabels?:Array}} o - `currentLabels` is the observed label array (string or `{name}` shape).
  * @returns {{allowed:boolean, addLabel:string, removeLabels:string[], keepsHuman:boolean, reason:string}}
  */
-export function decideRearm({ currentLabels = [], headSha, comments } = {}) {
-  return decideSetLabel({ to: 'rearm', currentLabels, headSha, comments });
+export function decideRearm({ currentLabels = [], headSha, comments, reviews } = {}) {
+  return decideSetLabel({ to: 'rearm', currentLabels, headSha, comments, reviews });
 }
 
 /** Read-only preflight. An accepted-head candidate delegates to the shared writer,
  * which reads the actual live labels before deciding; preflight grants no acceptance.
  * read and timeoutMs are injectable so replay never consults the host. */
-export function runRearmPreflight({ pr, repo, read = readGh, timeoutMs = resolveChildTimeoutMs() } = {}) {
-  const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: timeoutMs, killSignal: 'SIGKILL' };
-  const liveHead = JSON.parse(read(['pr', 'view', pr, ...(repo ? [`--repo=${repo}`] : []), '--json', 'headRefOid'], opts)).headRefOid;
+export function runRearmPreflight({ pr, repo, read = readGh, timeoutMs = resolveChildTimeoutMs(), onHead = () => {} } = {}) {
+  const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer: 64 * 1024 * 1024 };
+  const state = JSON.parse(read(['pr', 'view', pr, ...(repo ? [`--repo=${repo}`] : []), '--json', 'headRefOid,labels'], opts));
+  const liveHead = state.headRefOid;
+  if (typeof liveHead !== 'string' || !/^[0-9a-f]{40}$/i.test(liveHead)) throw new Error('re-arm preflight head unreadable — retry the shared live read');
+  // Retain this observation even if the next independent read fails. A caller's
+  // conflicting pin must still refuse before the shared writer is entered.
+  onHead(liveHead);
+  if (!Array.isArray(state.labels) || !state.labels.every(l => typeof (typeof l === 'string' ? l : l?.name) === 'string'
+    && (typeof l === 'string' ? l : l.name).trim())) throw new Error('re-arm preflight labels unreadable — retry the shared live read');
   const pages = JSON.parse(read(['api', `repos/${repo || ':owner/:repo'}/issues/${pr}/comments`, '--paginate', '--slurp'], opts));
   if (!Array.isArray(pages) || !pages.every(Array.isArray)) throw new Error('re-arm preflight comments unreadable');
   const comments = pages.flat();
-  const candidate = decideSetLabel({ to: 'rearm', currentLabels: ['review:accepted'], headSha: liveHead, comments });
-  return { ...(candidate.alreadyAccepted ? { empty: false } : decideEmptyFixRound({ comments, liveHead })), liveHead };
+  // Only a LIVE accepted label delegates the empty-round exception. This grants
+  // no acceptance: the shared writer must check the complete native reviews and
+  // comments under its lock before preserving or resetting that verdict.
+  const reviewLabels = state.labels.map(l => typeof l === 'string' ? l : l.name).filter(name => name.startsWith('review:'));
+  const accepted = reviewLabels.length === 1 && reviewLabels[0] === 'review:accepted';
+  return { ...(accepted ? { empty: false } : decideEmptyFixRound({ comments, liveHead })), liveHead };
 }
 
 /**
@@ -408,9 +419,10 @@ if (IS_CLI) {
     let verdict = { empty: false };
     let liveHead;
     try {
-      verdict = runRearmPreflight({ pr: prArg, repo: repoVal });
-      liveHead = verdict.liveHead;
-    } catch { /* fail open: never block a real push on a read error */ }
+      verdict = runRearmPreflight({ pr: prArg, repo: repoVal, onHead: head => { liveHead = head; } });
+    } catch {
+      process.stderr.write('re-arm preflight evidence unreadable — deferring to the shared live-state validation; observed caller pin still enforced\n');
+    }
     // Outside the read-error catch: a conflicting pin must refuse before even the no-change note.
     if (liveHead !== undefined || verdict.noCodeResume) {
       try { labelArgv = rearmLabelArgv(labelArgv, verdict, liveHead); }

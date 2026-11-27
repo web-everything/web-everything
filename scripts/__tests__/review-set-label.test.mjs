@@ -91,34 +91,124 @@ describe('REARM-KEEP-ACCEPT shared writer', () => {
   const accept = (sha = headSha, extra = {}) => ({ id: 'IC_accept', author: { login: 'web-everything' },
     body: buildVerdictComment({ to: 'accepted', actor: 'reviewer', headSha: sha }), ...extra });
   let dir;
-  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'keep-accept-')); vi.useFakeTimers(); vi.setSystemTime(new Date('2026-11-26T12:00:00Z')); });
-  afterEach(() => { vi.useRealTimers(); rmSync(dir, { recursive: true, force: true }); });
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'keep-accept-'));
+    vi.spyOn(process, 'cwd').mockReturnValue(dir);
+    vi.stubEnv('HOME', dir);
+    vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'fixture-reviewer');
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-11-26T12:00:00Z'));
+  });
+  afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
 
-  function replay({ comments = [accept()], head = headSha, labels = [REVIEW_LABELS.accepted, READY_TO_MERGE_LABEL], fresh = {}, onlyIf = false, onWrite = () => {} } = {}) {
+  function replay({ comments = [accept()], head = headSha, labels = [REVIEW_LABELS.accepted, READY_TO_MERGE_LABEL], fresh = {}, onlyIf = false, onWrite = () => {},
+    reviews = [], freshReviews = reviews, pinned = false, commentFailures = 0 } = {}) {
     const writes = [];
+    const retrySleep = vi.fn();
     const initial = { state: 'OPEN', headRefOid: head, labels, comments, body: '', headRefName: 'lane/fixture', isDraft: false };
     const provider = { readPrState: vi.fn().mockReturnValueOnce(initial).mockImplementation(() => {
       if (fresh instanceof Error) throw fresh;
       return { ...initial, ...fresh };
-    }), readComments: vi.fn(() => comments), readLabels: () => labels,
-    postComment: () => { writes.push('comment'); onWrite('comment', initial); },
-    setLabels: () => { writes.push('labels'); onWrite('labels', initial); } };
+    }), readComments: vi.fn(() => comments), readLabels: () => initial.labels,
+    readPrReviews: vi.fn().mockImplementationOnce(() => {
+      if (reviews instanceof Error) throw reviews;
+      return reviews;
+    }).mockImplementation(() => {
+      if (freshReviews instanceof Error) throw freshReviews;
+      return typeof freshReviews === 'function' ? freshReviews() : freshReviews;
+    }),
+    postComment: () => {
+      writes.push('comment'); onWrite('comment', initial);
+      if (commentFailures-- > 0) throw new Error('HTTP 503: comment unavailable');
+    },
+    setLabels: (_repo, _pr, { add, remove }) => {
+      writes.push('labels');
+      initial.labels = [...new Set([...initial.labels.filter(label => !remove.includes(label)), ...(add ? add.split(',') : [])])];
+      onWrite('labels', initial);
+    } };
     const chunks = [];
     const exit = vi.spyOn(process, 'exit').mockImplementation(code => { throw Object.assign(new Error('exit'), { exitCode: code }); });
     let code;
     try {
-      runReviewLabelCliRaw({ argv: ['7472', '--repo=fixture/repo', ...(onlyIf ? ['--only-if=accepted'] : [])], fixedTo: 'rearm',
+      runReviewLabelCliRaw({ argv: ['7472', '--repo=fixture/repo', ...(onlyIf ? ['--only-if=accepted'] : []), ...(pinned ? [`--expect-head=${head}`] : [])], fixedTo: 'rearm',
         provider, defaultActor: 'fixture', usage: 'fixture', emit: line => chunks.push(line),
         buildComment: () => REARM_COMMENT_MARKER, successResult: value => ({ ok: true, ...value }),
         refusalResult: ({ decision }) => ({ ok: false, reason: decision.reason }),
         appendLedgerVerdict: () => { writes.push('ledger'); onWrite('ledger', initial); return { ok: true }; },
         signalFix: () => writes.push('dispatch'),
         withRearmWriteLock: (_repo, _pr, fn) => fn(),
+        rearmRetrySleep: retrySleep,
       });
     } catch (error) { if (error.exitCode === undefined) throw error; code = error.exitCode; }
     finally { exit.mockRestore(); }
-    return { code, writes, result: JSON.parse(chunks.join('')), provider };
+    return { code, writes, result: JSON.parse(chunks.join('')), provider, labels: initial.labels, retrySleep };
   }
+
+  it.each(['```\nPlease fix the security finding before merging.\n```', '> Please fix the security finding before merging.'])(
+    'audit quoted objection retains its hold and restores pending: %s', body => {
+      const result = replay({ comments: [accept(), { id: 'IC_objection', author: { login: 'chalbert' }, body }] });
+      expect(result.code).toBe(0);
+      expect(result.result.alreadyAccepted).not.toBe(true);
+      expect(result.labels).toEqual([REVIEW_LABELS.pending]);
+    });
+
+  it.each([headSha, 'b'.repeat(40)])('audit later changes verdict restores pending and strips merge clearances on head %s', head => {
+    const comments = [accept(), { id: 'IC_bounce', author: { login: 'web-everything' }, body: '🔁 review — changes requested\nFix the finding.' }];
+    const result = replay({ comments, head });
+    expect(result.code).toBe(0);
+    expect(result.labels).toEqual([REVIEW_LABELS.pending]);
+    expect(result.writes).toEqual(['ledger', 'labels', 'comment', 'dispatch']);
+  });
+
+  it.each(['initial', 'locked reread'])('audit standing formal CHANGES_REQUESTED on %s prevents accepted no-op', phase => {
+    const objection = [{ state: 'CHANGES_REQUESTED', submitted_at: '2026-11-25T12:00:00Z', user: { login: 'independent-reviewer' } }];
+    const result = replay({ reviews: phase === 'initial' ? objection : [], freshReviews: objection });
+    expect(result.result.alreadyAccepted).not.toBe(true);
+    if (phase === 'initial') {
+      expect(result.code).toBe(0);
+      expect(result.labels).toEqual([REVIEW_LABELS.pending]);
+    } else {
+      expect(result.code).toBe(1);
+      expect(result.writes).toEqual([]);
+    }
+    expect(result.provider.readPrReviews).toHaveBeenCalledWith('fixture/repo', '7472');
+  });
+
+  it.each([['null', null], ['missing', undefined], ['object', {}], ['malformed row', [null]], ['unknown state', [{ state: 'UNKNOWN' }]],
+    ['timeout', new Error('review read timed out')], ['over limit', Array(10001).fill({ state: 'APPROVED' })]])(
+    'audit unreadable or oversized formal reviews retain the hold without writes (%s)', (_name, reviews) => {
+      // Set the port after constructing it so undefined is an explicit unreadable result.
+      const failure = reviews === undefined ? new Error('formal reviews missing') : reviews;
+      const result = replay({ reviews: failure });
+      expect(result.code).toBe(1);
+      expect(result.writes).toEqual([]);
+      expect(result.result.reason ?? result.result.error).toMatch(/formal reviews.*(?:unreadable|limit|operator)/i);
+    });
+
+  it.each([1, 3])('audit accepted rearm preserves pinned comment retries and rollback after %i failures', commentFailures => {
+    const labels = [REVIEW_LABELS.accepted, READY_TO_MERGE_LABEL];
+    const result = replay({ head: 'b'.repeat(40), labels, pinned: true, commentFailures });
+    expect(result.writes).toEqual(commentFailures === 1
+      ? ['ledger', 'labels', 'comment', 'comment', 'dispatch']
+      : ['ledger', 'labels', 'comment', 'comment', 'comment', 'labels']);
+    expect(result.retrySleep.mock.calls).toEqual(commentFailures === 1 ? [[1000]] : [[1000], [1000]]);
+    expect(result.labels).toEqual(commentFailures === 1 ? [REVIEW_LABELS.pending] : labels);
+    expect(result.code).toBe(commentFailures === 1 ? 0 : 1);
+    if (commentFailures === 3) expect(result.result.error).toMatch(/503.*labels restored/);
+  });
+
+  it('audit accepted rollback retains pending when a native review revokes acceptance during the final failed comment', () => {
+    let reviews = [], attempts = 0;
+    const result = replay({ head: 'b'.repeat(40), pinned: true, commentFailures: 3,
+      freshReviews: () => reviews,
+      onWrite: step => {
+        if (step === 'comment' && ++attempts === 3) reviews = [{ state: 'CHANGES_REQUESTED',
+          submitted_at: '2026-11-26T12:00:00Z', user: { login: 'independent-reviewer' } }];
+      } });
+    expect(result.code).toBe(1);
+    expect(result.writes).toEqual(['ledger', 'labels', 'comment', 'comment', 'comment']);
+    expect(result.labels).toEqual([REVIEW_LABELS.pending]);
+    expect(result.result.error).toMatch(/rollback failed.*formal review evidence.*newer review state retained/);
+  });
 
   it.each([false, true])('unchanged accepted head is a successful explicit no-op, accepted-only=%s', onlyIf => {
     for (let tick = 0; tick < 2; tick++) {

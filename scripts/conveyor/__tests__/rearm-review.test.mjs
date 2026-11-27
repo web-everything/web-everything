@@ -12,7 +12,7 @@ import { mkdtempSync, writeFileSync, readFileSync, existsSync, chmodSync, rmSync
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { decideRearm, buildRearmComment, presentRemoveLabels, countRearmComments, REARM_COMMENT_MARKER, buildSameHeadWakeComment, SAME_HEAD_WAKE_TRAILER, decideEmptyFixRound, rearmWindow, hasUnexpectedPositionals, hasInvalidArgs, buildNoChangeComment, NO_CHANGE_COMMENT_MARKER, runRearmPreflight } from '../rearm-review.mjs';
+import { decideRearm, buildRearmComment, presentRemoveLabels, countRearmComments, REARM_COMMENT_MARKER, buildSameHeadWakeComment, SAME_HEAD_WAKE_TRAILER, decideEmptyFixRound, rearmWindow, hasUnexpectedPositionals, hasInvalidArgs, buildNoChangeComment, NO_CHANGE_COMMENT_MARKER, runRearmPreflight, rearmLabelArgv } from '../rearm-review.mjs';
 import { REVIEW_LABELS, READY_TO_MERGE_LABEL } from '../../lib/review-escalation.mjs';
 import { RED_TEAM_STATUS_LABELS } from '../../lib/red-team-status-label-meta.mjs';
 
@@ -29,7 +29,7 @@ describe('REARM-KEEP-ACCEPT', () => {
     body: `✅ review — accepted\n\n<!-- reviewed-sha: ${headSha} -->` };
 
   it('accepted exact head rearm is a zero-write no-op', () => {
-    const input = { currentLabels: lbl(REVIEW_LABELS.accepted, READY_TO_MERGE_LABEL), headSha, comments: [accept] };
+    const input = { currentLabels: lbl(REVIEW_LABELS.accepted, READY_TO_MERGE_LABEL), headSha, comments: [accept], reviews: [] };
     const before = JSON.stringify(input);
     for (let replay = 0; replay < 2; replay++) {
       expect(decideRearm(input)).toMatchObject({ allowed: false, alreadyAccepted: true,
@@ -43,12 +43,37 @@ describe('REARM-KEEP-ACCEPT', () => {
   it('accepted head bypasses the empty-round note and delegates live label validation to the shared writer', () => {
     const comments = [{ author: accept.author, body: '🔁 review — changes requested' },
       { author: accept.author, body: `🔒 conveyor fix-begin — fix claim held\n**Branch:** \`lane/fixture\` at \`${headSha}\`` }, accept];
-    const io = vi.fn(args => args[0] === 'pr' ? JSON.stringify({ headRefOid: headSha }) : JSON.stringify([comments]));
+    const io = vi.fn(args => args[0] === 'pr' ? JSON.stringify({ headRefOid: headSha, labels: lbl(REVIEW_LABELS.accepted) }) : JSON.stringify([comments]));
     const result = runRearmPreflight({ pr: '7472', repo: 'fixture/repo', read: io, timeoutMs: 1000 });
     expect(result).toMatchObject({ empty: false, liveHead: headSha });
     expect(io.mock.calls).toHaveLength(2);
     expect(io.mock.calls.every(([args]) => args[0] === 'api' || args[1] === 'view')).toBe(true);
     expect(countRearmComments(comments)).toBe(0);
+  });
+
+  it('audit preflight reads live changes labels and retains the empty-round guard despite an accepted comment', () => {
+    const comments = [{ author: accept.author, body: '🔁 review — changes requested' },
+      { author: accept.author, body: `🔒 conveyor fix-begin — fix claim held\n**Branch:** \`lane/audit-fixture\` at \`${headSha}\`` }, accept];
+    const io = vi.fn(args => args[0] === 'pr'
+      ? JSON.stringify({ headRefOid: headSha, labels: lbl(REVIEW_LABELS.changes) }) : JSON.stringify([comments]));
+    const result = runRearmPreflight({ pr: '7472', repo: 'fixture/repo', read: io, timeoutMs: 1000 });
+    expect(result).toMatchObject({ empty: true, liveHead: headSha });
+    expect(io.mock.calls[0][0].at(-1)).toContain('labels');
+    expect(io.mock.calls.every(([, opts]) => opts.timeout === 1000)).toBe(true);
+  });
+
+  it('audit preflight preserves the observed head for caller-pin refusal when the comments read fails', () => {
+    let observedHead;
+    const io = vi.fn(args => {
+      if (args[0] === 'pr') return JSON.stringify({ headRefOid: headSha, labels: lbl(REVIEW_LABELS.changes) });
+      throw new Error('comments timed out');
+    });
+    expect(() => runRearmPreflight({ pr: '7472', repo: 'fixture/repo', read: io, timeoutMs: 1000,
+      onHead: head => { observedHead = head; } })).toThrow('comments timed out');
+    expect(observedHead).toBe(headSha);
+    expect(() => rearmLabelArgv(['7472', '--repo=fixture/repo', `--expect-head=${'b'.repeat(40)}`], { empty: false }, observedHead))
+      .toThrow('caller --expect-head differs from the guard live head');
+    expect(io).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -460,7 +485,7 @@ describe('rearm-review.mjs CLI — the empty-round guard wiring', () => {
       "fs.appendFileSync(process.env.FAKE_GH_LOG, JSON.stringify(a) + '\\n');",
       "const sc = JSON.parse(process.env.FAKE_GH_SCENARIO);",
       "const fail = (m) => { process.stderr.write(m + '\\n'); process.exit(1); };",
-      "if (a[0] === 'pr' && a[1] === 'view' && a.includes('headRefOid')) { if (sc.failView) fail('view failed'); console.log(JSON.stringify({ headRefOid: sc.head })); }",
+      "if (a[0] === 'pr' && a[1] === 'view' && a.includes('headRefOid,labels')) { if (sc.failView) fail('view failed'); console.log(JSON.stringify({ headRefOid: sc.head, labels: [{ name: 'review:changes' }] })); }",
       "else if (a[0] === 'api' && String(a[1]).includes('/comments')) { if (sc.failApi) fail('api failed'); console.log(JSON.stringify([sc.comments])); }",
       "else if (a[0] === 'pr' && a[1] === 'comment') { fs.writeFileSync(process.env.FAKE_GH_LOG + '.body', fs.readFileSync(0, 'utf8')); if (sc.failComment) fail('comment failed'); }",
       "else fail('fake gh: unsupported ' + a.join(' '));",

@@ -115,7 +115,7 @@ function withRearmWriteLock(repo, pr, effect) {
 /** Exact-head preservation only: unknown evidence still owes review, never a new acceptance.
  * The provider's complete thread order is authoritative; timestamps never select a winner.
  * Bounds refuse with an operator recovery path instead of accepting a truncated thread. */
-function acceptedHeadRearm({ currentLabels, headSha, comments }) {
+function acceptedHeadRearm({ currentLabels, headSha, comments, reviews }) {
   const stopped = reason => ({ allowed: false, addLabel: '', removeLabels: [],
     keepsHuman: hasReviewLabel(currentLabels, REVIEW_LABELS.human), reason });
   if (!Array.isArray(currentLabels) || !currentLabels.every(l => typeof (typeof l === 'string' ? l : l?.name) === 'string'
@@ -129,7 +129,7 @@ function acceptedHeadRearm({ currentLabels, headSha, comments }) {
   const acceptanceHeading = /^(?:✅ review — (?:accepted|`review:human` cleared via the sanctioned path)|📌 review — acceptance re-stamped after a rebase \(no new review\))\s*$/;
   const records = comments.map(c => {
     const body = blankQuotedRegions(c.body);
-    const record = { ...c, viewerDidAuthor: false, body: body.replace(/reviewed-sha/g, 'unbound-sha') };
+    const record = { ...c, viewerDidAuthor: false, body: c.body.replace(/reviewed-sha/g, 'unbound-sha') };
     if (!isTrustedMarkerAuthor(record)) return record;
     return { ...record, body: acceptanceHeading.test(body.trimStart().split('\n')[0]) ? body : record.body };
   });
@@ -139,10 +139,8 @@ function acceptedHeadRearm({ currentLabels, headSha, comments }) {
   const id = source.node_id ?? source.id;
   const stamps = [...source.body.matchAll(/^<!-- reviewed-sha: ([0-9a-f]{40}) -->$/gim)];
   if (stamps.length !== 1 || !(typeof id === 'string' && id.trim().length > 0 && id.length <= 200
-    || Number.isSafeInteger(id) && id > 0)
-    || record.laterVerdict || record.laterBodyDerivedHold
-    || records.slice(record.index + 1).some(c => /^🔒 conveyor fix-begin —/.test(c.body.trimStart()))) {
-    return stopped('acceptance provenance or finality unproven — independent review is owed; ask the operator if the thread cannot be read');
+    || Number.isSafeInteger(id) && id > 0)) {
+    return stopped('acceptance provenance unproven — independent review is owed; ask the operator if the thread cannot be read');
   }
   if (currentLabels.some(l => {
     const name = typeof l === 'string' ? l : l.name;
@@ -150,6 +148,16 @@ function acceptedHeadRearm({ currentLabels, headSha, comments }) {
       || (/^(?:red-team:|redteam:|security:|advisory:)/.test(name)
         && !['red-team:clear', REVIEW_LABELS.redteamAccepted, ADVISORY_LABELS.ACCEPTED].includes(name));
   })) return stopped('concurrent human/security/review hold — independent review is owed; hold retained');
+  if (!Array.isArray(reviews) || reviews.length > 10000 || reviews.some(r => !r || typeof r !== 'object'
+    || !['APPROVED', 'CHANGES_REQUESTED', 'COMMENTED', 'DISMISSED', 'PENDING'].includes(r.state)
+    || (r.state !== 'PENDING' && !Number.isFinite(Date.parse(r.submitted_at ?? r.submittedAt ?? ''))))) {
+    return stopped('formal reviews unreadable or over the evidence limit — retry the complete read or ask the operator');
+  }
+  // Observed revocation owes a new review. Restore pending and remove the merge
+  // clearances rather than retaining them behind a zero-write refusal.
+  if (record.laterVerdict || record.laterBodyDerivedHold
+    || records.slice(record.index + 1).some(c => /^🔒 conveyor fix-begin —/.test(c.body.trimStart()))) return null;
+  if (laterReviewHold(reviews, record.at)) return null;
   if (record.sha !== headSha.toLowerCase()) return null;
   return { ...stopped('already-accepted — trusted accepted verdict covers the exact unchanged head; nothing was changed'), alreadyAccepted: true };
 }
@@ -469,7 +477,7 @@ export { decideParkToHuman, findContradictoryReviewVerdicts, decideContradictory
  *   its CLI also binds OPEN state and the pushed head before writing and verifies the result afterward.
  * @returns {{allowed:boolean, addLabel:string, removeLabels:string[], keepsHuman:boolean, reason:string}}
  */
-export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null, humanOnlyHold = false, redTeamRulingHold = false, sentBackSameHead = false, acceptanceStillCoversHead = false, humanClearedHead = false, operatorRestamp = false, headSha, comments } = {}) {
+export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null, humanOnlyHold = false, redTeamRulingHold = false, sentBackSameHead = false, acceptanceStillCoversHead = false, humanClearedHead = false, operatorRestamp = false, headSha, comments, reviews } = {}) {
   // we:scripts/review-set-label.mjs#decideSetLabel — only the targets in the closed set are valid.
   if (!REVIEW_LABEL_TARGETS.includes(to)) {
     throw new Error(
@@ -577,7 +585,7 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
     if (humanClearedHead) return { allowed: false, addLabel: '', removeLabels: [], keepsHuman: isHuman, reason: 'head carries a human clearance — a rearm never undoes it' };
     // Label-only callers plan a review hold; only complete live evidence can preserve an acceptance.
     if (headSha !== undefined || comments !== undefined) {
-      const preserved = acceptedHeadRearm({ currentLabels, headSha, comments });
+      const preserved = acceptedHeadRearm({ currentLabels, headSha, comments, reviews });
       if (preserved) return preserved;
     }
     const missing = requireLive === 'missing';
@@ -1675,6 +1683,19 @@ export function runReviewLabelCli({
     return comments;
   };
   const rearmThread = to === 'rearm' ? fullThread() : null;
+  // Native GitHub reviews are a separate channel from issue comments. Missing
+  // evidence cannot preserve an acceptance or authorize its later rollback.
+  const readRearmReviews = comments => {
+    if (!latestAcceptRecord(comments)) return undefined;
+    if (typeof provider.readPrReviews !== 'function') throw new Error('formal reviews unreadable — retry with the complete review reader or ask the operator');
+    try { return provider.readPrReviews(repo, pr); }
+    catch (error) { throw new Error(`formal reviews unreadable — retry or ask the operator: ${ghErr(error, 'review read failed')}`); }
+  };
+  let rearmReviews;
+  if (to === 'rearm' && hasReviewLabel(currentLabels, REVIEW_LABELS.accepted)) {
+    try { rearmReviews = readRearmReviews(rearmThread); }
+    catch (error) { refuseRearm(error.message); }
+  }
   // Capture before either write; a send-back during the swap or comment must not
   // become the verdict this older re-arm claims to have handled.
   const rearmVerdict = to === 'rearm' ? latestChangesVerdict(rearmThread) : null;
@@ -1704,7 +1725,7 @@ export function runReviewLabelCli({
     acceptanceStillCoversHead: parseReviewedSha(prComments.filter(isTrustedMarkerAuthor)) === headSha,
     humanClearedHead: to === 'rearm' && headEverHumanCleared(rearmThread, headSha.trim()),
     operatorRestamp: to === 'restamp' && actorArg.trim().toLowerCase() === 'operator',
-    ...(to === 'rearm' ? { headSha, comments: rearmThread } : {}),
+    ...(to === 'rearm' ? { headSha, comments: rearmThread, reviews: rearmReviews } : {}),
   });
   if (decision.alreadyAccepted) {
     // Even a no-op reports live evidence: a concurrent push/hold cannot inherit this result.
@@ -1714,7 +1735,8 @@ export function runReviewLabelCli({
         const fresh = provider.readPrState(repo, pr);
         if (fresh.state !== 'OPEN' || fresh.headRefOid !== headSha) throw new Error('accepted re-arm live head or state changed — retry; nothing was changed');
         const comments = fullThread(fresh.comments, fresh.headRefOid, reason => { throw new Error(reason); });
-        liveDecision = decideSetLabel({ to: 'rearm', currentLabels: fresh.labels, headSha: fresh.headRefOid, comments });
+        const reviews = readRearmReviews(comments);
+        liveDecision = decideSetLabel({ to: 'rearm', currentLabels: fresh.labels, headSha: fresh.headRefOid, comments, reviews });
         if (!liveDecision.alreadyAccepted) throw new Error(liveDecision.reason);
         return { fresh };
       }));
@@ -2202,15 +2224,17 @@ export function runReviewLabelCli({
   let acceptedRearmSwapped = false;
   const writeRearmEffect = effect => {
     if (!protectAcceptedRearm) return effect();
+    let effectStarted = false;
     try {
       return lockRearmWrite(repo, pr, () => {
         const fresh = provider.readPrState(repo, pr);
         assertPinnedRearmHead(fresh);
         if (fresh.state !== 'OPEN' || fresh.headRefOid !== headSha) throw new Error('accepted re-arm head or state changed — retry; hold retained');
         const comments = fullThread(fresh.comments, fresh.headRefOid, reason => { throw new Error(reason); });
-        const liveDecision = decideSetLabel({ to: 'rearm', currentLabels: fresh.labels, headSha: fresh.headRefOid, comments });
+        const reviews = readRearmReviews(comments);
+        const liveDecision = decideSetLabel({ to: 'rearm', currentLabels: fresh.labels, headSha: fresh.headRefOid, comments, reviews });
         // Our pending label cannot hide a new acceptance arriving before the marker.
-        const acceptance = acceptedHeadRearm({ currentLabels: [REVIEW_LABELS.accepted], headSha: fresh.headRefOid, comments });
+        const acceptance = acceptedHeadRearm({ currentLabels: [REVIEW_LABELS.accepted], headSha: fresh.headRefOid, comments, reviews });
         if (acceptance || (!liveDecision.allowed && !acceptedRearmSwapped)) throw new Error((acceptance ?? liveDecision).reason);
         const hold = fresh.labels.some(l => {
           const name = typeof l === 'string' ? l : l.name;
@@ -2220,9 +2244,13 @@ export function runReviewLabelCli({
               && !['red-team:clear', REVIEW_LABELS.redteamAccepted, ADVISORY_LABELS.ACCEPTED].includes(name));
         });
         if (hold) throw new Error('concurrent human/security/review hold — accepted re-arm stopped; hold retained');
+        effectStarted = true;
         return effect();
       });
     } catch (error) {
+      // Only validation/lock failures refuse immediately. A failed provider
+      // effect must retain the pinned retry and compensating rollback path.
+      if (effectStarted) throw error;
       throw Object.assign(new Error(ghErr(error, 'accepted re-arm evidence or effect unreadable — retry or ask the operator')), { rearmRefusal: true, rearmPinRefusal: error.rearmPinRefusal });
     }
   };
@@ -2381,29 +2409,38 @@ export function runReviewLabelCli({
     if (!pinnedPlainRearm) fail(commentFailure, 1);
     if (resumePinnedRearm) fail(`${commentFailure}; PR is review:pending without a marker — retry the same pinned re-arm`, 1);
     try {
-      const { fresh, freshComments } = recheckRearmClearance({
-        refuse: reason => { throw new Error(reason); },
-        readError: e => { throw e; },
-      });
-      if (JSON.stringify(carryEvidence(freshComments)) !== rearmRollbackEvidence) {
-        throw new Error('review verdict evidence changed before rollback — newer review state retained');
-      }
-      if (!Array.isArray(fresh.labels) || !fresh.labels.every(l => {
-        const name = typeof l === 'string' ? l : l?.name;
-        return typeof name === 'string' && name.length > 0;
-      })) throw new Error('rollback labels unreadable — cannot prove the re-arm state is unchanged');
-      const relevantLabels = labels => [...new Set(labels.filter(name =>
-        name.startsWith('review:') || decision.removeLabels.includes(name) || name === decision.addLabel))].sort();
-      const expectedLabels = [...preSwapLabels.filter(name => !removals.includes(name)), ...(decision.addLabel ? [decision.addLabel] : [])];
-      if (JSON.stringify(relevantLabels(fresh.labels.map(l => typeof l === 'string' ? l : l.name)))
-        !== JSON.stringify(relevantLabels(expectedLabels))) {
-        throw new Error('re-arm labels changed before rollback — newer review state retained');
-      }
-      // Invert only this swap. Restore every removed pre-swap label, and remove
-      // the new pending hold only if it was absent before the attempt.
-      provider.setLabels(repo, pr, {
-        add: removals.filter(label => preSwapLabels.includes(label)).join(','),
-        remove: decision.addLabel && !preSwapLabels.includes(decision.addLabel) ? [decision.addLabel] : [],
+      lockRearmWrite(repo, pr, () => {
+        const { fresh, freshComments } = recheckRearmClearance({
+          refuse: reason => { throw new Error(reason); },
+          readError: e => { throw e; },
+        });
+        if (JSON.stringify(carryEvidence(freshComments)) !== rearmRollbackEvidence) {
+          throw new Error('review verdict evidence changed before rollback — newer review state retained');
+        }
+        if (protectAcceptedRearm) {
+          const reviews = readRearmReviews(freshComments);
+          if (JSON.stringify(reviews) !== JSON.stringify(rearmReviews)
+            || (Array.isArray(reviews) && laterReviewHold(reviews))) {
+            throw new Error('formal review evidence changed or revokes acceptance before rollback — newer review state retained');
+          }
+        }
+        if (!Array.isArray(fresh.labels) || !fresh.labels.every(l => {
+          const name = typeof l === 'string' ? l : l?.name;
+          return typeof name === 'string' && name.length > 0;
+        })) throw new Error('rollback labels unreadable — cannot prove the re-arm state is unchanged');
+        const relevantLabels = labels => [...new Set(labels.filter(name =>
+          name.startsWith('review:') || decision.removeLabels.includes(name) || name === decision.addLabel))].sort();
+        const expectedLabels = [...preSwapLabels.filter(name => !removals.includes(name)), ...(decision.addLabel ? [decision.addLabel] : [])];
+        if (JSON.stringify(relevantLabels(fresh.labels.map(l => typeof l === 'string' ? l : l.name)))
+          !== JSON.stringify(relevantLabels(expectedLabels))) {
+          throw new Error('re-arm labels changed before rollback — newer review state retained');
+        }
+        // Invert only this swap. Restore every removed pre-swap label, and remove
+        // the new pending hold only if it was absent before the attempt.
+        provider.setLabels(repo, pr, {
+          add: removals.filter(label => preSwapLabels.includes(label)).join(','),
+          remove: decision.addLabel && !preSwapLabels.includes(decision.addLabel) ? [decision.addLabel] : [],
+        });
       });
     } catch (e) {
       fail(`${commentFailure}; rollback failed: ${ghErr(e, 'gh pr edit failed')}; review:pending without a marker may remain — inspect the current review state before retrying the pinned re-arm`, 1);
