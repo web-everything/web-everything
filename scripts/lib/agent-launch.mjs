@@ -91,7 +91,8 @@ function paths(value, name) {
   return value.map(p => absolute(p, name));
 }
 
-// D5: caller-allowlisted keys. Launcher-owned keys (PATH, HOME, USER, LOGNAME, SHELL, CODEX_HOME, TMP*, WE_GH_*) are never read from the caller.
+// D5: caller-allowlisted keys plus LC_ALL, LC_COLLATE, LC_CTYPE, LC_MESSAGES, LC_MONETARY, LC_NUMERIC, LC_TIME. Launcher-owned keys (PATH, HOME, USER, LOGNAME, SHELL, CODEX_HOME, TMP*, WE_GH_*) are never read from the caller.
+const LOCALE_KEYS = Object.freeze(new Set(['LC_ALL', 'LC_COLLATE', 'LC_CTYPE', 'LC_MESSAGES', 'LC_MONETARY', 'LC_NUMERIC', 'LC_TIME']));
 const CALLER_KEYS = new Set(['TERM', 'LANG', 'TZ', 'NO_COLOR', 'FORCE_COLOR', 'CI',
   'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy']);
 const AGENT_KEYS = { codex: ['OPENAI_API_KEY', 'CODEX_API_KEY'], claude: ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'] };
@@ -106,7 +107,7 @@ function envRecord(value) {
 }
 function callerEnv(env, agent) {
   const keep = new Set([...CALLER_KEYS, ...AGENT_KEYS[agent]]);
-  return Object.fromEntries(Object.entries(env).filter(([key, entry]) => entry !== undefined && (keep.has(key) || key.startsWith('LC_'))));
+  return Object.fromEntries(Object.entries(env).filter(([key, entry]) => entry !== undefined && (keep.has(key) || LOCALE_KEYS.has(key))));
 }
 function configValue(key, value) {
   switch (key) {

@@ -8,7 +8,11 @@ import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
  * `we:scripts/operations/__tests__/review-dispatch.test.mjs`'s own style for the sibling operation this file's
  * `dispatchFix` composition was mirrored from.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import * as settingsFiles from '../../lib/settings-files.mjs';
+import { FIX_SETTINGS_DEFAULTS } from '../fix-takeover.mjs';
 import { FIX_OVERLAP_PROSE_GLOBS, stripProseScope } from '../fix-scope-policy.mjs';
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
@@ -3108,6 +3112,138 @@ describe('PUSH-GATE-S4 — a live hold read right before launch stops a fixer sp
     });
     it('pending stays a hold for E1 when the pending label is the only exemption absent (no repair)', () => {
       expect(read(undefined, ['red-team:pending'])).toEqual(HELD);
+    });
+
+    describe('E4 operator send-back eligible route', () => {
+      const E4L = ['review:changes', 'review:human', 'red-team:pending'];
+      const E4 = { mode: 'operator-send-back', operatorSendBack: { verdictId: 'SB1', login: 'chalbert', body: 'fix A4' },
+        labels: E4L, reviewHuman: true, headRefOid: H, isConflict: false };
+      let root;
+      beforeEach(() => {
+        root = mkdtempSync(join(tmpdir(), 'e4-holds-'));
+        const preferences = join(root, 'preferences.json');
+        writeFileSync(preferences, '{}');
+        vi.stubEnv('WE_PLATFORM_PREFERENCES_FILE', preferences);
+        vi.spyOn(settingsFiles, 'readSettings').mockReturnValue({});
+        vi.spyOn(settingsFiles, 'readDeclaredSettings').mockReturnValue({ settings: {}, errors: [], tainted: [], sources: {} });
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date('2026-11-26T22:17:00Z'));
+      });
+      afterEach(() => {
+        vi.useRealTimers();
+        vi.restoreAllMocks();
+        vi.unstubAllEnvs();
+        rmSync(root, { recursive: true, force: true });
+      });
+      const e4Run = extra => run({ root, dryRun: false, listBuildClaims: () => [], listFixClaims: () => [],
+        prStack: null, prStackSettings: {}, priorityShadow: null, landingBlockedState: null,
+        fixSettings: { ...FIX_SETTINGS_DEFAULTS, strongerModelFromRound: 0 },
+        readMainRedPriorityRecord: () => null, now: 1000, clock: () => 1000, stepNow: () => 1000, stepLog: () => {},
+        tryResume: () => ({ resumed: false }), tryResumeRound: null,
+        fetchItemlessDiffPaths: () => ['scripts/fixture.mjs'], ...extra }, [{ ...entry, ...E4, attempts: 2 }]);
+
+      it('E4 passes with the exact live head, review:changes, MERGEABLE and main', () => {
+        expect(read(E4, E4L, OKV)).toBeNull();
+      });
+      it.each(['', '   ', 42])('E4 invalid body %j holds pending without falling through', body => {
+        expect(read({ ...E4, operatorSendBack: { ...E4.operatorSendBack, body } }, E4L, OKV)).toEqual(HELD);
+      });
+      it.each(['', 7, undefined])('E4 invalid verdictId %j holds pending', verdictId => {
+        expect(read({ ...E4, operatorSendBack: { ...E4.operatorSendBack, verdictId } }, E4L, OKV)).toEqual(HELD);
+      });
+      it.each([undefined, 'abc', 'A'.repeat(40)])('E4 invalid planned head %j holds pending', headRefOid => {
+        expect(read({ ...E4, headRefOid }, E4L, OKV)).toEqual(HELD);
+      });
+      it.each([undefined, 'b'.repeat(40)])('E4 missing or moved live head %j holds pending', headRefOid => {
+        expect(read(E4, E4L, { ...OKV, headRefOid })).toEqual(HELD);
+      });
+      it('E4 conflict repair holds pending', () => {
+        expect(read({ ...E4, isConflict: true }, E4L, OKV)).toEqual(HELD);
+      });
+      it('E4 without live review:changes holds pending', () => {
+        expect(read(E4, ['review:human', 'red-team:pending'], OKV)).toEqual(HELD);
+      });
+      it.each([
+        ['conflict label', [...E4L, 'merge-status:conflicting'], OKV],
+        ['UNKNOWN mergeability', E4L, { ...OKV, mergeable: 'UNKNOWN' }],
+        ['CONFLICTING mergeability', E4L, { ...OKV, mergeable: 'CONFLICTING' }],
+        ['retargeted base', E4L, { ...OKV, baseRefName: 'lane/x' }],
+        ['missing mergeability', E4L, { baseRefName: 'main' }],
+        ['missing base', E4L, { mergeable: 'MERGEABLE' }],
+        ['missing mergeability and base', E4L, {}],
+      ])('E4 %s holds pending', (_name, labels, live) => {
+        expect(read(E4, labels, live)).toEqual(HELD);
+      });
+      it.each([false, true])('E4 live red-team:blocked prevents pending exemption (carried=%s)', carried => {
+        const labels = [...E4L, 'red-team:blocked'];
+        expect(read({ ...E4, labels: carried ? labels : E4L }, labels, OKV)).toEqual(HELD);
+      });
+      it.each([false, true])('E4 preserves the outer held-mechanical exception (carried=%s)', carried => {
+        const labels = ['review:changes', 'review:human', 'review:held-mechanical', 'red-team:pending'];
+        expect(read({ ...E4, labels: carried ? labels : E4L }, labels, OKV))
+          .toEqual(carried ? null : { code: 'hold-label', reason: 'review:held-mechanical' });
+      });
+      it.each(['takeover', 'joinedInputs', 'restack', 'rulingNotAddressed', 'blockRuledReferrals', 'mqFailureRecovery', 'scopeBloat'])(
+        'E4 excluded %s flag holds pending', flag => {
+          expect(read({ ...E4, [flag]: flag === 'blockRuledReferrals' ? [{}] : {} }, E4L, OKV)).toEqual(HELD);
+        });
+      it('mixed advisory-fix plus operatorSendBack cannot pass through E1', () => {
+        expect(read({ ...E1, operatorSendBack: E4.operatorSendBack },
+          ['review:human', 'advisory:changes', 'red-team:pending'], OKV)).toEqual(HELD);
+      });
+      it('mixed plain send-back plus operatorSendBack cannot pass through E3', () => {
+        expect(read({ ...E3, operatorSendBack: E4.operatorSendBack }, E3L, OKV)).toEqual(HELD);
+      });
+      it('E4 mode without operatorSendBack cannot fall through to E3', () => {
+        expect(read({ ...E4, operatorSendBack: undefined }, E4L, OKV)).toEqual(HELD);
+      });
+      it('E4 retains the independent staleBase pending shortcut', () => {
+        expect(read({ ...E4, staleBase: {} }, E4L, OKV)).toBeNull();
+      });
+      it('E4 incomplete live labels refuse unreadable', () => {
+        expect(readLivePushHold({ repo: 'we', pr: 1764, repair: E4 }, { hermetic: false,
+          run: () => JSON.stringify({ state: 'OPEN', headRefOid: H, ...OKV }) }))
+          .toEqual({ code: 'unreadable', reason: 'Incomplete PR evidence' });
+      });
+      it.each(['throws', 'bad JSON'])('E4 %s live read refuses unreadable before dispatch', fault => {
+        const dispatch = vi.fn();
+        const result = e4Run({ dispatch, readPushHoldOptions: { hermetic: false,
+          run: () => { if (fault === 'throws') throw Error('fixture timeout'); return 'not json'; } } });
+        expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'push-hold', why: expect.stringContaining('unreadable') }));
+        expect(dispatch).not.toHaveBeenCalled();
+      });
+      it.each([false, true])('E4 re-checks the head between admission and launch (moved=%s)', moved => {
+        const dispatch = vi.fn(p => ({ sessionId: 'fixture', pr: p.pr }));
+        let reads = 0;
+        const result = e4Run({ dispatch, readPushHold: context => readLivePushHold(context, { hermetic: false,
+          run: () => view(E4L, { ...OKV, headRefOid: ++reads === 1 || !moved ? H : 'b'.repeat(40) }) }) });
+        expect(reads).toBe(2);
+        if (moved) {
+          expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'push-hold' }));
+          expect(dispatch).not.toHaveBeenCalled();
+        } else {
+          expect(result.refusals).toEqual([]);
+          expect(dispatch).toHaveBeenCalledTimes(1);
+        }
+      });
+      it.each([false, true])('E4 round resume re-checks live blocked evidence (blocked=%s)', blocked => {
+        const dispatch = vi.fn();
+        const tryResumeRound = vi.fn(() => ({ resumed: true, result: { sessionId: 'fixture-resume' } }));
+        let reads = 0;
+        const result = e4Run({ dispatch, tryResumeRound, fixExecutorRoute: () => ({ executor: 'claude' }),
+          readPushHold: context => readLivePushHold(context, { hermetic: false,
+            run: () => view(++reads > 1 && blocked ? [...E4L, 'red-team:blocked'] : E4L, OKV) }) });
+        expect(reads).toBe(2);
+        expect(dispatch).not.toHaveBeenCalled();
+        if (blocked) {
+          expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'push-hold' }));
+          expect(tryResumeRound).not.toHaveBeenCalled();
+        } else {
+          expect(result.refusals).toEqual([]);
+          expect(tryResumeRound).toHaveBeenCalledTimes(1);
+          expect(result.dispatched).toEqual([{ sessionId: 'fixture-resume' }]);
+        }
+      });
     });
   });
 

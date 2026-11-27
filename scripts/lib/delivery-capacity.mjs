@@ -222,6 +222,11 @@ function assessment(prs, host, policy, sources, fallbackReason, nowMs = Date.now
     ...(fallbackReason ? { fallbackReason } : {}) };
 }
 
+/**
+ * Capacity admits starts only on complete, attributable evidence: an incomplete or truncated
+ * PR population (flag or reader marker) and, under population=builder, any row without launch
+ * provenance fall back to count mode and hold.
+ */
 export function assessCapacity(input = {}) {
   let policy = DELIVERY_CAPACITY_DEFAULTS;
   let sources = standardSources();
@@ -233,11 +238,15 @@ export function assessCapacity(input = {}) {
     const nowMs = input?.nowMs ?? Date.now();
     const override = resolveCapacityOverride(input?.overrides, nowMs);
     if (!Array.isArray(evidence)) return assessment([], input?.host, policy, sources, 'PR evidence unreadable; count-mode fallback', nowMs, override);
+    const discovered = evidence.discoveryIncomplete === true;
     prs = Array.from(evidence);
     const failures = [
       ...(prs.some(pr => !validPrRow(pr)) ? ['PR evidence malformed: each row must be an object with a finite integer number'] : []),
       ...(input?.incomplete === true ? ['PR evidence incomplete; inspect full population'] : []),
-      ...(input?.discoveryIncomplete === true ? ['PR discovery incomplete; inspect full population'] : []),
+      ...(input?.discoveryIncomplete === true || discovered ? ['PR discovery incomplete; inspect full population'] : []),
+      ...(policy.population === 'builder' && prs.some(pr => validPrRow(pr)
+        && (typeof pr.headRefName !== 'string' || pr.headRefName.length === 0))
+        ? ['PR evidence lacks provenance (headRefName) under population=builder; inspect full population'] : []),
       ...(prs.length >= 200 ? ['PR evidence at or above 200-PR limit; inspect full population'] : []),
       ...(input?.fallbackReason ? [input.fallbackReason] : []),
     ];

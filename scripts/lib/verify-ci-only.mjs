@@ -4,7 +4,9 @@ import { join } from 'node:path';
 import { collectHostCapacity } from '../readiness/host-capacity.mjs';
 import { hostLoadAdmission } from './host-load.mjs';
 import { greenLedgerWritable } from './lane-verify.mjs';
-import { DEFERRED_OPEN_MODES, oneLine } from './lane-verify-deferred.mjs';
+import { DEFERRED_OPEN_MODES, DISCLOSURE_DETAIL_MAX, oneLine } from './lane-verify-deferred.mjs';
+
+export const CI_ONLY_LOCAL_ROUTE = 'run: node scripts/verify-lane.mjs request, then repeat node scripts/verify-lane.mjs check --wait=150000 until green, then re-run open-pr without --verify';
 
 /** IO with injectable sources. Unknown readings and memory-only refusals cannot authorize ci-only. */
 export function hostSaturation({ collect = collectHostCapacity, admission = hostLoadAdmission } = {}) {
@@ -40,7 +42,11 @@ export function ciOnlyDecision({ verify, mode, saturation = hostSaturation } = {
   if (!DEFERRED_OPEN_MODES.includes(mode)) return { ok: false, reason: 'bad-verify', detail: '--verify=ci-only requires park, label-on-green, or open-only; land is forbidden' };
   let host;
   try { host = saturation(); } catch { /* unreadable evidence refuses */ }
-  if (host?.saturated !== true) return { ok: false, reason: 'ci-only-not-saturated', detail: oneLine(host?.reason || 'CPU idle unknown; host saturation unreadable; retry local verification or inspect host probes') };
+  if (host?.saturated !== true) {
+    const hostReason = host?.reason || 'CPU idle unknown; host saturation unreadable; retry local verification or inspect host probes';
+    // Reserve the full route and separator within the disclosure cap (145 characters for the reason).
+    return { ok: false, reason: 'ci-only-not-saturated', detail: `${oneLine(hostReason, Math.min(160, DISCLOSURE_DETAIL_MAX - CI_ONLY_LOCAL_ROUTE.length - 2))}; ${CI_ONLY_LOCAL_ROUTE}` };
+  }
   const reason = oneLine(host.reason);
   return { ok: true, reason: 'ci-only', hostReason: reason, disclosure: `verify: ci-only (host saturated: ${reason})` };
 }

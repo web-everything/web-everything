@@ -9,7 +9,7 @@ export const JUDGE_SWEEP_REPO = CONSTELLATION_REPOS[DEFAULT_REPO_KEY].slug;
 export const STALL_DEFAULTS = Object.freeze({ fixerInfraLoop: 3, needsHumanAgedHours: 6,
   draftWithdrawnAgedHours: 4, waitingFixerMinutes: 45, unownedMinutes: 45 });
 
-/** First match wins, including when a worker is running on a PR already near its cap. */
+/** Required judgments precede transient progress; observations never mutate worker leases. */
 function existingJudgment(pr, thresholds = STALL_DEFAULTS) {
   const limits = { ...STALL_DEFAULTS, ...thresholds };
   const labels = Array.isArray(pr.labels) ? pr.labels : [];
@@ -26,19 +26,20 @@ function existingJudgment(pr, thresholds = STALL_DEFAULTS) {
     && headAge > limits.needsHumanAgedHours * 60) return yes('needs-human-aged');
   if ((pr.isDraft === true || labels.includes('review-status:draft-withdrawn'))
     && headAge > limits.draftWithdrawnAgedHours * 60) return yes('draft-withdrawn-aged');
-  // With readable evidence and no unruled referral, a live fixer, CI, or recent fix-loop means the PR is moving.
-  if (pr.fixerRunning) return no('fixer running');
-  if (pr.inCi) return no('in CI');
-  if (Number.isFinite(pr.minutesSinceFixLoop) && pr.minutesSinceFixLoop < 60) return no('fix-loop active (<60 min)');
+  // Merge admission and operator acceptance end the repair episode, even if cap labels linger.
   if (labels.includes('ready-to-merge')) return no('awaiting-merge');
   if (labels.includes('review:accepted') && labels.includes('review:human')) return yes('awaiting-operator');
-  if (pr.fixerRunning === false && labels.some(l => ['status:answered-waiting-fixer', 'review:changes'].includes(l))
-    && (pr.minutesSinceFixDispatch === null || (Number.isFinite(pr.minutesSinceFixDispatch)
-      && pr.minutesSinceFixDispatch > limits.waitingFixerMinutes))) return yes('waiting-fixer-not-dispatched');
   const capHold = labels.some(l => /round-limit|cap-exhausted/.test(l));
   if (capHold || (Number.isInteger(pr.round) && Number.isInteger(pr.cap) && pr.round >= pr.cap)) return yes('at-cap');
   if (pr.redTeam?.latestOutcome === 'round-cap' && pr.redTeam.state === 'blocked'
     && (pr.round === null || pr.round >= pr.cap)) return yes('red-team-blocked-at-cap');
+  // With readable evidence and no unruled referral, a live fixer, CI, or recent fix-loop means the PR is moving.
+  if (pr.fixerRunning) return no('fixer running');
+  if (pr.inCi) return no('in CI');
+  if (Number.isFinite(pr.minutesSinceFixLoop) && pr.minutesSinceFixLoop < 60) return no('fix-loop active (<60 min)');
+  if (pr.fixerRunning === false && labels.some(l => ['status:answered-waiting-fixer', 'review:changes'].includes(l))
+    && (pr.minutesSinceFixDispatch === null || (Number.isFinite(pr.minutesSinceFixDispatch)
+      && pr.minutesSinceFixDispatch > limits.waitingFixerMinutes))) return yes('waiting-fixer-not-dispatched');
   const [latest, previous] = pr.verdictHistory ?? [];
   const keys = new Set((previous?.findings ?? []).map(f => f.key));
   if ((latest?.findings ?? []).some(f => f.key && keys.has(f.key)) || pr.ignoredFindingReturned === true) {
@@ -86,8 +87,13 @@ function deriveResponsibility(pr, thresholds) {
     ['review-status:draft-withdrawn', 'status:needs-human', 'review-status:needs-human'].includes(l))) {
     return result('orchestrator', 'Inspect the hold and assign the next responsible worker.');
   }
-  // Empty-owner fallback only, after every guard above. Only an explicit CONFLICTING on a known non-draft PR counts.
-  if (pr.mergeable === 'CONFLICTING' && pr.isDraft === false && !labels.includes('hold:fix')) {
+  // Validation only governs the empty-owner conflict fallback; it cannot displace a responsible worker.
+  if (pr.isDraft === false && pr.mergeable !== 'MERGEABLE' && pr.conflictOwnershipError) {
+    return { ...result('operator', pr.conflictOwnershipError), conflictFallback: true };
+  }
+  // Only an explicit CONFLICTING on a known non-draft PR counts. Effective and worker holds may differ.
+  if (pr.mergeable === 'CONFLICTING' && pr.isDraft === false && !labels.includes(pr.fixHoldLabel ?? 'hold:fix')
+    && !labels.includes(pr.workerFixHoldLabel ?? 'hold:fix')) {
     return { ...result('fixer', 'Resolve the conflict.'), conflictFallback: true };
   }
   return result('nobody', 'Inspect the PR and assign its next responsible worker.');

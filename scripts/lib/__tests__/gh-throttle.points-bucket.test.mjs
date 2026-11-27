@@ -451,7 +451,7 @@ function child(old, extra = {}) {
   return new Promise((resolve, reject) => {
     const p = spawn(process.execPath, ['--input-type=module', '--eval', code, root, String(clock)], { env: process.env, stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '', err = ''; p.stdout.on('data', b => { out += b; if (out.length > 65536) p.kill(); }); p.stderr.on('data', b => { err += b; if (err.length > 65536) p.kill(); });
-    p.on('error', reject); p.on('exit', code => code === 0 ? resolve(JSON.parse(out)) : reject(new Error(err)));
+    p.on('error', reject); p.on('close', code => code === 0 ? resolve(JSON.parse(out)) : reject(new Error(err)));
   });
 }
 it('interleaved-old-new-processes-compat-respects-legacy', async () => {
