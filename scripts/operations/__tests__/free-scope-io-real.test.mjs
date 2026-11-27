@@ -51,8 +51,13 @@ it('a gh subprocess that fails makes the verdict unknown, never free', async () 
     mkdirSync(join(tmp, 'coord'), { recursive: true });
     const snapshot = collectFreeScope({ files: 'scripts/z.mjs', env: { WE_FREE_SCOPE_GH_BIN: bin },
       registryPath: join(tmp, 'coord', 'none.json') });
-    expect(snapshot.unreadable.length).toBe(2);
-    expect(assessFreeScope(snapshot).status).toBe('unknown');
+    expect(snapshot.unreadable).toEqual([
+      { repo: 'web-everything/web-everything', error: 'HTTP 502' },
+      { repo: 'frontier-ui/frontierui', error: 'HTTP 502' },
+      { repo: 'plateauapp/plateau-app', error: 'HTTP 502' },
+    ]);
+    expect(assessFreeScope(snapshot)).toMatchObject({ status: 'unknown', freeFiles: [],
+      files: [{ file: 'we:scripts/z.mjs', state: 'unknown', free: false }] });
   });
 });
 

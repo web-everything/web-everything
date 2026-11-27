@@ -118,6 +118,14 @@ const booleanKeys = new Set(['sharedGreenReuse', 'phaseAdmission', 'matchRequest
 // Preserve which keys survived validation without adding configuration keys to the file shape.
 const fileKeys = new WeakMap();
 
+// Empty guard overrides inherit the configured policy. Use the same normalization
+// when loading the cascade and resolving values so provenance agrees with the gate.
+function verifyEnvValue(key, env) {
+  const value = env?.[envKeys[key]];
+  return key === 'alwaysRunTests' && typeof value === 'string' && value.trim() === ''
+    ? undefined : value;
+}
+
 /** Normalize each key independently; malformed/missing keys keep the safe built-in value. */
 export function validateVerifySettings(raw) {
   const config = { ...BUILT_IN_VERIFY_SETTINGS };
@@ -140,7 +148,7 @@ export function loadVerifySettingsFile(path = defaultVerifySettingsPath(), { env
   let tool;
   try { tool = JSON.parse(readFileSync(path, 'utf8')); } catch { tool = undefined; }
   const c = cascadePolicy('verify', tool, { env, standard: BUILT_IN_VERIFY_SETTINGS,
-    envValues: Object.fromEntries(Object.entries(envKeys).map(([k, n]) => [k, env?.[n] || undefined])) });
+    envValues: Object.fromEntries(Object.keys(envKeys).map(k => [k, verifyEnvValue(k, env) || undefined])) });
   return validateVerifySettings(c.layered ?? null);
 }
 
@@ -151,14 +159,15 @@ export function resolveVerifySettings({ fileConfig, env = {} } = {}) {
   const sources = {};
   for (const [key, check] of Object.entries(rules)) {
     sources[key] = fileKeys.get(validated).has(key) ? 'file' : 'default';
-    let value = env?.[envKeys[key]];
+    let value = verifyEnvValue(key, env);
     if (booleanKeys.has(key)) value = value === '0' ? false : value === '1' ? true : undefined;
     else if (['retryFailed', 'shardMinTests', 'shardSize', 'shardParallel', 'testTimeoutFactor', 'fastTargets', 'relatedMaxTests', 'relatedDepth', 'revertRedMaxFiles', 'phaseTimeoutMs', 'slotHeartbeatMs'].includes(key)) {
       value = value != null && String(value).trim() !== '' ? Number(value) : undefined;
     }
     else if (key === 'alwaysRunTests') {
-      // Comma-separated list; an empty-but-set value switches the always-run set off.
-      value = value != null ? String(value).split(',').map(f => f.trim()).filter(Boolean) : undefined;
+      // Blank overrides inherit policy and provenance; an explicit validated file [] disables guards.
+      // Keep empty comma-list entries so malformed lists fail validation instead of dropping guards.
+      value = typeof value === 'string' ? value.split(',').map(f => f.trim()) : undefined;
     }
     if (check(value)) {
       values[key] = value;

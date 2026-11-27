@@ -38,7 +38,7 @@ import { types } from 'node:util';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createServer } from 'node:http';
 import { get as httpGet, request as httpRequest } from 'node:http';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, statSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
 import { dirname, join, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -124,14 +124,15 @@ import {
 } from '../http-adapter.mjs';
 
 describe('codex-audit runner output', () => {
+  const scopeDiagnostic = 'audit scope: hunkContextLines=3 (tool)\n';
   const cases = [
-    { name: 'passing verdict', answer: 'NOT WEAKENED', code: 0, stdout: 'NOT WEAKENED\n', stderr: '' },
+    { name: 'passing verdict', answer: 'NOT WEAKENED', code: 0, stdout: 'NOT WEAKENED\n', stderr: scopeDiagnostic },
     { name: 'weakened verdict with quoted multiline findings', answer: 'WEAKENED\nscripts/x.mjs:1 — "guard" weakened\nscripts/y.mjs:2 — second finding', code: 1,
-      stdout: 'WEAKENED\nscripts/x.mjs:1 — "guard" weakened\nscripts/y.mjs:2 — second finding\n', stderr: '' },
+      stdout: 'WEAKENED\nscripts/x.mjs:1 — "guard" weakened\nscripts/y.mjs:2 — second finding\n', stderr: scopeDiagnostic },
     { name: 'invalid answer', answer: 'incomplete', code: 3, stdout: '',
-      stderr: 'UNPARSEABLE audit (no verdict line (first line: "incomplete")): incomplete or failed evidence; retry or request human review of the full diff.\n' },
+      stderr: scopeDiagnostic + 'UNPARSEABLE audit (no verdict line (first line: "incomplete")): incomplete or failed evidence; retry or request human review of the full diff.\n' },
     { name: 'record write failure', answer: 'NOT WEAKENED', recordError: true, code: 3, stdout: '',
-      stderr: 'Audit record write failed; repair the record path and retry.\n' },
+      stderr: scopeDiagnostic + 'Audit record write failed; repair the record path and retry.\n' },
     { name: 'unresolved ref', resolveError: true, code: 2, stdout: '',
       stderr: 'Cannot resolve commits. usage: node scripts/operations/codex-audit.mjs --base=<ref|sha> --head=<40-hex sha> [--json] [--now] [--branch=<ref>]\n' },
     { name: 'invalid audit arguments', head: 'invalid', code: 2, stdout: '',
@@ -170,7 +171,7 @@ describe('codex-audit runner output', () => {
         expect(JSON.parse(output).verdict).toEqual({ ok: testCase.code === 0, code: testCase.code,
           stdout: testCase.stdout, stderr: testCase.stderr });
       } else {
-        expect(output).toContain((testCase.stdout || testCase.stderr).trimEnd());
+        expect(output).toBe(testCase.stdout + testCase.stderr);
       }
       expect(leakedOut).toBe('');
       expect(leakedErr).toBe('');
@@ -1241,4 +1242,42 @@ describe('capacity writers are CLI only', () => {
     expect(response.status).toBe(200);
     expect(response.body.readOnly).toBe(true);
   });
+});
+
+it('http read-only leaves cache untouched while reading all repo pools and a live old holder', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pool-http-'));
+  try {
+    const { readPoolSource, readPoolJson } = await import('../../lib/resource-pool-io.mjs');
+    const { readPoolLaneStatus } = await import('../../lib/resource-pool-lanes.mjs');
+    const pools = join(root, 'pools'), redTeam = join(root, 'red-team'); mkdirSync(redTeam);
+    const readRegistry = () => ({ repos: [{ name: 'one' }, { name: 'two' }] });
+    const caches = [];
+    for (const name of ['one', 'two']) {
+      const pool = join(pools, name), lane = join(pool, 'lane-8'); mkdirSync(lane, { recursive: true });
+      writeFileSync(join(lane, '.lane-lease'), JSON.stringify({ session: `fix-${name}`, acquiredAt: new Date(0).toISOString(), reserved: true }));
+      const file = join(pool, '.lane-status-cache.json'); writeFileSync(file, 'untouched cache');
+      caches.push({ file, bytes: readFileSync(file), mtimeMs: statSync(file).mtimeMs });
+    }
+    const head = 'a'.repeat(40);
+    writeFileSync(join(redTeam, `we-12-${head}.json`), JSON.stringify({ repo: 'we', pr: 12, head,
+      status: 'running', pid: 123, pidStart: 'start', host: 'fixture' }));
+    const env = { HOME: root, LANE_POOL_ROOT: pools }, nowMs = 9000000000000;
+    const run = () => join(root, '.lanes', 'one', 'lane-8');
+    const laneStatus = () => readPoolLaneStatus({ env, cwd: root, nowMs, run, readRegistry, readJson: file => readPoolJson(file).data });
+    const collect = () => Object.fromEntries(['workers', 'redTeam'].map(source => [source, readPoolSource(source, {
+      env, cwd: root, nowMs, paths: { redTeam }, run, laneStatus, heavyStatus: () => ({ held: [] }),
+      host: 'fixture', namespace: 'fixture', processAlive: () => true, readStart: () => 'start',
+    })]));
+    const declaration = op('pool-shadow-fixture', { input: {}, verdictFrom: 'read', read: compute({ reads: [], fn: collect }) });
+    const registry = createRegistry(); registry.register(declaration);
+    const res = await handleOperationRequest({ method: 'GET', url: '/operations/pool-shadow-fixture/run' }, {
+      names: () => ['pool-shadow-fixture'], resolve: () => ({ declaration, registry }), store: refusingStore(), newRunId: idMinter(),
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.verdict.workers).toMatchObject({ ok: true, holders: [{ jobId: 'fix-one' }, { jobId: 'fix-two' }] });
+    expect(res.body.verdict.redTeam).toMatchObject({ ok: true, holders: [{ kind: 'redTeam' }] });
+    for (const { file, bytes, mtimeMs } of caches) {
+      expect(readFileSync(file)).toEqual(bytes); expect(statSync(file).mtimeMs).toBe(mtimeMs);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

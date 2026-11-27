@@ -23,6 +23,9 @@ function sqlStorage(storage) {
   sql.exec(`CREATE UNIQUE INDEX IF NOT EXISTS events_delivery ON events(delivery_id) WHERE delivery_id IS NOT NULL`);
   sql.exec(`CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)`);
   sql.exec('CREATE TABLE IF NOT EXISTS projection (bucket TEXT, k TEXT, body TEXT NOT NULL, PRIMARY KEY (bucket, k))');
+  sql.exec('CREATE TABLE IF NOT EXISTS receipts (k TEXT PRIMARY KEY, at INTEGER NOT NULL, seq INTEGER NOT NULL)');
+  sql.exec('CREATE INDEX IF NOT EXISTS receipts_at ON receipts(at)');
+  sql.exec('CREATE INDEX IF NOT EXISTS receipts_seq ON receipts(seq)');
   return {
     transaction: (fn) => storage.transactionSync(fn),
     getProjection: (bucket, key) => JSON.parse(sql.exec('SELECT body FROM projection WHERE bucket = ? AND k = ?', bucket, key).toArray()[0]?.body || 'null'),
@@ -31,6 +34,14 @@ function sqlStorage(storage) {
     getMeta: (k) => sql.exec('SELECT v FROM meta WHERE k = ?', k).toArray()[0]?.v ?? null,
     setMeta: (k, v) => { sql.exec('INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v', k, v); },
     hasDelivery: (id) => sql.exec('SELECT 1 FROM events WHERE delivery_id = ? LIMIT 1', id).toArray().length > 0,
+    hasReceipt: (key) => sql.exec('SELECT 1 FROM receipts WHERE k = ?', key).toArray().length > 0,
+    putReceipt: (key, at, seq) => { sql.exec('INSERT INTO receipts (k, at, seq) VALUES (?, ?, ?)', key, at, seq); },
+    pruneReceipts: (olderThan, max) => {
+      const before = sql.exec('SELECT COUNT(*) AS n FROM receipts').toArray()[0].n;
+      sql.exec('DELETE FROM receipts WHERE at < ?', olderThan);
+      sql.exec('DELETE FROM receipts WHERE k IN (SELECT k FROM receipts ORDER BY seq DESC LIMIT -1 OFFSET ?)', max);
+      return before - sql.exec('SELECT COUNT(*) AS n FROM receipts').toArray()[0].n;
+    },
     insert: (seq, id, at, body, keep = false) => { sql.exec('INSERT INTO events (seq, delivery_id, at, body, keep) VALUES (?, ?, ?, ?, ?)', seq, id, at, body, keep ? 1 : 0); },
     range: (after, limit) => sql.exec('SELECT body FROM events WHERE seq > ? ORDER BY seq LIMIT ?', after, limit).toArray().map((r) => r.body),
     minSeq: () => sql.exec('SELECT MIN(seq) AS m FROM events').toArray()[0]?.m ?? null,
@@ -50,7 +61,7 @@ export class PrEventLog extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this.storageAdapter = sqlStorage(ctx.storage);
-    this.log = createEventLog(this.storageAdapter);
+    this.log = createEventLog(this.storageAdapter, { occDedupe: env.OCC_DEDUPE ?? 'shadow' });
   }
   append(record, now) { return this.log.append(record, now); }
   appendRuntime(raw, now) { return this.log.appendRuntime(raw, now); }

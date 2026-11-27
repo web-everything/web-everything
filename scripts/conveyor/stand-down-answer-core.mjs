@@ -291,5 +291,7 @@ export function noCodeRearmPlan({ comments, labels, headRefOid } = {}) {
     || after.some(c => [REARM_COMMENT_MARKER, NO_CHANGE_COMMENT_MARKER].some(m => c.body?.trimStart().startsWith(m)))) {
     return result('spent', 'the no-code ruling was already spent', answerId);
   }
+  // Bound admission of a live rearm without reviving a retired or spent ruling.
+  if (comments.length > 2000) return held('thread exceeds 2000 comments; operator must inspect the complete thread before a fresh answer');
   return result('ready', 'operator ruled no code owed', answerId);
 }

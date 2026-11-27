@@ -338,6 +338,7 @@ describe('runner freshness policy', () => {
 
   describe('codex-audit --json', () => {
     const SHA = 'a'.repeat(40), HEAD = 'b'.repeat(40);
+    const scopeDiagnostic = 'audit scope: hunkContextLines=3 (tool)\n';
     const deps = (answer, out = []) => ({ resolveSha: ref => (ref === HEAD ? HEAD : SHA), runCodex: () => answer,
       appendRecord: async () => {}, now: () => '2026-11-02T00:00:00Z', stdout: t => out.push(t), stderr: () => {} });
     const run = async (answer, json) => {
@@ -358,7 +359,7 @@ describe('runner freshness policy', () => {
       expect(out.code).toBe(0);
       expect(out.lines).toHaveLength(1);
       const env = JSON.parse(out.lines[0]);
-      expect(env.verdict).toEqual({ ok: true, code: 0, stdout: 'NOT WEAKENED\n', stderr: '' });
+      expect(env.verdict).toEqual({ ok: true, code: 0, stdout: 'NOT WEAKENED\n', stderr: scopeDiagnostic });
       expect(records).toEqual([[expect.objectContaining({ verdict: 'NOT WEAKENED', base: SHA, head: HEAD, findings: [] })]]);
       expect(verdict.code).toBe(0);
     });
@@ -367,12 +368,12 @@ describe('runner freshness policy', () => {
       expect(out.code).toBe(1);
       expect(written).toEqual([]);
       expect(JSON.parse(out.lines[0]).verdict).toEqual({ ok: false, code: 1,
-        stdout: 'WEAKENED\nrun.mjs:1 loosened\n', stderr: '' });
+        stdout: 'WEAKENED\nrun.mjs:1 loosened\n', stderr: scopeDiagnostic });
       expect(records).toEqual([[expect.objectContaining({ verdict: 'WEAKENED', findings: ['run.mjs:1 loosened'] })]]);
     });
-    it('plain mode is unchanged: verdict then findings lines, no JSON', async () => {
+    it('plain mode prints verdict then findings and scope provenance, no JSON', async () => {
       const { out } = await run('WEAKENED\nrun.mjs:1 loosened\n', false);
-      expect(out.lines.join('\n')).toBe('WEAKENED\nrun.mjs:1 loosened');
+      expect(out.lines.join('\n')).toBe(`WEAKENED\nrun.mjs:1 loosened\n${scopeDiagnostic.trimEnd()}`);
     });
     it('an incomplete audit keeps its code and returns its diagnostic in the operations envelope', async () => {
       const { written, records, out } = await run(undefined, true);
@@ -381,7 +382,7 @@ describe('runner freshness policy', () => {
       expect(records).toEqual([]);
       expect(out.lines).toHaveLength(1);
       expect(JSON.parse(out.lines[0]).verdict).toEqual({ ok: false, code: 3, stdout: '',
-        stderr: 'UNPARSEABLE audit (missing final message): incomplete or failed evidence; retry or request human review of the full diff.\n' });
+        stderr: scopeDiagnostic + 'UNPARSEABLE audit (missing final message): incomplete or failed evidence; retry or request human review of the full diff.\n' });
     });
     it.each([
       ['NOT WEAKENED', [], 0],
@@ -402,7 +403,7 @@ describe('runner freshness policy', () => {
           store: createMemoryRunStore(), newRunId: () => 'audit-json-regression',
         });
         expect(auditDeps).toHaveBeenCalledOnce();
-        const captured = { ok: code === 0, code, stdout: `${[verdict, ...findings].join('\n')}\n`, stderr: '' };
+        const captured = { ok: code === 0, code, stdout: `${[verdict, ...findings].join('\n')}\n`, stderr: scopeDiagnostic };
         expect(outcome.run.verdict).toEqual(captured);
         expect(injectedDeps.appendRecord).toHaveBeenCalledOnce();
         expect(injectedDeps.appendRecord).toHaveBeenCalledWith(expect.objectContaining({

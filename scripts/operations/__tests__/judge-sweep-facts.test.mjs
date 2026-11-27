@@ -9,8 +9,10 @@ import * as judgeSweepFactsIo from '../judge-sweep-facts-io.mjs';
 import { buildJudgeSweepBundle, finishJudgeSweep, judgeSweepFactsOperation, needsJudgment, JUDGE_SWEEP_REPO } from '../judge-sweep-facts.mjs';
 import { createJudgeSweepFactsReader, createShapeCache, operatorGh } from '../judge-sweep-facts-io.mjs';
 import { resolveOperation } from '../run.mjs';
-import { createRegistry, isReadOnlyOperation } from '../registry.mjs';
-import { runOperationCli } from '../cli-adapter.mjs';
+import { op, createRegistry, isReadOnlyOperation } from '../registry.mjs';
+import { startRun } from '../engine.mjs';
+import { compute, effect } from '../step-kinds.mjs';
+import { driveRun, runOperationCli } from '../cli-adapter.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { renderPanelComment } from '../../lib/review-render.mjs';
 import { redTeamMarker } from '../../lib/red-team-gate.mjs';
@@ -50,7 +52,7 @@ function fixture(overrides = {}) {
   const gh = vi.fn(() => JSON.stringify([pr()]));
   const readComments = vi.fn(() => []);
   const shape = vi.fn(() => ({ humanRequired: false }));
-  const options = { findSuspendedRuns: () => [], checkoutState: () => ({ behind: 0 }), gh, now: () => NOW, readLedgerRows: nearCapRows, readFixRows: () => [],
+  const options = { env: {}, readFile: () => '{}', log: () => {}, findSuspendedRuns: () => [], checkoutState: () => ({ behind: 0 }), gh, now: () => NOW, readLedgerRows: nearCapRows, readFixRows: () => [],
     readJobs: () => [], readComments, cache: memoryCache(), shape, baseCap: 5, cardReadable: () => false, ...overrides };
   const transport = options.gh;
   const readerOptions = { ...options, gh: args => {
@@ -72,10 +74,10 @@ describe('deterministic first-match judge classification', () => {
     ['finding-back-unfixed-more-than-once', { verdictHistory: [{ findings: [{ key: 'k' }] }, { findings: [{ key: 'k' }] }] }],
     ['clean-and-owed-approval', { labels: ['review:human'], latestVerdict: { accepted: true }, redTeam: { state: 'clear' } }],
     ['stalled>45min-no-owner', { minutesSinceUpdate: 46 }],
-    ['fixer running', { fixerRunning: true, round: 5 }],
-    ['fix-loop active (<60 min)', { minutesSinceFixLoop: 59, round: 5 }],
+    ['fixer running', { fixerRunning: true, round: 4 }],
+    ['fix-loop active (<60 min)', { minutesSinceFixLoop: 59, round: 4 }],
     ['waiting on review', { round: 4 }],
-    ['in CI', { inCi: true, round: 5 }],
+    ['in CI', { inCi: true, round: 4 }],
     ['in CI', { inCi: true }],
     ['waiting on review', {}],
   ])('%s', (reason, patch) => {
@@ -122,9 +124,9 @@ describe('deterministic first-match judge classification', () => {
       expect(needsJudgment(facts({ openReferrals }))).toEqual({ needsJudgment: false, reason: 'waiting on review' });
     }
   });
-  it('keeps at-cap PRs in CI out of judgment when evidence is readable and no referral awaits a ruling', () => {
+  it('requires judgment for at-cap PRs in CI even when evidence is readable and no referral awaits a ruling', () => {
     for (const patch of [{ round: 5 }, { labels: ['status:round-limit'] }]) {
-      expect(needsJudgment(facts({ ...patch, inCi: true }))).toEqual({ needsJudgment: false, reason: 'in CI' });
+      expect(needsJudgment(facts({ ...patch, inCi: true }))).toEqual({ needsJudgment: true, reason: 'at-cap' });
     }
   });
   it('builds one complete bundle with counts and no internal classifier inputs', () => {
@@ -922,4 +924,127 @@ it('R746 assigns suspended mandatory referrals to the judge with run and finding
   const suspendedReferralRun = { runId: 'review-pr-held', ageMinutes: 3, findings: [{ key: 'k', summary: 'guard' }] };
   expect(needsJudgment(facts({ suspendedReferralRun }))).toEqual({ needsJudgment: true, reason: 'suspended-referral-run' });
   expect(buildJudgeSweepBundle({ prs: [facts({ suspendedReferralRun })] }).prs[0].suspendedReferralRun).toEqual(suspendedReferralRun);
+});
+
+
+describe('CONFLICT-OWNER-HARDEN cap routing', () => {
+  it('a round-capped PR with running CI and a young fix loop still requires judgment', () => {
+    expect(needsJudgment(facts({ round: 5, inCi: true, minutesSinceFixLoop: 0 })))
+      .toEqual({ needsJudgment: true, reason: 'at-cap' });
+  });
+  it.each([{ fixerRunning: true }, { inCi: true }, { minutesSinceFixLoop: 59 },
+    { minutesSinceFixLoop: 60 }, { fixerRunning: true, inCi: true, minutesSinceFixLoop: 0 }])(
+    'exposes cap exhaustion through transient activity %j', activity => {
+      for (const cap of [{ round: 5 }, { labels: ['status:cap-exhausted'] },
+        { round: null, redTeam: { state: 'blocked', latestOutcome: 'round-cap' } }]) {
+        const row = buildJudgeSweepBundle({ prs: [facts({ ...activity, ...cap })] }).prs[0];
+        expect(row).toMatchObject({ needsJudgment: true, nextOwner: 'judge' });
+        expect(row.reason).toMatch(/^(at-cap|red-team-blocked-at-cap)$/);
+      }
+    });
+  async function assertLeaseSafety(makeDeclaration = judgeSweepFactsOperation) {
+    const lease = { token: 'fixture-token', owner: 'fixture-worker', generation: 7 };
+    let storedLease = structuredClone(lease);
+    const leaseStore = { read: vi.fn(() => structuredClone(storedLease)),
+      write: vi.fn(value => { storedLease = value; }), release: vi.fn(() => { storedLease = null; }) };
+    const dispatch = vi.fn();
+    const readFacts = () => ({ generatedAt: at(0), prs: [facts({ round: 5,
+      inCi: true, minutesSinceFixLoop: 0, fixerRunning: true, owner: leaseStore.read().owner })] });
+    const declaration = makeDeclaration({ readFacts });
+    const sinks = { 'lease.write': () => leaseStore.write({ ...lease, generation: 8 }),
+      'lease.release': () => leaseStore.release(), 'fixer.dispatch': dispatch };
+    const registry = createRegistry();
+    registry.register(declaration);
+    const store = createMemoryRunStore();
+    const run = startRun({ op: declaration.name, id: 'lease-safety-fixture', registry });
+    store.write(run);
+    const outcome = await driveRun({ run, registry, store, sinks, clock: () => NOW });
+    expect(outcome.stopped).toBe('complete');
+    const row = outcome.run.verdict.prs[0];
+    expect({ owner: row.nextOwner, judgment: row.needsJudgment, reason: row.reason })
+      .toEqual({ owner: 'judge', judgment: true, reason: 'at-cap' });
+    expect(leaseStore.read()).toEqual(lease);
+    expect(leaseStore.write).not.toHaveBeenCalled();
+    expect(leaseStore.release).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+  }
+  it('a capped PR with an active worker routes to judgment without competing dispatch', async () => {
+    await assertLeaseSafety();
+  });
+  it.each(['lease.write', 'lease.release', 'fixer.dispatch'])(
+    'the safety fixture detects a real %s effect through the production executor', async type => {
+      const unsafeDeclaration = ({ readFacts }) => op('judge-sweep-facts', {
+        verdictFrom: 'bundle',
+        read: compute({ reads: [], fn: readFacts }),
+        bundle: compute({ reads: ['findings.read'], fn: ({ findings }) => buildJudgeSweepBundle(findings.read) }),
+        unsafe: effect({ reads: [], effects: () => [{ type, payload: {}, idempotent: true }] }),
+      });
+      await expect(assertLeaseSafety(unsafeDeclaration)).rejects.toThrow();
+    });
+});
+
+// Acceptance and merge admission end the repair episode; stale cap evidence must not reopen it.
+it.each(['ready-to-merge', 'operator-accepted'])('preserves %s ownership despite cap evidence', state => {
+  const labels = ['status:cap-exhausted', ...(state === 'ready-to-merge'
+    ? ['ready-to-merge'] : ['review:accepted', 'review:human'])];
+  const row = buildJudgeSweepBundle({ prs: [facts({ labels, round: 5 })] }).prs[0];
+  expect(row).toMatchObject(state === 'ready-to-merge'
+    ? { needsJudgment: false, reason: 'awaiting-merge', nextOwner: 'drain' }
+    : { needsJudgment: true, reason: 'awaiting-operator', nextOwner: 'judge' });
+});
+
+
+const ownershipRules = [
+  ['active fixer', { fixerRunning: true }, 'fixer'],
+  ['merge admission', { labels: ['ready-to-merge'] }, 'drain'],
+  ...['review:accepted', 'review:human', 'status:needs-you'].map(label => [label, { labels: [label] }, 'operator']),
+  ...['review:pending', 'status:awaiting-review'].map(label => [label, { labels: [label] }, 'review']),
+  ['red-team state', { redTeam: { state: 'pending' } }, 'red-team'],
+  ['red-team label', { labels: ['red-team:pending'] }, 'red-team'],
+  ...['review:changes', 'status:answered-waiting-fixer'].map(label =>
+    [label, { labels: [label], minutesSinceFixDispatch: 5 }, 'fixer']),
+  ['draft', { isDraft: true }, 'orchestrator'],
+  ...['review-status:draft-withdrawn', 'status:needs-human', 'review-status:needs-human'].map(label =>
+    [label, { labels: [label] }, 'orchestrator']),
+];
+it.each(ownershipRules.flatMap(([rule, patch, nextOwner]) =>
+  ['MERGEABLE', 'CONFLICTING', 'UNKNOWN', null].map(mergeable => ({ rule, patch, nextOwner, mergeable }))))(
+  'conflict validation preserves $rule ownership for $mergeable', ({ patch, nextOwner, mergeable }) => {
+    const input = facts({ labels: [], owner: null, fixerRunning: false, minutesSinceUpdate: 1,
+      minutesSinceFixLoop: 90, isDraft: false, ...patch, mergeable });
+    const before = buildJudgeSweepBundle({ prs: [input] }).prs[0];
+    expect(before.nextOwner).toBe(nextOwner);
+    const after = buildJudgeSweepBundle({ prs: [{ ...input,
+      conflictOwnershipError: 'Inspect conflict ownership settings and rerun.' }] }).prs[0];
+    expect(after).toMatchObject({ nextOwner, needsJudgment: before.needsJudgment, reason: before.reason,
+      nextStep: before.nextStep });
+  });
+
+it('unknown mergeability preserves judgment for an ownerless 90-minute-old fix loop', () => {
+  const input = facts({ owner: null, fixerRunning: false, minutesSinceUpdate: 1,
+    minutesSinceFixLoop: 90, mergeable: 'UNKNOWN', isDraft: false,
+    conflictOwnershipError: 'Inspect PR mergeability and rerun; merge state is unknown or unreadable.' });
+  expect(buildJudgeSweepBundle({ prs: [input] }).prs[0]).toMatchObject({
+    needsJudgment: true, reason: expect.stringMatching(/^unowned:/), nextOwner: 'operator',
+    nextStep: input.conflictOwnershipError });
+});
+
+it.each([
+  ['MERGEABLE', false, 'nobody'], ['UNKNOWN', true, 'orchestrator'], ['UNKNOWN', undefined, 'nobody'],
+])('conflict validation does not route mergeable or draft-unknown PRs (%s, draft=%s)', (mergeable, isDraft, nextOwner) => {
+  expect(judgeSweepFacts.deriveNextOwner(facts({ mergeable, isDraft,
+    conflictOwnershipError: 'Inspect hold settings and rerun.' }))).toMatchObject({ nextOwner });
+});
+
+it.each(['custom:fix', 'worker:fix'])(
+  'conflict fallback respects %s alongside effective and worker hold overrides', label => {
+    expect(judgeSweepFacts.deriveNextOwner(facts({ mergeable: 'CONFLICTING', isDraft: false,
+      fixHoldLabel: 'custom:fix', workerFixHoldLabel: 'worker:fix', labels: [label] })))
+      .toMatchObject({ nextOwner: 'nobody' });
+  });
+
+it('effective and worker hold overrides replace the default hold label', () => {
+  expect(judgeSweepFacts.deriveNextOwner(facts({ mergeable: 'CONFLICTING', isDraft: false,
+    fixHoldLabel: 'custom:fix', workerFixHoldLabel: 'worker:fix', labels: ['hold:fix'] })))
+    .toMatchObject({ nextOwner: 'fixer', nextStep: 'Resolve the conflict.' });
 });

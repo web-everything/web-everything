@@ -6418,6 +6418,21 @@ reservation or post while a non-excluded PR receives an answer.
 Verify gates execute explicit sorted test files, including complete graph selections. Graph failures,
 empty lists and oversized argv use changed tests plus direct importers clipped to `relatedMaxTests`,
 then the named `alwaysRunTests` suites. An empty union skips the test half; never emit unfiltered Vitest.
+`WE_VERIFY_ALWAYS_RUN_TESTS` unset, empty (`''`), or whitespace-only inherits the configured
+guards and their provenance. It cannot disable guards. To deliberately disable the named
+guard suites, set `"alwaysRunTests": []` in the verifier's tool settings file
+(`scripts/verify-settings.json` in the checkout running verify-lane, not the target cwd).
+Fixtures should pass a fixture-local settings file to `loadVerifySettingsFile` rather than
+relying on an empty env override. This disables only named guards; selected tests still run.
+A nonblank env override must be a valid comma-separated list of test paths. Empty entries,
+including a trailing comma (`a.test.mjs,`), reject the entire override and retain configured guards.
+
+For a PR changing a `WE_VERIFY_*` default or env normalization, the test-plan checklist must
+include a repository-wide reference search (for example `rg 'WE_VERIFY_ALWAYS_RUN_TESTS'`)
+across tests, scripts and docs. Include every test that sets the affected variable in the
+verified set, even when it does not import the resolver directly; record the search and
+selected test files in the PR evidence.
+
 Explicit related gates share the selector; `--gate-uncapped` is an audited exemption.
 A related gate stamped by an older dispatcher (`--run --passWithNoTests --testTimeout=N --hookTimeout=N`)
 converts to a capped gate keeping its stamped timeouts; any other unknown option is still refused.
