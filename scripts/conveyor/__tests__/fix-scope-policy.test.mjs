@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -332,6 +332,35 @@ describe('shared registry scope holds', () => {
   const run = (entries, claims = [], overrides = {}, options = {}) => filterFixesByInFlightScope(entries, [], claims, {
     now: NOW, maxWaitMinutes: null, rebaseExempt: null,
     policy: { value: { ...policyApi.FIX_SCOPE_DEFAULTS, overlapGranularity: 'file', ...overrides }, sources: {} }, ...options,
+  });
+  it.each([
+    ['urgent', { urgentPrs: new Set([2]) }],
+    ['operator priority', { priorityPrs: new Set([2]) }],
+    ['disjoint regions', {}],
+  ])('live shared-registry claim blocks %s writers without consulting regions', (_name, options) => {
+    const regionOverlap = vi.fn(() => ({ overlap: false, why: 'fixture disjoint regions' }));
+    const out = run([candidate(2)], [live(1)], { overlapGranularity: 'region' }, { regionOverlap, ...options });
+    expect(out.planned).toEqual([]);
+    expect(out.refusals).toHaveLength(1);
+    expect(out.refusals[0]).toMatchObject({ pr: 2, kind: 'scope-overlap', registry: X,
+      waitingOn: [{ kind: 'fix', pr: 1 }] });
+    expect(regionOverlap).not.toHaveBeenCalled();
+    // The same injected observation admits an ordinary file: the hold is registry-specific.
+    const ordinary = run([candidate(2, [F])], [live(1, [F])], { overlapGranularity: 'region' }, { regionOverlap });
+    expect(ordinary.planned.map(e => e.pr)).toEqual([2]);
+    expect(ordinary.refusals).toEqual([]);
+    expect(regionOverlap).toHaveBeenCalledTimes(1);
+  });
+  it.each([
+    ['urgent', { urgentPrs: new Set([2]) }],
+    ['operator priority', { priorityPrs: new Set([2]) }],
+  ])('shared-registry FIFO admits the older writer before a newer %s writer', (_name, options) => {
+    const out = run([candidate(2, [X], 1), candidate(1, [X], 2)], [], {}, options);
+    expect(out.ranks.map(r => [r.pr, r.rank])).toEqual([[1, 1], [2, 2]]);
+    expect(out.planned.map(e => e.pr)).toEqual([1]);
+    expect(out.refusals).toHaveLength(1);
+    expect(out.refusals[0]).toMatchObject({ pr: 2, registry: X, queuePosition: 2,
+      waitingOn: [{ kind: 'fix', pr: 1 }] });
   });
   it('R10 registry entries use a frozen exact WE path list', () => {
     expect(policyApi.FIX_OVERLAP_SHARED_REGISTRY_PATHS).toEqual([X.slice(3), Y.slice(3), 'scripts/lib/settings-registry.mjs']);

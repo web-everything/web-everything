@@ -5,6 +5,15 @@ import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 import { parseScopeEntry } from '../readiness/overlap-chain.mjs';
 
+/** Exact shared WE registries serialize repair writers regardless of priority or region. */
+export const FIX_OVERLAP_SHARED_REGISTRY_PATHS = Object.freeze([
+  'scripts/push-gate-allowlist.json', 'scripts/lib/repo-scan-tests.mjs', 'scripts/lib/settings-registry.mjs',
+]);
+export function registryEntries(scope) {
+  return Array.isArray(scope) ? scope.filter(entry => typeof entry === 'string'
+    && FIX_OVERLAP_SHARED_REGISTRY_PATHS.some(path => entry === `we:${path}`)) : [];
+}
+
 export const FIX_OVERLAP_PROSE_GLOBS = Object.freeze(['backlog/**/*.md', 'docs/**/*.md']);
 
 /** Ignore prose only when computing fix overlap; retain original dispatch/claim scopes. */

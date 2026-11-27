@@ -88,7 +88,7 @@ import { withSalvageHint } from '../lib/salvage-index.mjs';
 import { repoKeyForSlug, CONSTELLATION_REPOS, ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { assertCapability, repoProfile, briefTokensForRepo } from '../lib/repo-profile.mjs';
 import { resolvePrWorkUnit, isSafeFallbackScopeEntry } from './pr-work-unit.mjs';
-import { resolveFixScopePolicy, resolveOperatorPriorityPrs, createRegionReader, createLiveRegionOverlap, createHolderStateReader, landingHolderDecision, stripProseScope } from './fix-scope-policy.mjs';
+import { resolveFixScopePolicy, resolveOperatorPriorityPrs, createRegionReader, createLiveRegionOverlap, createHolderStateReader, landingHolderDecision, stripProseScope, registryEntries, FIX_OVERLAP_SHARED_REGISTRY_PATHS } from './fix-scope-policy.mjs';
 import { DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES } from './fix-claim-store.mjs';
 import { execFileSyncThrottled, runGhSync } from '../lib/gh-throttle.mjs';
 import { PUSH_HOLD_LABELS } from '../lib/review-hold-model.mjs';
@@ -2367,8 +2367,22 @@ export function runReconcileFixDispatch({
   const landingState = landingBlockedState ?? (isUnderTestEnv() ? null
     : createLandingHolderBlockedState({ repo: ghRepoSlug(repoKey) }));
   const landingBlockedSince = landingState?.read() ?? new Map();
+  // Bound live pre-reads. Overflow retains ordinary scope filtering and the launch-time
+  // authority check; it never gains permission to launch from missing evidence.
+  const registryPrecheckRefusals = [];
+  const scopeCandidates = fixStep('registry-precheck', () => {
+    let reads = 0;
+    return stackOrder.planned.filter(entry => {
+      if (dryRun || !registryEntries(entry.overlapScope ?? entry.scope).length || reads >= 8) return true;
+      reads += 1;
+      const hold = pushHoldRefusal(entry);
+      if (!hold) return true;
+      registryPrecheckRefusals.push(hold);
+      return false;
+    });
+  });
   const scopeFilter = fixStep('scope-filter', () => filterFixesByInFlightScope(
-    stackOrder.planned, listBuildClaims(), claims, {
+    scopeCandidates, listBuildClaims(), claims, {
       urgentPrs, stackAbove: stackOrder.stackAbove, policy: scopePolicy, regionOverlap, priorityPrs, holderEntries,
       holderState: holderStateReader ? pr => holderStateReader.stateFor(pr) : null, landingHolders,
       now, landingBlockedSince,
@@ -2390,7 +2404,7 @@ export function runReconcileFixDispatch({
     const start = planned.findIndex(entry => entry.pr === cursor);
     if (start > 0) planned = [...planned.slice(start), ...planned.slice(0, start)];
   }
-  const refusals = [...guardRefusals, ...ciHealRefusals, ...planRefusals, ...stackOrder.refusals, ...scopeFilter.refusals];
+  const refusals = [...guardRefusals, ...ciHealRefusals, ...planRefusals, ...stackOrder.refusals, ...registryPrecheckRefusals, ...scopeFilter.refusals];
   // Card xjddimd — log the class each owed PR WOULD get (shadow). Best-effort; reads nothing the pass uses.
   const priorityShadowResult = priorityShadow
     ? priorityShadow({ planned: plannedAll, ranks: scopeFilter.ranks, refusals: scopeFilter.refusals, dispatchEntries, repoKey }) : null;
@@ -3051,6 +3065,13 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
       || waitingTime(a) - waitingTime(b)
       || Number(Boolean(b.reviewHuman)) - Number(Boolean(a.reviewHuman)) || a.pr - b.pr;
   });
+  // Preserve non-registry slots while giving every registry writer one FIFO order.
+  const registryQueue = queue.filter(e => registryEntries(scopeFor(e)).length)
+    .sort((a, b) => waitingTime(a) - waitingTime(b) || a.pr - b.pr);
+  let registryIndex = 0;
+  for (let i = 0; i < queue.length; i += 1) {
+    if (registryEntries(scopeFor(queue[i])).length) queue[i] = registryQueue[registryIndex++];
+  }
   const orderedRanks = queue.map((entry, index) => ({ ...rankByPr.get(entry.pr), rank: index + 1 }));
   const ordinal = (n) => `${n}${n % 100 >= 11 && n % 100 <= 13 ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' }[n % 10] ?? 'th')}`;
   for (const entry of queue) {
@@ -3061,7 +3082,7 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
     const inFlight = [
       ...buildClaims
         .filter((c) => !(entry.itemNum != null && String(c.meta?.num) === String(entry.itemNum)))
-        .map((c) => ({ id: `build #${c.meta?.num}`, num: c.meta?.num, scope: c.meta?.scope, build: true })),
+        .map((c) => ({ id: `build #${c.meta?.num}`, num: c.meta?.num, scope: c.meta?.scope, build: true, claim: c })),
       ...fixClaims
         .filter((c) => c.meta?.pr !== entry.pr && !above.has(Number(c.meta?.pr)))
         .map((c) => ({ ...holderEntries.get(Number(c.meta?.pr)), ...c.meta, pr: Number(c.meta?.pr), id: `fix PR #${c.meta?.pr}`, scope: c.meta?.scope, claim: c })),
@@ -3080,8 +3101,20 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
     }
     const protectedIds = new Set();
     const protectedHolds = new Map();
-    let blockers = urgentPrs.has(entry.pr) ? [] : inFlight.filter((c) => {
+    const registryHolds = new Map();
+    let blockers = inFlight.filter((c) => {
       if (!overlapsInFlight(scopeFor(entry), [overlapClaim(c)])) return false;
+      const shared = registryEntries(scopeFor(entry)).filter(file => overlapsInFlight([file], [overlapClaim(c)]));
+      if (shared.length && !c.landing) {
+        if (settings?.holdMode === 'active-session' && c.claim && expired(c.claim)) {
+          decide(entry, c, 'holdMode', false, 'fixer heartbeat exceeds claim TTL'); return false;
+        }
+        registryHolds.set(c.id, shared);
+        protectedIds.add(c.id);
+        if (settings) decide(entry, c, 'overlapGranularity', true, 'shared registry: file hold, no bypass');
+        return true;
+      }
+      if (urgentPrs.has(entry.pr)) return false;
       if (!settings) return true; // Public API compatibility: historical policy when omitted.
       if (settings.holdMode === 'active-session' && c.claim && expired(c.claim)) {
         decide(entry, c, 'holdMode', false, 'fixer heartbeat exceeds claim TTL'); return false;
@@ -3153,13 +3186,21 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
     // Deduplicate claims for the same fixer when formatting the queue position.
     const ahead = [...new Set(blockers.map((c) => c.id))];
     const waiter = { ...entry, id: `fix PR #${entry.pr}`, scope: entry.overlapScope ?? entry.scope };
-    if (hit && settings?.holdMode === 'active-session') released.push(waiter);
+    if (hit && (registryEntries(scopeFor(entry)).length || settings?.holdMode === 'active-session')) released.push(waiter);
     else picked.push(waiter);
     if (hit) {
+      const registryBlockers = blockers.filter(c => registryHolds.has(c.id));
+      const heldRegistries = new Set(registryBlockers.flatMap(c => registryHolds.get(c.id)));
+      const registry = FIX_OVERLAP_SHARED_REGISTRY_PATHS.map(path => `we:${path}`).find(file => heldRegistries.has(file));
+      const waitingOn = [...new Map(registryBlockers.map(c => [c.id, c.build
+        ? { kind: 'build', item: String(c.num) } : { kind: 'fix', pr: c.pr }])).values()]
+        .sort((a, b) => a.kind === b.kind ? (a.pr ?? Number(a.item)) - (b.pr ?? Number(b.item)) : a.kind === 'fix' ? -1 : 1);
       refusals.push({
         pr: entry.pr, kind: 'scope-overlap',
         queuePosition: ahead.length + 1,
         why: `${hit.hit} overlaps in-flight ${hit.with} — waiting ${ordinal(ahead.length + 1)} behind ${ahead.map((id) => id.replace('fix PR ', '')).join(', ')} on ${hit.hit} — serializing, retrying next pass`,
+        ...(registry ? { registry, waitingOn,
+          why: `${registry} is a shared registry — waiting on ${waitingOn.map(h => h.kind === 'fix' ? `#${h.pr}` : `build #${h.item}`).join(', ')}, retried every pass` } : {}),
       });
       continue;
     }
@@ -3191,5 +3232,5 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
     group.waitedMinutes = Math.floor(elapsed / 60000);
     return maxWaitMinutes != null && elapsed >= maxWaitMinutes * 60000;
   });
-  return { planned: accepted, refusals, ranks: orderedRanks, landingHolds, landingEscalations, ...(policy ? { scopeDecisions } : {}), ...(agedAdmits.length ? { agedAdmits } : {}) };
+  return { planned: accepted, refusals, ranks: orderedRanks, landingHolds, landingEscalations, ...(policy ? { scopeDecisions } : {}), ...((policy || agedAdmits.length) ? { agedAdmits } : {}) };
 }
