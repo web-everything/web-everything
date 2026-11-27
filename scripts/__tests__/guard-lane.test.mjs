@@ -203,6 +203,22 @@ describe('laneGuardDecision — Standards-owned paths', () => {
       }
     });
 
+    it('an unresolvable path containing `..` fails closed instead of falling back to a lexical guess', () => {
+      const loop = path.join(ws, 'dotdot-loop');
+      symlinkSync(loop, loop);
+      expect(() => resolveReal(`${loop}/../STATUS.md`)).toThrow(/cannot resolve/);
+      for (const marker of ['1', '0']) {
+        for (const optOut of [false, true]) {
+          const result = runHook(marker, `${loop}/../STATUS.md`, optOut);
+          expect(result.error).toBeUndefined();
+          expect(result.status, `marker=${marker} optOut=${optOut}: ${result.stderr}`).toBe(2);
+          expect(result.stderr).toContain('handoff/designs/<id>-standards-request.md');
+        }
+      }
+      // The orchestrator/Standards session is unaffected by the unresolvable path.
+      expect(runHook(undefined, `${loop}/../STATUS.md`).status).toBe(0);
+    });
+
     it('CLI does not over-block `..` that leaves Standards via a symlink', () => {
       const result = runHook('1', `${deepLink}/../../../../../allowed.md`, true);
       expect(result.status, result.stderr).not.toBe(2);

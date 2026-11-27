@@ -290,7 +290,9 @@ export function resolveReal(file) {
     }
     return current;
   } catch {
-    // Unreadable/looping path: keep the previous best-effort behaviour (the CLI's ancestry check fails closed).
+    // The walk could not finish (loop, over-long, unreadable). The lexical fallback below is only faithful when
+    // there is no `..` to mis-collapse after a symlink; with one, refuse to guess and let the caller fail closed.
+    if (raw.split(SEP).includes('..')) throw Object.assign(new Error(`cannot resolve "${raw}" without a lexical guess`), { code: 'EUNRESOLVABLE' });
     let real = path.resolve(raw);
     try { real = realpathSync(real); } catch {
       try { real = path.join(realpathSync(path.dirname(real)), path.basename(real)); } catch { /* keep raw */ }
@@ -305,8 +307,15 @@ if (process.argv[1] && realpathSyncSafe(process.argv[1]) === realpathSyncSafe(fi
     const ev = JSON.parse(readFileSync(0, 'utf8') || '{}');
     const file = ev?.tool_input?.file_path;
     const weRoot = hookRoot(import.meta.url);
-    const real = file ? resolveReal(file) : null;
     const sessionRole = classifySession(process.env).role;
+    let real = null;
+    try { real = file ? resolveReal(file) : null; } catch {
+      // An unresolvable target (e.g. `..` after an over-long/looping symlink chain) fails closed for workers.
+      if (sessionRole === 'worker' || sessionRole === 'unknown') {
+        process.stderr.write('guard-lane: ' + standardsOwnershipDecision('', weRoot, sessionRole, true) + ' (target path could not be resolved)\n');
+        process.exit(2);
+      }
+    }
     // Standards ownership has no worker escape hatch; LANE_GUARD_OFF only bypasses lane checks.
     if (real && (sessionRole === 'worker' || sessionRole === 'unknown')) {
       const msg = standardsOwnershipDecision(real, weRoot, sessionRole, hasStandardsAncestor(real, weRoot));
