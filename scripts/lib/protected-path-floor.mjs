@@ -173,6 +173,8 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   'scripts/lib/file-class-policy.mjs',
   // The CI retry allowance is consumed with an exclusive `wx` create.
   'scripts/ci/rerun-failed-once.mjs',
+  // Red-main metric events dedupe across writers and state-write retries with an exclusive 'wx' create.
+  'scripts/conveyor/main-red-metrics-journal.mjs',
   // Red-team reprobe requests dedupe across gate sources and restarts with an exclusive `wx` create.
   'scripts/lib/red-team-queue-state.mjs',
   'scripts/conveyor/health-file-request.mjs', 'scripts/lib/review-seat-pool.mjs', 'scripts/daemon-overlay.mjs',
