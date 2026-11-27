@@ -90,6 +90,24 @@ function projectPr(listed) {
   return pr;
 }
 
+function snapshotForLocalReader(listed) {
+  const descriptors = Object.getOwnPropertyDescriptors(listed);
+  for (const field of Reflect.ownKeys(descriptors)) {
+    const descriptor = descriptors[field];
+    descriptor.configurable = true;
+    if ('value' in descriptor) descriptor.writable = true;
+    else {
+      // Reading stays lazy; assigning must never invoke a source-owned setter.
+      descriptor.set = function (value) {
+        Object.defineProperty(this, field, {
+          value, writable: true, configurable: true, enumerable: descriptor.enumerable,
+        });
+      };
+    }
+  }
+  return Object.create(Object.getPrototypeOf(listed), descriptors);
+}
+
 /**
  * Observational only. `checked` remains the legacy attempt count, never promotion evidence.
  * Optional caller-owned `coverage` receives attempted/evaluated/failed/disagreements and complete.
@@ -112,7 +130,7 @@ export function runEligibilityShadow({ dispatch = [], prs = [], mode = 'shadow',
       const pr = projectPr(listed);
       // Copy descriptors so reader-only getters stay lazy and top-level writes stay local.
       // The gate consumes its own projection, independent of reader mutations.
-      const readerPr = Object.create(Object.getPrototypeOf(listed), Object.getOwnPropertyDescriptors(listed));
+      const readerPr = snapshotForLocalReader(listed);
       const facts = buildEligibilityFacts({ pr, comments: pr.comments, commentsComplete: pr.commentsComplete,
         population: entry.kind, locals: readLocals(entry, readerPr) });
       const gate = eligibility(pr, facts);

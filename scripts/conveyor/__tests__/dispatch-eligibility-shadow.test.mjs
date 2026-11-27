@@ -345,12 +345,36 @@ describe('shadow mode line never pollutes machine-readable stdout', () => {
 
 
 describe('explicit shadow evaluation coverage', () => {
+  it('isolates reader assignments to accessors without invoking source setters', () => {
+    const p = sentBackPr();
+    let sourceEvidence = 'source';
+    const getter = vi.fn(() => sourceEvidence);
+    const setter = vi.fn(value => { sourceEvidence = value; });
+    Object.defineProperty(p, 'readerEvidence', { enumerable: true, get: getter, set: setter });
+    const readLocals = vi.fn((_entry, snapshot) => {
+      expect(getter).not.toHaveBeenCalled();
+      snapshot.readerEvidence = 'local';
+      expect(snapshot.readerEvidence).toBe('local');
+      expect(getter).not.toHaveBeenCalled();
+      return locals();
+    });
+    const coverage = {};
+    const onError = vi.fn();
+    run({ dispatch: [entry()], prs: [p], readLocals, coverage, onError });
+    expect(readLocals).toHaveBeenCalledTimes(1);
+    expect(onError).not.toHaveBeenCalled();
+    expect(setter).not.toHaveBeenCalled();
+    expect(p.readerEvidence).toBe('source');
+    expect(coverage).toEqual({ attempted: 1, evaluated: 1, failed: 0, disagreements: 0, complete: true });
+  });
+
   it('keeps reader-only getters lazy on a separate local-reader snapshot', () => {
     const p = sentBackPr();
     const getter = vi.fn(() => 'reader evidence');
     Object.defineProperty(p, 'readerEvidence', { enumerable: true, get: getter });
     const readLocals = vi.fn((_entry, snapshot) => {
-      expect(snapshot).not.toBe(p);
+      // Compare identity without Vitest's object diff probing the lazy getters.
+      expect(Object.is(snapshot, p)).toBe(false);
       expect(getter).not.toHaveBeenCalled();
       expect(snapshot.readerEvidence).toBe('reader evidence');
       snapshot.isDraft = true;
@@ -393,7 +417,8 @@ describe('explicit shadow evaluation coverage', () => {
     Object.defineProperty(p, 'unrelated', { enumerable: true, get: unused });
     const appendLine = vi.fn();
     const readLocals = vi.fn((_entry, snapshot) => {
-      expect(snapshot).not.toBe(p);
+      // Compare identity without Vitest's object diff probing the lazy getters.
+      expect(Object.is(snapshot, p)).toBe(false);
       expect(snapshot.readerEvidence).toBe('fixture');
       snapshot.state = 'CLOSED';
       snapshot.readerEvidence = 'changed';
