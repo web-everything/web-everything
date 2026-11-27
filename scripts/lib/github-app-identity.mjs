@@ -326,10 +326,10 @@ export function buildIdentityChain({ requestedRole = FALLBACK_ROLE, identity, en
 }
 
 /**
- * PURE: the role table the generated `gh` shim bakes in — `{role: {cachePath, installations}}` for every configured
+ * The role table the generated `gh` shim bakes in — `{role: {cachePath, installations}}` for every configured
  * role. Empty when nothing is configured (the shim then behaves exactly as before).
  */
-export function shimRoleTable({ identity, cachePath, env = {} }) {
+export function shimRoleTable({ identity, cachePath, env = process.env }) {
   const out = {};
   for (const role of IDENTITY_ROLES) {
     let app = identity?.roles?.[role];
