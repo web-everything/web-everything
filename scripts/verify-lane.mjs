@@ -612,7 +612,15 @@ if (!resolvedGate && typeof flags.gate === 'string') {
 
 const priorAudit = readMarker();
 // A dispatched --gate transports the original request; preserve its explicit/default provenance.
-const gateExplicit = DISPATCHED_RUN ? priorAudit?.sha === headSha && priorAudit?.gateExplicit === true
+// A run id also identifies direct raw-command invocations with no request marker.
+// Their --gate remains an explicit override. Recognized/default-shaped test gates
+// still require soak, including old dispatcher stamps without gateExplicit.
+// A present but unreadable, foreign or default request never grants an override.
+const directRawGate = typeof flags.gate === 'string' && !resolvedGate
+  && [flags.gate, GATE].every(command => !isSelectedTestCommand(command) && !isShardWrapperCommand(command)
+    && !/^(?:npx vitest|npm (?:test|run test(?::unit)?))(?:\s|$)/.test(command));
+const gateExplicit = DISPATCHED_RUN ? (priorAudit === null && directRawGate)
+  || (priorAudit?.sha === headSha && priorAudit?.gateExplicit === true)
   : typeof flags.gate === 'string';
 const gateAudit = { ...(gateExplicit ? { gateExplicit: true } : {}),
   ...(explicitSelection || resolvedGate?.decision?.selection ? { selection: explicitSelection ?? resolvedGate.decision.selection } : {}),

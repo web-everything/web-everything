@@ -254,6 +254,56 @@ syncBuiltinESMExports();register(${JSON.stringify(pathToFileURL(loader).href)});
     expect(commands.at(-1).held).toBe(true);
     expect(existsSync(join(dir, '.git/held'))).toBe(false);
   });
+  it.each(['changed-set-unknown', 'selector-error'])('a directly supplied raw gate keeps its explicit provenance with a run id despite %s', reason => {
+    const f = soakFixture({ whole: true, config: false });
+    if (reason === 'changed-set-unknown') execFileSync('git', ['update-ref', '-d', 'refs/heads/origin/main'], { cwd: dir });
+    const seen = join(dir, '.git', 'seen-marker.json');
+    const script = `require('node:fs').copyFileSync(${JSON.stringify(marker())},${JSON.stringify(seen)})`;
+    const gate = `${shellQuote(process.execPath)} -e ${shellQuote(script)}`;
+    const r = f.invoke([`--gate=${gate}`, '--run-id=direct-raw-gate']);
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.json.status).toBe('green');
+    expect(r.json.phases.soak).toMatchObject({ status: 'skipped', reason: 'explicit-gate' });
+    expect(r.persisted.gateExplicit).toBe(true);
+    expect(JSON.parse(readFileSync(seen, 'utf8'))).toMatchObject({ status: 'running', runId: 'direct-raw-gate', gateExplicit: true });
+    expect(f.calls().some(call => call.args?.includes('--config'))).toBe(false);
+  });
+  it.each(['npx vitest run', 'npx vitest run legacy.test.mjs --legacy', 'npx vitest related source.mjs --run'])('a dispatched default-shaped gate without a marker still refuses unknown selection: %s', gate => {
+    const f = soakFixture({ whole: true });
+    execFileSync('git', ['update-ref', '-d', 'refs/heads/origin/main'], { cwd: dir });
+    const r = f.invoke([`--gate=${gate}`, '--run-id=legacy-default']);
+    expect(r.status, r.stderr).toBe(2);
+    expect(r.json.phases.soak).toMatchObject({ status: 'failed', reason: 'changed-set-unknown' });
+    expect(r.persisted.gateExplicit).toBeUndefined();
+    expect(r.stderr).toContain('restore soak selection evidence and rerun verify');
+  });
+  it('capping a default-shaped related request to an empty-test echo never grants an override', () => {
+    const f = soakFixture({ whole: true });
+    execFileSync('git', ['update-ref', '-d', 'refs/heads/origin/main'], { cwd: dir });
+    expect(existsSync(marker())).toBe(false);
+    const emptyTestGate = "echo 'verify-lane: no selected or named test suites; CI owns exhaustive verification'";
+    const r = f.invoke(['--gate=npx vitest related source.mjs --run', '--run-id=capped-default']);
+    expect(r.stderr).toContain('explicit related gate capped (1 → 0 tests)');
+    expect(r.persisted.suites).toBe(emptyTestGate);
+    expect(r.persisted.executedGate).toBe(emptyTestGate);
+    expect(f.calls().filter(call => call.args)).toEqual([]);
+    expect(r.persisted.gateExplicit).toBeUndefined();
+    expect(r.status, r.stderr).toBe(2);
+    expect(r.json.status).toBe('red');
+    expect(r.json.phases.soak).toMatchObject({ status: 'failed', reason: 'changed-set-unknown' });
+    expect(r.persisted.phases.soak).toEqual(r.json.phases.soak);
+    expect(r.stderr).toContain('restore soak selection evidence and rerun verify');
+  });
+  it.each(['default', 'corrupt', 'foreign'])('a dispatched raw gate cannot infer an override from %s request provenance', provenance => {
+    const f = soakFixture({ whole: true, config: false });
+    const prior = { sha: provenance === 'foreign' ? OTHER_SHA : headSha(), status: 'running', suites: 'true',
+      startedAt: '2026-11-27T12:00:00.000Z', ...(provenance === 'foreign' ? { gateExplicit: true } : {}) };
+    writeFileSync(marker(), provenance === 'corrupt' ? '{' : JSON.stringify(prior));
+    const r = f.invoke(['--gate=true', '--run-id=recorded-default']);
+    expect(r.status, r.stderr).toBe(2);
+    expect(r.json.phases.soak).toMatchObject({ status: 'failed', reason: 'selector-error' });
+    expect(r.persisted.gateExplicit).toBeUndefined();
+  });
   it.each(['ok', 'missing', 'unavailable', 'extra'])('soak red or incomplete execution stays red without retry: %s', report => {
     const f = soakFixture({ report, soakExit: report === 'ok' ? 1 : 0 });
     const r = f.invoke();
