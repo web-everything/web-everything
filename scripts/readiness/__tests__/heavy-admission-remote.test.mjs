@@ -6,6 +6,10 @@ import { readdirSync, mkdtempSync, mkdirSync, chmodSync, writeFileSync, existsSy
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { main, decideRemote, runWithRemoteDecision, adaptLegacyRemoteResult, resolveAdmissionPolicy, heldSlots, shellQuoteWord, DEFAULT_ADMISSION_CEILING_MS, DEFAULT_FAST_RUN_TIMEOUT_MS } from '../heavy-admission.mjs';
+import { remoteHealthFile } from '../forge-remote-health.mjs';
+import { DEFAULT_REMOTE_HOSTS } from '../remote-target.mjs';
+import { easternTimestamp } from '../forge-exec-run.mjs';
+import { heldTombstone } from '../forge-slot-markers.mjs';
 import { runRemote } from '../remote-exec.mjs';
 import { bindingEvidence } from './fixtures/forge-bound-git.mjs';
 import { execContainerized } from '../../lib/container-exec.mjs';
@@ -14,11 +18,16 @@ import { createRunFinisher } from '../forge-run-finish.mjs';
 import { buildMarkerTags, HOLD_SESSION_ENV } from '../heavy-admission.mjs'; // marker tag builder round-trip (R1012)
 import { markerContent, createMarkerReaper } from '../forge-slot-markers.mjs';
 
+vi.mock('../forge-slot-markers.mjs', async original => {
+  const actual = await original();
+  return {...actual, heldTombstone:vi.fn(actual.heldTombstone)};
+});
+
 vi.mock('../forge-run-finish.mjs', () => ({createRunFinisher: vi.fn(() => vi.fn(async () => ({finished: true})))}));
 
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal();
-  return {...actual, mkdtempSync:vi.fn(actual.mkdtempSync)};
+  return {...actual, mkdtempSync:vi.fn(actual.mkdtempSync), writeFileSync:vi.fn(actual.writeFileSync)};
 });
 vi.mock('node:child_process', async (importOriginal) => ({
   ...await importOriginal(), execSync: vi.fn(),
@@ -33,7 +42,7 @@ vi.mock('../../lib/container-exec.mjs', async (importOriginal) => ({
 
 // Keep this a selected run: the shell-looking text is a test-name value, not an unknown positional filter.
 const argv = ['npm', 'run', 'test:unit', '--', 'a file.test.mjs', '-t', '$(must-stay-literal)'];
-const remoteDefaults = { hosts:[{alias:'forge',root:'/srv/forge-exec'}], enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null, manifest: 'legacy',
+const remoteDefaults = { hosts:DEFAULT_REMOTE_HOSTS, enabled: true, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null, manifest: 'legacy',
   slotUnitsByKind:{FULL:"auto",soak:"auto",standards:"auto"},elasticSlots:{enabled:true},autoSlotUnits:3,
   maxConcurrent:8, backoffMs:120000, backoffFailures:3, maxLoadPerCore:0.8, minFreeRamPct:15, stuckMinSlots:2, stuckAgeMs:600000, stuckSignalEveryMs:600000, busyWaitMs:600000, busyBackoffMs:45000, transport:'rsync', bundle:{ mainMaxAgeMin:10 } };
 const testRoots=[];
@@ -56,6 +65,85 @@ function fixture({ remote = {}, load = 4, result = { mode: 'remote', code: 0 } }
     loadPerCore: vi.fn(() => load), remoteExec: vi.fn(async () => result), log: vi.fn(),
   };
 }
+
+// New dispatch guarantees use only a temp checkout and injected host/time/IO evidence.
+function dispatchFixture() {
+  const cwd=mkdtempSync(join(process.env.TMPDIR,'dispatch-log-'));testRoots.push(cwd);
+  writeFileSync(join(cwd,'a.test.mjs'),'export {};\n');
+  let now=Date.parse('2026-11-26T20:00:00-05:00');
+  return {cwd,lockRoot:join(cwd,'heavy'),env:{NODE_ENV:'test'},
+    argv:['npm','run','test:unit','--','a.test.mjs'],policy:policyFor({mode:'always',maxConcurrent:1}),
+    clock:()=>now,loadPerCore:()=>100,hostOverloaded:()=>false,
+    sleep:vi.fn(async ms=>{now+=ms;}),targetExec:vi.fn(async()=>({code:0})),
+    readCapability:vi.fn(()=>true),readTelemetry:vi.fn(async()=>({sampledAtET:easternTimestamp(now),
+      cores:8,loadPerCore:0.1,memFreePct:90,activeRuns:0,recent:[]})),
+    remoteExec:vi.fn(async()=>({mode:'remote',code:0})),log:vi.fn()};
+}
+const locationLines = log => log.mock.calls.flat().filter(line=>line.includes('location=remote'));
+
+describe('remote dispatch location', () => {
+  it('location=remote host=mesa-01 is logged exactly once, before remoteExec', async () => {
+    const f=dispatchFixture(),events=[];
+    f.log.mockImplementation(line=>events.push(line));
+    f.remoteExec.mockImplementation(async()=>{
+      events.push('dispatch');
+      expect(existsSync(join(f.cwd,'remote','slot-0.unconfirmed'))).toBe(true);
+      return {mode:'remote',code:0};
+    });
+    expect(await runWithRemoteDecision(f)).toMatchObject({handled:true,exitCode:0});
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(locationLines(f.log)).toEqual(['heavy-admission: location=remote host=mesa-01\n']);
+    expect(events[events.indexOf('dispatch')-1]).toBe(locationLines(f.log)[0]);
+    expect(f.targetExec).not.toHaveBeenCalled();
+  });
+  it('busy-wait re-dispatch keeps one location=remote line', async () => {
+    const f=dispatchFixture();
+    f.remoteExec.mockResolvedValueOnce({mode:'not-started',terminated:true,reason:'forge-busy'});
+    expect(await runWithRemoteDecision(f)).toMatchObject({handled:true,exitCode:0});
+    expect(f.remoteExec).toHaveBeenCalledTimes(2);
+    expect(locationLines(f.log)).toEqual(['heavy-admission: location=remote host=mesa-01\n']);
+  });
+  it.each(['health refusal','remote-slot-unreadable','remote-full','remote-slot-held',
+    'marker-unwritable','confined-local','no-healthy-remote'])(
+    'no location=remote line on %s', async scenario => {
+      const f=dispatchFixture(),remoteRoot=join(f.cwd,'remote');
+      mkdirSync(remoteRoot);
+      const actualFs=await vi.importActual('node:fs');
+      let restore=()=>{};
+      let reason=scenario;
+      if(scenario==='health refusal') {f.readTelemetry.mockResolvedValue(null);reason='forge-unreachable';}
+      if(scenario==='remote-slot-unreadable') f.policy.settings.remote.maxConcurrent=0;
+      if(scenario==='remote-full') writeFileSync(join(remoteRoot,'slot-0.unconfirmed'),'{}');
+      if(scenario==='remote-slot-held') {
+        const actual=await vi.importActual('../forge-slot-markers.mjs');
+        vi.mocked(heldTombstone).mockReturnValue(true);
+        restore=()=>vi.mocked(heldTombstone).mockImplementation(actual.heldTombstone);
+      }
+      if(scenario==='marker-unwritable') {
+        const actual=actualFs.writeFileSync;
+        vi.mocked(writeFileSync).mockImplementation((file,...args)=>{
+          if(String(file).endsWith('.unconfirmed')) throw Object.assign(new Error('fixture denied'),{code:'EACCES'});
+          return actual(file,...args);
+        });
+        restore=()=>vi.mocked(writeFileSync).mockImplementation(actual);
+        reason='remote-execution-marker-unwritable';
+      }
+      if(scenario==='confined-local') {
+        vi.mocked(mkdtempSync).mockImplementation(()=>{throw Object.assign(new Error('fixture denied'),{code:'EACCES'});});
+        restore=()=>vi.mocked(mkdtempSync).mockImplementation(actualFs.mkdtempSync);
+      }
+      if(scenario==='no-healthy-remote') {
+        f.policy=policyFor({mode:'always',hosts:[{alias:'custom-runner',root:'/srv/forge-exec'}]});
+        f.targetExec.mockResolvedValue({code:255});
+      }
+      try {
+        expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+        expect(f.remoteExec).not.toHaveBeenCalled();
+        expect(locationLines(f.log)).toEqual([]);
+        expect(f.log.mock.calls.flat().join('')).toContain(reason);
+      } finally {restore();}
+    });
+});
 
 function expectLines(log, count, direction) {
   expect(log).toHaveBeenCalledTimes(count);
@@ -165,10 +253,10 @@ describe('remote slot recovery across target switches', () => {
 });
 
 function expectFallback(log, reason) {
-  expectLines(log, 2, 'remote');
-  expect(log.mock.calls[1][0]).toMatch(/fallback/i);
-  if (reason) expect(log.mock.calls[1][0]).toContain(reason);
-  else expect(log.mock.calls[1][0].replace(/fallback/gi, '').replace(/[^a-z0-9]/gi, '')).not.toBe('');
+  expectLines(log, 3, 'remote');
+  expect(log.mock.calls[2][0]).toMatch(/fallback/i);
+  if (reason) expect(log.mock.calls[2][0]).toContain(reason);
+  else expect(log.mock.calls[2][0].replace(/fallback/gi, '').replace(/[^a-z0-9]/gi, '')).not.toBe('');
 }
 
 describe('R1017 remote marker provenance and nonce plumbing', () => {
@@ -391,7 +479,7 @@ describe('remote admission policy', () => {
       expect(heldSlots({lockRoot:join(pool,'.admission','remote'),cap:8})).toHaveLength(0);
     } finally { exit.mockRestore(); stderr.mockRestore(); vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); }
   });
-  it('defaults to disabled, above-threshold, threshold 3, with standard sources', () => {
+  it('defaults to enabled, above-threshold, threshold 3, with standard sources', () => {
     const policy = resolveAdmissionPolicy({});
     expect(policy.settings.remote).toEqual(remoteDefaults);
     expect(policy.sources).toMatchObject({
@@ -410,7 +498,7 @@ describe('remote admission policy', () => {
     ['--container', {}, ['--container'], true, true, false],
     ['WE_HEAVY_ADMISSION_HELD=1', { WE_HEAVY_ADMISSION_HELD: '1' }, [], true, false, false],
     ['WE_HEAVY_ADMISSION_HELD set to another truthy value', { WE_HEAVY_ADMISSION_HELD: 'true' }, [], true, true, false],
-    ['remote disabled by default', {}, [], false, true, false],
+    ['platform remote.enabled=false', {}, [], false, true, false],
     ['remote.* env vars cannot enable remote', {
       'remote.enabled': 'true', 'remote.mode': 'always',
       WE_HEAVY_ADMISSION_REMOTE_ENABLED: 'true', WE_HEAVY_ADMISSION_REMOTE_MODE: 'always',
@@ -423,7 +511,7 @@ describe('remote admission policy', () => {
     mkdirSync(join(root, '.claude'));
     const prefs = join(root, '.claude', 'platform-preferences.json');
     writeFileSync(prefs, JSON.stringify({ heavyAdmission: {
-      ...(enableRemote ? { remote: { enabled: true, mode: 'always' } } : {}),
+      remote: enableRemote ? { enabled: true, mode: 'always' } : {enabled:false},
       fastScale: { maxSlots: 1 },
     } }));
     const exited = new Error('test exit');
@@ -455,7 +543,7 @@ describe('remote admission policy', () => {
         expect(existsSync(join(root, 'verify-report.jsonl'))).toBe(false);
       }
       expect(heldSlots({ lockRoot, cap: 2, fastSlots: 1 })).toHaveLength(0);
-      if (!enableRemote) expect(stderr).toHaveBeenCalledWith(expect.stringContaining('remote.enabled=false (standard)'));
+      if (!enableRemote) expect(stderr).toHaveBeenCalledWith(expect.stringContaining('remote.enabled=false (platform)'));
     } finally {
       vi.mocked(execSync).mockReset(); vi.mocked(execContainerized).mockReset();
       exit.mockRestore(); stderr.mockRestore(); vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true });
@@ -560,12 +648,11 @@ describe('adaptLegacyRemoteResult', () => {
 });
 
 describe('runWithRemoteDecision', () => {
-  it('remote is disabled by default even above the load threshold', async () => {
-    const f = fixture({ load: 100 });
-    expect(await runWithRemoteDecision({ ...f, policy: resolveAdmissionPolicy({}) })).toEqual({ handled: false });
-    expect(f.remoteExec).not.toHaveBeenCalled();
-    expectLines(f.log, 1, 'local');
-    expect(f.log.mock.calls[0][0]).toContain('remote.enabled=false (standard)');
+  it('remote is enabled by default above the load threshold and dispatches mesa-01', async () => {
+    const f = dispatchFixture();
+    expect(await runWithRemoteDecision({ ...f, policy: resolveAdmissionPolicy({}) })).toMatchObject({ handled: true, exitCode: 0 });
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(f.remoteExec).toHaveBeenCalledWith(expect.objectContaining({host:'mesa-01'}));
   });
   it.each([
     ['below threshold -> local', {}, 2.9],
@@ -593,7 +680,7 @@ describe('runWithRemoteDecision', () => {
     expect(f.remoteExec).toHaveBeenCalledWith(expect.objectContaining({ argv: originalArgv, cwd: f.cwd }));
     expect(f.remoteExec.mock.calls[0][0].argv).toBe(f.argv);
     expect(f.argv).toEqual(originalArgv);
-    expectLines(f.log, 1, 'remote');
+    expectLines(f.log, 2, 'remote');
   });
 
   it('keeps an opaque positional filter FULL while passing its literal argv unchanged', async () => {
@@ -612,7 +699,7 @@ describe('runWithRemoteDecision', () => {
     expect(await runWithRemoteDecision(f)).toMatchObject({ handled: true, exitCode: 0 });
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
     expect(f.argv).toEqual(originalArgv);
-    expectLines(f.log, 2, 'remote');
+    expectLines(f.log, 3, 'remote');
     expect(f.log.mock.calls[1][0]).toContain('remote.slotUnits=3');
     expect(readdirSync(remoteRoot).filter(n => n.endsWith('.unconfirmed'))).toEqual([]);
     expect(heldSlots({ lockRoot: remoteRoot, cap: 8 })).toEqual([]);
@@ -635,8 +722,8 @@ describe('runWithRemoteDecision', () => {
     const f = fixture({ result: { mode: 'fallback', reason, terminated } });
     expect(await runWithRemoteDecision(f)).toEqual({ handled: true, exitCode: 124 });
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
-    expect(f.log.mock.calls[1][0]).toContain(reason);
-    expect(f.log.mock.calls[1][0]).toContain('refusing local rerun');
+    expect(f.log.mock.calls[2][0]).toContain(reason);
+    expect(f.log.mock.calls[2][0]).toContain('refusing local rerun');
   });
 
   it.each(['not-started','cancelled'].flatMap(mode=>
@@ -826,7 +913,7 @@ describe('runWithRemoteDecision', () => {
       const f = fixture({ result: { mode, terminated } });
       expect(await runWithRemoteDecision(f)).toEqual({ handled: true, exitCode: 124 });
       expect(f.remoteExec).toHaveBeenCalledTimes(1);
-      expect(f.log.mock.calls[1][0]).toContain('refusing local rerun');
+      expect(f.log.mock.calls[2][0]).toContain('refusing local rerun');
     });
   });
 
@@ -876,10 +963,12 @@ describe('runWithRemoteDecision', () => {
         });
         if (!result.handled) local();
         expect(actions).toEqual(['true', 'bases', 'prepare', 'run', 'finish']);
+        expect(actions.filter(action=>action==='run')).toHaveLength(1);
+        expect(locationLines(log)).toHaveLength(1);
         expect(result).toEqual({ handled: true, exitCode: 124 });
         expect(local).not.toHaveBeenCalled();
-        expect(log.mock.calls[1][0]).toContain('ambiguous-result');
-        expect(log.mock.calls[1][0]).toContain('refusing local rerun');
+        expect(log.mock.calls[2][0]).toContain('ambiguous-result');
+        expect(log.mock.calls[2][0]).toContain('refusing local rerun');
       } finally { rmSync(cwd, { recursive: true, force: true }); }
     });
   });
@@ -888,8 +977,9 @@ describe('runWithRemoteDecision', () => {
     f.remoteExec.mockRejectedValue(new Error('injected transport failure'));
     expect(await runWithRemoteDecision(f)).toEqual({ handled: true, exitCode: 124 });
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
-    expect(f.log.mock.calls[1][0]).toContain('injected transport failure');
-    expect(f.log.mock.calls[1][0]).toContain('refusing local rerun');
+    expect(locationLines(f.log)).toHaveLength(1);
+    expect(f.log.mock.calls[2][0]).toContain('injected transport failure');
+    expect(f.log.mock.calls[2][0]).toContain('refusing local rerun');
   });
 
   it('a remoteExec pending until confirmed cancellation times out and falls back to local admission', async () => {
@@ -899,8 +989,8 @@ describe('runWithRemoteDecision', () => {
     }));
     expect(await runWithRemoteDecision({ ...f, timeoutMs: 20 })).toEqual({ handled: false });
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
-    expectLines(f.log, 3, 'remote');
-    expect(f.log.mock.calls[2][0]).toBe('heavy-admission: remote failed (remote-timeout) - falling back to local admission\n');
+    expectLines(f.log, 4, 'remote');
+    expect(f.log.mock.calls[3][0]).toBe('heavy-admission: remote failed (remote-timeout) - falling back to local admission\n');
   });
 
   it.each([
@@ -932,7 +1022,7 @@ describe('runWithRemoteDecision', () => {
       await vi.advanceTimersByTimeAsync(timeoutMs + 4000);
       const remoteRoot = join(f.lockRoot, '..', 'remote'), marker = join(remoteRoot, 'slot-0.unconfirmed');
       const content = JSON.parse(readFileSync(marker, 'utf8'));
-      expect(content).toMatchObject({v: 1, note: 'remote termination unconfirmed', host: 'forge', pid: process.pid});
+      expect(content).toMatchObject({v: 1, note: 'remote termination unconfirmed', host: DEFAULT_REMOTE_HOSTS[0].alias, pid: process.pid});
       expect(content.owner).toMatch(/^remote-\d+-[0-9a-f]+$/);
       expect(JSON.parse(readFileSync(marker + '.run', 'utf8'))).toEqual({owner: content.owner, run});
       expect(heldSlots({lockRoot: remoteRoot, cap: 8})).toHaveLength(1);
@@ -1116,10 +1206,10 @@ describe('runWithRemoteDecision', () => {
         expect(await pending).toEqual({ handled: true, exitCode: 124 });
         expect(signal.aborted).toBe(true);
         expect(local).not.toHaveBeenCalled();
-        expectLines(f.log, 3, 'remote');
-        expect(f.log.mock.calls[2][0]).toContain('remote-timeout');
-        expect(f.log.mock.calls[2][0]).toContain('termination unconfirmed; refusing local rerun');
-        expect(f.log.mock.calls[2][0]).toContain('Confirm remote termination before retrying');
+        expectLines(f.log, 4, 'remote');
+        expect(f.log.mock.calls[3][0]).toContain('remote-timeout');
+        expect(f.log.mock.calls[3][0]).toContain('termination unconfirmed; refusing local rerun');
+        expect(f.log.mock.calls[3][0]).toContain('Confirm remote termination before retrying');
         expect(vi.getTimerCount()).toBe(0);
       } finally { vi.useRealTimers(); }
     },
@@ -1204,7 +1294,7 @@ describe('runWithRemoteDecision', () => {
             expect(logs).not.toContain('exit 124');
             const reason = outcome === 'timeout' ? 'remote-timeout' : outcome === 'unconfirmed' ? 'receipt unavailable' : 'transport lost';
             expect(JSON.parse(readFileSync(join(f.lockRoot, 'remote-fallbacks.jsonl'), 'utf8'))).toMatchObject({reason});
-            const health = JSON.parse(readFileSync(join(remoteRoot, 'health-g2.json'), 'utf8'));
+            const health = JSON.parse(readFileSync(remoteHealthFile(remoteRoot, DEFAULT_REMOTE_HOSTS[0].alias), 'utf8'));
             expect(health).toMatchObject({failures: 0, backoffUntil: 0});
           }
           expect(vi.getTimerCount()).toBe(0);
@@ -1264,8 +1354,8 @@ describe('runWithRemoteDecision', () => {
     f.remoteExec.mockResolvedValue(result);
     expect(await runWithRemoteDecision(f)).toEqual({ handled: true, exitCode: 124 });
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
-    expectLines(f.log, 2, 'remote');
-    expect(f.log.mock.calls[1][0]).toContain('refusing local rerun');
+    expectLines(f.log, 3, 'remote');
+    expect(f.log.mock.calls[2][0]).toContain('refusing local rerun');
   });
 });
 

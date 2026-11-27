@@ -1,5 +1,5 @@
 /** Ordered SSH runner discovery. No job, credentials or remote writes are involved. */
-export const DEFAULT_REMOTE_HOSTS = Object.freeze([Object.freeze({alias:'forge',root:'/srv/forge-exec'})]);
+export const DEFAULT_REMOTE_HOSTS = Object.freeze([Object.freeze({alias:'mesa-01',root:'/srv/forge-exec'})]);
 export function validRemoteHosts(hosts) {
   return Array.isArray(hosts) && hosts.length > 0 && hosts.length <= 32 && hosts.every(host =>
     host && typeof host.alias === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._-]*(?![\s\S])/.test(host.alias)

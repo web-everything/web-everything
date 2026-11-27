@@ -5,8 +5,6 @@ import {join} from 'node:path';
 import {resolveAdmissionPolicy, runWithRemoteDecision} from '../heavy-admission.mjs';
 import {easternTimestamp} from '../forge-exec-run.mjs';
 
-vi.mock('../remote-target.mjs', async importOriginal => ({...await importOriginal(),
-  DEFAULT_REMOTE_HOSTS:[{alias:'mesa-01',root:'/srv/forge-exec'}]}));
 const roots=[];
 afterEach(()=>{vi.restoreAllMocks();for(const root of roots.splice(0))rmSync(root,{recursive:true,force:true});});
 

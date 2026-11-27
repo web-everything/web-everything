@@ -104,7 +104,7 @@
  * Settings: heavyAdmission.remote.clientPath selects an external remote-exec.mjs outside all lane pools.
  * Remove the setting to revert to the bundled client; no environment mapping.
  *
- * REMOTE ROUTING CONTRACT — remote stays disabled by default (heavyAdmission.remote.enabled=false).
+ * REMOTE ROUTING CONTRACT — remote is enabled by default (heavyAdmission.remote.enabled=true).
  * Only { mode: 'remote', code: <integer 0..254> } exits with that code. Local admission may follow only
  * { mode: 'not-started', terminated: true } or { mode: 'cancelled', terminated: true }. After a timeout,
  * confirmed cancellation or fresh finished telemetry permits local admission. R989 also accepts a late
@@ -252,7 +252,7 @@ export const ADMISSION_POLICY_STANDARD = Object.freeze({
   // main-fix-queue-priority — a red-main repair waiter (P0) is admitted to the next free slot ahead of all others.
   priority: Object.freeze({ mode: 'enforce', repairPatterns: DEFAULT_REPAIR_PATTERNS }),
   // transport (R593): 'rsync' (default, rollback value) | 'git-bundle' (ship a verified git bundle; needs a runner advertising gitBundle:1).
-  remote: Object.freeze({ hosts: DEFAULT_REMOTE_HOSTS, enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null, transport: 'rsync', manifest: 'legacy',
+  remote: Object.freeze({ hosts: DEFAULT_REMOTE_HOSTS, enabled: true, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null, transport: 'rsync', manifest: 'legacy',
     // R559: bundle mode needs the Forge mirror's public main fetched within this many minutes (else it falls back to rsync).
     bundle: Object.freeze({ mainMaxAgeMin: 10 }),
     maxConcurrent: 8, slotUnitsByKind: Object.freeze({ FULL: 'auto', soak: 'auto', standards: 'auto' }),
@@ -1622,6 +1622,7 @@ export async function runWithRemoteDecision({
         if (recordMarkerRun(executionMarker, {owner, run, nonce:metadata?.nonce, slot:metadata?.slot})) executionRun = run;
       } }));
     };
+    log(`heavy-admission: location=remote host=${host}\n`);
     let remote = dispatch();
     let result = await Promise.race([remote, timeout, signalPromise]);
     // forge-busy-wait: an explicit, confirmed non-start (never 'unconfirmed') waits and retries Forge within a total
