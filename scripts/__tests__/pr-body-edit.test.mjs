@@ -331,6 +331,13 @@ describe('guard-bash denies a raw PR-body rewrite', () => {
   // cut — `gh` documents `-b`/`-F` as exact equivalents, and a quoted `"--body-file"` has a quote before the
   // dashes rather than whitespace, so a raw-string regex missed both.
   for (const cmd of [
+    'gh -R o/r pr edit 1162 --body x',
+    'gh -Ro/r pr edit 1162 --body x',
+    'gh -R "o/r" pr edit 1162 -b x',
+    'gh --repo=o/r pr edit 1162 --body-file f',
+    'gh --repo o/r pr edit 1162 -F f',
+    'gh --hostname github.com pr edit 1162 --body x',
+    'gh --hostname=github.com -R o/r pr edit 1162 --body x',
     'gh pr edit 1162 --body-file /tmp/body.md',
     'gh pr edit 1162 --repo web-everything/web-everything --body-file /tmp/b.md',
     'gh pr edit 1162 --body "text"',
@@ -397,5 +404,33 @@ describe('guard-bash denies a raw PR-body rewrite', () => {
   it('honours the sanctioned override, which is how pr-body-edit itself writes', () => {
     expect(reason('PR_BODY_STAMP_OK=1 gh pr edit 1162 --body-file /tmp/b.md')).toBeFalsy();
     expect(reason('PR_BODY_STAMP_OK=1 gh pr edit 1162 -F /tmp/b.md')).toBeFalsy();
+  });
+
+  it.each([
+    'gh pr edit 1 --body x',
+    'gh -R o/r pr edit 1 --body x',
+  ])('the pr edit refusal names both pr-body-edit routes: %s', (cmd) => {
+    expect(reason(cmd)).toMatch(/--append-file/);
+    expect(reason(cmd)).toMatch(/--body-file/);
+  });
+
+  it('global flags do not widen pr edit beyond body flags', () => {
+    for (const cmd of [
+      'gh -R o/r pr edit 1 --add-label x',
+      'gh --repo=o/r pr edit 1 -B main',
+      'gh -R o/r pr view 1162 --json body',
+      'PR_BODY_STAMP_OK=1 gh -R o/r pr edit 1 --body x',
+    ]) expect(reason(cmd)).toBeFalsy();
+  });
+
+  it.each([
+    ['help only; stays allowed', 'gh --help pr edit 1 --body x'],
+    ['unknown flag rejected by gh; stays allowed', 'gh --foo pr edit 1 --body x'],
+    ['F1: api head unchanged', 'gh -R o/r api -X PATCH repos/o/r/pulls/1 -f body=x'],
+    ['F1: file-payload arm unchanged', 'gh --hostname github.com api repos/o/r/pulls/1 -X PATCH --input /tmp/p.json'],
+    ['F2: substring escape kept', 'gh pr edit 1 --body "PR_BODY_STAMP_OK=1"'],
+    ['F3: quoted global flag', 'gh "--repo=o/r" pr edit 1 --body x'],
+  ])('out-of-rule boundaries are unchanged — %s', (_boundary, cmd) => {
+    expect(reason(cmd)).toBeFalsy();
   });
 });
