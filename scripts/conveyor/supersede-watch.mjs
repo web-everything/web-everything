@@ -107,8 +107,12 @@ const timestamp = (value, now) => {
   const ms = Date.parse(value);
   return Number.isFinite(ms) && ms <= now && new Date(ms).toISOString() === value.replace(/Z$/, value.includes('.') ? 'Z' : '.000Z');
 };
-const authorLogin = p => p?.author?.login?.replace(/^app\//, '');
-const snapshotVersion = (p) => JSON.stringify([p.id, p.number, p.body, p.state, p.author?.login,
+// Compare API spellings only after the author trust gate; normalization grants no authority.
+const authorLogin = p => {
+  const login = p?.author?.login;
+  return typeof login === 'string' ? login.replace(/^app\//, '').replace(/\[bot\]$/i, '').toLowerCase() : '';
+};
+const snapshotVersion = (p) => JSON.stringify([p.id, p.number, p.body, p.state, authorLogin(p),
   p.mergedAt, p.updatedAt, p.headRefOid, p.lastEditedAt, p.editor?.login ?? null]);
 function validateSnapshot(p, listed, now) {
   if (!p || p.number !== listed.number || typeof p.id !== 'string' || !p.id

@@ -285,6 +285,40 @@ const hardOptions = () => ({ repo: 'fixture/project', now: hardNow, settings: { 
   postHold: vi.fn(() => ({ ok: true, labeled: true })) });
 
 describe('bound supersede evidence', () => {
+  it.each([
+    [{ login: 'web-everything[bot]' }, { login: 'web-everything' }],
+    [{ login: 'web-everything' }, { login: 'web-everything[bot]' }],
+    [{ login: 'Web-Everything[bot]' }, { login: 'WEB-EVERYTHING' }],
+    [{ login: 'app/web-everything', is_bot: true }, { login: 'web-everything[bot]' }],
+    [{ login: 'web-everything[bot]' }, { login: 'app/web-everything', is_bot: true }],
+    [{ login: 'Chalbert' }, { login: 'chalbert' }],
+  ])('holds across equivalent trusted author shapes: %j -> %j', (listedAuthor, snapshotAuthor) => {
+    const opts = hardOptions();
+    opts.readMergedPrs.mockReturnValue([{ ...hardSource(), author: listedAuthor }]);
+    // Revalidation may encounter the other API shape too; it is still the same version.
+    opts.readBodyEdit.mockReturnValueOnce({ ...hardSource(), author: snapshotAuthor })
+      .mockReturnValue({ ...hardSource(), author: listedAuthor });
+    opts.postHold.mockImplementation(({ hold: h }) => {
+      opts.readPr.mockReturnValue({ ...hardTarget(), comments: [{ author: { login: 'web-everything' },
+        body: buildSupersededStandDownComment(h) }] });
+      return { ok: true, labeled: true };
+    });
+    const result = runSupersedeWatch(opts);
+    expect(result.bodyEditFailures).toBeUndefined();
+    expect(result.holds).toEqual([{ pr: 10, by: 20, mergedAt: hardSource().mergedAt }]);
+    expect(result.applied).toEqual([expect.objectContaining({ ok: true })]);
+    expect(opts.postHold).toHaveBeenCalledTimes(1);
+  });
+  it.each([
+    { login: 'chalbert' }, { login: 'rando[bot]' }, { login: 'app/web-everything' },
+    { login: 'APP/web-everything', is_bot: true }, { login: 'app/app/web-everything', is_bot: true },
+    { login: ' web-everything[bot]' }, { login: 'web-everything[bot][bot]' },
+  ])('does not equate different principals or bypass author trust: %j', author => {
+    const opts = hardOptions();
+    opts.readBodyEdit.mockReturnValue({ ...hardSource(), author });
+    expect(runSupersedeWatch(opts)).toMatchObject({ holds: [], bodyEditFailures: 1 });
+    expect(opts.postHold).not.toHaveBeenCalled();
+  });
   it('199 unique candidates from a claimed 200-item mutable listing reports incomplete and supersedes nothing', () => {
     const rows = Array.from({ length: 200 }, (_, i) => ({ number: i + 1, state: 'open' }));
     rows[100] = rows[99];
