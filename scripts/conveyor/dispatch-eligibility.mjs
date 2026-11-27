@@ -3,6 +3,11 @@
  * @description Pure, fail-closed dispatch eligibility from complete caller-supplied facts.
  */
 
+/** PR fields consumed by eligibility; shadow copies only this contract plus the fact builder's fields. */
+export const ELIGIBILITY_PR_FIELDS = Object.freeze([
+  'commentsComplete', 'number', 'headRefOid', 'state', 'labels', 'isDraft',
+]);
+
 /** Dispatch populations sharing the ordered eligibility rules. */
 export const POPULATIONS = Object.freeze([
   'fix', 'ci-heal', 'rebase', 'stacked-rebase', 'restack', 'takeover',

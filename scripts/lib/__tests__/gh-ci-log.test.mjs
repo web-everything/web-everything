@@ -102,7 +102,7 @@ const deferredFindingReaders = new Map([
   ['scripts/conveyor/ci-red-recovery-watch.mjs', 1],
   ['scripts/conveyor/main-ci-red-probe.mjs', 0], // Reads logs through ciJobLogApiArgs.
   ['scripts/conveyor/reconcile-pass.mjs', 1],
-  ['scripts/conveyor/stale-base-refresh.mjs', 1],
+  ['scripts/conveyor/stale-base-refresh.mjs', 0], // Job-log reads use ciJobLogApiArgs.
   ['scripts/lib/drain-queue-safety.mjs', 0], // All job-log readers use ciJobLogApiArgs, including generic endpoint readers.
   ['scripts/lib/finished-ci-cache.mjs', 0],
   ['scripts/lib/red-main-quarantine-io.mjs', 1], // Only the documented shell command remains; readJobFailures uses the helper.

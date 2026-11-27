@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 import { execFileSyncThrottled, isGhDeferred } from '../lib/gh-throttle.mjs';
+import { ciJobLogApiArgs } from '../lib/gh-ci-log.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
@@ -163,7 +164,7 @@ export function readStaleBaseFacts({ repo, pr, defaultBranch = 'main', exec = ex
       jobId: c.detailsUrl?.match(/\/job\/(\d+)/)?.[1] ?? null, log: '' }));
   if (!facts.failingChecks.length || facts.failingChecks.some(c => c.conclusion !== 'FAILURE')) return finish();
   for (const c of facts.failingChecks) {
-    try { if (c.jobId) c.log = run('gh', ['api', `repos/${repo}/actions/jobs/${c.jobId}/logs`]); } catch { c.log = ''; }
+    try { if (c.jobId) c.log = run('gh', ciJobLogApiArgs(`repos/${repo}/actions/jobs/${c.jobId}/logs`)); } catch { c.log = ''; }
     if (!extractFailingTestFiles(c.log).length && !AGGREGATOR_PATTERNS.some(p => p.test(c.log))) return finish();
   }
   const failingFiles = [...new Set(facts.failingChecks.flatMap(c => extractFailingTestFiles(c.log)))];

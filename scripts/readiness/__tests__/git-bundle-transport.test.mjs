@@ -317,6 +317,8 @@ describe('R593 client and routing', () => {
         const decisions = []; const calls = [];
         await runWithRemoteDecision({ argv: ['npx', 'vitest', 'run', 'git.test.mjs'], policy: policyFor(clientPath), cwd, env: {}, lockRoot, loadPerCore: () => 4,
           hostOverloaded: () => false, log: () => {}, onDecision: d => decisions.push(d),
+          // hermetic: never read real Forge telemetry over ssh (a configured ssh alias made this wait out the 5 s test timeout)
+          readTelemetry: async () => { throw new Error('hermetic: no telemetry'); },
           remoteExec: async (o) => { calls.push(o); return { mode: 'not-started', terminated: true, reason: 'forge-runner-too-old' }; } });
         return { decisions, calls };
       };
