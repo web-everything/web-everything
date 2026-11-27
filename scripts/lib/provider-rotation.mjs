@@ -110,6 +110,9 @@ export function drawArm({ kind, subject, policy, capacity, exclude = [], builder
   if (typeof subject !== 'string' || !subject.length || !strings(exclude)) return refuse('invalid-input');
   if (!object(capacity)) return refuse('missing-capacity');
   const kindLens = kind === 'red-team' ? kind : kind?.startsWith('review-') && kind !== 'review-lens' ? kind.slice(7) : undefined;
+  // Security is a floor: overrides cannot waive independence or reviewer strength.
+  if ((lens === 'security' || kindLens === 'security') &&
+    lensOverride !== undefined && lensOverride !== 'security') return refuse('kind-lens-mismatch');
   if (lensOverride !== undefined) lens = lensOverride;
   if (kindLens && lens !== undefined && lens !== kindLens) return refuse('kind-lens-mismatch');
   lens ??= kindLens;
