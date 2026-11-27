@@ -2137,7 +2137,7 @@ export function runReviewLabelCli({
   // fresh state so a push during that read cannot bypass the pin.
   const assertPinnedRearmHead = (fresh) => {
     if (pinnedRearm && onlyIf !== 'missing' && (fresh ?? provider.readPrState(repo, pr)).headRefOid !== expectedHead) {
-      throw new Error('live head differs from --expect-head');
+      throw Object.assign(new Error('live head differs from --expect-head'), { rearmPinRefusal: true });
     }
   };
   const recheckRearmClearance = ({ refuse = refuseRearm,
@@ -2205,6 +2205,7 @@ export function runReviewLabelCli({
     try {
       return lockRearmWrite(repo, pr, () => {
         const fresh = provider.readPrState(repo, pr);
+        assertPinnedRearmHead(fresh);
         if (fresh.state !== 'OPEN' || fresh.headRefOid !== headSha) throw new Error('accepted re-arm head or state changed — retry; hold retained');
         const comments = fullThread(fresh.comments, fresh.headRefOid, reason => { throw new Error(reason); });
         const liveDecision = decideSetLabel({ to: 'rearm', currentLabels: fresh.labels, headSha: fresh.headRefOid, comments });
@@ -2222,7 +2223,7 @@ export function runReviewLabelCli({
         return effect();
       });
     } catch (error) {
-      throw Object.assign(new Error(ghErr(error, 'accepted re-arm evidence or effect unreadable — retry or ask the operator')), { rearmRefusal: true });
+      throw Object.assign(new Error(ghErr(error, 'accepted re-arm evidence or effect unreadable — retry or ask the operator')), { rearmRefusal: true, rearmPinRefusal: error.rearmPinRefusal });
     }
   };
 
@@ -2286,6 +2287,7 @@ export function runReviewLabelCli({
       }
     }
   } catch (e) {
+    if (e.rearmPinRefusal) fail(ghErr(e, 'live head differs from --expect-head'), 1);
     if (e.rearmRefusal) refuseRearm(ghErr(e, 'accepted re-arm refused — retry or ask the operator'));
     if (to === 'clear-human') {
       clearingLedgerMiss = true;
@@ -2370,6 +2372,7 @@ export function runReviewLabelCli({
         writeRearmEffect(() => provider.postComment(repo, pr, commentBody));
         return;
       } catch (e) {
+        if (e.rearmPinRefusal) fail(ghErr(e, 'live head differs from --expect-head'), 1);
         if (e.rearmRefusal) refuseRearm(ghErr(e, 'accepted re-arm refused — retry or ask the operator'));
         commentFailure = ghErr(e, 'gh pr comment failed');
       }
