@@ -320,6 +320,11 @@ function isStrictChainMachineBody(body, comment) {
   // Restamps are a heading and a terminal marker block, optionally the producer's attribution and carry reason.
   const restamp = /^📌 review — acceptance re-stamped(?: after a rebase \(no new review\))?\n(?:\nRecorded by [^\r\n]+\.\n(?:\nidentical whitespace-sensitive contribution patch; from [0-9a-f]{40}; patch-id [0-9a-f]{40}\n)?\n)?<!-- reviewed-sha: [0-9a-f]{40} -->(?:\n<!-- reviewed-(?:diff|contribution): [0-9a-f]{64} -->)*$/;
   if (restamp.test(text)) return true;
+  // buildVerdictComment also emits independence disclosure, carried-human
+  // attribution and terminal actor markers. Consume each complete field rather
+  // than accepting arbitrary prose below the restamp heading.
+  const producerRestamp = /^📌 review — acceptance re-stamped after a rebase \(no new review\)\n\nRecorded by [^\n]+?\.(?: The HUMAN clearance [^\n]+ granted \(reviewed-sha [0-9a-f]{12}…\) is carried forward to this head: the drain's own content-preserving rebase moved the tree, and the reviewed diff\/contribution is unchanged, so that clearance still covers it \(#x9krtkb\)\. No new review ran here — `review:human` stays cleared on the strength of the ORIGINAL clearance, not a fresh one\.)?(?:\n\n⚠️ Independence NOT established for this clearance \(#2844\): [^\n]+\. This record does not show that a party other than the author cleared it\.)?(?:\n\nidentical whitespace-sensitive contribution patch; from [0-9a-f]{40}; patch-id [0-9a-f]{40})?\n\n<!-- reviewed-sha: [0-9a-f]{40} -->(?:\n<!-- reviewed-diff: [0-9a-f]{64} -->)?(?:\n<!-- reviewed-contribution: [0-9a-f]{64} -->)?(?:\n<!-- cleared-human: [^<>\n]+ -->\n<!-- cleared-from: [A-Za-z0-9_-]+ -->)?(?:\n<!-- cleared-by-actor: [^<>\n]{1,200} -->)?$/;
+  if (producerRestamp.test(text)) return true;
   // Drain reasons have a single reason field; an extra line is not part of that machine record.
   const reason = /^<!-- drain-(skip|land|merge-trace|review-coverage|stacked-base-close)-reason -->\n([^\n]+)(?:\n\n([^\n]+))?$/.exec(text);
   if (!reason) return false;
