@@ -178,6 +178,54 @@ describe('BLD-8110 watcher/reconcile target budget replay', () => {
     expect(out.reconciled.refusals).toMatchObject([{ kind: 'cap-exhausted', attempts: 3 }]);
   });
 
+  it('watcher lifetime three-round ceiling still escalates after the target moves', () => {
+    const out = replay(['aaaaaaa', 'bbbbbbb', 'ccccccc'].map(round));
+    expect(out.postFinding).not.toHaveBeenCalled();
+    expect(out.watched[0]).toMatchObject({ conflictFixRoundsSpent: 0, conflictFixRoundsTotal: 3 });
+    expect(out.watched[0].routedTo).toContain('cap-exhausted');
+    expect(out.notes).toHaveLength(1);
+    expect(out.notes[0][0].body).toMatch(/lifetime.*3\/3.*person/);
+    expect(out.events.slice(-3)).toEqual(['state', 'comments', 'state']);
+  });
+
+  it.each(['BEHIND', 'DIRTY'])('stacked rebase holds ambiguous same-target history without a conflict label (%s)', mergeStateStatus => {
+    const root = mkdtempSync(join(tmpdir(), 'bld-8110-stacked-'));
+    const path = join(root, 'pr.json');
+    const cwd = vi.spyOn(process, 'cwd').mockReturnValue(root);
+    const target = 'lane/fixture-base';
+    const pr = {
+      number: 8110, state: 'OPEN', headRefName: 'lane/fixture-stacked', headRefOid: sha('e'),
+      baseRefName: target, baseRefSha: sha('d'), mergeable: 'UNKNOWN', mergeStateStatus,
+      labels: [{ name: 'review:pending' }],
+      rowsComplete: true, rowsHead: sha('e'), commentsComplete: true,
+      statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }],
+      comments: Array.from({ length: 3 }, () => ({
+        ...round('ddddddd'),
+        body: `${CONFLICT_FIX_COMMENT_MARKER}\n<!-- conveyor-conflict-fix-target: ${target}@ddddddd -->\n`
+          + `<!-- conveyor-conflict-fix-target: ${target}@ddddddd -->`,
+      })),
+    };
+    try {
+      writeFileSync(path, JSON.stringify(pr));
+      const out = planReconcile({
+        repo: 'fixture/repo', prs: [JSON.parse(readFileSync(path, 'utf8'))], agents: [], now,
+        mainSha: sha('a'), requiredChecks: ['gate'], reviewTiming: { startAfter: 'ci-green' },
+        reviewLabelHeal: 'off', ciHealBudget: { cap: 3, resetOnFixHead: false },
+        ciHealBudgetRestore: { value: false }, verdictSettings: {}, codeqlOwnBudget: { value: false },
+        shadowDeps: { mode: 'off' }, operatorRulingExtraRounds: { value: 0 },
+        roundExtensionAnchor: { value: false },
+      });
+      expect(out.dispatch).toEqual([]);
+      expect(out.refusals).toMatchObject([{
+        kind: 'conflict-evidence-unreadable', phase: 'conflicted',
+        why: expect.stringMatching(/target history ambiguous.*person/),
+      }]);
+    } finally {
+      cwd.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('lifetime ceiling still escalates', () => {
     const out = replay(Array.from({ length: CONFLICT_FIX_ABSOLUTE_CEILING }, () => round('aaaaaaa')));
     expect(out.watched[0].routedTo).toContain('cap-exhausted');
