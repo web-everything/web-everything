@@ -195,8 +195,12 @@ function failedRows(smokeResult) {
 /** PURE: does `control` fail every check `candidate` failed (by name)? — the "the harness itself is broken"
  *  test: a failure the last-good build reproduces is not evidence against the candidate's code. */
 export function failsSameChecks(candidateFailed, controlFailed) {
-  const c = new Set((controlFailed || []).map((r) => r.name));
-  return Array.isArray(candidateFailed) && candidateFailed.length > 0 && candidateFailed.every((r) => c.has(r.name));
+  // Rows retained from an invalid table preserve diagnostics, never authorization to adopt as no worse.
+  if (![candidateFailed, controlFailed].every(rows => Array.isArray(rows) && rows.length > 0
+    && rows.every(row => row && typeof row.name === 'string' && row.name.length > 0
+      && !Object.hasOwn(row, 'evidenceReason')))) return false;
+  const c = new Set(controlFailed.map(r => r.name));
+  return candidateFailed.every(r => c.has(r.name));
 }
 
 // ── the rebuild's smoke BUDGET (live 2026-10-10) ─────────────────────────────────────────────────────────────
@@ -516,7 +520,8 @@ export async function smokeAndAdopt({
         verdict: 'unknown', evidenceReason,
         smoke: { results: Array.isArray(smokeResult?.smoke?.results)
           ? smokeResult.smoke.results.slice(0, SMOKE_CHECKS.length)
-            .filter(row => row && SMOKE_CHECKS.some(check => check.name === row.name) && row.ok === false) : [] },
+            .filter(row => row && SMOKE_CHECKS.some(check => check.name === row.name) && row.ok === false)
+            .map(row => ({ ...row, evidenceReason })) : [] },
       };
       if (!freshComparison) {
         firstSmoke = smokeResult;

@@ -565,6 +565,69 @@ describe('BLD-5539 — rate-limited overlay recovery', () => {
     expect(result.alerts.some(a => a.kind === 'smoke-rate-limited')).toBe(false);
   });
 
+  it('a null row in last-good control cannot authorize no-worse adoption', async () => {
+    f.env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE = '1';
+    const candidate = passed();
+    candidate.verdict = 'code'; candidate.smoke.pass = false;
+    Object.assign(candidate.smoke.results.find(row => row.name === 'dispatch-dry-run'), {
+      ok: false, detail: 'TypeError: invalid dispatch',
+    });
+    const control = structuredClone(candidate);
+    control.smoke.results[0] = null;
+    f.smoke.mockResolvedValueOnce(candidate).mockResolvedValue(control);
+
+    const result = await f.rebuild();
+    expect(f.smoke).toHaveBeenCalledTimes(3); // candidate, plain main, last-good
+    expect(result.adopted).toBeFalsy();
+    expect(f.adopt).not.toHaveBeenCalled();
+    expect(f.git(['rev-parse', 'HEAD'])).toBe(f.lastGood);
+    expect(f.refs()).toEqual(['lane/rate-limit']);
+    expect(result.reason).toBe('smoke-rejected');
+    expect(f.state().held).toMatchObject({ reason: 'smoke-rejected', controlPassed: false });
+    expect(f.state().rejected?.harnessBroken).not.toBe(true);
+    expect(result.alerts.some(a => a.kind.startsWith('smoke-harness-broken') || a.kind.includes('overlay-dropped'))).toBe(false);
+  });
+
+  it('smoke producer refuses throttle-only recovery when TypeError precedes ten throttle lines', async () => {
+    let produced;
+    f.smoke.mockImplementation(async ({ root, env }) => {
+      const smoke = await runLiveSmoke({ root, env, repos: [], clock: f.now, now: f.now(), load: () => 0, cores: () => 1,
+        shadow: () => null, admit: () => null, hostBusy: () => false,
+        makeReadMemoDir: () => mkdtempSync(join(f.env.TMPDIR, 'memo-')),
+        runChild: async (cmd, args, options) => {
+          if (cmd === 'gh') throw Object.assign(new Error(`exited 1: ${throttle}`), {
+            status: 1, signal: null, stdout: throttle,
+            stderr: ['TypeError: invalid dispatch', ...Array(10).fill(throttle)].join('\n'),
+          });
+          if (args[1] === 'list') return '[]';
+          if (args[1] === 'acquire') return JSON.stringify({ lane: 39 });
+          if (options.env.GH_CALLER === 'rebuild-smoke:dispatch-dry-run') {
+            return JSON.stringify([{ kind: options.env.WE_SMOKE_DRYRUN_ONLY, ok: true, ms: 1 }]);
+          }
+          return cmd === 'node' ? JSON.stringify({ ok: true }) : '';
+        } });
+      produced = { verdict: classifySmokeFailure(smoke.results), smoke };
+      return produced;
+    });
+
+    const result = await f.rebuild();
+    const failed = produced.smoke.results.filter(row => row.ok === false);
+    expect(failed.map(row => row.name)).toEqual(['gh-api-repo', 'gh-pr-list']);
+    for (const row of failed) {
+      expect(row.detail).toContain(throttle);
+      expect(row.stderrTail.split(' | ')).toEqual(Array(10).fill(throttle));
+      expect(row.stderrTail).not.toContain('TypeError');
+    }
+    expect(rateLimitOnly(produced)).toBe(false);
+    expect(result.adopted).toBeFalsy();
+    expect(result.alerts.some(a => a.kind === 'smoke-rate-limited')).toBe(false);
+    expect(f.state().held.reason).toBe('smoke-harness-broken');
+    expect(f.state().held.cause).not.toBe('github-rate-limit');
+    expect(f.git(['rev-parse', 'HEAD'])).toBe(f.lastGood);
+    expect(f.refs()).toEqual(['lane/rate-limit']);
+    expect(f.adopt).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['oversized', 'dispatch-dry-run', 'detail'],
     ['oversized', 'dispatch-dry-run', 'stderrTail'],
@@ -644,6 +707,12 @@ describe('BLD-5539 — rate-limit proof boundaries', () => {
     results: SMOKE_CHECKS.map(({ name, mayBeTransient }) => name === 'gh-api-repo'
       ? { name, mayBeTransient, ok: false, detail: 'gh api --method GET repos/o/r failed: exited 1: HTTP 403: API rate limit exceeded', ...patch }
       : { name, mayBeTransient, ok: true }) } });
+  it.each([10, 300, 2400])('stderr at the %i producer cap cannot prove rate-limit-only failure', cap => {
+    const prefix = 'HTTP 403: API rate limit exceeded for ';
+    const stderrTail = cap === 10 ? Array(cap).fill('HTTP 403: API rate limit exceeded').join(' | ')
+      : prefix + 'x'.repeat(cap - prefix.length);
+    expect(rateLimitOnly(result({ stderrTail }))).toBe(false);
+  });
   it.each([
     { detail: 'gh api failed: rate limit exceeded; TypeError: invalid code' },
     { stderrTail: 'TypeError: invalid code' },
