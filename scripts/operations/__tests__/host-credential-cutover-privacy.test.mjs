@@ -33,6 +33,32 @@ afterEach(async () => {
 });
 
 describe('R972 inventory fixture privacy', () => {
+  it('allows the policy to quote synthetic App IDs only at its exact self-entry context', async () => {
+    const path = 'scripts/settings/privacy-terms-allowlist.json';
+    const file = join(root, path);
+    await mkdir(dirname(file), { recursive: true });
+    await writeFile(file, privacyPolicySource);
+    const text = await readFile(file, 'utf8');
+    const allowlist = loadAllowlist(text);
+    const fixtureEntries = allowlist.entries.filter(entry => entry.path === fixturePath
+      && entry.pattern === 'account-id');
+    expect(fixtureEntries).toHaveLength(6);
+    expect(scanText(text, { path, allowlist })
+      .filter(hit => hit.pattern === 'account-id')).toEqual([]);
+    for (const matchText of new Set(fixtureEntries.map(entry => entry.matchText))) {
+      const line = `      "matchText": ${JSON.stringify(matchText)},`;
+      expect(text.split('\n')).toContain(line);
+      expect(scanText(line, { path }).some(hit => hit.pattern === 'account-id')).toBe(true);
+      expect(scanText(line, { path, allowlist })).toEqual([]);
+      expect(scanText(`${line} `, { path, allowlist })
+        .some(hit => hit.pattern === 'account-id')).toBe(true);
+      expect(scanText(line, { path: 'scripts/settings/other.json', allowlist })
+        .some(hit => hit.pattern === 'account-id')).toBe(true);
+      expect(scanText(line.replace(/\b2\b/, '3'), { path, allowlist })
+        .some(hit => hit.pattern === 'account-id')).toBe(true);
+    }
+  });
+
   it('creates and scans a fixture with TMPDIR unset using the injected OS temp directory', async () => {
     vi.stubEnv('TMPDIR', undefined);
     delete process.env.TMPDIR;
