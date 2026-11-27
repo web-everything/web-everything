@@ -2557,6 +2557,97 @@ describe('item 98 — --help prints usage without running the gate', () => {
   }
 });
 
+describe('verify-lane — unknown subcommands never run the gate', () => {
+  let calls;
+  let preload;
+  let env;
+  beforeEach(() => {
+    const sha = headSha();
+    calls = join(dir, 'cli-calls.jsonl');
+    preload = join(dir, 'cli-fixture.mjs');
+    writeFileSync(calls, '');
+    writeFileSync(preload, `
+      import cp from 'node:child_process';
+      import fs from 'node:fs';
+      import os from 'node:os';
+      import { syncBuiltinESMExports } from 'node:module';
+      const root = ${JSON.stringify(dir)};
+      Date.now = () => Date.parse('2026-11-26T12:00:00Z');
+      os.homedir = os.tmpdir = () => root;
+      os.hostname = () => 'fixture-host';
+      const readFile = fs.readFileSync;
+      fs.readFileSync = (path, ...args) => {
+        if (!String(path).startsWith(root + '/') && !/\\.[cm]?js$/.test(String(path)))
+          throw new Error('fixture refuses external data: ' + path);
+        return readFile(path, ...args);
+      };
+      const record = (file, args, options) => fs.appendFileSync(${JSON.stringify(calls)},
+        JSON.stringify({ file, args, cwd: options?.cwd }) + '\\n');
+      cp.execFileSync = (file, args, options) => {
+        record(file, args, options);
+        if (file !== 'git' || options?.cwd !== root) throw new Error('fixture refuses external command');
+        if (args.includes('rev-parse') && args.includes('--absolute-git-dir')) return root + '/.git';
+        if (args.includes('rev-parse') && args.includes('HEAD')) return ${JSON.stringify(sha)};
+        throw new Error('fixture refuses unexpected git arguments');
+      };
+      for (const method of ['spawn', 'spawnSync', 'exec', 'execSync', 'execFile']) cp[method] = (...args) => {
+        record(method, args); throw new Error('fixture refuses subprocess');
+      };
+      syncBuiltinESMExports();
+    `);
+    const preferences = join(dir, 'preferences.json');
+    writeFileSync(preferences, '{}');
+    env = { ...gateScrubbedEnv(), HOME: dir, TMPDIR: dir, WE_TOOLS_ROOT: '',
+      WE_PLATFORM_PREFERENCES: preferences, WE_PLATFORM_PREFERENCES_FILE: preferences,
+      WE_COORDINATION_ROOT: dir, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_LANE_SESSION: 'fixture-lane' };
+  });
+  function invoke(args, repo = dir) {
+    const result = spawnSync(process.execPath, ['--import', preload, VERIFY_LANE, ...args, `--repo=${repo}`], {
+      cwd: dir, env, encoding: 'utf8', timeout: 60000, maxBuffer: 1024 * 1024,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).not.toBe(1);
+    return result;
+  }
+  it.each([false, true])('status is a read-only alias of check: same JSON and exit as check, marker untouched (seeded=%s)', (seeded) => {
+    const bytes = JSON.stringify({ sha: headSha(), status: 'green', exitCode: 0,
+      startedAt: '2026-11-26T11:59:00Z', finishedAt: '2026-11-26T12:00:00Z', suites: 'fixture' }) + '\n';
+    if (seeded) writeFileSync(marker(), bytes);
+    for (const flags of [[], ['--require-verified'], ['--wait=50']]) {
+      const check = invoke(['check', '--json', ...flags]);
+      const status = invoke(['status', '--json', ...flags]);
+      expect(JSON.parse(status.stdout)).toEqual(JSON.parse(check.stdout));
+      expect(status.status).toBe(check.status);
+      if (seeded) expect(readFileSync(marker(), 'utf8')).toBe(bytes);
+      else expect(existsSync(marker())).toBe(false);
+    }
+    const commands = readFileSync(calls, 'utf8').trim().split('\n').map(JSON.parse);
+    expect(commands.every(call => call.file === 'git')).toBe(true);
+  });
+  it.each([[[]], [['--dry-run']]])('an unknown subcommand exits 3 with reason unknown-subcommand and writes no marker (%j)', (flags) => {
+    const result = invoke(['bogus', '--json', ...flags], join(dir, 'missing-repo'));
+    expect(JSON.parse(result.stdout)).toEqual({ status: 'error', reason: 'unknown-subcommand',
+      detail: 'unknown subcommand "bogus"; use check (or status) for a read-only verdict' });
+    expect(result.status).toBe(3);
+    expect(existsSync(marker())).toBe(false);
+    expect(existsSync(join(dir, 'missing-repo'))).toBe(false);
+    expect(readFileSync(calls, 'utf8')).toBe('');
+    const plain = invoke(['bogus', ...flags]);
+    expect(plain.status).toBe(3);
+    expect(plain.stdout).toBe('');
+    expect(plain.stderr).toContain('unknown subcommand "bogus"; use check (or status) for a read-only verdict');
+    expect(existsSync(marker())).toBe(false);
+    expect(readFileSync(calls, 'utf8')).toBe('');
+  });
+  it('help wins over an unknown subcommand and lists status next to check without git reads', () => {
+    const result = invoke(['bogus', '--help']);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('check|status');
+    expect(readFileSync(calls, 'utf8')).toBe('');
+    expect(existsSync(marker())).toBe(false);
+  });
+});
+
 describe('build finalGateStandards preview', () => {
   beforeEach(() => {
     const preferences = join(dir, '.git', 'platform-preferences.json');
