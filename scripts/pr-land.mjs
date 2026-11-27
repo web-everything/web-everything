@@ -86,7 +86,7 @@ import { publicationTitle, readMainCard } from './operations/machine-pr-title.mj
 import { producerBuildContext, checkpointBuildPr } from './operations/build-pr-authorship.mjs';
 import { execFileSync } from 'node:child_process';
 import { hasClosingKeywordRef } from './lib/commit-message-safety.mjs';
-import { readFileSync, realpathSync, appendFileSync } from 'node:fs';
+import { readFileSync, realpathSync, appendFileSync, mkdirSync, rmdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
@@ -101,7 +101,8 @@ export function admitPrSize(request, effects = {}) {
 /** Pre-create admission also runs before the direct CLI's dry-run branch. */
 export function admitCanonicalAudit(request, { check = checkCanonicalAuditForOpen, refuse } = {}) {
   const gate = check(request);
-  if (!gate.ok) refuse({ repo: request.repo, merged: false, reason: gate.reason, detail: gate.message }, 3);
+  if (gate?.ok !== true) refuse({ repo: request.repo, merged: false,
+    reason: gate?.reason || 'canonical-audit-missing', detail: gate?.message || 'canonical audit evidence unreadable; run the canonical audit again' }, 3);
   return gate;
 }
 
@@ -186,6 +187,7 @@ const REMOTE = typeof flags.remote === 'string' ? flags.remote : 'origin';
 const METHOD = typeof flags.method === 'string' ? flags.method : 'merge';
 const WAIT = !flags['no-wait'];
 const CHECK = !!flags.check;
+const SKIP_PUSH = flags['skip-push'] === true;
 const DRY_RUN = !!flags['dry-run'] && !CHECK;
 const FALLBACK_GIT = !!flags['fallback-git'];
 const AS_JSON = !!flags.json;
@@ -847,6 +849,9 @@ if (IS_CLI) runCli().catch((error) => emit({ repo: REPO, merged: false, reason: 
 async function runCli() {
   // Install the closure before setup so the entry-point catch can use the normal failure output.
   emit = emitResult;
+  let submissionLock = null;
+  let submissionWritten = false;
+  let prNum = null;
   const gitC = (args) => {
     const output = execFileSync('git', args, { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
     return args.includes('-z') ? output : output.trim();
@@ -860,6 +865,73 @@ async function runCli() {
   const blockers = [];
   const collect = (gate, reason, detail, sha) => blockers.push(blocker(gate, reason, detail, sha));
   const forge = createGhLandProvider({ cwd: REPO }); // #3585 — every bare `gh` call below goes through this port
+
+  // Publication reuse is a closed transaction. Never reclaim an unknown lock owner;
+  // a crashed submission requires operator inspection before retrying.
+  function refuseSubmission(reason, detail) {
+    emit({ repo: REPO, merged: false, reason,
+      ...(prNum != null ? { pr: Number(prNum) } : {}),
+      ...(submissionWritten ? { incomplete: true } : {}),
+      detail: `${submissionWritten ? 'incomplete submission: ' : ''}${detail}; inspect the lane and PR, then rerun pr-land` }, 3);
+  }
+  function submissionPrs() {
+    let rows;
+    try { rows = forge.listOpenByHead(REF); }
+    catch { refuseSubmission('pr-head-mismatch', 'pr-lookup-unreadable'); }
+    if (!Array.isArray(rows) || rows.length > 1 || rows.some(row => !Number.isSafeInteger(row?.number) || row.number < 1)) {
+      refuseSubmission('pr-head-mismatch', 'pr-lookup-ambiguous');
+    }
+    return rows;
+  }
+  function assertPublishedHead() {
+    let output;
+    try {
+      output = execFileSync('git', ['ls-remote', '--refs', REMOTE, `refs/heads/${REF}`], {
+        cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 64 * 1024,
+      });
+    } catch { refuseSubmission('pr-head-mismatch', 'remote-ref-unreadable (timeout or output limit requires inspection)'); }
+    if (typeof output !== 'string' || Buffer.byteLength(output) > 64 * 1024) refuseSubmission('pr-head-mismatch', 'remote-ref-oversized-or-invalid');
+    if (!output) refuseSubmission('pr-head-mismatch', 'remote-ref-missing');
+    const match = /^([a-f0-9]{40})\t([^\r\n]+)\n?(?![\s\S])/i.exec(output);
+    if (!match || match[2] !== `refs/heads/${REF}`) refuseSubmission('pr-head-mismatch', 'remote-ref-malformed-or-ambiguous');
+    if (match[1].toLowerCase() !== refSha.toLowerCase()) refuseSubmission('pr-head-mismatch', 'remote-ref-mismatch');
+  }
+  function assertSubmissionEvidence() {
+    if (!SKIP_PUSH) return;
+    if (!submissionLock) refuseSubmission('pr-head-mismatch', 'submission-lock-missing');
+    let source;
+    try { source = execFileSync('git', ['rev-parse', SRC], {
+      cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 64 * 1024,
+    }).trim(); }
+    catch { refuseSubmission('pr-head-mismatch', 'local-head-unreadable'); }
+    if (source !== refSha || !/^[a-f0-9]{40}$/i.test(source)) refuseSubmission('pr-head-mismatch', 'local-head-mismatch');
+    admitCanonicalAudit({ repo: REPO, ref: REF, sha: refSha, refreshMain: false }, { refuse: result => refuseSubmission(result.reason, result.detail) });
+    let claim;
+    try { claim = pushRefusal({ repo: repoKeyForCheckout(REPO, { remote: REMOTE }), branch: REF, ...callerIdentity() }); }
+    catch { refuseSubmission('fix-claimed', 'claim-unreadable'); }
+    if (claim !== null) refuseSubmission('fix-claimed', claim?.message || 'claim-evidence-unknown');
+    assertPublishedHead();
+    const rows = submissionPrs();
+    if (prNum == null) {
+      if (rows.length) refuseSubmission('pr-head-mismatch', 'pr-adoption-changed');
+    } else {
+      if (rows.length !== 1 || rows[0].number !== Number(prNum)) refuseSubmission('pr-head-mismatch', 'pr-adoption-changed');
+      let live;
+      try { live = forge.viewPr(prNum, 'headRefOid,state,headRefName,baseRefName,labels,comments,body'); }
+      catch { refuseSubmission('pr-head-mismatch', 'pr-head-unreadable'); }
+      if (live?.headRefOid !== refSha || live.state !== 'OPEN' || live.headRefName !== REF || live.baseRefName !== BASE
+        || !Array.isArray(live.labels) || !Array.isArray(live.comments) || typeof live.body !== 'string') {
+        refuseSubmission('pr-head-mismatch', 'pr-head-or-live-state-mismatch');
+      }
+    }
+  }
+  function beforeSubmissionWrite() {
+    assertSubmissionEvidence();
+    if (SKIP_PUSH) submissionWritten = true;
+  }
+  function submissionWriteFailed() {
+    if (SKIP_PUSH) refuseSubmission('gh-error', 'submission-write-unconfirmed');
+  }
 
   // #2290 — the single-couple FAST DRAIN pr-land shells after labelling green so /pr still feels instant. The
   // drain is the sole writer to main; scoping it to this ONE PR (+ --this-repo) lands the couple immediately
@@ -884,10 +956,17 @@ async function runCli() {
     // NO label of any kind; once the fix daemon healed the red the PR sat green and label-less forever.
     let handOff = null;
     try { handOff = unlabelledHandOffLabel({ mode: PLAN.mode, reason: result?.reason, labelApplied, prNum }); } catch { /* emitted before the PR/plan existed (TDZ) — nothing to hand off */ }
-    if (handOff) {
-      try { forge.ensureLabel(handOff, { color: 'FBCA04', description: 'Review pending — an independent review is owed once required checks are green' }); } catch { /* already exists — fine */ }
+    if (handOff && (!SKIP_PUSH || exitCode === 0)) {
+      beforeSubmissionWrite();
+      try { forge.ensureLabel(handOff, { color: 'FBCA04', description: 'Review pending — an independent review is owed once required checks are green' }); } catch { submissionWriteFailed(); }
+      beforeSubmissionWrite();
       try { forge.addLabel(prNum, handOff); result = { ...result, handOffLabel: handOff }; }
-      catch (e) { if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · could not hand #${prNum} off with "${handOff}" (${String(e.message || e).split('\n')[0]})\n`); }
+      catch (e) { submissionWriteFailed(); if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · could not hand #${prNum} off with "${handOff}" (${String(e.message || e).split('\n')[0]})\n`); }
+    }
+    if (submissionLock) {
+      try { rmdirSync(submissionLock); submissionLock = null; }
+      catch { result = { ...result, merged: false, reason: 'pr-head-mismatch', incomplete: true,
+        detail: 'submission-lock-release-failed; inspect the lock and PR before rerunning pr-land' }; exitCode = 3; }
     }
     if (AS_JSON) writeAllSync(1, JSON.stringify(result) + '\n');
     else {
@@ -908,6 +987,7 @@ async function runCli() {
   // bad/empty body, auth, "a pull request already exists", validation) is NOT infra → the normal hard fail
   // (ghFailed) applies, never a doomed retry loop.
   function onCreateFailed(e) {
+    submissionWriteFailed();
     const errText = `${String(e?.message || e)}\n${String(e?.stderr || '')}`;
     const { infra, cause } = classifyPrOpenFailure(errText);
     const stderrTail = ghStderrTail(e);
@@ -949,6 +1029,9 @@ async function runCli() {
   }
   if (!REF) emit({ repo: REPO, merged: false, reason: 'no-ref', detail: 'pass --ref=lane/<name> (the head ref to land onto ' + BASE + ')' }, 3);
   if (!/^lane\//.test(REF)) emit({ repo: REPO, merged: false, reason: 'bad-ref', detail: `--ref="${REF}" must be a lane/* ref (the #1934 guard carve-out) — never a local branch` }, 3);
+  if (Object.hasOwn(flags, 'skip-push') && (flags['skip-push'] !== true || argv.filter(a => a === '--skip-push').length !== 1)) {
+    emit({ repo: REPO, merged: false, reason: 'bad-ref', detail: 'pass --skip-push once, without a value; inspect the invocation and retry' }, 3);
+  }
   // #2622 — `--park=<review:human|review:pending>`: open the PR with that review label already on it and STOP
   // (no green-wait, no ready-to-merge, no drain trigger). The first-class way to open a deliberately-held-for-
   // review PR through the producer, so an agent no longer reaches for `gh pr create` (which skips pr-land's
@@ -966,6 +1049,17 @@ async function runCli() {
   if (ciOnly && !ciOnly.ok) emit({ repo: REPO, merged: false, reason: ciOnly.reason, detail: ciOnly.detail }, 3);
 
   initializeVerifierIdentity(); // Freeze once before repository work; invalid flags run no Git.
+  if (SKIP_PUSH) {
+    let commonDir;
+    try { commonDir = execFileSync('git', ['rev-parse', '--git-common-dir'], {
+      cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 64 * 1024,
+    }).trim(); }
+    catch { refuseSubmission('pr-head-mismatch', 'submission-lock-location-unreadable'); }
+    if (!commonDir || /[\r\n\0]/.test(commonDir)) refuseSubmission('pr-head-mismatch', 'submission-lock-location-invalid');
+    const lock = resolve(REPO, commonDir, 'open-pr-submit.lock');
+    try { mkdirSync(lock); submissionLock = lock; }
+    catch { refuseSubmission('pr-head-mismatch', 'submission-lock-busy-or-unreadable: inspect the lock owner before retrying'); }
+  }
 
   // 1. Resolve the SOURCE commit to publish (the lane clone's HEAD, or an explicit --sha). No local
   //    branch is created (that's guarded) — the lane model pushes `<source>:lane/<n>` straight to origin.
@@ -982,6 +1076,10 @@ async function runCli() {
     } catch { /* ledger miss never changes a hold */ }
   };
   if (!refSha) emit({ repo: REPO, merged: false, reason: 'no-such-src', detail: `source commit "${SRC}" not found — pass --sha=<commit> or run from a checkout whose HEAD carries the lane work` }, 3);
+  if (SKIP_PUSH) {
+    if (!/^[a-f0-9]{40}$/i.test(refSha)) refuseSubmission('pr-head-mismatch', 'local-head-invalid');
+    assertPublishedHead();
+  }
 
   admitCanonicalAudit({ repo: REPO, ref: REF, sha: refSha, refreshMain: CHECK }, {
     refuse: DRY_RUN ? emit : result => collect('canonical-audit', result.reason, result.detail, refSha),
@@ -1032,7 +1130,8 @@ async function runCli() {
       plan: [
         `node scripts/lint-locus-prefix.mjs ${buildLocusLintArgs({ root: REPO, range: `${REMOTE}/${BASE}..${refSha}` }).join(' ')}   # #2331 producer locus-prefix re-check (fail fast on the #2170 review-append leak) — swept in --root, the clone holding the commits (#3342)`,
         `soak precheck (if no PR exists yet): ${soak.ok ? soak.skipped || soak.reason : `REFUSE: ${soak.message}`}`,
-        `git push ${REMOTE} ${SRC}:refs/heads/${REF}   # publish the lane clone's ${SRC} (${refSha.slice(0, 8)}) to the lane ref`,
+        SKIP_PUSH ? `reuse authoritative ${REMOTE} refs/heads/${REF} at ${refSha} (all admission gates still apply)`
+          : `git push ${REMOTE} ${SRC}:refs/heads/${REF}   # publish the lane clone's ${SRC} (${refSha.slice(0, 8)}) to the lane ref`,
         prCreateBodyGuard(BODY).ok ? `gh ${createArgs.join(' ')}` : `REFUSE (if no PR exists yet): ${prCreateBodyGuard(BODY).reason}  # #2332 fail-fast — an existing PR for this head is exempt`,
         PLAN.waitForChecks ? 'poll: gh pr view <pr> mergeStateStatus + gh pr checks <pr> --required  (wait until green; abort on red)'
           : PLAN.mode === 'park' ? '(--park: skip check-wait — the PR is HELD for review, not landed by this run)'
@@ -1155,7 +1254,7 @@ async function runCli() {
 
   // Create only: existing PRs use their live body; lookup failure falls toward checking.
   let existingSoakPr = null;
-  try { existingSoakPr = forge.listOpenByHead(REF)?.[0] ?? null; } catch { /* check locally */ }
+  try { existingSoakPr = (SKIP_PUSH ? submissionPrs() : forge.listOpenByHead(REF))?.[0] ?? null; } catch { /* check locally */ }
   if (!existingSoakPr) {
     const bodyGuard = prCreateBodyGuard(BODY);
     if (!bodyGuard.ok) collect('body', bodyGuard.code, bodyGuard.reason);
@@ -1192,7 +1291,7 @@ async function runCli() {
     detail: ['all pre-push gates passed', ...info].join('\n') }, 0);
 
   // 2. Publish the source commit to the lane ref on origin (guard-safe: lane/*). Never force, no local branch.
-  try { gitC(['push', REMOTE, `${refSha}:refs/heads/${REF}`]); }
+  try { if (!SKIP_PUSH) gitC(['push', REMOTE, `${refSha}:refs/heads/${REF}`]); }
   catch (e) { emit({ repo: REPO, merged: false, reason: 'push-failed', detail: pushFailedDetail(e.message || e, { SRC, REF, REMOTE }) }, 3); }
 
   // 2b. (#2291 — pruned) The PRE-CHECK id-collision self-heal (#2222) that used to run here is now DEAD wiring:
@@ -1206,8 +1305,7 @@ async function runCli() {
 
   // 3. Find an existing open PR for this head, else create a self-approved one.
   const buildContext = producerBuildContext();
-  let prNum = null;
-  try { prNum = forge.listOpenByHead(REF)?.[0]?.number ?? null; } catch { /* gh may be absent */ }
+  try { prNum = (SKIP_PUSH ? submissionPrs() : forge.listOpenByHead(REF))?.[0]?.number ?? null; } catch { /* gh may be absent */ }
   let sizeBody = CREATE_BODY;
   let sizeBodyRead = false;
   if (prNum != null) {
@@ -1225,11 +1323,15 @@ async function runCli() {
     sizeAdmission = { status: 'unknown', body: sizeBody, reviewLabel: REVIEW_LABELS.pending };
   }
   createParams.body = sizeAdmission.body;
+  assertSubmissionEvidence(); // Card filing may have waited; admission is live again before any PR write.
   if (prNum != null && sizeBodyRead && sizeAdmission.body !== sizeBody) {
     // Card filing can take minutes: re-read first and skip the note if the body changed meanwhile.
     try {
-      if (composePrBody(forge.viewPr(prNum, 'body').body || '') === sizeBody) forge.editBody(prNum, sizeAdmission.body);
-    } catch { /* retry will reuse the local split card */ }
+      if (composePrBody(forge.viewPr(prNum, 'body').body || '') === sizeBody) {
+        beforeSubmissionWrite();
+        forge.editBody(prNum, sizeAdmission.body);
+      }
+    } catch { submissionWriteFailed(); /* retry will reuse the local split card */ }
   }
 
   if (prNum == null) {
@@ -1248,8 +1350,10 @@ async function runCli() {
       }
     }
 
-    try { const out = forge.create(createParams); prNum = (out.match(/\/pull\/(\d+)/) || [])[1] ?? null; }
+    beforeSubmissionWrite();
+    try { const out = forge.create(createParams); submissionWritten = SKIP_PUSH; prNum = (out.match(/\/pull\/(\d+)/) || [])[1] ?? null; }
     catch (e) { return onCreateFailed(e); }
+    assertSubmissionEvidence(); // Confirm publication after create before labels or body edits.
     if (prNum != null) checkpointBuildPr(buildContext, { repo: originSlugOf(REPO), pr: prNum, ref: REF });
   } else if (LANE_MANIFEST || AUTHOR_MARKER || DELEGATION_MARKER_LINE) {
     // xnsk54v — an existing PR (a re-run, or one opened before the manifest was ready) may lack the manifest
@@ -1267,8 +1371,9 @@ async function runCli() {
       const liveBody = forge.viewPr(prNum, 'body').body || '';
       const updated = composePrBody(liveBody);
       // R893: a rerun records the deferral on an existing PR too (idempotent), in the same single body edit.
+      beforeSubmissionWrite();
       syncDeferredBody({ forge, prNum, liveBody, composed: updated, deferred: DEFERRED_TO_CI });
-    } catch { /* best-effort — drain ref fallback covers a miss */ }
+    } catch { submissionWriteFailed(); /* drain ref fallback covers a miss in ordinary publication mode */ }
   }
   if (prNum == null) return ghFailed('could not determine the PR number after create');
 
@@ -1287,9 +1392,11 @@ async function runCli() {
   let held = false;
   const applyLabel = () => {
     if (!LABEL || prNum == null) return; // same guard buildAddLabelArgs applies internally — don't run it twice
-    try { forge.ensureLabel(LABEL, { color: '0E8A16', description: 'Producer-certified: required checks green, safe for the label lander (/drain) to merge' }); } catch { /* already exists — fine */ }
+    beforeSubmissionWrite();
+    try { forge.ensureLabel(LABEL, { color: '0E8A16', description: 'Producer-certified: required checks green, safe for the label lander (/drain) to merge' }); } catch { submissionWriteFailed(); }
+    beforeSubmissionWrite();
     try { forge.addLabel(prNum, LABEL); labelApplied = true; }
-    catch (e) { if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · could not apply label "${LABEL}" to #${prNum} (${String(e.message || e).split('\n')[0]}) — land continues\n`); }
+    catch (e) { submissionWriteFailed(); if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · could not apply label "${LABEL}" to #${prNum} (${String(e.message || e).split('\n')[0]}) — land continues\n`); }
   };
 
   // #2307 — the deterministic REVIEW-ESCALATION label, applied AT PRODUCER TIME (never left for a later drain
@@ -1394,19 +1501,23 @@ async function runCli() {
 
     if (verdict.label && verdict.apply) {
       const meta = REVIEW_LABEL_META[verdict.label];
-      try { forge.ensureLabel(verdict.label, { color: meta.color, description: meta.description }); } catch { /* already exists — fine */ }
+      beforeSubmissionWrite();
+      try { forge.ensureLabel(verdict.label, { color: meta.color, description: meta.description }); } catch { submissionWriteFailed(); }
       ledgerProducerHold(verdict.label, verdict.reasons.join('; ') || 'producer review escalation', prNum);
+      beforeSubmissionWrite();
       try { forge.addLabel(prNum, verdict.label); }
-      catch (e) { if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · could not apply review label "${verdict.label}" to #${prNum} (${String(e.message || e).split('\n')[0]}) — land continues\n`); }
+      catch (e) { submissionWriteFailed(); if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · could not apply review label "${verdict.label}" to #${prNum} (${String(e.message || e).split('\n')[0]}) — land continues\n`); }
       // mechanical-dispatcher — a PR that opens review:human also opens carrying review:awaiting-advisory: the
       // operator's standing rule is that no review:human PR is ever reviewed cold, and that "the advisory panel
       // hasn't posted yet" state has to be a visible label, not something inferred from a missing bot comment.
       // review-pr.mjs's `advise` step mechanically clears it the moment the panel actually posts (#xlw02hw).
       if (verdict.label === REVIEW_LABELS.human && shouldApplyReviewLabel(REVIEW_LABELS.awaitingAdvisory, currentLabels)) {
         const awaitMeta = REVIEW_LABEL_META[REVIEW_LABELS.awaitingAdvisory];
-        try { forge.ensureLabel(REVIEW_LABELS.awaitingAdvisory, { color: awaitMeta.color, description: awaitMeta.description }); } catch { /* already exists — fine */ }
+        beforeSubmissionWrite();
+        try { forge.ensureLabel(REVIEW_LABELS.awaitingAdvisory, { color: awaitMeta.color, description: awaitMeta.description }); } catch { submissionWriteFailed(); }
+        beforeSubmissionWrite();
         try { forge.addLabel(prNum, REVIEW_LABELS.awaitingAdvisory); }
-        catch (e) { if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · could not apply "${REVIEW_LABELS.awaitingAdvisory}" to #${prNum} (${String(e.message || e).split('\n')[0]}) — land continues\n`); }
+        catch (e) { submissionWriteFailed(); if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · could not apply "${REVIEW_LABELS.awaitingAdvisory}" to #${prNum} (${String(e.message || e).split('\n')[0]}) — land continues\n`); }
       }
       // Stamp the WHY into the PR body (mirrors the drain's #2324 guarantee) so an operator sees it without
       // re-deriving the rubric — and, for #2635, so the roster-expansion re-alignment reason is trailed where
@@ -1423,9 +1534,9 @@ async function runCli() {
         try { liveBody = forge.viewPr(prNum, 'body').body || ''; liveBodyRead = true; } catch { /* fetch miss — never replace an unread body */ }
         if (liveBodyRead) {
           const reconciled = reconcileEscalationReasonBlock(liveBody, verdict.reasons);
-          if (reconciled.changed) forge.editBody(prNum, reconciled.body);
+          if (reconciled.changed) { beforeSubmissionWrite(); forge.editBody(prNum, reconciled.body); }
         }
-      } catch { /* best-effort — the label already carries the signal */ }
+      } catch { submissionWriteFailed(); /* the label already carries the signal in ordinary publication mode */ }
     }
     // #2832 — the producer applies `ready-to-merge` (applyLabel, on green) BEFORE this escalation verdict. When
     // the verdict is a review-HOLD (review:human/pending/changes), that go-ahead and the hold would coexist —
@@ -1444,8 +1555,9 @@ async function runCli() {
     const holdDecision = decideHoldReadyStrip(verdict.label, currentLabels, { labelApplied, acceptedAtHead: !!verdict.acceptedAtHead });
     if (holdDecision.held) held = true;
     if (holdDecision.strip) {
+      beforeSubmissionWrite();
       try { forge.removeLabel(prNum, READY_TO_MERGE_LABEL); labelApplied = false; }
-      catch (e) { if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · #${prNum} held ${verdict.label} — could not strip ${READY_TO_MERGE_LABEL} (${String(e.message || e).split('\n')[0]}); the drain reconcile will strip it (#2832)\n`); }
+      catch (e) { submissionWriteFailed(); if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · #${prNum} held ${verdict.label} — could not strip ${READY_TO_MERGE_LABEL} (${String(e.message || e).split('\n')[0]}); the drain reconcile will strip it (#2832)\n`); }
     }
     return verdict;
   };
@@ -1487,9 +1599,11 @@ async function runCli() {
     const parkLabel = PLAN.parkLabel;
     const meta = REVIEW_LABEL_META[parkLabel];
     let parkApplied = false;
-    try { forge.ensureLabel(parkLabel, { color: meta.color, description: meta.description }); } catch { /* already exists — fine */ }
+    beforeSubmissionWrite();
+    try { forge.ensureLabel(parkLabel, { color: meta.color, description: meta.description }); } catch { submissionWriteFailed(); }
     ledgerProducerHold(parkLabel, `producer --park ${parkLabel}`, prNum);
-    const parkTry = applyLabelWithRetry(() => forge.addLabel(prNum, parkLabel), { attempts: 3 });
+    const parkTry = applyLabelWithRetry(() => { beforeSubmissionWrite(); return forge.addLabel(prNum, parkLabel); }, { attempts: 3 });
+    if (!parkTry.applied) submissionWriteFailed();
     parkApplied = parkTry.applied;
     if (!parkTry.applied && !AS_JSON) process.stderr.write(`pr-land [${REPO}] · could not apply park label "${parkLabel}" to #${prNum} after ${parkTry.attempts} tries (${parkTry.error}) — the PR IS open; set the label by hand\n`);
     emit({

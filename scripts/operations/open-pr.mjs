@@ -93,7 +93,7 @@ export function resolveRef({ ref, branch, derive = () => '' } = {}) {
   return derive();
 }
 
-export function planOpen({ ref, base, title, bodyFile, mode, parkLabel, sha = '', verify = '', requireVerified = false, dryRun = false, check = false, skipPrePrReview = '', actor = '', operatorInstruction = '' } = {}) {
+export function planOpen({ ref, base, title, bodyFile, mode, parkLabel, sha = '', verify = '', requireVerified = false, dryRun = false, check = false, skipPush = false, skipPrePrReview = '', actor = '', operatorInstruction = '' } = {}) {
   const prepareItem = prepareItemFromRef(ref);
   if (prepareItem && !prepareBatchIds(title).length) title = preparePrTitle(prepareItem);
   const problems = [];
@@ -172,6 +172,7 @@ export function planOpen({ ref, base, title, bodyFile, mode, parkLabel, sha = ''
   if (requireVerified === true) argv.push('--require-verified');
   if (dryRun === true) argv.push('--dry-run');
   if (check === true) argv.push('--check');
+  if (skipPush === true) argv.push('--skip-push');
 
   return {
     ref,
@@ -260,6 +261,8 @@ export function openPrOperation({ parkLabels, deriveRef = () => '' } = {}) {
       // Rehearsal: the home prints the exact gh sequence and executes nothing.
       dryRun: { type: 'boolean', required: false, default: false },
       check: { type: 'boolean', required: false, default: false },
+      // Reuse publication only after the home confirms the authoritative exact head.
+      skipPush: { type: 'boolean', required: false, default: false },
       skipPrePrReview: { type: 'string', required: false, default: '' },
       // The bypass is operator-authority only: it needs both of these (see `authoriseBypass`).
       actor: { type: 'string', required: false, default: '' },
@@ -273,7 +276,7 @@ export function openPrOperation({ parkLabels, deriveRef = () => '' } = {}) {
       // PR #1516's round-1 juror found in `verify`, where the io layer was tested and this layer was not.
       reads: [
         'input.ref', 'input.branch', 'input.base', 'input.title', 'input.bodyFile', 'input.mode', 'input.parkLabel',
-        'input.sha', 'input.verify', 'input.requireVerified', 'input.dryRun', 'input.check', 'input.skipPrePrReview', 'input.actor', 'input.operatorInstruction',
+        'input.sha', 'input.verify', 'input.requireVerified', 'input.dryRun', 'input.check', 'input.skipPush', 'input.skipPrePrReview', 'input.actor', 'input.operatorInstruction',
       ],
       fn: (view) => planOpen({
         ref: resolveRef({ ref: view.input.ref, branch: view.input.branch, derive: deriveRef }),
@@ -287,6 +290,7 @@ export function openPrOperation({ parkLabels, deriveRef = () => '' } = {}) {
         requireVerified: view.input.requireVerified,
         dryRun: view.input.dryRun,
         check: view.input.check,
+        skipPush: view.input.skipPush,
         skipPrePrReview: view.input.skipPrePrReview,
         actor: view.input.actor,
         operatorInstruction: view.input.operatorInstruction,

@@ -6,10 +6,10 @@
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { readFileSync, mkdtempSync, writeFileSync, rmSync, mkdirSync, renameSync } from 'node:fs';
-import { resolve, join } from 'node:path';
+import { resolve, join, dirname } from 'node:path';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { pathToFileURL, fileURLToPath } from 'node:url';
+import { pathToFileURL } from 'node:url';
 import { drainScoredGit } from './fixtures/drain-scored-git.mjs';
 import * as prLand from '../pr-land.mjs';
 import { pushFailedDetail, mergeMethodFlag, buildCreateArgs, prCreateBodyGuard, liveBodyLandGuard, buildMergeArgs, buildRenumberHealArgs, buildRegenArgs, buildAddLabelArgs, classifyChecks, planPrLand, pollVerdict, isPostLandTreeDirty, postLandSkips, postLandReport, scopeHealChangedPaths, resolveProducerReviewLabel, resolveRosterReconcile, resolveParkLabel, withAuthorStamp, composePrBody, PARK_LABELS, decideHoldReadyStrip, isAcceptedAtHead, resolveDraft, isMainFixPr, decideReadyOnOpen, applyLabelWithRetry, unlabelledHandOffLabel, landTimeBodyGate } from '../pr-land.mjs';
@@ -26,33 +26,74 @@ describe('T-OPENPR authoritative published head', () => {
     sha = 'a'.repeat(40), skipFlag = '--skip-push', check = false, dryRun = false } = {}) {
     const dir = mkdtempSync(join(tmpdir(), 'pr-land-published-'));
     const trace = join(dir, 'effects.jsonl');
-    const cli = fileURLToPath(new URL('../pr-land.mjs', import.meta.url));
+    writeFileSync(trace, '');
+    const cli = resolve(__dirname, '../pr-land.mjs');
     const record = `import { appendFileSync } from 'node:fs';
       const effect = value => appendFileSync(${JSON.stringify(trace)}, JSON.stringify(value) + '\\n');`;
     const stubs = {
       './operations/canonical-audit-gate.mjs': `${record} export const checkCanonicalAuditForOpen = () => {
         effect(['audit']); return { ok: ${audit}, reason: 'canonical-audit-missing', message: 'run canonical audit' }; };`,
-      './lib/lane-verify.mjs': 'export const readVerifyMarker = () => null; export const verifyGateDecision = () => ({ ok: true });',
-      './lib/verify-ci-only.mjs': 'export const ciOnlyDecision = () => null;',
-      './lib/verify-lane-gate.mjs': 'export const initializeVerifierIdentity = () => ({}); export const verifySetting = () => 0;',
+      './lib/lane-verify.mjs': `export const readVerifyMarker = () => null;
+        export const verifyGateDecision = () => ({ ok: true });
+        export const resolveVerifyOptions = () => ({ requireVerified: true });
+        export const repoSlugFromRemote = () => 'fixture/project';
+        export const readCiCheckRuns = unexpected, readCiWorkflowRuns = unexpected;`,
+      './lib/verify-ci-only.mjs': 'export const ciOnlyDecision = () => null; export const recordCiOnly = unexpected;',
+      './lib/verify-lane-gate.mjs': `export const initializeVerifierIdentity = () => ({});
+        export const verifySetting = () => 0;
+        export const verifyPolicyKey = unexpected, verifyPolicyInputs = unexpected;
+        export const verifySettingSource = () => 'fixture', laneRelevantChangeSinceForRecord = () => null;`,
       './lib/soak-precheck-at-open.mjs': `export const soakPrecheckEnabled = () => true;
-        export const soakPrecheckAtOpen = () => ({ ok: true, reason: 'fixture' });`,
+        export const soakPrecheckAtOpen = () => ({ ok: true, reason: 'fixture' });
+        export const parseSoakNameStatus = () => ['README.md'];`,
       './lib/pr-limit.mjs': `export const countOpenPrsForRepo = () => ({ count: 0, limit: 15 });
-        export const isBranchAllowedLive = () => false; export const isGlobalOffLive = () => false;`,
+        export const isBranchAllowedLive = () => false; export const isGlobalOffLive = () => false;
+        export const decideOpenPr = () => ({ allowed: true });`,
       './conveyor/fix-procedure.mjs': `${record} export const pushRefusal = () => {
         effect(['claim']); return globalThis.fixtureStage === 'claim-moved' ? { message: 'live fixer owns this branch' } : null;
         }; export const repoKeyForCheckout = () => 'we'; export const callerIdentity = () => ({});`,
-      './conveyor/infra-blocked.mjs': 'export const originSlugOf = () => "fixture/project";',
+      './conveyor/infra-blocked.mjs': `export const originSlugOf = () => 'fixture/project';
+        export const classifyPrOpenFailure = unexpected, recordInfraBlockIO = unexpected,
+          infraStorePath = unexpected, primaryRootFromClone = unexpected, infraHas = unexpected, readInfraStore = unexpected;`,
       './operations/build-pr-authorship.mjs': 'export const producerBuildContext = () => null; export const checkpointBuildPr = () => {};',
+      './lib/gh-app-shim.mjs': `export const defaultShimDir = () => ${JSON.stringify(join(dir, 'shim'))};
+        export const resolveOrgAwareShimDir = unexpected, pathWithOrgAwareShim = unexpected;`,
+      './lib/gh-stderr-tail.mjs': 'export const ghStderrTail = () => "";',
+      './lib/delegation-marker.mjs': `export const DELEGATION_TASK_TYPES = ['build'], DELEGATION_MARKER = '';
+        export const buildDelegationMarker = unexpected;`,
+      './lane-drain.mjs': 'export const numberPendingHashes = unexpected, isPostLandTreeDirty = unexpected;',
+      './readiness/drain-lock.mjs': 'export const withNumberingLock = unexpected;',
+      './lib/duplicate-id-tripwire.mjs': 'export const findDuplicateIds = unexpected, summarizeDuplicates = unexpected;',
+      './merge-ai-prs.mjs': 'export const computeNetDiffSignals = unexpected; export const recordParkVerdict = () => ({ ok: true });',
+      './lib/review-escalation.mjs': `export const REVIEW_LABELS = ${JSON.stringify(REVIEW_LABELS)},
+          REVIEW_LABEL_META = ${JSON.stringify(REVIEW_LABEL_META)}, READY_TO_MERGE_LABEL = 'ready-to-merge', ROSTER_TIMING = {};
+        export const scoreEscalation = unexpected, parseDeviationDisclosure = unexpected, producerReviewLabel = unexpected,
+          shouldApplyReviewLabel = unexpected, reconcileEscalationReasonBlock = unexpected, reconcileRoster = unexpected,
+          isReviewHoldLabel = unexpected, readyMergeConflictsWithHold = unexpected, hasUnclearedReviewLabel = unexpected,
+          parseReviewedSha = unexpected;`,
+      './lib/review-core.mjs': 'export const resolveJuryPlan = unexpected;',
+      './lib/review-policy.mjs': 'export const POLICY_CARE_JURY = {};',
+      './lib/constellation-repos.mjs': 'export const repoKeyForSlug = () => "we";',
+      './readiness/heavy-admission.mjs': 'export const admittedArgv = unexpected;',
+      './operations/coordination-root.mjs': `export const resolveCoordinationRoot = () => ${JSON.stringify(dir)};`,
+      './lib/verify-shared-marker.mjs': 'export const readSharedGreen = () => null; export const resolveMarkerWithShared = () => null;',
+      './lib/lane-verify-deferred.mjs': `export const deferredToCiDecision = () => ({ ok: false });
+        export const readDeferredForSha = unexpected, appendDeferredDisclosure = unexpected, syncDeferredBody = unexpected,
+          deferredLabelRefusal = unexpected;`,
+      './lib/handoff-settings.mjs': 'export const resolveHandoffSettings = unexpected;',
+      './lib/approval-record.mjs': 'export const readApprovalRecord = unexpected;',
+      './conveyor/main-ci-red-core.mjs': 'export const MAIN_CI_RED_DEFAULTS = {};',
       './lib/pr-size-admission.mjs': `${record} export const createSizeAdmissionRunner = () => async request => {
         effect(['size-admission']); globalThis.fixtureStage = ${JSON.stringify(sizeChange)};
         return { body: request.body, status: 'small' }; };`,
       './lib/forge-land-provider.mjs': `${record}
+        export const mergeMethodFlag = unexpected, buildCreateArgs = unexpected,
+          buildMergeArgs = unexpected, buildAddLabelArgs = unexpected;
         export const createGhLandProvider = () => ({
           listOpenByHead: () => { effect(['lookup']);
             if (${JSON.stringify(lookup)} === 'throws') throw new Error('lookup unreadable');
             if (${JSON.stringify(lookup)} === 'ambiguous') return [{ number: 7 }, { number: 8 }];
-            return ${existing} ? [{ number: 7 }] : []; },
+            return ${existing} || globalThis.fixtureCreated ? [{ number: 7 }] : []; },
           create: p => { effect(['create', p]); globalThis.fixtureCreated = true; return 'https://example.invalid/pull/7'; },
           viewPr: (pr, fields) => { effect(['view', pr, fields]); return {
             headRefOid: ${JSON.stringify(reviewHead === 'matching' ? sha : 'b'.repeat(40))},
@@ -69,15 +110,19 @@ describe('T-OPENPR authoritative published head', () => {
     writeFileSync(loader, `const stubs = ${JSON.stringify(stubs)};
       export async function resolve(specifier, context, next) {
         if (context.parentURL === ${JSON.stringify(pathToFileURL(cli).href)} && stubs[specifier]) {
-          const original = new URL(specifier, context.parentURL).href;
-          return { url: 'data:text/javascript,' + encodeURIComponent('export * from ' + JSON.stringify(original) + ';' + stubs[specifier]), shortCircuit: true };
+          return { url: 'data:text/javascript,' + encodeURIComponent(
+            'const unexpected = () => { throw new Error("unexpected fixture dependency"); };' + stubs[specifier]), shortCircuit: true };
         }
         return next(specifier, context);
       }`);
     writeFileSync(preload, `import cp from 'node:child_process';
       import { syncBuiltinESMExports, register } from 'node:module';
       ${record}
-      Date.now = () => 1800000000000;
+      const NativeDate = Date;
+      globalThis.Date = class extends NativeDate {
+        constructor(...args) { super(...(args.length ? args : [1800000000000])); }
+        static now() { return 1800000000000; }
+      };
       globalThis.fixtureStage = ''; globalThis.fixtureCreated = false;
       cp.execFileSync = (cmd, args) => {
         effect([cmd, args]);
@@ -114,12 +159,13 @@ describe('T-OPENPR authoritative published head', () => {
         '--park=review:pending', '--json', ...(skipPush ? [skipFlag] : []),
         ...(check ? ['--check'] : []), ...(dryRun ? ['--dry-run'] : [])], {
         cwd: dir, encoding: 'utf8', timeout: 30_000, maxBuffer: 2 * 1024 * 1024,
-        env: { PATH: process.env.PATH, HOME: dir, TMPDIR: dir, WE_COORDINATION_ROOT: dir,
+        env: { PATH: dirname(process.execPath), HOME: dir, TMPDIR: dir, WE_COORDINATION_ROOT: dir,
           WE_POLICY_CASCADE_LOG: '0', WE_REVIEW_LEDGER_MODE: 'off' },
       });
       expect(child.error, child.stderr).toBeUndefined();
       expect(child.signal, child.stderr).toBeNull();
-      const effects = readFileSync(trace, 'utf8').trim().split('\n').map(JSON.parse);
+      expect(child.stdout.trim(), child.stderr).not.toBe('');
+      const effects = readFileSync(trace, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
       return { status: child.status, result: JSON.parse(child.stdout.trim()), effects,
         pushes: effects.filter(([cmd, args]) => cmd === 'git' && args[0] === 'push'),
         writes: effects.filter(([cmd]) => ['create', 'add-label', 'edit-body', 'remove-label', 'ensure-label'].includes(cmd)) };
