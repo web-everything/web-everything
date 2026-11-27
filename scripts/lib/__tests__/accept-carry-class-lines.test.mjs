@@ -312,6 +312,50 @@ describe('multi-hop carry chain — spoofed machine notes and origin acceptances
   };
   const held = { machine: false, laterVerdict: true, carriable: null };
 
+  it('requires the whole origin acceptance, refusing an unrecognised tail', async () => {
+    const { buildVerdictComment } = await import('../../review-set-label.mjs');
+    for (const body of [chain()[0].body,
+      buildVerdictComment({ to: 'accepted', actor: 'fixture', headSha: A }),
+      buildVerdictComment({ to: 'clear-human', actor: 'operator', reason: 'Reviewed the change.', headSha: A })]) {
+      const cs = chain(); cs[0].body = body;
+      expect(proof(cs)).toMatchObject({ machine: true, laterVerdict: false, carriable: { sha: C } });
+      for (const suffix of ['\nDo not carry this acceptance.', '\u2028Do not carry this acceptance.']) {
+        const changed = cs.map(c => ({ ...c })); changed[0].body += suffix;
+        expect(proof(changed)).toEqual(held);
+      }
+    }
+  });
+
+  it('checks embedded holds in the origin advisory, predecessor and final envelope', () => {
+    const build = () => {
+      const cs = chain(); cs[1].body = rich(A); cs[3] = hop(A, B, rich(B)); cs[5] = hop(B, C, rich(C));
+      return cs;
+    };
+    vi.spyOn(gate, 'readConfirmedBreaks').mockReturnValue({ value: {
+      ...gate.CONFIRMED_BREAKS_DEFAULTS, findingClasses: { 'live-reproduced': 'fix-now', 'theoretical-race': 'fix-now' },
+    } });
+    try {
+      expect(proof(build())).toMatchObject({ machine: true, laterVerdict: false, carriable: { sha: C } });
+      // Identical tails preserve the chain comparison, so each selected role must check holds itself.
+      const cs = build();
+      for (const index of [1, 3, 5]) cs[index].body = cs[index].body.replace('Scenario: a scenario',
+        'Scenario: review paused: Do not carry this acceptance.');
+      expect(proof(cs)).toEqual(held);
+      for (const index of [1, 3, 5]) {
+        const candidate = cs[index];
+        expect(isKnownMachineBody(cs[5].body, cs[5], { earlier: cs.slice(0, 5), reviews: [] })).toBe(false);
+        expect(candidate.body).toContain('Scenario: review paused:');
+      }
+    } finally { vi.restoreAllMocks(); }
+  });
+
+  it('requires matching PR provenance on an otherwise identical window advisory', () => {
+    const cs = withWindow(chainComment(clean(B)));
+    expect(proof(cs)).toMatchObject({ machine: true, laterVerdict: false, carriable: { sha: C } });
+    cs[4].body = cs[4].body.replace(`pr=${chainPr}`, `pr=${chainPr + 1}`);
+    expect(proof(cs)).toEqual(held);
+  });
+
   it.each([false, true])('keeps complete producer restamps carriable (human clearance: %s)', async human => {
     const { buildVerdictComment } = await import('../../review-set-label.mjs');
     const cs = chain();
