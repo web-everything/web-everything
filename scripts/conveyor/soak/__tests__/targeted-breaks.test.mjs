@@ -22,7 +22,7 @@ function fixture() {
     return `${prefix}${name}.soak.test.mjs`;
   }
   function plan(options = {}) {
-    // Native Node imports the actual temporary ESM registry, outside Vite's loader.
+    // Native Node reads the actual temporary registry, outside Vite's loader.
     const input = { root, changed: ['scripts/changed.mjs'], timings: { soak: { [`${prefix}timed.soak.test.mjs`]: 1 } }, ...options };
     const r = spawnSync(process.execPath, ['--input-type=module', '-e', `import {selectTargetedBreaks} from ${JSON.stringify(selectorUrl)}; console.log(JSON.stringify(await selectTargetedBreaks({...${JSON.stringify(input)}, now:()=>0})));`],
       { cwd: root, env: { HOME: root, TMPDIR: root }, encoding: 'utf8', timeout: 15000, maxBuffer: 1024 * 1024 });
@@ -34,17 +34,102 @@ function fixture() {
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 describe('targeted soak selector (temporary registries only)', () => {
+  it('audit: growth after stat never reads beyond the allowance plus one sentinel byte', () => {
+    const f = fixture();
+    f.add('growing');
+    const target = join(f.root, prefix, 'growing.mjs');
+    const allowance = Buffer.byteLength(readFileSync(target, 'utf8'));
+    const script = `
+import fs from 'node:fs';
+import {syncBuiltinESMExports} from 'node:module';
+const target=${JSON.stringify(target)}, allowance=${allowance};
+const original={stat:fs.statSync,open:fs.openSync,read:fs.readSync,close:fs.closeSync,readFile:fs.readFileSync};
+const descriptors=new Set(), ranges=[];
+let grew=false, bytesRead=0, unboundedReads=0, closed=0;
+fs.statSync=(path,...args)=>{
+ const info=original.stat(path,...args);
+ if(path===target&&!grew){grew=true;fs.appendFileSync(target,' '.repeat(2*1024*1024));}
+ return info;
+};
+fs.openSync=(path,...args)=>{const fd=original.open(path,...args);if(path===target)descriptors.add(fd);return fd;};
+fs.readFileSync=(path,...args)=>{if(path===target||descriptors.has(path))unboundedReads++;return original.readFile(path,...args);};
+fs.readSync=(fd,buffer,offset,length,position)=>{
+ if(!descriptors.has(fd))return original.read(fd,buffer,offset,length,position);
+ ranges.push({offset,length,position,bufferLength:buffer.length});
+ const n=original.read(fd,buffer,offset,Math.min(length,7),position);bytesRead+=n;return n;
+};
+fs.closeSync=fd=>{if(descriptors.delete(fd))closed++;return original.close(fd);};
+syncBuiltinESMExports();
+const {selectTargetedBreaks}=await import(${JSON.stringify(selectorUrl)});
+const selection=await selectTargetedBreaks({root:${JSON.stringify(f.root)},changed:['scripts/changed.mjs'],now:()=>0});
+console.log(JSON.stringify({selection,grew,bytesRead,unboundedReads,closed,ranges}));`;
+    const r = spawnSync(process.execPath, ['--input-type=module', '-e', script],
+      {cwd:f.root,env:{HOME:f.root,TMPDIR:f.root},encoding:'utf8',timeout:15000,maxBuffer:1024*1024});
+    expect(r.error,r.stderr).toBeUndefined(); expect(r.status,r.stderr).toBe(0);
+    const observed = JSON.parse(r.stdout);
+    expect(observed.grew).toBe(true);
+    expect(observed.selection).toMatchObject({status:'deferred',reason:'selector-error',detail:expect.stringContaining('rerun verify')});
+    expect(observed.unboundedReads).toBe(0);
+    expect(observed.bytesRead).toBe(allowance+1);
+    expect(observed.closed).toBe(1);
+    expect(observed.ranges.length).toBeGreaterThan(1);
+    for (const range of observed.ranges) {
+      expect(range.bufferLength).toBe(allowance+1);
+      expect(range.offset+range.length).toBeLessThanOrEqual(allowance+1);
+      expect(range.position+range.length).toBeLessThanOrEqual(allowance+1);
+    }
+  });
+
+  it('audit: registry cannot mutate verifier globals or files outside its harness', () => {
+    const f = fixture(), outside = fixture();
+    const marker = join(outside.root, 'marker');
+    f.add('hostile', `import {writeFileSync} from 'node:fs'; globalThis.registryEffect=true; writeFileSync(${JSON.stringify(marker)},'escaped'); export default {fixedBy:{paths:['scripts/changed.mjs']}}`);
+    expect(f.plan()).toMatchObject({status:'deferred',reason:'selector-error'});
+    expect(existsSync(marker)).toBe(false);
+    for (const source of ["export default {__proto__:{fixedBy:{paths:['scripts/changed.mjs']}}}", "export default {fixedBy:{paths(){return []}}}", "export default {fixedBy:{paths:()=>[]}}", "const PATH=LATER; const LATER='scripts/changed.mjs'; export default {fixedBy:{paths:[PATH]}}"]) {
+      writeFileSync(join(f.root,prefix,'hostile.mjs'),source);
+      expect(f.plan()).toMatchObject({status:'deferred',reason:'selector-error'});
+    }
+  });
+  it('audit: synchronous loops and descendant launches never execute during selection', () => {
+    const f = fixture();
+    f.add('hang', "import {spawn} from 'node:child_process'; spawn(process.execPath,['-e','while(true){}']); while(true){}; export default {};");
+    // An injected importer records the old execution path without hanging the test host.
+    const importModule = vi.fn(async () => ({default:{}}));
+    return selectTargetedBreaks({root:f.root,changed:['scripts/changed.mjs'],importModule}).then(selection => {
+      expect(importModule).not.toHaveBeenCalled();
+      expect(selection).toMatchObject({status:'deferred',reason:'selector-error'});
+      writeFileSync(join(f.root,prefix,'hang.mjs'), ' '.repeat(1024*1024+1));
+      return f.plan();
+    }).then(selection => {
+      expect(selection).toMatchObject({status:'deferred',reason:'selector-error',detail:expect.stringMatching(/bound.*rerun verify/)});
+      const declarations = ["const a0=['scripts/changed.mjs'];", ...Array.from({length:20},(_,i)=>`const a${i+1}=[a${i},a${i}];`)];
+      writeFileSync(join(f.root,prefix,'hang.mjs'), declarations.join('')+'export default {};');
+      expect(f.plan()).toMatchObject({status:'deferred',reason:'selector-error',detail:expect.stringMatching(/bound.*rerun verify/)});
+    });
+  });
+  it('audit: deleted sibling refuses selection and cached green reuse', () => {
+    const f = fixture(), file = f.add('deleted');
+    expect(f.plan()).toMatchObject({status:'run',files:[file]});
+    rmSync(join(f.root,file));
+    const selection = f.plan();
+    expect(selection).toMatchObject({status:'deferred',reason:'selector-error',detail:expect.stringContaining('missing test sibling')});
+    expect(soakCacheOk({phases:{soak:{status:'passed',files:[file]}}},selection,false)).toBe(false);
+  });
+
   it.each(['scenario-only', 'test-only'])('%s selects the sibling', async kind => {
     const f = fixture(), file = f.add('a');
     expect(await f.plan({ changed: [kind === 'scenario-only' ? `${prefix}a.mjs` : file] })).toMatchObject({ status: 'run', files: [file] });
   });
-  it('resolves constant fixedBy paths by import, without calling fixPresent or run', async () => {
+  it('resolves constant fixedBy paths statically, without calling fixPresent or run', async () => {
     const f = fixture();
     const file = f.add('constant', "const DISPATCH='scripts/changed.mjs'; export default {fixedBy:{paths:[DISPATCH]}, fixPresent(){throw Error('called fixPresent')}, run(){throw Error('called run')}}");
     expect(await f.plan()).toMatchObject({ status: 'run', files: [file] });
   });
-  it('missing-sibling and absent-paths do not match a dependency; absent-paths matches itself', async () => {
+  it('missing-sibling refuses; absent-paths does not match a dependency but matches itself', async () => {
     const f = fixture(); f.add('missing', undefined, false);
+    expect(await f.plan()).toMatchObject({ status: 'deferred', reason: 'selector-error' });
+    rmSync(join(f.root, prefix, 'missing.mjs'));
     const a = f.add('absent', 'export default {}');
     expect(await f.plan()).toMatchObject({ status: 'none', files: [], estSeconds: 0 });
     expect(await f.plan({ changed: [`${prefix}absent.mjs`] })).toMatchObject({ status: 'run', files: [a] });
@@ -84,6 +169,7 @@ describe('targeted soak selector (temporary registries only)', () => {
     const f = fixture(); for (let i = 0; i < 65; i++) f.add(`a${i}`);
     expect(await f.plan()).toMatchObject({ status: 'deferred', reason: 'over-budget', estSeconds: 65 });
     rmSync(join(f.root, prefix, 'a64.soak.test.mjs'));
+    rmSync(join(f.root, prefix, 'a64.mjs'));
     expect(await f.plan()).toMatchObject({ status: 'run', files: expect.any(Array) });
     expect(await f.plan({ timings: { soak: { [`${prefix}t.soak.test.mjs`]: 900 / 64 } } })).toMatchObject({ status: 'run', estSeconds: 900 });
     expect(await f.plan({ timings: { soak: { [`${prefix}t.soak.test.mjs`]: 900.01 / 64 } } })).toMatchObject({ status: 'deferred', reason: 'over-budget' });
@@ -94,9 +180,10 @@ describe('targeted soak selector (temporary registries only)', () => {
     symlinkSync(join(f.root, 'outside.soak.test.mjs'), join(f.root, prefix, 'a.soak.test.mjs'));
     expect(await f.plan()).toMatchObject({ status: 'deferred', reason: 'selector-error' });
   });
-  it('timed-out import defers with a named operator fallback', async () => {
+  it('expired metadata deadline defers with a named operator fallback', async () => {
     const f = fixture(); f.add('hang');
-    expect(await selectTargetedBreaks({ root: f.root, changed: ['scripts/changed.mjs'], importModule: () => new Promise(() => {}), now: () => 0, importTimeoutMs: 1 })).toMatchObject({ status: 'deferred', reason: 'selector-error', detail: expect.stringMatching(/hang.mjs.*timed out.*rerun verify/) });
+    let clock = 0;
+    expect(await selectTargetedBreaks({ root: f.root, changed: ['scripts/changed.mjs'], now: () => clock++, importTimeoutMs: 1 })).toMatchObject({ status: 'deferred', reason: 'selector-error', detail: expect.stringMatching(/hang.mjs.*timed out.*rerun verify/) });
   });
   it.each(['allowed-path-lookup', 'unexpected-process', 'write', 'append'])('cold import-effect probe detects %s without touching the host', kind => {
     const f = fixture();
@@ -116,14 +203,8 @@ syncBuiltinESMExports();`);
       { cwd: f.root, env: { HOME: f.root, TMPDIR: f.root }, encoding: 'utf8', timeout: 15000, maxBuffer: 1024 * 1024 });
     expect(r.error, r.stderr).toBeUndefined(); expect(r.status, r.stderr).toBe(0);
     const rows = r.stdout.trim().split('\n').map(JSON.parse), calls = rows.filter(row => row.probe).map(row => row.probe);
-    const assertAllowed = () => {
-      expect(calls.filter(call => call.kind === 'write')).toEqual([]);
-      expect(calls.filter(call => call.kind === 'process').every(call => call.name === 'execFileSync' && call.command === 'sh' && JSON.stringify(call.args) === JSON.stringify(['-c', 'command -v git']))).toBe(true);
-    };
-    if (kind === 'allowed-path-lookup') {
-      assertAllowed(); expect(calls).toHaveLength(1);
-      expect(rows.at(-1).selection.status).toBe('run');
-    } else expect(assertAllowed).toThrow();
+    expect(calls).toEqual([]);
+    expect(rows.at(-1).selection).toMatchObject({status:'deferred',reason:'selector-error'});
     expect(readFileSync(existing, 'utf8')).toBe('before');
   });
 });

@@ -264,14 +264,29 @@ syncBuiltinESMExports();register(${JSON.stringify(pathToFileURL(loader).href)});
     expect(r.stderr).not.toContain('Comparing ');
     expect(r.stderr).not.toContain('Re-running only');
   });
+  it.each(['selector-error', 'changed-set-unknown', 'timings-unavailable'])('audit: unresolved %s cannot finish green or reuse historical green', reason => {
+    const f = soakFixture({ config: reason !== 'selector-error', timings: reason !== 'timings-unavailable' });
+    if (reason === 'changed-set-unknown') execFileSync('git', ['branch', '-D', 'origin/main'], {cwd:dir});
+    const first = f.invoke();
+    expect(first.status, first.stderr).toBe(2);
+    expect(first.json.phases.soak).toMatchObject({status:'failed',reason});
+    const historical = first.persisted;
+    historical.status = 'green';
+    historical.phases.soak = {...historical.phases.soak,status:'deferred'};
+    writeFileSync(marker(),JSON.stringify(historical));
+    const next = f.invoke();
+    expect(next.status,next.stderr).toBe(2);
+    expect(next.json.reason).not.toBe('cached');
+    expect(next.stderr).toContain('restore soak selection evidence and rerun verify');
+  });
   it('explicit-override-skips', () => {
     const f = soakFixture(); const r = f.invoke([`--gate=${f.gate}`]);
     expect(r.json.phases.soak).toMatchObject({ status: 'skipped', reason: 'explicit-gate', files: f.files });
   });
-  it.each([{ config: false, reason: 'selector-error' }, { timings: false, reason: 'timings-unavailable' }, { count: 65, reason: 'over-budget' }])('named deferral preserves the earlier verdict: %j', options => {
+  it.each([{ config: false, reason: 'selector-error' }, { timings: false, reason: 'timings-unavailable' }, { count: 65, reason: 'over-budget' }])('only ruled over-budget deferral preserves the earlier verdict: %j', options => {
     const f = soakFixture(options); const r = f.invoke();
-    expect(r.status, r.stderr).toBe(0);
-    expect(r.json.phases.soak).toMatchObject({ status: 'deferred', reason: options.reason });
+    expect(r.status, r.stderr).toBe(options.reason === 'over-budget' ? 0 : 2);
+    expect(r.json.phases.soak).toMatchObject({ status: options.reason === 'over-budget' ? 'deferred' : 'failed', reason: options.reason });
   });
   it('none is recorded and no-standards still runs selected soak', () => {
     const f = soakFixture({ standards: false }); const r = f.invoke();
@@ -746,6 +761,9 @@ describe('verify-lane — card-only diff skips the local gate (skipLocalForCardO
   // #xgqwuq5 — a clean-tree default-gate green records HEAD in the green ledger, and the next round's selection on a
   // fixer-only commit is the delta since it (`selection mode: since-last-green`), logged on stderr.
   it('a green records the ledger and the next round selects only the delta since it', () => {
+    seedEmptySoakRegistry();
+    git('add', 'vitest.soak.config.ts');
+    git('commit', '-qm', 'complete empty soak registry');
     const ledgerDir = mkdtempSync(join(tmpdir(), 'green-ledger-'));
     try {
       const env = { ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_GREEN_LEDGER_DIR: ledgerDir, WE_VERIFY_SELECTION: 'since-last-green' };
@@ -2987,6 +3005,10 @@ describe('build finalGateStandards preview', () => {
 
 describe('full build gate default', () => {
   beforeEach(() => {
+    // Default-gate greens require complete selector evidence even in empty repos.
+    seedEmptySoakRegistry();
+    execFileSync('git', ['add', 'vitest.soak.config.ts'], {cwd:dir});
+    execFileSync('git', ['-c','user.email=t@t','-c','user.name=t','commit','-qm','complete empty soak registry'], {cwd:dir});
     const preferences = join(dir, '.git', 'platform-preferences.json');
     writeFileSync(preferences, '{}');
     vi.stubEnv('WE_PLATFORM_PREFERENCES_FILE', preferences);

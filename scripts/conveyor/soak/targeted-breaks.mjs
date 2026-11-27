@@ -1,13 +1,14 @@
 /** Diff-pinned local soak selection and exact-file execution (MQ-SOAK-PULLS).
- * Imports read default.fixedBy only. Registry top-level effects also run: today the
- * registry's read-only `sh -c 'command -v git'` lookup is the accepted exception.
- * Nothing calls fixPresent/run, starts a soak world, or excuses a failing break.
+ * Registry source is data: parse declarative metadata, never import target code.
+ * Unsupported/dynamic metadata requires repair and a fresh verification.
  */
-import { existsSync, statSync, readFileSync, readdirSync, realpathSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { openSync, closeSync, readSync, fstatSync, constants, existsSync, statSync, readFileSync, readdirSync, realpathSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
+
+import ts from 'typescript';
 
 const BREAKS = 'scripts/conveyor/soak/breaks/';
 const TEST = /^scripts\/conveyor\/soak\/breaks\/[^/]+\.soak\.test\.mjs$/;
@@ -29,8 +30,69 @@ function canonicalFile(root, file) {
   return slash(inRoot);
 }
 
+// Keep this reader deliberately smaller than JavaScript. No eval, vm, imports,
+// getters, spreads or executable top-level statements can participate in proof.
+function registryMetadata(source, scenario, now, deadline) {
+  const tree = ts.createSourceFile(scenario, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+  const refuse = node => { throw Error(`${scenario}: non-declarative metadata (${node?.getText(tree).slice(0, 100) ?? 'missing default'}); use literal/const metadata and rerun verify`); };
+  if (tree.parseDiagnostics.length) refuse();
+  const constants = new Map();
+  const inertFunction = Symbol('unexecuted registry function');
+  let exported;
+  for (const statement of tree.statements) {
+    if (ts.isImportDeclaration(statement) || ts.isFunctionDeclaration(statement) || ts.isEmptyStatement(statement)) continue;
+    if (ts.isVariableStatement(statement) && statement.declarationList.flags & ts.NodeFlags.Const) {
+      for (const declaration of statement.declarationList.declarations) {
+        if (!ts.isIdentifier(declaration.name) || constants.has(declaration.name.text)) refuse(declaration);
+        constants.set(declaration.name.text, declaration.initializer);
+      }
+    } else if (ts.isExportAssignment(statement) && !statement.isExportEquals && !exported) exported = statement.expression;
+    else refuse(statement);
+  }
+  const active = new Set();
+  let steps = 0;
+  function value(node, depth = 0) {
+    if (++steps > 100000 || !(deadline > now())) throw Error(`${scenario}: metadata evaluation bound exceeded; simplify metadata and rerun verify`);
+    if (!node || depth > 64) refuse(node);
+    if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text;
+    if (ts.isNumericLiteral(node)) return Number(node.text);
+    if (node.kind === ts.SyntaxKind.TrueKeyword) return true;
+    if (node.kind === ts.SyntaxKind.FalseKeyword) return false;
+    if (node.kind === ts.SyntaxKind.NullKeyword) return null;
+    if (ts.isIdentifier(node) && constants.has(node.text) && !active.has(node.text)
+      && constants.get(node.text)?.pos < node.pos) {
+      active.add(node.text);
+      const result = value(constants.get(node.text), depth + 1);
+      active.delete(node.text);
+      return result;
+    }
+    if (ts.isArrayLiteralExpression(node)) return node.elements.map(element => value(element, depth + 1));
+    if (ts.isObjectLiteralExpression(node)) {
+      const result = Object.create(null);
+      for (const property of node.properties) {
+        if (!property.name || !(ts.isIdentifier(property.name) || ts.isStringLiteral(property.name)) || Object.hasOwn(result, property.name.text)) refuse(property);
+        const name = property.name.text;
+        if (name === '__proto__') refuse(property);
+        if (ts.isMethodDeclaration(property)) result[name] = inertFunction; // methods never run
+        else if (ts.isPropertyAssignment(property)) result[name] = value(property.initializer, depth + 1);
+        else if (ts.isShorthandPropertyAssignment(property)) result[name] = value(property.name, depth + 1);
+        else refuse(property); // accessors, spreads and computed names are unknown
+      }
+      return result;
+    }
+    if (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) return inertFunction;
+    refuse(node);
+  }
+  // Even unused initializers could mutate the exported metadata when executed.
+  // Refuse them unless they belong to the same non-executable grammar.
+  for (const initializer of constants.values()) value(initializer);
+  const metadata = value(exported);
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) refuse(exported);
+  return metadata;
+}
+
 export async function selectTargetedBreaks({ root, changed, timings, cap = 64, budgetSeconds = 900,
-  importModule = url => import(url), now = () => performance.now(), importTimeoutMs = 10000 } = {}) {
+  now = () => performance.now(), importTimeoutMs = 10000 } = {}) {
   const deferred = (reason, files = [], estSeconds = 0, error) => ({ status: 'deferred', reason, files, estSeconds,
     ...(error ? { detail: detail(error) } : {}) });
   if (!Array.isArray(changed) || changed.some(file => typeof file !== 'string' || !file.length)) return deferred('changed-set-unknown');
@@ -42,24 +104,40 @@ export async function selectTargetedBreaks({ root, changed, timings, cap = 64, b
     if (entries.length > 8192) throw Error('break registry exceeds 8192 entries; inspect registry before rerunning verify');
     const changedSet = new Set(changed);
     const deadline = now() + importTimeoutMs;
+    let sourceBytes = 0;
     for (const name of entries) {
       if (!name.endsWith('.mjs') || name.endsWith('.soak.test.mjs') || name === 'index.mjs') continue;
       const scenario = `${BREAKS}${name}`;
       const test = scenario.replace(/\.mjs$/, '.soak.test.mjs');
-      if (!entries.includes(name.replace(/\.mjs$/, '.soak.test.mjs'))) continue;
-      let timer;
-      let module;
+      if (!entries.includes(name.replace(/\.mjs$/, '.soak.test.mjs'))) throw Error(`${scenario}: missing test sibling ${test}; restore the test and rerun verify`);
+      canonicalFile(root, test); // validate even non-selected siblings
+      const actual = realpathSync(join(root, scenario));
+      if (relative(root, actual) !== scenario.split('/').join(sep)) throw Error(`${scenario}: registry path escapes repository; restore source and rerun verify`);
+      const info = statSync(actual);
+      if (!info.isFile() || info.size > 1024 * 1024 || sourceBytes + info.size > 16 * 1024 * 1024) throw Error(`${scenario}: registry read bound exceeded; inspect registry and rerun verify`);
+      if (!(deadline > now())) throw Error(`${scenario}: registry selection timed out; inspect metadata and rerun verify`);
+      // Enforce the cap on the read itself, including concurrent growth after stat.
+      // The sentinel detects overflow without consuming the rest of the file.
+      const allowance = Math.min(info.size, 1024 * 1024, 16 * 1024 * 1024 - sourceBytes);
+      const fd = openSync(actual, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      let source;
       try {
-        const remaining = deadline - now();
-        if (!(remaining > 0)) throw Error('registry import deadline exceeded; inspect imports and rerun verify');
-        module = await Promise.race([
-          importModule(pathToFileURL(join(root, scenario)).href),
-          new Promise((_, reject) => { timer = setTimeout(() => reject(Error('registry import timed out; inspect imports and rerun verify')), remaining); }),
-        ]);
-      } catch (error) { throw Error(`${scenario}: ${detail(error)}`); }
-      finally { clearTimeout(timer); }
-      if (!module?.default || typeof module.default !== 'object') throw Error(`${scenario}: missing default break metadata`);
-      const paths = module.default.fixedBy?.paths;
+        if (!fstatSync(fd).isFile()) throw Error(`${scenario}: registry is not a regular file; restore source and rerun verify`);
+        const buffer = Buffer.alloc(allowance + 1);
+        let used = 0;
+        while (used < buffer.length) {
+          if (!(deadline > now())) throw Error(`${scenario}: registry selection timed out; inspect metadata and rerun verify`);
+          const count = readSync(fd, buffer, used, buffer.length - used, used);
+          if (!count) break;
+          used += count;
+        }
+        if (used > allowance) throw Error(`${scenario}: registry changed during read; read bound exceeded; inspect registry and rerun verify`);
+        sourceBytes += used;
+        source = buffer.subarray(0, used).toString('utf8');
+      } finally { closeSync(fd); }
+      const metadata = registryMetadata(source, scenario, now, deadline);
+      if (!(deadline > now())) throw Error(`${scenario}: registry selection timed out; inspect metadata and rerun verify`);
+      const paths = metadata.fixedBy?.paths;
       if (paths !== undefined && (!Array.isArray(paths) || paths.some(path => typeof path !== 'string' || !path))) throw Error(`${scenario}: malformed fixedBy.paths`);
       if (changedSet.has(scenario) || changedSet.has(test) || paths?.some(path => changedSet.has(path))) selected.add(canonicalFile(root, test));
     }

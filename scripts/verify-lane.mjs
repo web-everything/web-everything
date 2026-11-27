@@ -1407,6 +1407,13 @@ try {
       phaseResults.push({ phase: 'soak', result: soak });
     } finally { rmSync(reportDir, { recursive: true, force: true }); }
   }
+  if (soakPhase.status === 'deferred' && soakPhase.reason !== 'over-budget') {
+    const summary = `targeted soak ${soakPhase.reason}: restore soak selection evidence and rerun verify`;
+    process.stderr.write(`FAIL ${summary}\n`);
+    soakPhase = { ...soakPhase, status: 'failed' };
+    phaseResults.push({ phase: 'soak', result: { exitCode: 1, signal: null,
+      failureDetails: { tests: [], summary, truncated: false } } });
+  }
   if (soakPhase.status === 'deferred' || soakPhase.status === 'skipped' || soakPhase.status === 'none') {
     process.stderr.write(`verify-lane: targeted soak ${soakPhase.status}/${soakPhase.reason ?? 'empty-selection'}: ${soakFields.files.length} file(s), ${soakFields.estSeconds} estimated file-seconds${soakPhase.detail ? ` — ${soakPhase.detail}` : ''}; merge queue remains authoritative.\n`);
   }
