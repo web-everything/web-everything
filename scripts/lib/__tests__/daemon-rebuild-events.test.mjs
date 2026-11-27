@@ -299,6 +299,7 @@ describe('rebuildClone coordination events', () => {
     // nested planning/diagnostic reasons, which must not imply a failed rebuild.
     const idle = new Set([
       'readonly-job-mutation-due',
+      'adopt-not-worse-vetoed', // a tightening veto under the write lock is a deliberate hold, not a failed rebuild
       'adopted', 'already-adopted', 'already-head', 'already-on-main', 'applied', 'applied-',
       'applied-pinned', 'applied-retry', 'applied-stack-fallback', 'auto-rebase of ',
       'branch-not-allowlisted', 'clone-recloned', 'conflict', 'deps-job-running', 'deps-job-spaced',
