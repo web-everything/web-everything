@@ -97,7 +97,7 @@ function projectPr(listed) {
  * not policy agreement; off/empty runs prove nothing. Failure diagnostics use a separate sink so
  * existing disagreement consumers retain their record format. Production binds both to the ledger.
  */
-export function runEligibilityShadow({ dispatch = [], prs = [], mode = 'shadow', appendLine = () => {},
+export function runEligibilityShadow({ dispatch = [], prs = [], mode = 'shadow', appendLine,
   readLocals = () => undefined, now = () => new Date(), pathId = 'reconcile-core', onError = reportShadowError,
   coverage = {}, appendDiagnostic } = {}) {
   const result = { checked: 0, disagreements: 0 };
@@ -110,13 +110,16 @@ export function runEligibilityShadow({ dispatch = [], prs = [], mode = 'shadow',
     try {
       const listed = prs.find(p => p.number === entry.prNumber) ?? {};
       const pr = projectPr(listed);
-      // Preserve the local reader's existing PR input contract; the gate consumes only the projection.
+      // Copy descriptors so reader-only getters stay lazy and top-level writes stay local.
+      // The gate consumes its own projection, independent of reader mutations.
+      const readerPr = Object.create(Object.getPrototypeOf(listed), Object.getOwnPropertyDescriptors(listed));
       const facts = buildEligibilityFacts({ pr, comments: pr.comments, commentsComplete: pr.commentsComplete,
-        population: entry.kind, locals: readLocals(entry, listed) });
+        population: entry.kind, locals: readLocals(entry, readerPr) });
       const gate = eligibility(pr, facts);
       if (gate.dispatch !== true) {
         result.disagreements++;
         coverage.disagreements++;
+        if (typeof appendLine !== 'function') throw new Error('Shadow ledger writer required; repair and replay the complete batch before promotion');
         appendLine(JSON.stringify({ at: new Date(now()).toISOString(), pathId, pr: entry.prNumber,
           head: pr.headRefOid ?? null, path: 'dispatch', gate: gate.hold ? 'hold' : 'unknown',
           reasons: [gate.hold ?? gate.unknown] }));
