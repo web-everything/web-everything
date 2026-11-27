@@ -1413,6 +1413,30 @@ describe('guard-bash — differential write-shape table (#2108 review r5)', () =
 });
 
 describe('guard-bash — raw PR creation loses the author stamp', () => {
+  it('denies global-flag, alias, REST, graphql and variable-word creation', () => {
+    for (const command of [
+      'gh -R a/b pr create --fill', 'gh --repo a/b pr create --fill',
+      'gh -Ra/b pr create --fill', 'gh --repo=a/b pr create --fill',
+      'gh --hostname github.example pr new --fill', 'gh --hostname=github.example pr create',
+      'gh pr new --fill',
+      'gh api repos/a/b/pulls -f title=t -f head=h -f base=main',
+      'gh api -X POST repos/{owner}/{repo}/pulls -f head=h',
+      'gh api repos/a/b/pulls --method POST',
+      ...['-F head=h', '--field head=h', '--raw-field=head=h', '--input body.json']
+        .map((flag) => `gh api repos/a/b/pulls ${flag}`),
+      'gh api graphql -f query="mutation{createPullRequest(input:{}){x}}"',
+      'G=gh; $G pr create --fill', '"$GH" pr create --fill', '${GH} pr new',
+      '`printf gh` pr create', '$(printf gh) pr new',
+      'gh pr $cmd --fill', 'gh pr "$SUB" --fill', 'gh pr $X list',
+    ]) expect.soft(decide(command), command).toMatch(/authored-by-actor|expansion/);
+  });
+  it('names unreadable expansions and the operator fallback', () => {
+    for (const command of ['$GH pr create', 'gh pr "$SUB"']) {
+      expect(decide(command), command).toMatch(/expansion/);
+      expect(decide(command), command).toMatch(/RAW_PR_CREATE_OK=1/);
+      expect(decide(`RAW_PR_CREATE_OK=1 ${command}`), command).toBeNull();
+    }
+  });
   it('denies raw creation across repositories and command prefixes', () => {
     for (const command of ['gh pr create -R plateauapp/plateau-app --title t --body-file f',
       'cd /x && gh pr create --fill', 'env FOO=1 /usr/bin/gh pr create --fill']) {
@@ -1421,7 +1445,12 @@ describe('guard-bash — raw PR creation loses the author stamp', () => {
   });
   it('allows the explicit escape, reads and quoted mentions', () => {
     for (const command of ['RAW_PR_CREATE_OK=1 gh pr create --fill',
-      'gh pr view 204 -R plateauapp/plateau-app', 'git commit -m "mention gh pr create here"']) {
+      'gh pr view 204 -R plateauapp/plateau-app', 'git commit -m "mention gh pr create here"',
+      'gh pr list --json number', 'gh -R a/b pr view 1', 'gh api repos/a/b/pulls',
+      'gh api repos/a/b/pulls/1', 'gh api repos/a/b/pulls -X GET -f state=open',
+      'gh api repos/a/b/pulls/1 -X POST', 'gh api graphql -f query="query{viewer{login}}"',
+      'RAW_PR_CREATE_OK=1 gh -R a/b pr create --fill', 'git commit -m "gh pr new"',
+      '$GH pr view', "'\u0024GH' pr create", "gh pr '\u0024SUB'"]) {
       expect(decide(command), command).toBeNull();
     }
   });
