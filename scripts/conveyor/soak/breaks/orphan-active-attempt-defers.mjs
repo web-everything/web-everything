@@ -75,6 +75,38 @@ export function probe(checkout) {
       match(held.rows[0]?.result, /ambiguous attempt claim.*human inspection/);
       deepStrictEqual(JSON.parse(readFileSync(join(lockDirFor(abandonedRoot, ledger.resource), 'lock.json'), 'utf8')),
         entry, 'aged abandoned claims must remain untouched');
+
+      // A launching CLI can time out after starting the fixer. The production
+      // adapter reports ok:false, which alone cannot release the reservation.
+      let timeoutLaunches = 0;
+      const ambiguousRoot = join(attemptRoot, 'timeout');
+      const timedOptions = { ...options, attemptRoot: ambiguousRoot,
+        redispatch: async () => {
+          timeoutLaunches += 1;
+          return { ok: false, why: 'dispatch-failed: spawnSync claude ETIMEDOUT' };
+        } };
+      await runOrphanFixRoundPass(timedOptions);
+      const timedAgain = await runOrphanFixRoundPass(timedOptions);
+      await runOrphanFixRoundPass(timedOptions);
+      strictEqual(timeoutLaunches, 1, 'an unconfirmed launch must never receive a fresh budget');
+      match(timedAgain.rows[0]?.reason, /ambiguous pending attempt.*human inspection/);
+      const timeoutFile = readdirSync(ambiguousRoot).find(name => name.endsWith('.json'));
+      const timeoutLedger = JSON.parse(readFileSync(join(ambiguousRoot, timeoutFile), 'utf8'));
+      strictEqual(timeoutLedger.confirmed, 0);
+      strictEqual(timeoutLedger.pending, true, 'timeout uncertainty must survive later passes');
+
+      let capacityCalls = 0;
+      const capacityOptions = { ...options, attemptRoot: join(attemptRoot, 'capacity'),
+        redispatch: async () => {
+          capacityCalls += 1;
+          return capacityCalls === 1
+            ? { ok: false, launchNotStarted: true, why: 'fix-cap: full' }
+            : { ok: true };
+        } };
+      await runOrphanFixRoundPass(capacityOptions);
+      const capacityRetry = await runOrphanFixRoundPass(capacityOptions);
+      strictEqual(capacityCalls, 2, 'a proven prelaunch refusal must remain retryable');
+      match(capacityRetry.rows[0]?.result, /^re-dispatched/);
     } finally {
       rmSync(attemptRoot, { recursive: true, force: true });
     }

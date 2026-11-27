@@ -4,6 +4,6 @@ import { defineBreakTest } from '../define-break-test.mjs';
 
 defineBreakTest(b);
 
-it('defers a concurrent orphan pass and resumes after the holder releases', () => {
+it('defers concurrent orphan passes, holds ambiguous launch timeouts, and retries proven prelaunch refusals', () => {
   expect(b.judge(b.run())).toEqual([]);
 });

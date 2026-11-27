@@ -251,6 +251,13 @@ export function defaultRearm({ slug, pr, head, exec = execFileSync }) {
   return { ok: true };
 }
 
+// These refusals occur before either resume or fresh launch in runReconcileFixDispatch.
+// Unknown kinds and caught launch errors cannot prove that no session started.
+const PRELAUNCH_REFUSALS = new Set([
+  'fix-cap', 'host-load', 'queue-cap', 'executor-held',
+  'no-scope', 'scope-read-failed', 'scope-too-large', 'scope-overlap', 'unsupported-repo',
+]);
+
 /** One fixer for exactly this PR, through the ordinary dispatcher (its claims, caps and brief), without the stack
  *  restack preamble that consumed #4715's review round. */
 export async function defaultRedispatch({ slug, pr, reconcile }) {
@@ -267,8 +274,12 @@ export async function defaultRedispatch({ slug, pr, reconcile }) {
     prStack: null,
   });
   const dispatched = (result.dispatched ?? []).filter((d) => Number(d.pr ?? d.prNumber) === Number(pr));
-  const why = [...(result.refusals ?? []), ...(result.reconcileRefusalDetails ?? [])].map((r) => `${r.kind}: ${r.why ?? ''}`).join('; ');
-  return dispatched.length ? { ok: true } : { ok: false, why: why || 'the dispatcher planned no fix for it' };
+  const refusals = only(result.refusals);
+  const why = [...refusals, ...only(result.reconcileRefusalDetails)].map((r) => `${r.kind}: ${r.why ?? ''}`).join('; ');
+  return dispatched.length ? { ok: true } : {
+    ok: false, why: why || 'the dispatcher planned no fix for it',
+    launchNotStarted: refusals.length > 0 && refusals.every(r => PRELAUNCH_REFUSALS.has(r.kind)),
+  };
 }
 
 export function defaultEscalate({ slug, pr, labels, exec = execFileSync }) {
@@ -483,12 +494,18 @@ export async function runOrphanFixRoundPass({
       const r = plan.decision === 'rearm' ? await rearm({ slug, pr: p.number, head: p.headRefOid })
         : plan.decision === 'redispatch' ? await redispatch({ slug, pr: p.number, reconcile })
           : await escalate({ slug, pr: p.number, labels });
-      if (attempt?.record && (r?.ok === true || r?.ok === false)) {
+      // A negative acknowledgement can hide a live session (for example a CLI
+      // timeout). Only a proven prelaunch refusal may free its reservation.
+      if (attempt?.record && (r?.ok === true || (r?.ok === false && r.launchNotStarted === true))) {
         if (r.ok) attempt.record.confirmed += 1;
         attempt.record.pending = false;
         attempt.save();
       }
-      if (!r?.ok) { row.result = `not-done: ${r?.why ?? '?'}`; continue; }
+      if (!r?.ok) {
+        row.result = `not-done: ${r?.why ?? '?'}`;
+        if (attempt?.record?.pending) row.result += ' (launch unconfirmed; pending attempt requires human inspection)';
+        continue;
+      }
       row.result = plan.decision === 'rearm' ? 're-armed' : plan.decision === 'redispatch' ? 're-dispatched'
         : attempt?.hold ? `escalated: ${attempt.hold}` : 'escalated';
       try { await postComment({ slug, pr: p.number, body: buildOrphanGuardComment({ decision: plan.decision, reason: plan.reason, prNumber: p.number }) }); }

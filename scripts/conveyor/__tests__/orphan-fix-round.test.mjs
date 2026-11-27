@@ -979,7 +979,7 @@ describe('runOrphanFixRoundPass — IO shell', () => {
     await runOrphanFixRoundPass(ok);
     expect(ok.redispatch).toHaveBeenCalledWith({ slug: 'web-everything/web-everything', pr: 4715, reconcile: undefined });
     expect(ok.postComment.mock.calls[0][0].body).toMatch(/re-dispatched a fixer/);
-    const refused = seams([VERDICT, BEGIN, RESTACK, END], { redispatch: vi.fn(async () => ({ ok: false, why: 'fix-cap: full' })) });
+    const refused = seams([VERDICT, BEGIN, RESTACK, END], { redispatch: vi.fn(async () => ({ ok: false, launchNotStarted: true, why: 'fix-cap: full' })) });
     const r = await runOrphanFixRoundPass(refused);
     expect(r.rows[0].result).toBe('not-done: fix-cap: full');
     expect(refused.postComment).not.toHaveBeenCalled();
@@ -1125,6 +1125,83 @@ describe('durable orphan redispatch budget', () => {
     expect(f.redispatch).toHaveBeenCalledOnce();
     expect(f.ledgers()[0]).toMatchObject({ confirmed: 0, pending: true });
     expect(f.escalate).toHaveBeenCalledOnce();
+  });
+
+  it.each(['dispatch-failed', 'dispatch-env-fault', 'future-refusal'])(
+    '%s from the production redispatch adapter retains pending for human inspection', async kind => {
+      const f = fixture();
+      const dispatcher = vi.spyOn(fixDispatch, 'runReconcileFixDispatch').mockReturnValue({
+        dispatched: [], refusals: [{ pr: 4715, kind, why: 'spawnSync claude ETIMEDOUT' }],
+        reconcileRefusalDetails: [],
+      });
+      try {
+        const first = await f.run({ redispatch: defaultRedispatch });
+        await f.run({ redispatch: defaultRedispatch });
+        const third = await f.run({ redispatch: defaultRedispatch });
+        expect(first.rows[0].result).toContain('ETIMEDOUT');
+        expect(dispatcher).toHaveBeenCalledOnce();
+        expect(f.ledgers()[0]).toMatchObject({ confirmed: 0, pending: true });
+        expect(third.rows[0]).toMatchObject({ decision: 'escalate' });
+        expect(third.rows[0].reason).toMatch(/ambiguous pending attempt.*human inspection/);
+      } finally { dispatcher.mockRestore(); }
+    },
+  );
+
+  it.each([
+    ['unclassified false result', { ok: false }],
+    ['string no-launch flag', { ok: false, launchNotStarted: 'true' }],
+    ['missing acknowledgement', { launchNotStarted: true }],
+  ])('%s cannot prove that no launch occurred', async (_name, response) => {
+    const f = fixture();
+    f.redispatch.mockResolvedValue({ ...response, why: 'lost launch confirmation' });
+    await f.run(); await f.run();
+    expect(f.redispatch).toHaveBeenCalledOnce();
+    expect(f.ledgers()[0]).toMatchObject({ confirmed: 0, pending: true });
+    expect(f.escalate).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    'fix-cap', 'host-load', 'queue-cap', 'executor-held',
+    'no-scope', 'scope-read-failed', 'scope-too-large', 'scope-overlap', 'unsupported-repo',
+  ])('a proven %s refusal from the production adapter permits a retry', async kind => {
+    const f = fixture();
+    const dispatcher = vi.spyOn(fixDispatch, 'runReconcileFixDispatch')
+      .mockReturnValueOnce({ dispatched: [], refusals: [
+        { pr: 4715, kind, why: 'before launch' },
+        { pr: 9, kind: 'dispatch-failed', why: 'other PR' },
+      ] })
+      .mockReturnValueOnce({ dispatched: [{ pr: 4715 }], refusals: [] });
+    try {
+      const first = await f.run({ redispatch: defaultRedispatch });
+      expect(first.rows[0].result).toBe(`not-done: ${kind}: before launch`);
+      expect(f.ledgers()[0]).toMatchObject({ confirmed: 0, pending: false });
+      await f.run({ redispatch: defaultRedispatch });
+      expect(dispatcher).toHaveBeenCalledTimes(2);
+      expect(f.ledgers()[0]).toMatchObject({ confirmed: 1, pending: false });
+      expect(f.escalate).not.toHaveBeenCalled();
+    } finally { dispatcher.mockRestore(); }
+  });
+
+  it.each([
+    ['empty response', {}],
+    ['no dispatch confirmation', { dispatched: [], refusals: [] }],
+    ['other PR only', { dispatched: [{ pr: 9 }], refusals: [{ pr: 9, kind: 'fix-cap' }] }],
+    ['mixed capacity and timeout', { dispatched: [], refusals: [
+      { pr: 4715, kind: 'fix-cap' }, { pr: 4715, kind: 'dispatch-failed' },
+    ] }],
+    ['planner detail cannot mask a timeout', { dispatched: [],
+      refusals: [{ pr: 4715, kind: 'dispatch-failed' }],
+      reconcileRefusalDetails: [{ prNumber: 4715, kind: 'fix-cap' }] }],
+  ])('%s cannot release a production adapter reservation', async (_name, response) => {
+    const f = fixture();
+    const dispatcher = vi.spyOn(fixDispatch, 'runReconcileFixDispatch').mockReturnValue(response);
+    try {
+      const first = await f.run({ redispatch: defaultRedispatch });
+      expect(first.rows[0].result).toMatch(/pending attempt requires human inspection/);
+      await f.run({ redispatch: defaultRedispatch });
+      expect(dispatcher).toHaveBeenCalledOnce();
+      expect(f.ledgers()[0]).toMatchObject({ confirmed: 0, pending: true });
+    } finally { dispatcher.mockRestore(); }
   });
 
   it('abandoned attempt claims remain held regardless of age', async () => {
@@ -1282,7 +1359,7 @@ describe('durable orphan redispatch budget', () => {
 
   it('confirmed dispatch refusal releases the reservation for a retry', async () => {
     const f = fixture();
-    f.redispatch.mockResolvedValueOnce({ ok: false, why: 'capacity' });
+    f.redispatch.mockResolvedValueOnce({ ok: false, launchNotStarted: true, why: 'capacity' });
     await f.run(); await f.run();
     expect(f.redispatch).toHaveBeenCalledTimes(2);
     expect(f.ledgers()[0]).toMatchObject({ confirmed: 1, pending: false });
