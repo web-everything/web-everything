@@ -6,7 +6,8 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync, rmSync, openSync, readSync, closeSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import * as atomicJson from '../../lib/atomic-json-file.mjs';
 import * as processIdentity from '../../lib/pid-alive.mjs';
@@ -251,8 +252,10 @@ describe('durable orphan redispatch attempts', () => {
       { pr: 4715, decision: 'escalate', result: expect.stringMatching(/escalated:.*release failed: fixture release failed/) },
       { pr: 4716, decision: 'redispatch', result: 're-dispatched' },
     ]);
-    expect(options.escalate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ pr: 4715 }));
-    expect(options.redispatch).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ pr: 4716 }));
+    expect(options.escalate).toHaveBeenCalledOnce();
+    expect(options.escalate).toHaveBeenCalledWith(expect.objectContaining({ pr: 4715 }));
+    expect(options.redispatch).toHaveBeenCalledOnce();
+    expect(options.redispatch).toHaveBeenCalledWith(expect.objectContaining({ pr: 4716 }));
     expect(release).toHaveBeenCalledTimes(2);
     expect(readLockEntry(attemptRoot, resource)).not.toBeNull();
     expect(ledgers().map(record => record.confirmed).sort()).toEqual([1, 2]);
@@ -302,7 +305,7 @@ it('replays same-second operator rulings and malformed history through the orpha
 
 it('holds failed listings and processes complete listings beyond the 500-PR boundary (PR #7429)', async () => {
   const { default: scenario } = await import('../soak/breaks/orphan-guard-lists-past-200.mjs');
-  const report = await scenario.run({});
+  const report = await scenario.run({ root: join(dirname(fileURLToPath(import.meta.url)), '../../..') });
   expect(scenario.judge(report)).toEqual([]);
 });
 

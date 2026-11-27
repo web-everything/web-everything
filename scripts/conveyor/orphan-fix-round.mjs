@@ -517,7 +517,13 @@ export async function runOrphanFixRoundPass({
       if (!rows.includes(row)) rows.push(row);
       row.decision ??= 'error';
       row.result = `error: ${String(e?.message ?? e).split('\n')[0]}`;
-    } finally { attempt?.release?.(); }
+    } finally {
+      try { attempt?.release?.(); }
+      catch (e) {
+        row.result = `${row.result ?? 'error'} (release failed: ${stripVTControlCharacters(String(e?.message ?? e))
+          .split('\n')[0].replace(/[\x00-\x1f\x7f-\x9f]/g, '').slice(0, 2000)})`;
+      }
+    }
   }
   // A listed repo's cursor becomes its first deferred PR (or clears); an unlisted repo's cursor is kept untouched.
   const nextRepoCursors = { ...repoCursors };

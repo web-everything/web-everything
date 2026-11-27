@@ -2537,6 +2537,11 @@ export function runReconcileFixDispatch({
         refusals.push({ pr: entry.pr, kind: 'dispatch-failed', why: describeDispatchFailure(e) });
         continue;
       }
+      if (attempt.resumed !== true && attempt.resumed !== false) {
+        launchUncertain.add(Number(entry.pr));
+        refusals.push({ pr: entry.pr, kind: 'dispatch-failed', why: 'malformed conflict resume result; human inspection required' });
+        continue;
+      }
       if (attempt?.resumed === true) {
         console.error(`reconcile-fix-dispatch: PR #${entry.pr} ${formatFixExecutorLog(executorDecision ?? { executor: 'claude', reason: 'resuming existing session', source: 'default' })}`);
         dispatched.push(attempt.result);
@@ -2554,6 +2559,11 @@ export function runReconcileFixDispatch({
         attempt = fixStep('resume-round', () => tryResumeRound(entry, { root, repo: repoKey }), entry.pr);
       } catch (e) {
         attempt = { resumed: false, resumeAttempt: { attempted: false, roundResume: true, refused: 'error', why: describeDispatchFailure(e) } };
+      }
+      if (attempt != null && attempt.resumed !== true && attempt.resumed !== false) {
+        launchUncertain.add(Number(entry.pr));
+        refusals.push({ pr: entry.pr, kind: 'dispatch-failed', why: 'malformed round resume result; human inspection required' });
+        continue;
       }
       if (attempt?.resumed === true) {
         console.error(`reconcile-fix-dispatch: PR #${entry.pr} ${formatFixExecutorLog(executorDecision ?? { executor: 'claude', reason: 'resuming existing session', source: 'default' })}`);
