@@ -83,6 +83,29 @@ describe('boot evidence privacy (S2a audit)', () => {
     }
     expect(failsSameChecks([candidate], [JSON.parse(JSON.stringify(control))])).toBe(false);
   });
+
+  it.each([
+    ['SIGKILL', null],
+    [null, 1],
+  ])('a caught import report retains signal=%s and exitCode=%s with private raw evidence (F1)', async (signal, status) => {
+    const rawError = 'TypeError: private "caught-child-sentinel" | at fixture.mjs:1:1';
+    const result = await checkDaemonEntriesBoot({
+      root, diagnosticsDir: join(root, 'diagnostics'), clock: () => 1_000_000,
+      budgets: { daemonBootMs: 45_000 }, log: { error() {} },
+      env: { [DAEMON_ENTRIES_ENV]: 'fixture.mjs', WE_SMOKE_BOOT_SIGNAL_RETRIES: '0' },
+      runChild: vi.fn(async (_command, _args, options) => {
+        expect(options.cwd).toBe(root);
+        throw Object.assign(new Error('child failed'), { signal, status, stdout: JSON.stringify({ ok: false, error: rawError }) });
+      }),
+    });
+    const entry = result.entries[0];
+    for (const failure of [entry, entry.attempts[0]]) {
+      expect(failure).toMatchObject({ kind: 'import failed', signal, exitCode: status });
+      expect(Object.getOwnPropertyDescriptor(failure, 'rawError')).toMatchObject({ value: rawError, enumerable: false });
+      expect(JSON.stringify(failure)).not.toContain('caught-child-sentinel');
+    }
+    expect(failsSameChecks([{ name: 'daemon-entries-boot', ...result }], [{ name: 'daemon-entries-boot', ...result }])).toBe(true);
+  });
 });
 
 describe('resolveDaemonEntries', () => {
