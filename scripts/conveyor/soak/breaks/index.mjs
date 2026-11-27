@@ -72,7 +72,7 @@ import { dirname } from 'node:path';
 import { loadModuleRegistry } from '../../registry-discovery.mjs';
 import { validateBreakShape } from '../breaks-shape.mjs';
 
-// push-gate-valid-neighbor.mjs is registered by the same directory discovery.
+// main-red-metrics-recovery.mjs and push-gate-valid-neighbor.mjs use the same directory discovery.
 const DIR = dirname(fileURLToPath(import.meta.url));
 
 export const BREAKS = Object.freeze(await loadModuleRegistry(DIR, validateBreakShape));

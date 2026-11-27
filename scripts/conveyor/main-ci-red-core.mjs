@@ -924,30 +924,33 @@ export function reportMainRedMetrics(events, { from, to, now, warnings = [] } = 
   const rows = [...unique.values()].filter(e => e.at <= to).sort((a, b) => a.at - b.at || a.seq - b.seq);
   if (!rows.length || Math.min(...rows.map(e => e.kind === 'red' ? e.since : e.at)) > from)
     warn('Incomplete range: history does not cover the requested start; recover archived evidence.');
-  const episodes = new Map(); const intervals = new Map(); const signatures = new Map(); const queues = new Set();
+  const episodes = new Map(); const intervals = new Map(); const signatures = new Map(); const queues = new Map();
   for (const e of rows) {
     const episode = `${e.repo}:${e.seq}`;
     if (e.kind === 'unknown') warn('Unknown observation: red duration may include unobserved recovery; recover source evidence.');
     if (e.kind === 'queue' && !episodes.has(episode))
       warn('Incomplete range: queue observation has no episode start; recover archived evidence.');
-    if (e.kind === 'red') episodes.set(episode, { repo: e.repo, start: e.since, end: null });
+    if (e.kind === 'red' && !episodes.has(episode)) episodes.set(episode, { repo: e.repo, start: e.since, end: null });
     if (e.kind === 'green') {
       const open = episodes.get(episode);
-      if (open) open.end = e.at;
+      if (open) {
+        // Recovery is the first green for this episode; later tips retain its sequence.
+        if (open.end === null) open.end = e.at;
+      }
       else if (e.seq > 0) warn('Incomplete range: recovery has no episode start; recover archived evidence.');
+    }
+    const queueSample = e.kind === 'red' || e.kind === 'queue';
+    if (queueSample) {
+      // Include runs whose episode begins before the range, retaining their latest sample
+      // even when that sample also precedes the range. A lone older queue is not coverage.
+      const queueKey = `${e.repo}:${e.head}:${e.runId}`;
+      if (e.kind === 'red' || e.at >= from || queues.has(queueKey)) queues.set(queueKey, e);
     }
     if (e.at < from && e.kind !== 'red') continue;
     if (e.truncated) warn('Incomplete episode origin: source run window is truncated; recover archived evidence.');
-    if (e.kind === 'red' || e.kind === 'queue') {
-      // Last observation per check-run wins for timing; duplicate episodes may share a run.
-      const queueKey = `${e.repo}:${e.head}:${e.runId}`;
-      if (!queues.has(queueKey)) queues.add(queueKey);
-      if (e.signature) signatures.set(e.signature, (signatures.get(e.signature) ?? 0) + 1);
-    }
+    if (queueSample && e.signature) signatures.set(e.signature, (signatures.get(e.signature) ?? 0) + 1);
   }
-  for (const key of queues) {
-    const e = rows.filter(e => e.at <= to && (e.kind === 'red' || e.kind === 'queue')
-      && `${e.repo}:${e.head}:${e.runId}` === key).at(-1);
+  for (const e of queues.values()) {
     if (e.queue.waitMs === null) result.queue.unknown++;
     for (const field of ['waitMs', 'admissionWaitMs', 'serviceMs']) if (e.queue[field] !== null) result.queue[field].push(e.queue[field]);
   }
