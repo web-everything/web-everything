@@ -565,6 +565,36 @@ describe('BLD-5539 — rate-limited overlay recovery', () => {
     expect(result.alerts.some(a => a.kind === 'smoke-rate-limited')).toBe(false);
   });
 
+  it.each([
+    ['oversized', 'dispatch-dry-run', 'detail'],
+    ['oversized', 'dispatch-dry-run', 'stderrTail'],
+    ['oversized', 'gh-pr-list', 'detail'],
+    ['oversized', 'gh-pr-list', 'stderrTail'],
+    ['malformed', 'dispatch-dry-run', 'detail'],
+    ['malformed', 'dispatch-dry-run', 'stderrTail'],
+    ['malformed', 'gh-pr-list', 'detail'],
+    ['malformed', 'gh-pr-list', 'stderrTail'],
+  ])('%s %s %s holds a definite code failure as unknown, never transient', async (kind, name, field) => {
+    const evidence = limited();
+    Object.assign(evidence.smoke.results.find(row => row.name === 'dispatch-dry-run'), {
+      ok: false, detail: 'TypeError: invalid dispatch',
+    });
+    evidence.smoke.results.find(row => row.name === name)[field] = kind === 'oversized' ? 'x'.repeat(4001) : {};
+    f.smoke.mockResolvedValue(evidence);
+
+    const result = await f.rebuild();
+    expect(result.reason).toBe('smoke-evidence-held');
+    expect(result.adopted).toBeFalsy(); expectKept();
+    expect(f.state().held).toMatchObject({ reason: 'smoke-evidence-held', evidenceReason: 'incomplete-evidence',
+      target: f.target, failed: 'gh-api-repo,dispatch-dry-run' });
+    expect(f.state().held).not.toHaveProperty('retryAt');
+    expect(f.smoke).toHaveBeenCalledTimes(1);
+    expect(result.alerts.some(a => ['smoke-transient', 'smoke-rate-limited', 'smoke-rejected'].includes(a.kind)
+      || a.kind.includes('overlay-dropped'))).toBe(false);
+    expect(result.alerts.find(a => a.kind === 'smoke-evidence-held').detail.message)
+      .toContain('repair the smoke producer and rerun');
+  });
+
   it.each(['missing', 'ambiguous', 'duplicate', 'oversized', 'malformed', 'empty'])('%s required smoke evidence refuses adoption without overlay attribution', async kind => {
     const result = passed();
     if (kind === 'missing') result.smoke.results.pop();
