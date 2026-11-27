@@ -3,7 +3,8 @@ import * as hold from '../../review-referral-hold.mjs';
 import * as core from '../../reconcile-core.mjs';
 import * as review from '../../../operations/review-pr.mjs';
 import * as jury from '../../../lib/jury-core.mjs';
-import b from './review-human-escalated-head-no-advisory.mjs';
+import b, { NOW, REPO, rawRun } from './review-human-escalated-head-no-advisory.mjs';
+import { scanMultiRepo } from '../../../lib/multi-repo-scan.mjs';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -27,6 +28,9 @@ vi.mock('node:fs', async original => {
 describe('review-human-escalated-head-no-advisory', () => {
   beforeEach(() => {
     policyFixture.root = mkdtempSync(join(tmpdir(), 'escalated-policy-'));
+    policyFixture.cwd = vi.spyOn(process, 'cwd').mockReturnValue(policyFixture.root);
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(NOW);
     policyFixture.file = join(policyFixture.root, 'policy.json');
     policyFixture.unexpected = [];
     writeFileSync(policyFixture.file, '{}');
@@ -34,8 +38,18 @@ describe('review-human-escalated-head-no-advisory', () => {
   afterEach(() => {
     const { root, unexpected } = policyFixture;
     policyFixture.root = null;
+    policyFixture.cwd.mockRestore();
+    vi.useRealTimers();
     rmSync(root, { recursive: true, force: true });
     expect(unexpected).toEqual([]);
+  });
+
+  it('uses a repository-neutral fixture whose raw records retain their explicit repository', () => {
+    // Scan the exported fixture value in memory: no checkout walk or source-file read.
+    expect(scanMultiRepo(`const repo = ${JSON.stringify(REPO)};`)).toEqual([]);
+    const record = rawRun({ jury });
+    expect(record.input.repo).toBe(REPO);
+    expect(hold.reviewRunEvidence(record).repo).toBe(REPO);
   });
 
   it('always exercises both ticks, partial publication, counted failures and the conversion deferral', async () => {

@@ -29,7 +29,7 @@ import { parseAdvisories, latestAdvisory, advisoryCoversHead, trustedAdvisoryCom
 import { buildReviewedShaMarker } from '../../lib/review-escalation.mjs';
 import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
 import { reviewedHeadsOf } from '../mechanical-round-cap.mjs';
-import { HEAD as ESC_HEAD, OLD_HEAD, SETTINGS, CAPTURED_OPTIONS, rawRun, advisory as renderedNote, comment as threadComment,
+import { HEAD as ESC_HEAD, NOW as ESC_NOW, OLD_HEAD, SETTINGS, CAPTURED_OPTIONS, rawRun, advisory as renderedNote, comment as threadComment,
   pendingReferral, scenario } from '../soak/breaks/review-human-escalated-head-no-advisory.mjs';
 
 const planReconcile = options => planReconcileWithTiming({ reviewTiming: { startAfter: 'ci-green' }, fixTiming: { joinCiAndReview: false }, ...options });
@@ -441,6 +441,9 @@ vi.mock('node:fs', async original => {
 describe('review:human escalated after its only panel (#7385)', () => {
   beforeEach(() => {
     policyFixture.root = mkdtempSync(join(tmpdir(), 'escalated-policy-'));
+    policyFixture.cwd = vi.spyOn(process, 'cwd').mockReturnValue(policyFixture.root);
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(ESC_NOW);
     policyFixture.file = join(policyFixture.root, 'policy.json');
     policyFixture.unexpected = [];
     writeFileSync(policyFixture.file, '{}');
@@ -448,6 +451,8 @@ describe('review:human escalated after its only panel (#7385)', () => {
   afterEach(() => {
     const { root, unexpected } = policyFixture;
     policyFixture.root = null;
+    policyFixture.cwd.mockRestore();
+    vi.useRealTimers();
     rmSync(root, { recursive: true, force: true });
     expect(unexpected).toEqual([]);
   });
@@ -459,6 +464,15 @@ describe('review:human escalated after its only panel (#7385)', () => {
     const { pr } = scenario(api, options);
     return decide(pr, { ...pr.referralHold, ...change }, { settings: SETTINGS });
   };
+
+  it('the captured test and red-team successes leave only the review-owned CI hold', () => {
+    const { pr, plan } = scenario(api, CAPTURED_OPTIONS);
+    expect(pr.referralHoldAutoResolve).toMatchObject({ outcome: 'resume', advisoryOwed: true });
+    expect(coreApi.reviewHoldOnlyRed(pr.statusCheckRollup, ['test', 'red-team', 'review-gate'], ESC_HEAD)).toBe(true);
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'review',
+      advisoryReview: expect.objectContaining({ reason: 'head-moved-advisory' }) })]);
+    expect(plan.refusals).toEqual([]);
+  });
 
   it('#7385 shape: review:human mechanical head whose one halted review left no verdict and no advisory resumes and plans exactly one head-move advisory', () => {
     const { pr, plan } = scenario(api, CAPTURED_OPTIONS);

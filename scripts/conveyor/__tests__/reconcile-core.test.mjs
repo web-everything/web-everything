@@ -73,7 +73,7 @@ import * as escalatedCoreApi from '../reconcile-core.mjs';
 import * as escalatedReviewApi from '../../operations/review-pr.mjs';
 import * as escalatedJuryApi from '../../lib/jury-core.mjs';
 import { planConvertSupersededVerdict } from '../../lib/review-escalation.mjs';
-import { HEAD as ESC_HEAD, OLD_HEAD, CAPTURED_OPTIONS, scenario as escalatedScenario, comment as escalatedComment, advisory as escalatedNote } from '../soak/breaks/review-human-escalated-head-no-advisory.mjs';
+import { HEAD as ESC_HEAD, NOW as ESC_NOW, OLD_HEAD, CAPTURED_OPTIONS, scenario as escalatedScenario, comment as escalatedComment, advisory as escalatedNote } from '../soak/breaks/review-human-escalated-head-no-advisory.mjs';
 import { reviewedHeadsOf as escalatedReviewedHeads } from '../mechanical-round-cap.mjs';
 import { advisoryCoversHead as escalatedCoversHead, latestAdvisory as escalatedLatest, trustedAdvisoryComments as escalatedTrusted } from '../../lib/advisory-labels.mjs';
 
@@ -96,6 +96,9 @@ vi.mock('node:fs', async original => {
 describe('one owed advisory after a halted pre-escalation review', () => {
   beforeEach(() => {
     policyFixture.root = mkdtempSync(join(tmpdir(), 'escalated-policy-'));
+    policyFixture.cwd = vi.spyOn(process, 'cwd').mockReturnValue(policyFixture.root);
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(ESC_NOW);
     policyFixture.file = join(policyFixture.root, 'policy.json');
     policyFixture.unexpected = [];
     writeFileSync(policyFixture.file, '{}');
@@ -103,11 +106,19 @@ describe('one owed advisory after a halted pre-escalation review', () => {
   afterEach(() => {
     const { root, unexpected } = policyFixture;
     policyFixture.root = null;
+    policyFixture.cwd.mockRestore();
+    vi.useRealTimers();
     rmSync(root, { recursive: true, force: true });
     expect(unexpected).toEqual([]);
   });
 
   const api = { hold: escalatedHoldApi, core: escalatedCoreApi, review: escalatedReviewApi, jury: escalatedJuryApi };
+  it('the captured review-gate failure is waivable only with complete green CI evidence', () => {
+    const { pr, plan } = escalatedScenario(api, CAPTURED_OPTIONS);
+    expect(escalatedCoreApi.reviewHoldCiWaivable({ pr, requiredChecks: ['test', 'red-team', 'review-gate'] })).toBe(true);
+    expect(plan.dispatch.map(row => row.kind)).toEqual(['review']);
+    expect(plan.refusals).toEqual([]);
+  });
   it('the resume pre-pass clears the hold and preserves the human ceremony', () => {
     const { plan } = escalatedScenario(api, CAPTURED_OPTIONS);
     expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'review',

@@ -11,7 +11,7 @@ const HOLD = 'scripts/conveyor/review-referral-hold.mjs';
 export const HEAD = '85873d92475d'.padEnd(40, '0');
 export const OLD_HEAD = '9957f63'.padEnd(40, '0');
 export const NOW = Date.parse('2026-11-26T22:10:00Z');
-export const REPO = 'web-everything/web-everything';
+export const REPO = 'fixture-owner/fixture-repo';
 export const SETTINGS = { value: { enabled: true, onClean: 'resume', onBlock: 'send-back' } };
 export const CAPTURED_OPTIONS = {
   change: { labels: ['review:human', 'review:awaiting-advisory', 'red-team:pending', 'review-round:5'],
@@ -20,7 +20,9 @@ export const CAPTURED_OPTIONS = {
       { name: 'red-team', status: 'COMPLETED', conclusion: 'SUCCESS' },
       { name: 'review-gate', status: 'COMPLETED', conclusion: 'FAILURE' },
     ] },
-  planOptions: { requiredChecks: ['test', 'red-team', 'review-gate'] },
+  // Keep the captured red review-gate row, but do not invent a branch-protection requirement for it.
+  // A required review-gate takes the earlier review-hold route, not the mechanical head-move route.
+  planOptions: { requiredChecks: ['test', 'red-team'] },
 };
 export const comment = (body, createdAt = '2026-11-25T21:14:00Z') => ({ body, createdAt, author: { login: 'web-everything' } });
 
