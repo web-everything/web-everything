@@ -7,7 +7,7 @@
  * every run first retires registrations proved merged, in main, or superseded (prototype-retire.mjs).
  * Real deps bind only in defaultDeps.
  */
-import { readStore, storePath, withdrawnRevocations } from './ruled-weakened-store.mjs';
+import { readStore, storePath, withdrawnRevocations, validateEntry } from './ruled-weakened-store.mjs';
 import { requestForceAdopt } from '../lib/daemon-force-adopt.mjs';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -223,16 +223,32 @@ export function defaultDeps() {
     retirePlanner: defaultRetirePlanner };
 }
 /** Preserve tool/platform precedence and matching; ops contributes only validated entries. */
-export function loadRuledWeakened({ platform, tool, fs, env, warn = console.warn }) {
+export function loadRuledWeakened({ platform, tool, fs, env, now = () => Date.now(), warn = console.warn }) {
   const isRevoked = withdrawnRevocations({ fs, env, warn });
-  const merged = mergeRuledWeakened(platform, tool, warn).filter(e => !isRevoked(e));
-  const store = readStore({ path: storePath(env), fs, warn });
+  const candidates = [];
+  const store = readStore({ path: storePath(env), fs, warn, onEntry: entry => candidates.push(entry) });
   if (store.error) warn(`WARNING: ruled-weakened store unreadable: ${store.error}; no ops waivers loaded. Restore store readability and retry.`);
-  const key = e => JSON.stringify([e.ref, e.sha.toLowerCase(), e.ruling]);
-  const seen = new Set(merged.map(key));
-  for (const entry of store.entries) {
-    if (isRevoked(entry)) continue;
-    if (!seen.has(key(entry))) { seen.add(key(entry)); merged.push({ ...entry, layer: 'ops' }); }
+  const merged = [], seen = new Set();
+  const currentTime = Number(now());
+  for (const [layer, entries] of [['tool', tool], ['platform', platform], ['ops', candidates]]) {
+    for (const entry of Array.isArray(entries) ? entries : []) {
+      if (!entry || typeof entry.ref !== 'string' || !entry.ref
+        || !validSha(entry.sha) || typeof entry.ruling !== 'string') {
+        if (layer !== 'ops') warn(`WARNING: malformed ${layer} waiver key; restore valid evidence and retry.`);
+        continue;
+      }
+      const key = JSON.stringify([entry.ref, entry.sha.toLowerCase(), entry.ruling]);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const shapeValid = layer === 'ops' ? validateEntry(entry)
+        : mergeRuledWeakened([entry], [], warn).length === 1;
+      const hasTime = Object.hasOwn(entry, 'at');
+      const time = hasTime && typeof entry.at === 'string'
+        && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(entry.at)
+        ? Date.parse(entry.at) : NaN;
+      if (!shapeValid || (hasTime && (!Number.isFinite(time) || !Number.isFinite(currentTime) || time > currentTime)) || isRevoked(entry)) continue;
+      merged.push({ ...entry, layer });
+    }
   }
   return merged;
 }
@@ -249,7 +265,7 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
   const policy = resolveCascade({ standard: { combinedTest: COMBINED_TEST_DEFAULTS },
     platform: withoutMode(platform.prefs.prototypeLoad), tool: withoutMode(tool) });
   const config = { ...policy.value, ruledWeakened: loadRuledWeakened({
-    platform: platform.prefs.prototypeLoad?.ruledWeakened, tool: tool.ruledWeakened, fs, env }) };
+    platform: platform.prefs.prototypeLoad?.ruledWeakened, tool: tool.ruledWeakened, fs, env, now }) };
   // Explicit allowlist: no operator bypasses, credentials, git config injection or NODE_OPTIONS.
   const childEnv = Object.fromEntries(['HOME', 'PATH', 'USER', 'LOGNAME', 'TMPDIR', 'LANG', 'SSH_AUTH_SOCK', 'GIT_SSH_COMMAND', 'GIT_ASKPASS', 'XDG_CONFIG_HOME'].filter((key) => typeof env[key] === 'string').map((key) => [key, env[key]]));
   // Preserve a stricter caller policy without forwarding overrides that could weaken file policy.

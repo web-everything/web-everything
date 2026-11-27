@@ -101,7 +101,7 @@ export function validateEntry(e) {
     && Number.isFinite(Date.parse(e.at));
 }
 
-export function readStore({ path = storePath(), fs = nodeFs, warn = console.warn } = {}) {
+export function readStore({ path = storePath(), fs = nodeFs, warn = console.warn, onEntry = () => {} } = {}) {
   let body;
   try { body = fs.readFileSync(path, 'utf8'); }
   catch (e) { return { entries: [], error: e.code === 'ENOENT' ? null : String(e.message ?? e) }; }
@@ -110,6 +110,8 @@ export function readStore({ path = storePath(), fs = nodeFs, warn = console.warn
     if (!line && i === lines.length - 1) return;
     try {
       const entry = JSON.parse(line);
+      // Admission reserves identifiable keys before validation, including damaged first rows.
+      onEntry(entry);
       if (!validateEntry(entry)) throw new Error('invalid entry');
       const { ref, sha, ruling, findings, actor, at, quote } = entry;
       entries.push({ ref, sha, ruling, findings, actor, at, quote,

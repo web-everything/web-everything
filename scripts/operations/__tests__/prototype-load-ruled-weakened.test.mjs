@@ -2,6 +2,10 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, it, expect } from 'vitest';
 import { readyEvidence, mergeRuledWeakened, refusal } from '../prototype-load.mjs';
+import fixtureFs from 'node:fs';
+import { tmpdir } from 'node:os';
+import { loadRuledWeakened } from '../prototype-load-io.mjs';
+import { storePath } from '../ruled-weakened-store.mjs';
 
 const REF = 'lane/example-fix';
 const SHA = 'a'.repeat(40);
@@ -9,6 +13,41 @@ const OTHER = 'b'.repeat(40);
 const record = (over = {}) => ({ ref: REF, sha: SHA, tests: 'green', audit: 'WEAKENED', auditRuling: 'R396', auditDisclosed: ['excluded-file drop made loud'], ...over });
 const entry = (over = {}) => ({ ref: REF, sha: SHA, ruling: 'R396', findings: ['excluded-file drop made loud'], ...over });
 const input = { branch: REF, sha: SHA };
+
+describe('RS-7369-3 ordered waiver resolution', () => {
+  const now = () => Date.parse('2026-11-25T12:00:00Z');
+  const stored = (over = {}) => entry({ actor: 'operator', quote: 'Approved R396', at: '2026-11-24T12:00:00Z', ...over });
+  function resolveFixture({ rows = [], tool = [], platform = [], withdrawals = [] } = {}) {
+    const home = fixtureFs.mkdtempSync(join(tmpdir(), 'rs7369-waivers-'));
+    const env = { HOME: home };
+    const path = storePath(env);
+    try {
+      fixtureFs.mkdirSync(join(home, 'workspace/.operations/coordination'), { recursive: true });
+      fixtureFs.mkdirSync(join(home, 'workspace/.operations/handoff'), { recursive: true });
+      fixtureFs.writeFileSync(path, rows.map(e => JSON.stringify(e)).join('\n'));
+      fixtureFs.writeFileSync(join(home, 'workspace/.operations/handoff/waiver-requests.jsonl'), withdrawals.map(e => JSON.stringify(e)).join('\n'));
+      return loadRuledWeakened({ fs: fixtureFs, env, now, tool, platform, warn: () => {} });
+    } finally {
+      fixtureFs.rmSync(home, { recursive: true, force: true });
+    }
+  }
+  it('malformed-first-store-entry-blocks-valid-duplicate', () => {
+    expect(resolveFixture({ rows: [stored({ findings: [] }), stored()] })).toEqual([]);
+  });
+  it('withdrawn-first-duplicate-grants-nothing', () => {
+    expect(resolveFixture({ rows: [stored(), stored({ at: '2026-11-25T11:00:00Z' })],
+      withdrawals: [{ ref: REF, sha: SHA, ruling: 'WITHDRAWN', at: '2026-11-25T10:00:00Z' }] })).toEqual([]);
+  });
+  it('settings-waiver-without-at-accepted', () => {
+    expect(resolveFixture({ tool: [entry()] })).toMatchObject([{ ref: REF, sha: SHA, layer: 'tool' }]);
+  });
+  it('future-at-waiver-blocks-key', () => {
+    expect(resolveFixture({ rows: [stored({ at: '2026-11-26T12:00:00Z' }), stored()] })).toEqual([]);
+  });
+  it('bad-at-tool-blocks-store-fallback', () => {
+    expect(resolveFixture({ tool: [entry({ at: 'not-a-date' })], rows: [stored()] })).toEqual([]);
+  });
+});
 
 describe('prototype-load ruled-WEAKENED exception (operator R396)', () => {
   it('refuses an unlisted WEAKENED record', () => {
