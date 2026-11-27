@@ -25,6 +25,8 @@
  * discovery. Broad config/dependency/deletion changes, an unknown/empty diff, opt-out, or an oversized
  * target list need broader evidence. Broad selections on a known unsaturated host run `npx vitest run`
  * plus mandatory unscoped `node scripts/check-standards.mjs`, independent of checkout npm scripts.
+ * Checkout-backed selection refuses a missing, empty or unreadable direct validator before running tests;
+ * restore that validator, supply an explicit affected-test gate, or use CI for exhaustive verification.
  * The fallback requires a heavy-admission slot and runs always-run guards with executed-file inventory.
  * On a saturated host they stay `blocked` so ci-only can be used. Opt-out, unreadable saturation, and oversized target lists still refuse with
  * an explicit affected-test gate as the fallback. Push defaults continue to require a shrink selection.
@@ -590,13 +592,25 @@ function resolveGateFromBase({ base, runGit, env, scripts, fileExists, readRepoF
     if (!optOut && host?.saturated === false && host.known === true) {
       // package.json is itself a broad trigger: neither script presence nor its body is trusted here.
       const testCommand = 'npx vitest run';
-      // Sibling repos (plateau-app, frontierui) do not contain WE's check-standards script: when the caller can
+      // The IO shell supplies the checkout reader. A broad fallback must have a readable direct validator;
+      // package.json cannot authorize substituting an arbitrary npm script or omitting validation.
+      // Reader-less legacy decision callers retain their command-only selection contract below.
+      if (typeof readRepoFile === 'function') {
+        try {
+          const validator = readRepoFile('scripts/check-standards.mjs');
+          if (typeof validator !== 'string' || !validator.trim()) throw new Error('missing validator');
+        } catch {
+          return blocked([...local.reasons,
+            'Standards validator missing or unreadable: scripts/check-standards.mjs — restore the validator or supply an explicit affected-test --gate; use CI for exhaustive verification.']);
+        }
+      }
+      // Legacy command-only callers: sibling repos do not contain WE's check-standards script; when the caller can
       // tell the file is absent, use the checkout's own `check:standards` script, else skip with a logged reason.
       // Callers that cannot tell (no fileExists) keep the WE-shaped mandatory command.
       // Fail closed: only a checkout whose origin is a KNOWN non-WE constellation repo may skip or substitute;
       // WE, unknown or unreadable identity keeps the mandatory WE command (a deleted validator then fails loudly).
       const knownSibling = isKnownSiblingCheckout(runGit);
-      const hasWeStandards = !knownSibling || typeof fileExists !== 'function' || fileExists('scripts/check-standards.mjs');
+      const hasWeStandards = typeof readRepoFile === 'function' || !knownSibling || typeof fileExists !== 'function' || fileExists('scripts/check-standards.mjs');
       const ownScript = !hasWeStandards && scripts != null && [...scripts].includes('check:standards');
       const standardsCommand = hasWeStandards ? 'node scripts/check-standards.mjs' : ownScript ? 'npm run check:standards' : null;
       const reason = standardsCommand
