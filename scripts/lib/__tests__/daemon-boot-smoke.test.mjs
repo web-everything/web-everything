@@ -61,7 +61,7 @@ describe('boot evidence privacy (S2a audit)', () => {
     for (const failure of [entry, entry.attempts[1]]) {
       expect(failure.kind).toBe('import failed');
       expect(Object.getOwnPropertyDescriptor(failure, 'rawError')).toMatchObject({
-        value: 'TypeError: private "raw-child-sentinel"\nat fixture.mjs:1:1', enumerable: false,
+        value: 'TypeError: private "raw-child-sentinel" | at fixture.mjs:1:1', enumerable: false,
       });
     }
     for (const value of [row, entry, ...entry.attempts]) {
@@ -325,7 +325,7 @@ describe('checkDaemonEntriesBoot — injected runChild (no real subprocess)', ()
   });
 
   it('preserves a reported import failure when a pending timer later causes a timeout', async () => {
-    const error = 'SyntaxError: broken module | at /candidate/fixture.mjs:1:1';
+    const error = 'SyntaxError: broken module\n at /candidate/fixture.mjs:1:1';
     const r = await checkDaemonEntriesBoot({ ...ctx(async () => {
       throw Object.assign(new Error('timed out after 45000ms (process group killed)'), {
         stdout: JSON.stringify({ ok: false, error }), signal: 'SIGKILL',
@@ -518,7 +518,7 @@ describe('smoke diagnostics carry an allow-listed summary, never raw child text 
   });
 
   it('an import failure keeps its stack frames in the file, never in the summary', async () => {
-    const error = 'ReferenceError: Cannot access \'secretname\' before initialization | at file:///x/limaframe.mjs:3 | at file:///x/mikeframe.mjs:9';
+    const error = 'ReferenceError: Cannot access \'secretname\' before initialization\n at file:///x/limaframe.mjs:3\n at file:///x/mikeframe.mjs:9';
     const r = await checkDaemonEntriesBoot({
       root: '/candidate', budgets: { daemonBootMs: 1000 }, env: { [DAEMON_ENTRIES_ENV]: 'fixture.mjs' }, diagnosticsDir: dir,
       runChild: async () => JSON.stringify({ ok: false, error }),

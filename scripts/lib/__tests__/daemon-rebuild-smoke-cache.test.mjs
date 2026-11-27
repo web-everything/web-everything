@@ -120,10 +120,12 @@ describe('durable smoke pass cache', () => {
       return { verdict: result.pass ? 'pass' : 'code', smoke: result };
     };
     const result = await rebuild(f, smoke);
-    // S2a fails closed: a textual (untyped) dispatch-dry-run failure on the control never establishes adopt-not-worse
-    // (S1's typed evidence restores matching); the healthy overlay is still kept.
+    // Malformed dispatch output remains a sticky rejection, preserving the healthy overlay.
     expect(result.adopted).not.toBe(true);
-    expect(result.reason).not.toBe('harness-broken-adopted-not-worse');
+    expect(result.reason).toBe('smoke-rejected');
+    expect(readRebuildState(f.cloneDir, f.env)).toMatchObject({ held: { reason: 'smoke-rejected' }, rejected: { inputsKey: expect.any(String) } });
+    expect(readRebuildState(f.cloneDir, f.env).rejected?.harnessBroken).not.toBe(true);
+    expect(readRebuildState(f.cloneDir, f.env).rejected?.retryAt).toBeUndefined();
     expect(readOverlays(f.cloneDir, { env: f.env }).map(row => row.ref)).toContain('lane/healthy');
     expect(calls).toHaveLength(3);
     for (const { options, result: checked } of calls) {

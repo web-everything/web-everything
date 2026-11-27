@@ -6519,3 +6519,13 @@ Before changing an admission gate, compare each PREP acceptance line with the ne
 behavior change. Every new refusal path needs explicit authorization in the card;
 keep a deterministic test for admission without timing metadata so a separate
 measurement policy cannot silently reintroduce per-PR timing work.
+
+### Adopt-not-worse evidence and conservative holds
+
+`daemon-rebuild-smoke-audit.test.mjs` covers the environment-zero veto, lossless child
+stack text, report schema refusal, positive application-error types, executed flags on
+both sides, and unconditional soak regression registration. Raw text remains private
+and non-enumerable. Generic system `Error` failures cannot authorize adoption. Untyped
+parent-generated tree-cleanliness timeouts can only retain last-good with retry backoff.
+Malformed dispatch output retains sticky rejection. The fallback and cache suites assert
+the exact held reason, persisted retry state, and retry after expiry where applicable.

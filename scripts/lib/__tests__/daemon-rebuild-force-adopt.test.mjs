@@ -656,6 +656,7 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
     else {
       successor = advanceMain(originDir, (dir) => writeFile(dir, 'scripts/lane-pool.mjs', '// pool\n'));
       env = { ...env0 };
+      delete env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE; // exercise adoption with the legacy veto unset
       adoptFlag.on = true; // the on path (default-OFF, no env override, no production seam)
       extra = { runSmoke: failing() };
     }

@@ -513,16 +513,16 @@ describe('S2a audit regression guarantees', () => {
     expect(resolveAdoptNotWorse({})).toEqual({ enabled: true, source: 'file' });
   });
 
-  it('enabled setting ignores legacy env zero', () => {
+  it('enabled setting honors legacy env zero', () => {
     settingsFiles.readSettingsChecked.mockReturnValue({ value: { enabled: true }, taint: [], duplicates: [] });
     expect(resolveAdoptNotWorse({ WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' }))
-      .toEqual({ enabled: true, source: 'file' });
+      .toEqual({ enabled: false, source: 'environment' });
   });
 
-  it('active adopt-not-worse settings instructions have no retired environment override', () => {
+  it('active adopt-not-worse settings document the tightening-only environment veto', () => {
     expect(adoptSettings.rebuildAdoptNotWorse.enabled).toBe(false);
-    expect(adoptSettings.$comment).not.toContain('WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE');
-    expect(adoptSettings.$comment).toContain('No environment override');
+    expect(adoptSettings.$comment).toContain('WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE');
+    expect(adoptSettings.$comment).toContain('tightening-only');
   });
 
   it('default-off refused control preserves last-good', async () => {
@@ -630,7 +630,7 @@ describe('smoke-harness-broken (x5wbsbc)', () => {
     expect(runSmoke).toHaveBeenCalledTimes(2);
   });
 
-  it('rejects as smoke-harness-broken when the last-good control fails the same check, backs off, then retries', async () => {
+  it.each([false, true])('rejects as smoke-harness-broken when the last-good control fails the same check, backs off, then retries (untyped: %s)', async (untyped) => {
     const { originDir, cloneDir, env } = makeFixture();
     env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE = '0';
     pushBranch(originDir, 'lane/harness', (dir) => writeFile(dir, 'harness.txt', 'x\n'));
@@ -638,7 +638,9 @@ describe('smoke-harness-broken (x5wbsbc)', () => {
 
     let t = 1_000_000;
     const runSmoke = vi.fn(async () => ({
-      verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'daemon-entries-boot', detail: 'boom', entries: [{ entry: 'daemon.mjs', ok: false, kind: 'import failed', errorClass: 'TypeError: harness broke', rawError: 'TypeError: harness broke' }] }] },
+      verdict: 'code', attempts: 1, smoke: { results: [untyped
+        ? { ok: false, name: 'tree-stays-clean', detail: 'git status --porcelain failed: timed out after 1ms (process group killed)' }
+        : { ok: false, name: 'daemon-entries-boot', detail: 'boom', entries: [{ entry: 'daemon.mjs', ok: false, kind: 'import failed', errorClass: 'TypeError: harness broke', rawError: 'TypeError: harness broke' }] }] },
     }));
 
     const first = await rebuildClone({
@@ -664,7 +666,9 @@ describe('smoke-harness-broken (x5wbsbc)', () => {
     expect(stale.retryAt).not.toBeNull();
     expect(stale.retryAt).toBe(state2.rejected.retryAt);
     expect(stale.attempts).toBe(state2.rejected.attempts);
-    expect(stale.broken).toMatchObject({ failed: 'daemon-entries-boot', detail: 'boom' });
+    expect(stale.broken).toMatchObject(untyped
+      ? { failed: 'tree-stays-clean', detail: 'git status --porcelain failed: timed out after 1ms (process group killed)' }
+      : { failed: 'daemon-entries-boot', detail: 'boom' });
     expect(runSmoke.mock.calls.length).toBe(callsAfterFirst); // not called again
 
     t += 24 * 60 * 60_000; // comfortably past the default retry backoff (minutes, not hours)
@@ -687,7 +691,7 @@ describe('smoke-harness-broken (x5wbsbc)', () => {
     const prevHead = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
     const runSmoke = vi.fn(async () => ({
       verdict: 'code', attempts: 1,
-      smoke: { results: [{ ok: false, name: 'daemon-entries-boot', detail: 'cross-org auth', entries: [{ entry: 'daemon.mjs', ok: false, kind: 'import failed', errorClass: 'Error: cross-org auth', rawError: 'Error: cross-org auth' }] }] },
+      smoke: { results: [{ ok: false, name: 'daemon-entries-boot', detail: 'cross-org auth', entries: [{ entry: 'daemon.mjs', ok: false, kind: 'import failed', errorClass: 'TypeError: cross-org auth', rawError: 'TypeError: cross-org auth' }] }] },
     }));
 
     const result = await rebuildClone({
@@ -941,7 +945,7 @@ describe('failsSameChecks', () => {
   });
 
   it('true only for the same boot entry with a byte-identical raw error', () => {
-    expect(failsSameChecks([bootRow(['a.mjs', 'TypeError: x at 12'])], [bootRow(['a.mjs', 'TypeError: x at 12'], ['b.mjs', 'Error: y'])])).toBe(true);
+    expect(failsSameChecks([bootRow(['a.mjs', 'TypeError: x at 12'])], [bootRow(['a.mjs', 'TypeError: x at 12'], ['b.mjs', 'TypeError: y'])])).toBe(true);
   });
 
   it('false when the raw errors differ only by case, digits or whitespace (no normalisation)', () => {
@@ -957,25 +961,25 @@ describe('failsSameChecks', () => {
   });
 
   it('false when the control is missing one of the candidate\'s failed boot entries', () => {
-    expect(failsSameChecks([bootRow(['a.mjs', 'Error: x'], ['b.mjs', 'Error: y'])], [bootRow(['a.mjs', 'Error: x'])])).toBe(false);
+    expect(failsSameChecks([bootRow(['a.mjs', 'TypeError: x'], ['b.mjs', 'TypeError: y'])], [bootRow(['a.mjs', 'TypeError: x'])])).toBe(false);
   });
 
   it('false when the control fails a disjoint set of boot entries', () => {
-    expect(failsSameChecks([bootRow(['a.mjs', 'Error: x'])], [bootRow(['b.mjs', 'Error: x'])])).toBe(false);
+    expect(failsSameChecks([bootRow(['a.mjs', 'TypeError: x'])], [bootRow(['b.mjs', 'TypeError: x'])])).toBe(false);
   });
 
   it('false when the same entry failed with a different error', () => {
-    expect(failsSameChecks([bootRow(['a.mjs', 'TypeError: new regression'])], [bootRow(['a.mjs', 'Error: old failure'])])).toBe(false);
+    expect(failsSameChecks([bootRow(['a.mjs', 'TypeError: new regression'])], [bootRow(['a.mjs', 'TypeError: old failure'])])).toBe(false);
   });
 
   it('infrastructure errors, short-cap timeouts and textual-only rows are never evidence', () => {
-    const candidate = [bootRow(['a.mjs', 'Error: x'])];
+    const candidate = [bootRow(['a.mjs', 'TypeError: x'])];
     // Identical raw errors on both sides, so only the control-evidence check can reject.
     expect(failsSameChecks([bootRow(['a.mjs', 'Error: spawn git ENOENT'])], [bootRow(['a.mjs', 'Error: spawn git ENOENT'])])).toBe(false);
-    expect(failsSameChecks(candidate, [bootRow(['a.mjs', 'Error: x', 'child failed: timed out after 1ms (process group killed)'])])).toBe(false);
-    expect(failsSameChecks(candidate, [bootRow(['a.mjs', 'Error: x', 'unparsable child output'])])).toBe(false);
-    expect(failsSameChecks(candidate, [{ ...bootRow(['a.mjs', 'Error: x']), budgetInterrupted: true }])).toBe(false);
-    expect(failsSameChecks(candidate, [bootRow(['a.mjs', 'Error: x'])])).toBe(true); // control: the same fixture is accepted when valid
+    expect(failsSameChecks(candidate, [bootRow(['a.mjs', 'TypeError: x', 'child failed: timed out after 1ms (process group killed)'])])).toBe(false);
+    expect(failsSameChecks(candidate, [bootRow(['a.mjs', 'TypeError: x', 'unparsable child output'])])).toBe(false);
+    expect(failsSameChecks(candidate, [{ ...bootRow(['a.mjs', 'TypeError: x']), budgetInterrupted: true }])).toBe(false);
+    expect(failsSameChecks(candidate, [bootRow(['a.mjs', 'TypeError: x'])])).toBe(true); // control: the same fixture is accepted when valid
     expect(failsSameChecks(candidate, [{ ok: false, name: 'daemon-entries-boot', detail: 'threw: unable to initialize smoke check' }])).toBe(false);
     expect(failsSameChecks([{ ok: false, name: 'tree-stays-clean', detail: 'dirt' }], [{ ok: false, name: 'tree-stays-clean', detail: 'git status --porcelain failed: spawn git ENOENT' }])).toBe(false);
   });
