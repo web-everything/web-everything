@@ -61,6 +61,8 @@ export function auditEvidenceFor(sha, { auditRecords = [], waivers = [], ref, co
   for (const entry of waivers) {
     // Settings rulings have the prototype loader's schema; only ledger entries require actor/quote/at.
     const settingsWaiver = entry?.layer === 'tool' || entry?.layer === 'platform';
+    // A future-dated ruling could outlive a later WITHDRAWN record; an absent `at` stays allowed for settings waivers.
+    if (typeof entry?.at === 'string' && Date.parse(entry.at) > Date.now()) continue;
     if (!(settingsWaiver ? waiverForHead([entry], { branch: ref, sha }) : validateEntry(entry))
       || !fullSha(entry.sha) || entry.ref !== ref || entry.sha.toLowerCase() !== sha.toLowerCase()) continue;
     if (evaluate({ record: entry, ruledWeakened: entry }).ok)

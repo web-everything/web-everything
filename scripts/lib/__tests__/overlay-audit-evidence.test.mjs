@@ -271,6 +271,42 @@ test('waivers require valid exact ref, SHA and findings and cannot substitute fo
   assert.equal(check(waiver).kind, 'waiver');
   assert.equal(check(waiver, [{ ...weak, base: sha }]).ok, false);
 });
+test('malformed findings shapes refuse', () => {
+  const pass = { ...valid, head: sha, base, verdict: 'NOT WEAKENED' };
+  const weak = { ...valid, head: sha, base, verdict: 'WEAKENED' };
+  for (const findings of ['WEAKENED', null, {}, 7, [null], [{}]]) {
+    for (const negativeBase of [base, 'c'.repeat(40)]) {
+      const negative = { ...weak, base: negativeBase, findings, at: '2026-11-11T00:00:00Z' };
+      assert.equal(auditEvidenceFor(sha, { auditRecords: [pass, negative], ref, covers }).ok, false,
+        `${JSON.stringify(findings)} on base ${negativeBase.slice(0, 1)}`);
+    }
+  }
+});
+test('later unusable negative record refuses a valid older pass', () => {
+  const pass = { ...valid, head: sha, base, verdict: 'NOT WEAKENED' };
+  const weak = { ...valid, head: sha, verdict: 'WEAKENED', findings: ['accepted'] };
+  assert.equal(auditEvidenceFor(sha, { auditRecords: [pass], ref, covers }).kind, 'audit');
+  // Another base: an unplaceable WEAKENED (bad timestamp) still vetoes. The same-base case is the RS-7369-2 gap named in the card.
+  assert.equal(auditEvidenceFor(sha, { auditRecords: [pass, { ...weak, base: 'c'.repeat(40), at: 'bad' }], ref, covers }).ok, false);
+});
+test('future-dated stored waiver is refused', () => {
+  const weak = { ...valid, head: sha, base, verdict: 'WEAKENED', findings: ['accepted'] };
+  const check = entry => auditEvidenceFor(sha, { auditRecords: [weak], waivers: [entry], ref, covers });
+  assert.equal(check(waiver).kind, 'waiver');
+  for (const at of ['2999-01-01T00:00:00Z', '2999-01-01T00:00:00+05:00', '2999-01-01T00:00:00-05:00'])
+    assert.equal(check({ ...waiver, at }).ok, false, at);
+});
+test('future-dated settings waiver is refused', () => {
+  const weak = { ...valid, head: sha, base, verdict: 'WEAKENED', findings: ['accepted'] };
+  const check = entry => auditEvidenceFor(sha, { auditRecords: [weak], waivers: [entry], ref, covers });
+  for (const layer of ['tool', 'platform']) {
+    assert.equal(check({ ...waiver, layer }).kind, 'waiver', `${layer} past-dated`);
+    const { at, ...undated } = waiver;
+    assert.equal(check({ ...undated, layer }).kind, 'waiver', `${layer} undated stays allowed`);
+    for (const future of ['2999-01-01T00:00:00Z', '2999-01-01T00:00:00+05:00', '2999-01-01T00:00:00-05:00'])
+      assert.equal(check({ ...waiver, layer, at: future }).ok, false, `${layer} ${future}`);
+  }
+});
 test('withdrawals and unreadable revocation ledgers revoke stored waivers', () => {
   const home = mkdtempSync(join(tmpdir(), 'overlay-revocation-'));
   const dir = join(home, 'workspace/.operations');
