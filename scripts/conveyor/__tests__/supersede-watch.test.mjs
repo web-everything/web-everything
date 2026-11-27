@@ -407,12 +407,13 @@ describe('complete listing replay', () => {
 describe('closed completeness paths', () => {
   it.each([null, undefined, -1, '200', 1.5])('missing or unreadable inventory count blocks the default authority: %j', totalCount => {
     const postHold = vi.fn();
-    const exec = vi.fn(() => JSON.stringify({ data: { repository: { pullRequests: { totalCount } } } }));
+    const exec = routeExec({ open: [{ number: 10 }], closed: [probeClosed()], totalCount });
     const result = runSupersedeWatch({ repo: 'fixture/project', now: hardNow,
       settings: { hold: true, lookbackDays: 14 }, exec, postHold });
     expect(result).toMatchObject({ blocked: true, holds: [], applied: [], error: expect.stringMatching(/incomplete.*retry/) });
     expect(postHold).not.toHaveBeenCalled();
-    expect(exec).toHaveBeenCalledTimes(1);
+    expect(proofCalls(exec)).toHaveLength(1);
+    expect(exec.mock.calls.at(-1)[1][1]).toBe('graphql');
   });
   it('oversized proved inventory refuses with operator inspection and retry', () => {
     const exec = vi.fn(() => JSON.stringify({ data: { repository: { pullRequests: { totalCount: 10001 } } } }));
@@ -431,6 +432,126 @@ describe('closed completeness paths', () => {
     const opts = hardOptions();
     opts.readBodyEdit.mockReturnValueOnce(hardSource()).mockImplementation(() => { throw Error('read unavailable'); });
     expect(runSupersedeWatch(opts).applied).toEqual([expect.objectContaining({ ok: false, error: 'read unavailable' })]);
+    expect(opts.postHold).not.toHaveBeenCalled();
+  });
+});
+
+// Synthetic API rows and injected IO only: these tests never discover a checkout or host state.
+function probeClosed(number = 20, body = 'Supersedes: #10') {
+  return { number, state: 'closed', body, updated_at: hardSource().updatedAt,
+    merged_at: hardSource().mergedAt, user: { login: 'web-everything' } };
+}
+function routeExec(spec) {
+  return vi.fn((_file, args) => {
+    if (args[1] !== 'graphql') {
+      const url = new URL(args[1], 'https://fixture.invalid');
+      const state = url.searchParams.get('state');
+      const page = Number(url.searchParams.get('page'));
+      const override = spec.rest?.(state, page);
+      if (override !== undefined) return override;
+      return JSON.stringify((state === 'open' ? spec.open : spec.closed).slice((page - 1) * 100, page * 100));
+    }
+    if (spec.rejectGraphql) throw Error('fake-gh: unsupported graphql query');
+    if (args.some(a => a.includes('totalCount'))) {
+      const totalCount = Object.hasOwn(spec, 'totalCount') ? spec.totalCount
+        : (args.includes('s[]=OPEN') ? spec.open : spec.closed).length;
+      return JSON.stringify({ data: { repository: { pullRequests: { totalCount } } } });
+    }
+    if (args.some(a => a.includes('pullRequest(number:'))) {
+      if (spec.snapshotError) throw Error('snapshot unavailable');
+      const number = Number(args.find(a => a.startsWith('p=')).slice(2));
+      return JSON.stringify({ data: { repository: { pullRequest: { ...hardSource(), number, id: `PR_${number}` } } } });
+    }
+    throw Error('fake-gh: unsupported graphql query');
+  });
+}
+const proofCalls = exec => exec.mock.calls.filter(([, args]) => args[1] === 'graphql');
+const probeOptions = exec => ({ repo: 'fixture/project', now: hardNow,
+  settings: { hold: true, lookbackDays: 14 }, exec, postHold: vi.fn() });
+
+describe('default authority candidate probe', () => {
+  it('default authority with no observed candidate reads no count proof and does not block', () => {
+    const exec = routeExec({ open: [{ number: 10 }], closed: [], rejectGraphql: true });
+    const opts = probeOptions(exec);
+    expect(runSupersedeWatch(opts)).toEqual({ repo: opts.repo, holds: [], applied: [] });
+    expect(proofCalls(exec)).toHaveLength(0);
+    expect(opts.postHold).not.toHaveBeenCalled();
+  });
+  it('daemon wrapper sees no error/blocked for a candidate-free repo', () => {
+    const exec = routeExec({ open: [{ number: 10 }], closed: [], rejectGraphql: true });
+    const opts = probeOptions(exec);
+    const result = runSupersedeAllRepos({ ...opts, repos: [opts.repo] }).repos[0];
+    expect(result.error).toBeUndefined();
+    expect(result.blocked).toBeUndefined();
+    expect(proofCalls(exec)).toHaveLength(0);
+    expect(opts.postHold).not.toHaveBeenCalled();
+  });
+  it('a trusted marker whose target is not open is not an observed candidate', () => {
+    const exec = routeExec({ open: [{ number: 10 }], closed: [probeClosed(20, 'Supersedes: #99')], rejectGraphql: true });
+    const opts = probeOptions(exec);
+    expect(runSupersedeWatch(opts)).toEqual({ repo: opts.repo, holds: [], applied: [] });
+    expect(proofCalls(exec)).toHaveLength(0);
+    expect(opts.postHold).not.toHaveBeenCalled();
+  });
+  it.each(['open throws', 'closed throws', 'malformed JSON', 'bad open row', 'bad closed row', 'page cap', 'parser failure'])(
+    'probe failure blocks and stops all further reads: %s', failure => {
+      const spec = { open: [{ number: 10 }], closed: [probeClosed()] };
+      let last;
+      if (failure === 'bad open row') spec.open = [{ number: 'x' }];
+      if (failure === 'bad closed row') spec.closed = [{ ...probeClosed(), updated_at: 'bad' }];
+      spec.rest = (state, page) => {
+        last = { state, page };
+        if (failure === `${state} throws`) throw Error('probe unavailable');
+        if (failure === 'malformed JSON') return 'not json';
+        if (failure === 'page cap' && state === 'open') return JSON.stringify(Array.from({ length: 100 }, (_, i) => ({ number: (page - 1) * 100 + i + 1 })));
+      };
+      if (failure === 'parser failure') setMarkdownLoader(() => { throw Error('md down'); });
+      const exec = routeExec(spec);
+      const opts = probeOptions(exec);
+      try {
+        const result = runSupersedeWatch(opts);
+        expect(result.blocked).toBe(true);
+        expect(opts.postHold).not.toHaveBeenCalled();
+        expect(proofCalls(exec)).toHaveLength(0);
+        const expectedState = ['closed throws', 'bad closed row', 'parser failure'].includes(failure) ? 'closed' : 'open';
+        expect(last).toEqual({ state: expectedState, page: failure === 'page cap' ? 100 : 1 });
+        expect(exec).toHaveBeenCalledTimes(failure === 'page cap' ? 100 : expectedState === 'closed' ? 2 : 1);
+        if (failure === 'page cap') expect(result.error).toMatch(/page cap.*operator.*retry/);
+      } finally { setMarkdownLoader(); }
+    });
+  it.each([150, 6300])('candidate on a later page completes with a separate probe budget: %i rows', count => {
+    const source = count === 150 ? 1120 : 1000 + count;
+    const spec = { open: Array.from({ length: count }, (_, i) => ({ number: i + 1 })),
+      closed: Array.from({ length: count }, (_, i) => probeClosed(1001 + i, 1001 + i === source ? 'Supersedes: #10' : 'No marker')) };
+    const exec = routeExec(spec);
+    const opts = { ...probeOptions(exec), readPr: vi.fn(() => hardTarget()) };
+    opts.postHold.mockImplementation(({ hold }) => {
+      opts.readPr.mockReturnValue({ ...hardTarget(), comments: [{ author: { login: 'web-everything' }, body: buildSupersededStandDownComment(hold) }] });
+      return { ok: true };
+    });
+    const result = runSupersedeWatch(opts);
+    expect(result.applied).toEqual([expect.objectContaining({ pr: 10, by: source, ok: true })]);
+    expect(result.evidence).toEqual([expect.objectContaining({ candidateId: 'PR_10', sourceId: `PR_${source}` })]);
+    expect(proofCalls(exec).filter(([, args]) => args.some(a => a.includes('totalCount')))).toHaveLength(4);
+    expect(proofCalls(exec).filter(([, args]) => args.some(a => a.includes('pullRequest(number:')))).toHaveLength(2);
+    expect(opts.readPr).toHaveBeenCalledTimes(3);
+    expect(opts.postHold).toHaveBeenCalledTimes(1);
+  });
+  it.each(['readMergedPrs', 'readOpenNumbers'])('only %s injected skips probe and keeps default completeness', reader => {
+    const exec = routeExec({ open: [], closed: [], rejectGraphql: true });
+    const opts = { ...probeOptions(exec), [reader]: () => reader === 'readMergedPrs' ? [] : [10] };
+    expect(runSupersedeWatch(opts)).toMatchObject({ blocked: true, error: 'fake-gh: unsupported graphql query' });
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(proofCalls(exec)).toHaveLength(1);
+    expect(exec.mock.calls[0][1]).toContain(reader === 'readMergedPrs' ? 's[]=OPEN' : 's[]=CLOSED');
+    expect(opts.postHold).not.toHaveBeenCalled();
+  });
+  it('initial candidate source snapshot failure blocks dispatch after complete inventories', () => {
+    const exec = routeExec({ open: [{ number: 10 }], closed: [probeClosed()], snapshotError: true });
+    const opts = { ...probeOptions(exec), readPr: vi.fn() };
+    expect(runSupersedeWatch(opts)).toMatchObject({ blocked: true, holds: [], applied: [] });
+    expect(proofCalls(exec)).toHaveLength(5);
+    expect(opts.readPr).not.toHaveBeenCalled();
     expect(opts.postHold).not.toHaveBeenCalled();
   });
 });

@@ -8,7 +8,15 @@
  * `review-status:stood-down` and `superseded` labels). It never closes a PR: that is an operator decision.
  *
  * Setting off (`supersede-settings.json` / `WE_SUPERSEDE_HOLD`) = no read, no write. Every read is bounded; a failed
- * list/planning failure blocks dispatch; a body-edit failure skips only its PR. Apply failures are reported per hold.
+ * probe/list/planning failure blocks dispatch. Apply failures are reported per hold.
+ *
+ * SW-DISPATCH-1: Supersede evidence and fix dispatch.
+ * When neither listing reader is injected, a since-bounded candidate probe runs on its own call budget.
+ * No candidate observed among its returned (possibly incomplete) rows returns clean, suppresses supersede writes
+ * and permits fix/CI-heal dispatch. Any probe error blocks dispatch even without a proved supersede.
+ * An observed candidate requires complete count-proved inventories and every hardened snapshot, pre-write and
+ * trusted read-back check before recording success. Initial snapshot failures block dispatch; apply failures
+ * are reported per hold. The probe permits no writes and does not prove absence of supersedes.
  * Usage as a one-off: `node supersede-watch.mjs
  * [--repo=<owner/name>] [--apply]` (dry run without `--apply`).
  */
@@ -26,6 +34,7 @@ const STAND_DOWN_CLI = join(HERE, 'stand-down.mjs');
 export const SUPERSEDE_WATCH_ACTOR = 'supersede-watch (card xiqtf7w)';
 const PAGE_SIZE = 100;
 const MAX_LIST_PAGES = 100;
+const PROBE_CALL_CAP = 2 * MAX_LIST_PAGES;
 
 const slugOf = (repo) => CONSTELLATION_REPOS[repo]?.slug ?? repo;
 const ghJson = (args, exec) => JSON.parse(String(exec('gh', args, {
@@ -72,7 +81,7 @@ function readPullPages({ repo, state, exec, since, requireComplete = false }) {
   throw new Error(`PR list page cap reached in ${slugOf(repo)}; operator must narrow the inventory or inspect the full list before dispatch; retry next tick`);
 }
 
-/** Low-level merged list, normalized to the planner shape. The daemon requires count proof via requireComplete. */
+/** Low-level merged list, normalized to the planner shape. SW-DISPATCH-1 requires count proof after the candidate probe. */
 export function defaultReadMergedPrs({ repo, lookbackDays, now = Date.now(), exec = execFileSync, requireComplete = false }) {
   const since = now - lookbackDays * 86_400_000;
   return readPullPages({ repo, state: 'closed', exec, since, requireComplete })
@@ -97,10 +106,8 @@ export function defaultReadBodyEdit({ repo, pr, exec = execFileSync }) {
 
 /**
  * Put the body-edit facts on each merged PR whose marker could matter (trusted author, at least one target that is
- * still OPEN, so a read costs a call only when a hold is actually possible). A failed read marks that one PR
- * `bodyEditUnknown` (the rule then ignores it: a missed hold costs one fixer run, a false one stops an unrelated PR);
- * it never throws and never blocks the others. Returns `{ rows, failures }` so a persistent failure (no GraphQL access,
- * a rate limit) is reported instead of silently switching every hold off.
+ * still OPEN, so a read costs a call only when a hold is actually possible). Failed snapshots are marked
+ * `bodyEditUnknown` and counted in `{ rows, failures }`; the caller must block dispatch on any failure.
  */
 const timestamp = (value, now) => {
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(value)) return false;
@@ -134,7 +141,7 @@ export function withBodyEdits({ repo, mergedPrs, openNumbers, readBodyEdit = def
   return { rows, failures };
 }
 
-/** Low-level open numbers; the daemon requires count proof via requireComplete before authorizing effects. */
+/** Low-level open numbers; SW-DISPATCH-1 requires count proof before authorizing effects. */
 export function defaultReadOpenNumbers({ repo, exec = execFileSync, requireComplete = false }) {
   return readPullPages({ repo, state: 'open', exec, requireComplete }).map(p => p.number);
 }
@@ -176,6 +183,18 @@ export function runSupersedeWatch({
 } = {}) {
   if (!settings?.hold) return { repo, holds: [], applied: [], skipped: 'supersede hold is off' };
   try {
+    const defaultAuthority = readMergedPrs == null && readOpenNumbers == null;
+    if (defaultAuthority) {
+      let probeCalls = 0;
+      const probeExec = (...args) => {
+        if (++probeCalls > PROBE_CALL_CAP) throw new Error('supersede probe call cap reached; operator must inspect the inventory and retry next tick');
+        return exec(...args);
+      };
+      const openNumbers = defaultReadOpenNumbers({ repo, exec: probeExec, requireComplete: false });
+      const mergedPrs = defaultReadMergedPrs({ repo, lookbackDays: settings.lookbackDays, now,
+        exec: probeExec, requireComplete: false });
+      if (!supersedeCandidates({ mergedPrs, openNumbers }).length) return { repo, holds: [], applied: [] };
+    }
     let calls = 0;
     const boundedExec = (...args) => {
       if (++calls > 256) throw new Error('supersede evidence call cap reached; operator must inspect the inventory and retry next tick');
@@ -190,6 +209,7 @@ export function runSupersedeWatch({
     const openNumbers = readOpenNumbers({ repo });
     const { rows: mergedPrs, failures: bodyEditFailures } = withBodyEdits({
       repo, mergedPrs: readMergedPrs({ repo, lookbackDays: settings.lookbackDays, now }), openNumbers, readBodyEdit, now });
+    if (defaultAuthority && bodyEditFailures) throw new Error('initial merged PR snapshot unreadable; operator must inspect evidence and retry next tick');
     const candidates = supersedeCandidates({ mergedPrs, openNumbers });
     // Re-read each candidate: it must still be OPEN, and its own thread decides idempotency.
     const openPrs = candidates.map((pr) => {
@@ -224,7 +244,7 @@ export function runSupersedeWatch({
       }
       catch (e) { return { ...hold, ok: false, error: String(e?.message || e).split('\n')[0] }; }
     }) : [];
-    return { repo, holds, applied, ...(evidence.length ? { evidence } : {}), ...(bodyEditFailures ? { bodyEditFailures } : {}) };
+    return { repo, holds, applied, ...(evidence.length ? { evidence } : {}), ...(bodyEditFailures ? { bodyEditFailures, blocked: true } : {}) };
   } catch (e) {
     return { repo, holds: [], applied: [], blocked: true, error: String(e?.message || e).split('\n')[0] };
   }
