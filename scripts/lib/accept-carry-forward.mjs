@@ -101,7 +101,7 @@ const MECHANICAL_PARK_RE = /^\s*<!--\s*drain-park-reason\s*-->\s*\n⏸ \*\*Parke
 
 /** Pure: is this (trusted) comment body a later verdict / deliberate hold that an identical diff proves nothing about? */
 export function isLaterVerdictBody(body) {
-  const text = typeof body === 'string' ? body : '';
+  const text = typeof body === 'string' ? body.replace(/\r\n/g, '\n') : '';
   if (!text) return false;
   if (LATER_VERDICT_HEADING_RE.test(text) || LATER_REARM_RE.test(text) || LATER_STANDING_HOLD_RE.test(text)) return true;
   return DRAIN_PARK_MARKER_RE.test(text) && !MECHANICAL_PARK_RE.test(text);
@@ -376,7 +376,7 @@ function isProvenMultiHop(text, comment, context) {
  * Verdicts, re-arms, stand-downs and non-mechanical drain parks are NOT machine shapes (they supersede the accept).
  */
 export function isKnownMachineBody(body, comment = undefined, context = undefined) {
-  const text = typeof body === 'string' ? body : '';
+  const text = typeof body === 'string' ? body.replace(/\r\n/g, '\n') : '';
   if (!text.trim()) return true;
   if (isLaterVerdictBody(text)) return false;
   if (text.startsWith('<!-- review-verdict-carried ')) return isNonBlockingCarriedVerdict(text, comment) || isProvenMultiHop(text, comment, context);

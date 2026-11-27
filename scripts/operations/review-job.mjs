@@ -590,7 +590,13 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     readCarryEvidence: ({ pr, repo }) => {
       const view = JSON.parse(execRead('gh', ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'], { cwd: root, env }));
       const comments = readCompletePrComments(pr, { repo, exec: (f, a, o) => execRead(f, a, { ...o, cwd: root, env }) });
-      return { headSha: view.headRefOid, comments };
+      let reviews = null;
+      try {
+        const pages = JSON.parse(execRead('gh', ['api', `repos/${repo}/pulls/${pr}/reviews`, '--paginate', '--slurp'],
+          { cwd: root, env, timeout: 60_000, maxBuffer: 1024 * 1024 }));
+        if (Array.isArray(pages) && pages.length > 0 && pages.every(Array.isArray)) reviews = pages.flat();
+      } catch { /* Unknown formal-review evidence requires normal review. */ }
+      return { headSha: view.headRefOid, comments, reviews };
     },
     contributionPatchId: ({ sha, repo }) => contributionPatchId({ sha,
       exec: (f, a, o) => execRead(f, a, { ...o, cwd: planReviewDispatch({ pr: 1, repo }).laneRepo, env }) }),

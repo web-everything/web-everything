@@ -24,8 +24,8 @@ export function contributionPatchId({ exec, sha, base = 'origin/main' } = {}) {
 }
 
 /** PURE: a trusted accept survives only without a superseding verdict or unknown hold. */
-export function findCarriableVerdict({ comments, headSha, pr } = {}) {
-  if (!HEX.test(headSha ?? '')) return null;
+export function findCarriableVerdict({ comments, headSha, pr, reviews } = {}) {
+  if (!HEX.test(headSha ?? '') || !Array.isArray(reviews)) return null;
   const trusted = (Array.isArray(comments) ? comments : []).filter(isTrustedMarkerAuthor);
   const sha = parseReviewedSha(trusted);
   const gates = trusted.map(c => parseRedTeamGateMarker(c.body)).filter(m => m && m.rev === sha && (pr == null || m.pr === Number(pr)));
@@ -44,9 +44,12 @@ export function findCarriableVerdict({ comments, headSha, pr } = {}) {
   // Keep every other comment for the shared approval guard, including untrusted holds.
   const verdictComments = (Array.isArray(comments) ? comments : []).filter(c => {
     if (!isTrustedMarkerAuthor(c) || String(c?.body ?? '').split('\n').some(isLaterVerdictBody)) return true;
+    // Keep head-labelled carry envelopes in the full thread: the shared guard
+    // must prove their canonical shape, predecessor path and formal-review window.
+    if (parseVerdictCarriedMarker(c?.body) && /Head `[0-9a-f]{12}`/.test(c?.body ?? '')) return true;
     return !informationalProvenance(c?.body, sha, number);
   });
-  const record = latestAcceptRecord(verdictComments);
+  const record = latestAcceptRecord(verdictComments, reviews);
   if (!HEX.test(sha ?? '') || sha === headSha || !record || record.laterVerdict || record.laterBodyDerivedHold) return null;
   return { ...record, ...findAcceptVerdictComment(trusted, sha), sha,
     gateOutcomes: [...gateOutcomesForHead(trusted, number, sha)], advisory: advisory?.parsed ?? null, advisoryBody: advisory?.body ?? null };
