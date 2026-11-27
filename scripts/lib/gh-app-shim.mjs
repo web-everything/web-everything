@@ -792,9 +792,10 @@ function freshCachedToken() {
   // \`legacy\` names today's App itself (the WE App, WE_APP_ID): a caller that must author as it (the red-team check
   // writer, #6535) gets it or nothing, never a role App standing in.
   const legacyOnly = role === 'legacy';
+  const stewardOnly = role === 'steward';
   if (!legacyOnly && ROLE_IDENTITIES[role]) chain.push([role, ROLE_IDENTITIES[role]]);
-  if (!legacyOnly && role !== 'worker' && ROLE_IDENTITIES.worker) chain.push(['worker', ROLE_IDENTITIES.worker]);
-  chain.push(['legacy', { cachePath: CACHE_PATH, installations: null }]);
+  if (!legacyOnly && !stewardOnly && role !== 'worker' && ROLE_IDENTITIES.worker) chain.push(['worker', ROLE_IDENTITIES.worker]);
+  if (!stewardOnly) chain.push(['legacy', { cachePath: CACHE_PATH, installations: null }]);
   const misses = loud && !legacyOnly && !ROLE_IDENTITIES[role] ? [role + ': unconfigured'] : [];
   for (const [name, entry] of chain) {
     const r = tokenFrom(entry, owner);
@@ -812,7 +813,7 @@ function freshCachedToken() {
     misses.push(name + ': ' + r.miss);
   }
   tokenMisses = misses;
-  if (!DAEMON && loud) process.stderr.write('gh-shim: no App token for role "' + role + '" (' + misses.join('; ') + ') - using personal auth for this call\\n');
+  if (!DAEMON && loud && !stewardOnly) process.stderr.write('gh-shim: no App token for role "' + role + '" (' + misses.join('; ') + ') - using personal auth for this call\\n');
   return null;
 }
 
@@ -833,6 +834,9 @@ function invalidateSharedCache() {
 // process down before it drains, silently truncating whatever \`gh\` printed. Setting \`exitCode\` and letting the
 // script fall off the end instead keeps the event loop alive until every queued write really lands.
 async function runInherited(env, reason, rejectedStderr) {
+  if (requestedRole(env) === 'steward') {
+    throw new Error('steward token refused; operator must provision or refresh the scoped App token');
+  }
   const inheritedApp = DAEMON && !unsupportedHost && env.GH_TOKEN && env.WE_GH_AUTH_TOKEN_HASH === createHash('sha256').update(env.GH_TOKEN).digest('hex');
   if (DAEMON) {
     if (!inheritedApp) {

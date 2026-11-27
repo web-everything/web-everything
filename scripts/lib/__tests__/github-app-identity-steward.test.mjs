@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -41,6 +42,64 @@ describe('HANDLING-COMBO-A-WE steward identity', () => {
       expect(existsSync(effect)).toBe(false);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
+  it.each(['missing', 'expired', 'rejected'].flatMap(state =>
+    ['worker', 'legacy', 'personal', 'inherited App'].map(fallback => ({ state, fallback }))))(
+    '$state steward token refuses $fallback credentials without invoking gh under that identity', ({ state, fallback }) => {
+      const root = mkdtempSync(join(tmpdir(), 'steward-fallback-'));
+      try {
+        const cachePath = join(root, 'cache.json'), calls = join(root, 'calls.jsonl');
+        const fakeGh = join(root, 'gh'), shim = join(root, 'shim.cjs'), entry = join(root, 'entry.cjs');
+        const id = resolveDeliveryIdentity({ tool: { steward: app, worker: { ...app, appId: fixtureIds.worker } }, env: {}, pinned: false });
+        const roleTable = shimRoleTable({ identity: id, cachePath });
+        const stewardCache = installationCachePath(roleTable.steward.cachePath, fixtureIds.installation);
+        const fresh = { v: 2, expiresAt: receipt().expiresAt, installationId: fixtureIds.installation };
+        if (fallback === 'worker' || fallback === 'legacy') {
+          writeFileSync(installationCachePath(fallback === 'worker' ? roleTable.worker.cachePath : cachePath, fixtureIds.installation),
+            JSON.stringify({ ...fresh, token: fallback + '-token' }));
+        }
+        if (state !== 'missing') writeFileSync(stewardCache, JSON.stringify({ ...fresh, token,
+          expiresAt: state === 'expired' ? '2026-11-26T14:00:00Z' : fresh.expiresAt }));
+        writeFileSync(shim, renderGhShimScript({ realGhPath: fakeGh, cachePath, roleTable,
+          ghThrottleCliPath: join(root, 'no-throttle'), refreshCliPath: join(root, 'no-refresh'),
+          personalFallbackPolicy: { personalFallback: 'allow', source: { personalFallback: 'fixture' } } }));
+        // Exercise the generated shim with bounded, injected process/clock IO. Any unexpected
+        // subprocess fails the fixture; neither git, ps, gh nor the throttle reaches the host.
+        writeFileSync(entry, `const fs = require('node:fs');
+const cp = require('node:child_process');
+Date.now = () => ${now()};
+for (const method of ['readFileSync', 'existsSync', 'realpathSync']) {
+  const original = fs[method];
+  fs[method] = (path, ...args) => {
+    if (!String(path).startsWith(${JSON.stringify(root + '/')})) throw new Error('unexpected filesystem read: ' + path);
+    return original(path, ...args);
+  };
+}
+cp.spawnSync = (file, argv, options) => {
+  if (file === '/usr/bin/git') return { status: 0, stdout: '', stderr: '' };
+  if (file !== ${JSON.stringify(fakeGh)}) throw new Error('unexpected subprocess: ' + file);
+  fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ token: options.env.GH_TOKEN, githubToken: options.env.GITHUB_TOKEN }) + '\\n');
+  return { status: 1, stdout: Buffer.from(''), stderr: Buffer.from('HTTP 401: Bad credentials') };
+};
+require(${JSON.stringify(shim)});
+`);
+        const inherited = fallback === 'inherited App';
+        const inheritedToken = inherited ? 'inherited-app-token' : 'personal-token';
+        const result = spawnSync(process.execPath, [entry, 'api', 'repos/fixture/repo'], {
+          cwd: root, timeout: 10000, maxBuffer: 1024 * 1024, encoding: 'utf8',
+          env: { HOME: root, PATH: root, GH_CONFIG_DIR: root, GH_REPO: 'fixture/repo', GH_CALLER: 'fixture',
+            GH_TOKEN: inheritedToken, GITHUB_TOKEN: 'personal-github-token', WE_GITHUB_APP_ROLE: 'steward',
+            WE_GITHUB_APP_INSTALLATIONS: '{"fixture":"101"}', WE_GH_THROTTLE_LOCK_ROOT: join(root, 'ledger'),
+            ...(inherited ? { WE_GH_DAEMON_CALLER: 'fixture-daemon',
+              WE_GH_AUTH_TOKEN_HASH: createHash('sha256').update(inheritedToken).digest('hex') } : {}) },
+        });
+        expect(result.error).toBeUndefined();
+        expect(result.status).toBe(1);
+        expect(result.stderr).toMatch(/steward.*operator/i);
+        const invocations = existsSync(calls) ? readFileSync(calls, 'utf8').trim().split('\n').map(line => JSON.parse(line)) : [];
+        expect(invocations).toEqual(state === 'rejected' ? [{ token, githubToken: 'personal-github-token' }] : []);
+        if (state === 'rejected') expect(existsSync(stewardCache)).toBe(false);
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    });
   it('legacy publisher App id cannot be configured as steward on either credential path', async () => {
     const legacyEnv = { ...env(), WE_GITHUB_APP_ID: app.appId };
     expect(() => buildIdentityChain({ requestedRole: 'steward', identity: identity(), env: legacyEnv, cachePath: '/fixture/cache.json' }))
