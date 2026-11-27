@@ -25,7 +25,7 @@ import {
   isRateLimitShaped, retryBackoffMs,
   parseGhDebugResponseHeaders, parseGraphQLRateLimit, classifyRateLimitSignal, calibratedBackoffMs,
   acquireGhSlotSync, releaseGhSlotSync, ghThrottleStatus,
-  decideGhPointsSpend, acquireGhPointsSync, ghThrottleLogPath, recordGhCallLogEntry,
+  decideGhPointsSpend, acquireGhPointsSync, ghPointsBudgetStatePath, ghThrottleLogPath, recordGhCallLogEntry,
   acquireGhWriteBudgetSync, classifyGhWrite, deriveGhCaller,
   runGhSync, execFileSyncThrottled, runGhCliPassthrough, stripGhDebug, scanGhApiFlags,
 } from './gh-throttle.window-fixture.mjs';
@@ -805,6 +805,45 @@ describe('runGhSync — points budget + sidecar log wiring (#3670)', () => {
 });
 
 // ── #gh-write-burst — the write-only budget and caller attribution, wired through runGhSync/runGhCliPassthrough
+it.each(['sync', 'passthrough'])('%s ungated write timeout still charges points and holds a concurrency slot', runner => {
+  const f = writeTimeoutFixture();
+  const held = [];
+  // Release checks the current process identity; use it for this fixture's owned slots.
+  f.throttle.pid = process.pid;
+  const execute = vi.fn(() => {
+    held.push(ghThrottleStatus({ lockRoot: f.throttle.lockRoot, cap: f.throttle.cap }).heldCount);
+    return runner === 'sync' ? 'ok' : { status: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+  });
+  try {
+    f.throttle.env.WE_GH_THROTTLE_ON_SLOT_TIMEOUT = 'ungated';
+    const call = args => runner === 'sync'
+      ? runGhSync(args, { env: f.throttle.env, throttle: { ...f.throttle, exec: execute } })
+      : runGhCliPassthrough(args, { throttle: f.throttle, spawn: execute });
+    call(['pr', 'edit', '1']);
+    call(['pr', 'edit', '2']);
+    expect(JSON.parse(readFileSync(ghPointsBudgetStatePath(f.throttle.lockRoot), 'utf8')).spent).toBe(2);
+    expect(held).toEqual([1, 1]);
+    expect(ghThrottleStatus({ lockRoot: f.throttle.lockRoot, cap: f.throttle.cap }).heldCount).toBe(0);
+  } finally { f.cleanup(); }
+});
+
+it.each(['sync', 'passthrough'])('%s ungated write timeout still waits for an exhausted points budget', runner => {
+  const f = writeTimeoutFixture();
+  f.throttle.pid = process.pid;
+  const execute = vi.fn(() => runner === 'sync' ? 'ok' : { status: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) });
+  try {
+    f.throttle.env.WE_GH_THROTTLE_ON_SLOT_TIMEOUT = 'ungated';
+    f.throttle.budgetPerMin = 1;
+    const call = args => runner === 'sync'
+      ? runGhSync(args, { env: f.throttle.env, throttle: { ...f.throttle, exec: execute } })
+      : runGhCliPassthrough(args, { throttle: f.throttle, spawn: execute });
+    call(['pr', 'edit', '1']);
+    call(['pr', 'edit', '2']);
+    expect(f.throttle.now()).toBe(100); // independent 50 ms write and points waits
+    expect(execute).toHaveBeenCalledTimes(2);
+  } finally { f.cleanup(); }
+});
+
 it.each(['sync', 'passthrough'])('%s explicitly ungated write timeout executes and logs the operator fallback', runner => {
   const f = writeTimeoutFixture();
   const exec = vi.fn(() => 'ok');

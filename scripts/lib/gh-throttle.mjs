@@ -2364,7 +2364,10 @@ function runGhSyncUnmemoized(args, opts = {}) {
     const waitStartedMs = Date.now();
     const acq = gated ? failOpenGate('acquire', () => {
       const writeGate = isWrite && acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
-      if (writeGate?.timedOut) return { ok: false, timedOut: true, waitedMs: writeGate.waitedMs };
+      if (writeGate?.timedOut) {
+        if (slotWait.onSlotTimeout !== 'ungated') return { ok: false, timedOut: true, waitedMs: writeGate.waitedMs };
+        noteSlotTimeout(logPath, writeGate, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv }, throttle.warn);
+      }
       const pointsGate = acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: reserved ? Math.min(acquireTimeoutMs, reservedCapMs) : acquireTimeoutMs, windowMs: pointsWindowMs, pointClass: pointsClass, reserved, env, pointsAlgorithm: throttle.pointsAlgorithm, toolFile: throttle.pointsToolFile, jitter: throttle.jitter });
       // A reserved read FAILS CLOSED if the points budget did not clear inside its own call bound (the freeze then holds).
       if (pointsGate?.closed || (pointsClosed && pointsGate?.ok === false)) return { ok: false, timedOut: true, waitedMs: pointsGate.waitedMs };
@@ -2673,7 +2676,10 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
     // A nested call rides the outer's slot (and its already-charged points/write budget) — one call, one slot.
     const acq = gated && !outer ? failOpenGate('acquire', () => {
       const writeGate = isWrite && acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
-      if (writeGate?.timedOut) return { ok: false, timedOut: true, waitedMs: writeGate.waitedMs };
+      if (writeGate?.timedOut) {
+        if (slotWait.onSlotTimeout !== 'ungated') return { ok: false, timedOut: true, waitedMs: writeGate.waitedMs };
+        noteSlotTimeout(logPath, writeGate, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv }, throttle.warn);
+      }
       const pointsGate = acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: reserved ? Math.min(acquireTimeoutMs, reservedCapMs) : acquireTimeoutMs, windowMs: pointsWindowMs, pointClass: pointsClass, reserved, env, pointsAlgorithm: throttle.pointsAlgorithm, toolFile: throttle.pointsToolFile, jitter: throttle.jitter });
       // A reserved read FAILS CLOSED if the points budget did not clear inside its own call bound (the freeze then holds).
       if (pointsGate?.closed || (pointsClosed && pointsGate?.ok === false)) return { ok: false, timedOut: true, waitedMs: pointsGate.waitedMs };
