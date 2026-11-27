@@ -57,6 +57,9 @@ export function attributeCiJobLog(log, steps) {
     if (owners.length > 1) return unknown('ambiguous-step-boundary');
     if (!owners.length) {
       if ((time >= ranges[0].start && time <= ranges.at(-1).end)
+          // Keep the whole-job parser's fatal diagnostics: no step can account
+          // for an unowned suite failure or unhandled error before/after its run.
+          || /Failed Suites|Unhandled Errors|Unhandled Rejection/i.test(match[2])
           || /^(?:FAIL\b|Error:|AssertionError:|Tests\s+\d+\s+failed\b|##\[error\])/.test(match[2].trim())) {
         return unknown('unowned-log-output');
       }

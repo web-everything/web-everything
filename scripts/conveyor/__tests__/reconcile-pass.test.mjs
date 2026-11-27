@@ -1406,6 +1406,24 @@ describe('failed CI step timeout attribution', () => {
     expectInvestigation(f, f.collect());
   });
 
+  it.each(['Unhandled Errors', 'Unhandled Rejection', 'Failed Suites'].flatMap(diagnostic =>
+    ['before', 'after'].map(position => [diagnostic, position])))
+  ('refuses unowned %s %s step boundaries alongside a complete timeout', (diagnostic, position) => {
+    const f = fixture();
+    f.data[`${prefix}/actions/jobs/20`].steps[0].started_at = at(1);
+    const control = stamped('Starting job', 1) + stamped(timeout, 25) + stamped('Complete job', 40);
+    f.data[`${prefix}/actions/jobs/20/logs`] = control;
+    expect(f.collect().eligible).toBe(true);
+    f.exec.mockClear();
+    const unowned = stamped(`\x1b[31m⎯⎯⎯ ${diagnostic} ⎯⎯⎯\x1b[0m`, position === 'before' ? 0 : 41);
+    f.data[`${prefix}/actions/jobs/20/logs`] = position === 'before' ? unowned + control : control + unowned;
+    const result = f.collect();
+    expect(result).toMatchObject({ eligible: false, attribution: 'unknown',
+      failedSteps: [{ job: 20, number: 2, name: 'Deploy' }],
+      reason: expect.stringContaining('failed-step-attribution-unknown:unowned-log-output') });
+    expectInvestigation(f, result);
+  });
+
   it('a skipped step without timestamps cannot own a passing-step timeout', () => {
     const f = fixture();
     f.data[`${prefix}/actions/jobs/20`].steps.push({ number: 3, name: 'Skipped', status: 'completed', conclusion: 'skipped', started_at: null, completed_at: null });
@@ -2471,36 +2489,129 @@ it('serially falls back through the throttle when the pool fails or returns a mi
   expect(execFileSyncThrottled.mock.calls.every(([file]) => file === 'gh')).toBe(true);
   execFileSync.mockReset();
 });
-it('runs the file-based synchronous pool with real child processes and cleans its temp directory', async () => {
-  const { mkdtempSync, rmSync } = await import('node:fs');
+it.each([false, true])('runs the file-based synchronous pool with real child processes and verifies death before cleanup (kill fails=%s)', async killFails => {
+  const { mkdtempSync, rmSync, renameSync, openSync, closeSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const lockRoot = mkdtempSync(evidenceJoin(tmpdir(), 'timeout-pool-throttle-'));
   const { spawn } = await vi.importActual('node:child_process');
-  // This fixture launches only our leaf workers. Process-table enumeration is a
-  // separate liveness contract; inject it here rather than inspecting the host.
-  const groupAlive = vi.fn(() => false);
-  const workerPids = [];
-  let folder;
-  const launch = (node, args, opts) => {
-    folder = evidenceJoin(args.at(-1), '..');
-    const script = `import { readFileSync, writeFileSync, renameSync } from 'node:fs';
-      const [input, output] = process.argv.slice(1);
+  const env = { HOME: lockRoot, TMPDIR: lockRoot, TMP: lockRoot, TEMP: lockRoot,
+    WE_GH_THROTTLE_LOCK_ROOT: evidenceJoin(lockRoot, 'throttle'), WE_GH_THROTTLE_CAP: '4',
+    WE_DAEMON_EVENTS: evidenceJoin(lockRoot, 'events.jsonl'), WE_TEST_HERMETIC: '1' };
+  const livePath = evidenceJoin(lockRoot, 'live.json'), live = new Set(), workers = [], exits = [];
+  const publishLive = () => {
+    evidenceWrite(livePath + '.tmp', JSON.stringify([...live]));
+    renameSync(livePath + '.tmp', livePath);
+  };
+  // The asynchronous test parent observes exit events for ONLY its own fixture
+  // children while the synchronous pool runs in a separate process. No host ps.
+  const script = `import { readFileSync, writeFileSync, renameSync } from 'node:fs';
+    process.on('message', ({ input, output }) => {
       const { pr } = JSON.parse(readFileSync(input, 'utf8'));
       writeFileSync(output + '.tmp', JSON.stringify({ eligible: true, number: pr.number }));
-      renameSync(output + '.tmp', output); ${keepAliveScript({ maxLifetimeMs: 10_000 })}`;
-    const child = spawn(process.execPath, ['--input-type=module', '-e', script, ...args.slice(-2)], opts);
-    workerPids.push(child.pid);
-    return child;
-  };
+      renameSync(output + '.tmp', output);
+    });
+    ${keepAliveScript({ anchorPid: process.pid, maxLifetimeMs: 10_000 })}`;
+  let runner;
+  const stderr = openSync(evidenceJoin(lockRoot, 'runner.stderr'), 'w');
   try {
-    expect(runTimeoutEvidencePool([{ number: 1 }, { number: 2 }, { number: 3 }], {
-      launch, groupAlive, probe: () => true, concurrency: 2, deadlineMs: 3000,
-      env: { ...process.env, WE_GH_THROTTLE_LOCK_ROOT: lockRoot, WE_GH_THROTTLE_CAP: '4' },
-    })).toEqual([{ eligible: true, number: 1 }, { eligible: true, number: 2 }, { eligible: true, number: 3 }]);
-    expect(evidenceExists(folder)).toBe(false);
-    expect(workerPids).toHaveLength(3);
-    expect(groupAlive.mock.calls).toEqual(workerPids.map(pid => [pid]));
-  } finally { rmSync(lockRoot, { recursive: true, force: true }); }
+    for (let index = 0; index < 3; index++) {
+      const child = spawn(process.execPath, ['--input-type=module', '-e', script], {
+        cwd: lockRoot, env, detached: true, stdio: ['ignore', 'ignore', stderr, 'ipc'],
+      });
+      expect(child.pid).toBeGreaterThan(0);
+      workers.push(child); live.add(child.pid);
+      exits.push(new Promise((resolve, reject) => {
+        child.once('error', reject);
+        child.once('exit', (code, signal) => { live.delete(child.pid); publishLive(); resolve({ code, signal }); });
+      }));
+    }
+    publishLive();
+    const source = `
+      import { readFileSync, rmSync, existsSync } from 'node:fs';
+      import { dirname } from 'node:path';
+      import { runTimeoutEvidencePool } from ${JSON.stringify(new NodeURL('../timeout-evidence-pool.mjs', import.meta.url).href)};
+      const [livePath, pids, killFails] = JSON.parse(process.argv[1]);
+      let clock = 0, folder, aliveAtRemoval, next = 0;
+      Date.now = () => clock;
+      const kill = process.kill.bind(process);
+      process.kill = (target, signal) => {
+        if (!pids.includes(-target) || signal !== 'SIGKILL') throw Error('unexpected fixture signal');
+        return killFails ? true : kill(target, signal);
+      };
+      const groupAlive = pid => {
+        if (!pids.includes(pid)) throw Error('unowned fixture process');
+        const live = JSON.parse(readFileSync(livePath, 'utf8'));
+        if (!Array.isArray(live) || live.some(member => !pids.includes(member))) throw Error('invalid fixture liveness');
+        return live.includes(pid);
+      };
+      let results, error;
+      try {
+        results = runTimeoutEvidencePool([{ number: 1 }, { number: 2 }, { number: 3 }], {
+          repo: 'fixture/repo', concurrency: 2, deadlineMs: 3000, env: process.env, probe: () => true,
+          now: () => clock, pause: ms => {
+            clock += killFails ? 1000 : ms;
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+          }, groupAlive,
+          launch: (_node, args, opts) => {
+            if (!opts.detached) throw Error('worker must have its own process group');
+            const input = args.at(-2), output = args.at(-1), index = next++;
+            folder = dirname(output);
+            process.send({ kind: 'launch', index, input, output });
+            return { pid: pids[index], on() {} };
+          },
+          remove: (path, opts) => {
+            aliveAtRemoval = JSON.parse(readFileSync(livePath, 'utf8'));
+            rmSync(path, opts);
+          },
+        });
+      } catch (cause) { error = { code: cause.code, message: cause.message }; }
+      process.send({ kind: 'result', results, error, aliveAtRemoval, launched: next,
+        folderRemoved: !!folder && !existsSync(folder) }, sendError => {
+        if (sendError) throw sendError;
+        process.disconnect();
+      });`;
+    runner = spawn(process.execPath, ['--input-type=module', '-e', source,
+      JSON.stringify([livePath, workers.map(child => child.pid), killFails])], {
+      cwd: lockRoot, env, stdio: ['ignore', 'ignore', stderr, 'ipc'],
+    });
+    const result = await new Promise((resolve, reject) => {
+      let report;
+      const timer = setTimeout(() => reject(Error('fixture pool did not finish')), 4000);
+      runner.on('message', message => {
+        if (message.kind === 'launch') workers[message.index].send(message, error => { if (error) reject(error); });
+        else if (message.kind === 'result') report = message;
+      });
+      runner.once('error', error => { clearTimeout(timer); reject(error); });
+      runner.once('exit', code => {
+        clearTimeout(timer);
+        if (code !== 0 || !report) reject(Error(`fixture pool exited ${code}: ${evidenceRead(evidenceJoin(lockRoot, 'runner.stderr'), 'utf8')}`));
+        else resolve(report);
+      });
+    });
+    expect(result.folderRemoved).toBe(true);
+    if (killFails) {
+      expect(result.error).toEqual({ code: 'TIMEOUT_EVIDENCE_CLEANUP_FAILED',
+        message: 'timeout-evidence worker group cleanup failed; operator cleanup required' });
+      expect(result.results).toBeUndefined();
+      expect(result.aliveAtRemoval.length).toBeGreaterThan(0);
+      expect(live.size).toBeGreaterThan(0);
+    } else {
+      expect(result.error).toBeUndefined();
+      expect(result.results).toEqual([{ eligible: true, number: 1 }, { eligible: true, number: 2 }, { eligible: true, number: 3 }]);
+      expect(result.launched).toBe(3);
+      expect(result.aliveAtRemoval).toEqual([]);
+      expect(await Promise.all(exits)).toEqual(workers.map(() => ({ code: null, signal: 'SIGKILL' })));
+    }
+  } finally {
+    if (runner?.exitCode === null && runner.signalCode === null) runner.kill('SIGKILL');
+    for (const child of workers) {
+      if (!live.has(child.pid)) continue;
+      try { process.kill(-child.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+    }
+    await Promise.all(exits);
+    closeSync(stderr);
+    rmSync(lockRoot, { recursive: true, force: true });
+  }
 });
 
 it('never-started CI keeps its own flag and the complete empty read is attested, so startBeforeCi + verifyGreen dispatches a review', async () => {
