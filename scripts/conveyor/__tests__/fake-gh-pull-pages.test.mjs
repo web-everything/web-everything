@@ -45,9 +45,9 @@ describe('fake GitHub REST pull list used by supersede-watch', () => {
       closed.state = 'CLOSED';
       closed.closedAt = closed.updatedAt;
     });
-    const open = defaultReadOpenNumbers({ repo, exec });
+    const open = defaultReadOpenNumbers({ repo, exec, requireComplete: true });
     expect(open).toEqual(Array.from({ length: 251 }, (_, index) => index + 1));
-    const merged = defaultReadMergedPrs({ repo, lookbackDays: 7, now, exec });
+    const merged = defaultReadMergedPrs({ repo, lookbackDays: 7, now, exec, requireComplete: true });
     expect(merged.map(pr => pr.number)).toEqual(Array.from({ length: 251 }, (_, index) => index + 252));
     expect(merged[0]).toEqual({ number: 252, body: 'Supersedes #9999', state: 'MERGED',
       mergedAt: new Date(now).toISOString(), author: { login: 'agent' } });
@@ -60,16 +60,39 @@ describe('fake GitHub REST pull list used by supersede-watch', () => {
 
   it('allows an empty daemon pass, blocks on an API fault, and recovers on the next pass', () => {
     const { gh, exec } = fixture();
-    const tick = () => runSupersedeWatch({ repo, now, settings: { hold: true, lookbackDays: 7 },
-      readOpenNumbers: args => defaultReadOpenNumbers({ ...args, exec }),
-      readMergedPrs: args => defaultReadMergedPrs({ ...args, exec }),
-    });
+    // Exercise the daemon's default readers, including the count proofs; injected legacy
+    // readers masked unsupported GraphQL calls and left every real daemon tick blocked.
+    const tick = () => runSupersedeWatch({ repo, now, settings: { hold: true, lookbackDays: 7 }, exec });
     expect(tick()).toEqual({ repo, holds: [], applied: [] });
     gh.fault({ verb: 'api', kind: '5xx', times: 1 });
     // The watch reports the failed command's first line, before the child stderr/status.
     expect(tick()).toMatchObject({ blocked: true,
-      error: `Command failed: gh api repos/${repo}/pulls?state=open&sort=updated&direction=desc&per_page=100&page=1` });
+      error: expect.stringContaining('Command failed: gh api graphql') });
     expect(tick()).toEqual({ repo, holds: [], applied: [] });
+  });
+
+  it('counts GraphQL states separately and rejects missing or unknown states and queries', () => {
+    const { gh, exec } = fixture();
+    withStore(gh.env.FAKE_GH_STORE, store => {
+      const state = store.repos[repo];
+      openPrPure(state, { head: 'fixture', now });
+      openPrPure(state, { head: 'fixture', now }).state = 'CLOSED';
+      openPrPure(state, { head: 'fixture', now }).state = 'MERGED';
+    });
+    const query = 'query($o:String!,$n:String!,$s:[PullRequestState!]!){repository(owner:$o,name:$n){pullRequests(states:$s){totalCount}}}';
+    const count = (states, text = query) => JSON.parse(exec('gh', ['api', 'graphql',
+      '-f', `query=${text}`, '-f', 'o=web-everything', '-f', 'n=web-everything',
+      ...states.flatMap(state => ['-f', `s[]=${state}`])], { encoding: 'utf8' }))
+      .data.repository.pullRequests.totalCount;
+    expect(count(['OPEN'])).toBe(1);
+    expect(count(['CLOSED'])).toBe(1);
+    expect(count(['MERGED'])).toBe(1);
+    expect(count(['CLOSED', 'MERGED'])).toBe(2);
+    expect(count(['OPEN', 'OPEN'])).toBe(1);
+    expect(() => count([])).toThrow(/unsupported pull request states/);
+    expect(() => count(['closed'])).toThrow(/unsupported pull request states/);
+    expect(() => count(['UNKNOWN'])).toThrow(/unsupported pull request states/);
+    expect(() => count(['OPEN'], query.replace('totalCount', 'nodes{id}'))).toThrow(/unsupported graphql query/);
   });
 
   it.each(['page=0', 'page=1.5', 'per_page=101', 'state=merged', 'sort=unknown', 'unknown=1'])(
