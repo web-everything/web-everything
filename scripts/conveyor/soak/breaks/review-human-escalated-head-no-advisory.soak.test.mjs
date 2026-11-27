@@ -52,7 +52,7 @@ describe('review-human-escalated-head-no-advisory', () => {
     expect(hold.reviewRunEvidence(record).repo).toBe(REPO);
   });
 
-  it('always exercises both ticks, partial publication, counted failures and the conversion deferral', async () => {
+  it('exercises historical caps on both head kinds, both ticks, partial publication, counted failures and conversion deferral', async () => {
     const report = await b.run({ api: { hold, core, review, jury } });
     expect(b.judge(report)).toEqual([]);
   });

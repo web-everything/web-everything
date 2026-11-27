@@ -114,6 +114,33 @@ describe('one owed advisory after a halted pre-escalation review', () => {
   });
 
   const api = { hold: escalatedHoldApi, core: escalatedCoreApi, review: escalatedReviewApi, jury: escalatedJuryApi };
+  it.each([5, 6, 12])('owes one advisory on a nonmechanical head despite %s historical advisory rounds', count => {
+    const comments = Array.from({ length: count }, (_, i) => escalatedNote(api, 'accept', OLD_HEAD,
+      `2026-11-24T${String(10 + i).padStart(2, '0')}:00:00Z`));
+    const { pr, plan } = escalatedScenario(api, { comments, change: {
+      commits: [{ oid: ESC_HEAD, messageHeadline: 'Fix regression', parents: [{ oid: OLD_HEAD }] }],
+    } });
+    expect(pr.referralHoldAutoResolve).toMatchObject({ outcome: 'resume', advisoryOwed: true });
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'review',
+      advisoryReview: expect.objectContaining({ head: ESC_HEAD }) })]);
+    expect(plan.dispatch[0].labels).toContain('review:human');
+    expect(plan.refusals).toEqual([]);
+  });
+  it.each([
+    ['missing attempt count', { attemptsSinceWake: undefined }],
+    ['second attempt', { attemptsSinceWake: 2 }],
+    ['second finished review', { count: 2 }],
+  ])('historical cap exemption fails closed for %s', (_name, holdChange) => {
+    const { pr } = escalatedScenario(api, { comments: Array.from({ length: 6 }, (_, i) =>
+      escalatedNote(api, 'accept', OLD_HEAD, `2026-11-24T${10 + i}:00:00Z`)), change: {
+      commits: [{ oid: ESC_HEAD, messageHeadline: 'Fix regression', parents: [{ oid: OLD_HEAD }] }],
+    } });
+    const { plan } = escalatedScenario(api, { planOptions: { prs: [{ ...pr,
+      referralHold: { ...pr.referralHold, ...holdChange } }] } });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'review-referrals-pending',
+      referralHoldAutoResolve: expect.objectContaining({ outcome: 'stay' }) }));
+  });
   it('the captured review-gate failure is waivable only with complete green CI evidence', () => {
     const { pr, plan } = escalatedScenario(api, CAPTURED_OPTIONS);
     expect(escalatedCoreApi.reviewHoldCiWaivable({ pr, requiredChecks: ['test', 'red-team', 'review-gate'] })).toBe(true);

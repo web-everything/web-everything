@@ -8,6 +8,7 @@ import { sealedBreakKeys } from '../../../lib/red-team-gate.mjs';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 const HOLD = 'scripts/conveyor/review-referral-hold.mjs';
+const CORE = 'scripts/conveyor/reconcile-core.mjs';
 export const HEAD = '85873d92475d'.padEnd(40, '0');
 export const OLD_HEAD = '9957f63'.padEnd(40, '0');
 export const NOW = Date.parse('2026-11-26T22:10:00Z');
@@ -129,6 +130,28 @@ export function exercise(api) {
   check(first.pr.referralHold?.count === 1 && first.pr.referralHold?.attemptsSinceWake === 1, 'fixture must project one counted panel');
   check(first.plan.dispatch.length === 1 && first.plan.dispatch[0].kind === 'review'
     && first.plan.dispatch[0].advisoryReview?.reason === 'head-moved-advisory', 'tick 1 owes exactly one head-move advisory');
+  for (const historicalCount of [5, 6]) {
+    const comments = Array.from({ length: historicalCount }, (_, i) =>
+      advisory(api, 'accept', OLD_HEAD, `2026-11-24T${String(10 + i).padStart(2, '0')}:00:00Z`));
+    for (const mechanical of [false, true]) {
+      const change = mechanical ? {} : {
+        commits: [{ oid: HEAD, messageHeadline: 'Fix regression', parents: [{ oid: OLD_HEAD }] }],
+      };
+      const { pr, plan } = scenario(api, { comments, change });
+      check(pr.referralHoldAutoResolve?.advisoryOwed === true, `history=${historicalCount} mechanical=${mechanical}: advisory is owed`);
+      check(plan.dispatch.length === 1 && plan.dispatch[0].kind === 'review',
+        `history=${historicalCount} mechanical=${mechanical}: historical rounds must not block the one owed advisory`);
+      check(pr.labels.includes('review:human'), 'the bounded advisory retains the human gate');
+      for (const incomplete of [false, true]) {
+        const failed = scenario(api, { comments, change,
+          runs: [rawRun(api), rawRun(api, { id: 'review-pr-pr7385-failed', second: true, incomplete })] });
+        check(failed.plan.dispatch.length === 0,
+          `history=${historicalCount} mechanical=${mechanical} incomplete=${incomplete}: second counted attempt must hold`);
+      }
+      const published = scenario(api, { comments: [...comments, advisory(api)], change });
+      check(published.plan.dispatch.length === 0, `history=${historicalCount} mechanical=${mechanical}: published advisory must not repeat`);
+    }
+  }
   for (const outcome of ['accept', 'changes', 'pending-referral']) {
     const notes = [advisory(api, outcome), ...(outcome === 'pending-referral' ? [pendingReferral(api)] : [])];
     for (const partial of [false, true]) {
@@ -152,8 +175,9 @@ export default {
   id: 'review-human-escalated-head-no-advisory', title: 'one halted pre-escalation panel owes one advisory, bounded by counted attempts',
   card: 'REVIEW-REARM-REDTEAM-PENDING.S1.1 (#7385; conversion #246 deferred)',
   // Pin after the wrapper creates the implementation commit; this task leaves the tree uncommitted.
-  fixedBy: { sha: 'pending', where: 'lane/review-rearm-redteam-pending-m1', paths: [HOLD] },
-  fixPresent(root) { return readFileSync(join(root, HOLD), 'utf8').includes('advisoryOwed: true'); },
+  fixedBy: { sha: 'pending', where: 'lane/review-rearm-redteam-pending-m1', paths: [HOLD, CORE] },
+  fixPresent(root) { return readFileSync(join(root, HOLD), 'utf8').includes('advisoryOwed: true')
+    && readFileSync(join(root, CORE), 'utf8').includes("reason: 'referral-hold-resumed'"); },
   async run({ sourceRoot = ROOT, api } = {}) { return exercise(api ?? await loadApi(sourceRoot)); },
   judge: report => report.violations,
 };
