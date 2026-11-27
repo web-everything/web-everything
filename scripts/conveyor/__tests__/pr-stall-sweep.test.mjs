@@ -1382,6 +1382,19 @@ describe('audit history repair digest (BLD-8039)', () => {
     const f = fixture([valid, {}, valid]);
     expect(readAuditHistory(f.dir)).toEqual({ records: [valid, valid], complete: false, issues: ['2026-09.jsonl:2: invalid audit record'] });
   });
+  it('throwing audit validation preserves subsequent records and fails closed with repair guidance', async () => {
+    const f = fixture([valid, { phase: 'pass', ts: { toString: null } }, valid]);
+    expect(readAuditHistory(f.dir)).toEqual({ records: [valid, valid], complete: false,
+      issues: ['2026-09.jsonl:2: invalid audit record'] });
+    const { out, digest } = await f.run({ prs: [{ ...PRS[0], labels: [{ name: 'red-team:pending' }] }],
+      settings: shadow({ actionModes: { 'restart-red-team': 'on' } }) });
+    expect(out.incomplete).toBe(true);
+    expect(out.act).toEqual([]);
+    actionable(digest);
+    expect(repair(out).map(i => i.action)).toEqual(['repair-audit-history']);
+    expect(f.dispatchRestart).not.toHaveBeenCalled();
+    expect(out.records.some(r => ['intent', 'did', 'would-do'].includes(r.phase))).toBe(false);
+  });
   it('repair item replaces an independently made operator item on the same head', async () => {
     const f = fixture();
     const overCap = fakeGh({ prs: [{ ...PRS[0], labels: [{ name: 'status:at-round-limit' }] }], changedFiles: 3001 });

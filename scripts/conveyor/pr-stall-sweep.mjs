@@ -94,7 +94,9 @@ export function readAuditHistory(dir) {
       if (!line.trim()) continue;
       let r;
       try { r = JSON.parse(line); } catch { issue(`${n}:${index + 1}: invalid JSON`); continue; }
-      if (wellFormed(r)) records.push(r); else issue(`${n}:${index + 1}: invalid audit record`);
+      try {
+        if (wellFormed(r)) records.push(r); else issue(`${n}:${index + 1}: invalid audit record`);
+      } catch { issue(`${n}:${index + 1}: invalid audit record`); }
     }
   }
   if (omitted) issues.push(`${omitted} additional corrupt rows; inspect full audit`);
