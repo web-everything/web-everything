@@ -14,7 +14,7 @@
  * Trace retention: runs older than 3 days are removed, then oldest eligible runs until below 2 GiB.
  * WE_TEST_CACHE_MAX_AGE_DAYS and WE_TEST_CACHE_MAX_BYTES override those limits. Active runs and runs
  * younger than 6 hours are protected. Under byte pressure an in-window run whose owner PID answers kill(pid, 0) is
- * removed only after every other eligible run; liveness reorders removal and adds no exemption (failures skip a run).
+ * removed only after every other eligible run; liveness reorders removal and adds no exemption (probe failures do not defer).
  * Key contexts prune at most hourly, only for enabled cache runs (so createKeyContext is no longer read-only
  * in that case: it may delete old trace run dirs and write .prune-stamp).
  */
@@ -115,7 +115,11 @@ export function pruneCache({ dir = cacheDir(), env = process.env, now = Date.now
     if (age <= settings.maxAgeDays * 86400 * 1000 && result.remainingBytes <= settings.maxBytes) continue;
     try {
       // Proven-live in-window owner: revisit once at the end (oldest-first among deferred); the cap still applies.
-      if (!run.deferred && age <= settings.maxAgeDays * 86400 * 1000 && isOwnerAlive(run.pid)) { runs.push({ ...run, deferred: true }); continue; }
+      if (!run.deferred && age <= settings.maxAgeDays * 86400 * 1000) {
+        let alive = false;
+        try { alive = isOwnerAlive(run.pid); } catch { /* No positive liveness evidence: do not defer eviction. */ }
+        if (alive) { runs.push({ ...run, deferred: true }); continue; }
+      }
       // Recheck eligibility immediately before removal; never follow a replacement symlink.
       const stat = lstatSync(run.path);
       if (!stat.isDirectory() || now - stat.mtimeMs < settings.minAgeMs) continue;

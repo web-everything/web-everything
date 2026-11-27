@@ -324,17 +324,18 @@ describe('test-result cache retention', () => {
     expect(calls).toEqual([102]);
   });
 
-  it('a throwing injected probe skips that run and pruneCache does not throw', () => {
+  it('a throwing injected probe cannot exempt an eligible run from the byte cap and pruneCache does not throw', () => {
     const dir = makeCache();
-    makeRun(dir, MIDDLE, 24 * HOUR);
+    const path = makeRun(dir, MIDDLE, 24 * HOUR);
     const calls = [];
     const probe = (pid) => { calls.push(pid); throw new Error('probe unavailable'); };
     let result;
     expect(() => { result = testResultCache.pruneCache({ dir, env: { WE_TEST_CACHE_MAX_BYTES: '1' }, now: NOW, isOwnerAlive: probe }); }).not.toThrow();
-    expect(result.removed).toEqual([]);
+    expect(result.removed).toEqual([MIDDLE]);
     expect(calls).toEqual([102]);
-    expect(result.freedBytes).toBe(0);
-    expect(result.remainingBytes).toBe(8);
+    expect(result.freedBytes).toBe(8);
+    expect(result.remainingBytes).toBe(0);
+    expect(existsSync(path)).toBe(false);
   });
 
   it('a deferred run refreshed during another owner\'s probe is kept and not re-probed', () => {
