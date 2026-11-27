@@ -8,7 +8,12 @@ import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
  * `we:scripts/operations/__tests__/review-dispatch.test.mjs`'s own style for the sibling operation this file's
  * `dispatchFix` composition was mirrored from.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import * as settingsFiles from '../../lib/settings-files.mjs';
+import * as cascadeApi from '../../lib/policy-cascade.mjs';
+import * as conflictWake from '../../lib/overlay-conflict-wake.mjs';
 import { FIX_OVERLAP_PROSE_GLOBS, stripProseScope } from '../fix-scope-policy.mjs';
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
@@ -3308,6 +3313,76 @@ describe('PUSH-GATE-S4 — a live hold read right before launch stops a fixer sp
   });
 });
 
+
+describe('shared registry pass admission', () => {
+  const now = Date.parse('2026-11-26T12:00:00Z'), X = 'scripts/push-gate-allowlist.json';
+  const rows = [
+    { prNumber: 7490, headRefOid: '5c08128a38265cd374dee696d0019eccf06aed3d', files: ['scripts/daemon-overlay-audit-check.mjs', 'scripts/lib/overlay-audit-evidence.mjs', X] },
+    { prNumber: 7526, headRefOid: 'a265c367f7a9008984c86bdf6a236292e5d619b4', files: ['scripts/lib/open-pr-preflight.mjs', 'scripts/lib/pr-size-admission.mjs', 'scripts/operations/open-pr-io.mjs', X] },
+  ].map((r, i) => ({ ...r, kind: 'fix', headRefName: `registry-fixture-${i}`, waitingSince: new Date(now - (10 - i) * 60000).toISOString() }));
+  let root;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'registry-pass-'));
+    vi.spyOn(settingsFiles, 'readSettings').mockReturnValue({});
+    vi.spyOn(settingsFiles, 'readDeclaredSettings').mockReturnValue({ settings: {} });
+    vi.spyOn(cascadeApi, 'cascadePolicy').mockImplementation((_name, tool, o = {}) => ({
+      ...cascadeApi.resolveCascade({ standard: o.standard, tool, platform: {}, operatorOverride: {}, valid: o.valid }), layered: tool ?? {},
+    }));
+    vi.spyOn(conflictWake, 'readOverlayConflictWakes').mockReturnValue(new Map());
+  });
+  afterEach(() => { vi.restoreAllMocks(); rmSync(root, { recursive: true, force: true }); });
+  const run = (extra = {}, entries = rows) => runReconcileFixDispatch({
+    root, repo: 'we', now, clock: () => now, stepNow: () => now, stepLog: () => {}, dryRun: false,
+    reconcile: () => ({ dispatch: entries, refusals: [] }), checkStaleness: FRESH,
+    findItemFn: () => null, loadItems: () => [], resolveFallbackScope: () => [], resolveCardScopeAtRef: () => [],
+    fetchItemlessDiffPaths: pr => entries.find(r => r.prNumber === pr)?.files ?? [X],
+    listBuildClaims: () => [], listFixClaims: () => [], pickFreeLanes: () => [901, 902],
+    resolveProfile: () => ({ capabilities: { fix: true, ciHeal: true }, canonicalPrefix: 'we', lanePoolRepo: root }),
+    prStack: null, prStackSettings: {}, netScope: null, priorityShadow: null, tryResumeRound: null, tryResume: () => ({ resumed: false }),
+    landingBlockedState: null, fixSettings: {}, loadLadder: () => [], readMainRedPriorityRecord: () => null,
+    readPushHold: () => null, dispatch: e => ({ pr: e.pr, sessionId: `fixture-${e.pr}` }), ...extra,
+  });
+  it.each(['hold-label', 'unreadable'])('R6/R7 registry: %s pre-check refuses before scope admission', code => {
+    const result = run({ readPushHold: ({ pr }) => {
+      if (pr !== 7490) return null;
+      if (code === 'unreadable') throw Error('fixture timeout');
+      return { code, reason: 'red-team:pending' };
+    } });
+    expect(result.refusals).toContainEqual(expect.objectContaining({ pr: 7490, kind: 'push-hold', why: expect.stringContaining(code) }));
+    expect(result.scopeRanks.map(r => r.pr)).toEqual([7526]); expect(result.dispatched.map(e => e.pr)).toEqual([7526]);
+  });
+  it('R9 registry pre-check is bounded; non-registry entries and overflow retain ordinary filtering', () => {
+    const entries = Array.from({ length: 12 }, (_, i) => ({ ...rows[0], prNumber: i + 1, headRefName: `fixture-${i}`, files: i < 10 ? [X] : [`scripts/ordinary-${i}.mjs`] }));
+    const reads = [], snapshots = [];
+    const out = run({ readPushHold: ({ pr }) => { reads.push(pr); return { code: 'hold-label', reason: 'fixture hold' }; },
+      stepLog: line => { if (line.includes('name=registry-precheck')) snapshots.push([...reads]); } }, entries);
+    expect(snapshots).toEqual([[1, 2, 3, 4, 5, 6, 7, 8]]);
+    expect(out.scopeRanks.map(r => r.pr).sort((a, b) => a - b)).toEqual([9, 10, 11, 12]);
+    expect(out.refusals.find(r => r.pr === 10)?.waitingOn).toEqual([{ kind: 'fix', pr: 9 }]);
+  });
+  it('P1 registry: dry run reads no hold', () => {
+    const readPushHold = vi.fn(), dispatch = vi.fn();
+    expect(run({ dryRun: true, readPushHold, dispatch }).dispatched).toEqual([]);
+    expect(readPushHold).not.toHaveBeenCalled(); expect(dispatch).not.toHaveBeenCalled();
+  });
+  it('P2 registry: hold appearing before launch holds this pass, then removes the phantom holder', () => {
+    let reads = 0;
+    const readPushHold = ({ pr }) => pr === 7490 && ++reads > 1 ? { code: 'hold-label', reason: 'red-team:pending' } : null;
+    const first = run({ readPushHold });
+    expect(first.dispatched).toEqual([]); expect(first.scopeRanks.map(r => r.pr)).toEqual([7490, 7526]);
+    expect(first.refusals).toContainEqual(expect.objectContaining({ pr: 7490, kind: 'push-hold' }));
+    expect(first.refusals).toContainEqual(expect.objectContaining({ pr: 7526, kind: 'scope-overlap' }));
+    const second = run({ readPushHold });
+    expect(second.dispatched.map(e => e.pr)).toEqual([7526]);
+    expect(second.refusals.some(r => r.waitingOn?.some(h => h.pr === 7490))).toBe(false);
+  });
+  it('P3 registry: push-held PR with a live claim still holds', () => {
+    const out = run({ readPushHold: ({ pr }) => pr === 7490 ? { code: 'hold-label', reason: 'red-team:pending' } : null,
+      listFixClaims: () => [{ heartbeatAt: new Date(now).toISOString(), meta: { pr: 7490, repo: 'we', scope: [`we:${X}`] } }] });
+    expect(out.dispatched).toEqual([]);
+    expect(out.refusals.find(r => r.pr === 7526)?.waitingOn).toEqual([{ kind: 'fix', pr: 7490 }]);
+  });
+});
 
 describe('candidate-side old smoke read isolation', () => {
   it.each(['', 'reconcile-fix-pass'])('sentinel PR + smoke marker %j skips the live hold read, gh never called', marker => {

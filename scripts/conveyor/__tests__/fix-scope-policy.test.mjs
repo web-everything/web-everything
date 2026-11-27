@@ -324,3 +324,90 @@ describe('wait only for a landing holder', () => {
     expect(run({ inMergeQueue: true }, {}, { landingHolders, stackAbove: new Map([[2, new Set([1])]]) }).planned).toHaveLength(1);
   });
 });
+
+describe('shared registry scope holds', () => {
+  const X = 'we:scripts/push-gate-allowlist.json', Y = 'we:scripts/lib/repo-scan-tests.mjs';
+  const candidate = (pr, scope = [X], age = 1, extra = {}) => entry(pr, { scope, waitingSince: new Date(NOW - age * 60000).toISOString(), ...extra });
+  const live = (pr, scope = [X], extra = {}) => claim(pr, { scope, ...extra });
+  const run = (entries, claims = [], overrides = {}, options = {}) => filterFixesByInFlightScope(entries, [], claims, {
+    now: NOW, maxWaitMinutes: null, rebaseExempt: null,
+    policy: { value: { ...policyApi.FIX_SCOPE_DEFAULTS, overlapGranularity: 'file', ...overrides }, sources: {} }, ...options,
+  });
+  it('R10 registry entries use a frozen exact WE path list', () => {
+    expect(policyApi.FIX_OVERLAP_SHARED_REGISTRY_PATHS).toEqual([X.slice(3), Y.slice(3), 'scripts/lib/settings-registry.mjs']);
+    expect(Object.isFrozen(policyApi.FIX_OVERLAP_SHARED_REGISTRY_PATHS)).toBe(true);
+    expect(policyApi.registryEntries([X, Y, 'we:scripts/lib/settings-registry.mjs', 'we:scripts/sub/push-gate-allowlist.json',
+      'plateau-app:scripts/push-gate-allowlist.json', 'we:scripts/', null, {}])).toEqual([X, Y, 'we:scripts/lib/settings-registry.mjs']);
+    expect(policyApi.registryEntries(null)).toEqual([]); expect(policyApi.registryEntries(undefined)).toEqual([]);
+  });
+  it('R1 registry wait is recorded', () => {
+    const out = run([candidate(7526)], [live(7490)]);
+    expect(out.refusals[0]).toMatchObject({ kind: 'scope-overlap', registry: X, queuePosition: 2,
+      waitingOn: [{ kind: 'fix', pr: 7490 }], why: expect.stringContaining('waiting on #7490, retried every pass') });
+  });
+  it('R2 registry order: one total order across registries; non-registry urgent keeps its slot', () => {
+    const out = run([candidate(3, [Y], 1), candidate(4, [F]), candidate(1, [X], 3), candidate(2, [X, Y], 2)], [], {}, { urgentPrs: new Set([4]) });
+    expect(out.ranks.map(r => [r.pr, r.rank])).toEqual([[4, 1], [1, 2], [2, 3], [3, 4]]);
+    expect(out.planned.map(e => e.pr)).toContain(1);
+  });
+  it.each([{ urgentPrs: new Set([2]) }, { priorityPrs: new Set([2]) }, { extra: { mainFix: true } },
+    { extra: { labels: ['fast-track'] } }, { extra: { scope: [X, F] }, score: true }])('R3 registry order: no urgent/priority/mainFix/score bypass %j', ({ extra, score, ...options }) => {
+    const entries = [candidate(2, [X], 1, extra), candidate(1, [X], 2)];
+    if (score) entries.push(candidate(3, [F]));
+    const out = run(entries, [], {}, options);
+    expect(out.planned.map(e => e.pr)).toContain(1); expect(out.refusals.find(r => r.pr === 2)?.waitingOn).toEqual([{ kind: 'fix', pr: 1 }]);
+  });
+  it.each([{ urgentPrs: new Set([2]) }, { priorityPrs: new Set([2]) }, { extra: { mainFix: true } },
+    { extra: { labels: ['priority:urgent'] } }, { directory: true }, { regionOverlap: () => ({ overlap: false }) }])('R4 registry: live claim holds with no bypass %j', ({ extra, directory, ...options }) => {
+    const out = run([candidate(2, [X], 1, extra)], [live(1, directory ? ['we:scripts/'] : [X])], { overlapGranularity: 'region' }, options);
+    expect(out.planned).toEqual([]); expect(out.refusals[0].waitingOn).toEqual([{ kind: 'fix', pr: 1 }]);
+    expect(out.scopeDecisions[0]).toMatchObject({ rule: 'overlapGranularity', why: 'shared registry: file hold, no bypass' });
+  });
+  it('R5 registry aging remains blocked without an aging-admit diagnostic', () => {
+    const out = run([candidate(2, [X], 61)], [live(1)], {}, { maxWaitMinutes: 60 });
+    expect(out.planned).toEqual([]); expect(out.agedAdmits).toEqual([]); expect(out.ranks[0]).not.toHaveProperty('agedAdmit');
+    expect(out.scopeDecisions[0].why).toContain('aging bound reached: escalated, not released');
+  });
+  it('R8 registry refusal fields: multi-registry, mixed and duplicate holders', () => {
+    const build = { heartbeatAt: new Date(NOW).toISOString(), meta: { num: '300', scope: [X] } };
+    const out = filterFixesByInFlightScope([candidate(99, [Y, X, F])], [build], [live(20), live(10, [Y]), live(10, [Y]), live(30, [F])],
+      { now: NOW, maxWaitMinutes: null, rebaseExempt: null });
+    expect(out.refusals[0]).toMatchObject({ registry: X, queuePosition: 5,
+      waitingOn: [{ kind: 'fix', pr: 10 }, { kind: 'fix', pr: 20 }, { kind: 'build', item: '300' }] });
+    expect(out.refusals[0].why).toBe(`${X} is a shared registry — waiting on #10, #20, build #300, retried every pass`);
+  });
+  it('P4 registry: TTL expires only under active-session, including build claims', () => {
+    const old = { ...live(1), heartbeatAt: new Date(NOW - 61 * 60000).toISOString(), ttlMinutes: 60 };
+    expect(run([candidate(2)], [old]).planned).toHaveLength(1);
+    expect(run([candidate(2)], [old], {}, { policy: null }).refusals).toHaveLength(1);
+    const build = { ...old, meta: { num: '300', scope: [X] } };
+    expect(filterFixesByInFlightScope([candidate(2)], [build], [], { now: NOW, maxWaitMinutes: null, rebaseExempt: null,
+      policy: { value: { ...policyApi.FIX_SCOPE_DEFAULTS }, sources: {} } }).planned).toHaveLength(1);
+  });
+  it('P5 registry: new holder head retains the session hold; release then admission', () => {
+    const entries = [candidate(2)];
+    expect(run(entries, [live(1, [X], { headSha: 'a'.repeat(40) })], {}, { holderEntries: new Map([[1, { headRefOid: 'b'.repeat(40) }]]) }).refusals[0].waitingOn)
+      .toEqual([{ kind: 'fix', pr: 1 }]);
+    expect(run(entries).planned).toEqual(entries);
+    expect(run(entries, [live(3, [F])]).planned).toEqual(entries);
+  });
+  it('refused multi-registry waiter is never a same-pass registry holder', () => {
+    const out = run([candidate(2, [X, Y], 2), candidate(3, [Y], 1)], [live(1)], { holdMode: 'pr-lifetime' });
+    expect(out.refusals.find(r => r.pr === 2).waitingOn).toEqual([{ kind: 'fix', pr: 1 }]);
+    expect(out.planned.map(e => e.pr)).toEqual([3]);
+  });
+  it('P6 registry exemptions preserved', () => {
+    expect(run([candidate(2, [X], 1, { overlapExempt: true })], [live(1)]).planned).toHaveLength(1);
+    expect(run([candidate(2)], [live(1)], {}, { rebaseExempt: () => ({ exempt: true, why: 'stale-base' }) }).planned).toHaveLength(1);
+    expect(run([candidate(2)], [live(1)], {}, { stackAbove: new Map([[2, new Set([1])]]) }).planned).toHaveLength(1);
+    const sameItem = filterFixesByInFlightScope([candidate(2, [X], 1, { itemNum: '300' })], [{ meta: { num: '300', scope: [X] } }], [],
+      { now: NOW, maxWaitMinutes: null, rebaseExempt: null });
+    expect(sameItem.planned).toHaveLength(1);
+  });
+  it('P7 registry landing-only holders retain waitForLandingHolder behavior', () => {
+    const options = { landingHolders: [{ pr: 1, scope: [X] }], regionOverlap: () => ({ overlap: true, conflict: true }), holderState: () => ({ labels: ['review:pending'] }) };
+    expect(run([candidate(2)], [], { overlapGranularity: 'region' }, options).planned).toHaveLength(1);
+    const out = run([candidate(2)], [], { overlapGranularity: 'region' }, { ...options, holderState: () => ({ labels: ['review:accepted'] }) });
+    expect(out.refusals).toHaveLength(1); expect(out.refusals[0]).not.toHaveProperty('registry');
+  });
+});
