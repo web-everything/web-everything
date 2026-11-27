@@ -1413,6 +1413,130 @@ describe('guard-bash — differential write-shape table (#2108 review r5)', () =
 });
 
 describe('guard-bash — raw PR creation loses the author stamp', () => {
+  it('denies creation across persistent-flag positions and expanded command words', () => {
+    for (const action of ['create', 'new']) {
+      for (const flags of ['-R a/b', '--repo a/b', '--hostname github.example']) {
+        for (const command of [`gh ${flags} pr ${action}`, `gh pr ${flags} ${action}`,
+          `gh pr ${action} ${flags}`, `gh ${flags} $X ${action}`, `gh pr ${flags} $X`]) {
+          expect.soft(decide(command), command).toMatch(/authored-by-actor|expansion/);
+        }
+        for (const command of [`gh ${flags} pr ${action}`, `gh pr ${flags} ${action}`, `gh pr ${action} ${flags}`]) {
+          const words = command.split(' ');
+          for (let position = 0; position < words.length; position++) {
+            for (const expansion of ['$X', '"$X"', '$(echo word)']) {
+              const variant = words.map((word, index) => index === position ? expansion : word).join(' ');
+              expect.soft(decide(variant), variant).toMatch(/authored-by-actor|expansion/);
+            }
+          }
+        }
+      }
+      for (const replacement of ['$X', '"$X"', '$(echo pr)', '`echo pr`']) {
+        for (const words of [[replacement, 'pr', action], ['gh', replacement, action], ['gh', 'pr', replacement]]) {
+          const command = words.join(' ');
+          expect.soft(decide(command), command).toMatch(/expansion/);
+        }
+      }
+      for (const redirect of ['> /dev/null', '2> /dev/null', '</dev/null']) {
+        for (const command of [`${redirect} gh pr ${action}`, `gh ${redirect} pr ${action}`,
+          `gh pr ${redirect} ${action}`, `gh pr ${action} ${redirect}`]) {
+          expect.soft(decide(command), command).toMatch(/authored-by-actor/);
+        }
+      }
+    }
+  });
+  it('allows read commands with expanded repository values and denies opaque flag words', () => {
+    for (const command of ['gh -R $R pr view 1', 'gh --repo $REPO pr list',
+      'gh pr -R $R view 1', 'gh --repo "$REPO" pr list']) {
+      expect.soft(decide(command), command).toBeNull();
+    }
+    for (const command of ['gh --$FLAG a/b pr create', 'gh -R$R pr create',
+      'gh --repo $REPO pr create', 'gh $FLAGS pr create', 'gh pr --$FLAG a/b create']) {
+      expect.soft(decide(command), command).toMatch(/expansion/);
+    }
+  });
+  it('normalizes REST creation endpoints and denies unreadable methods', () => {
+    for (const endpoint of ['repos/a/b/pulls', '/repos/a/b/pulls', 'repos/a/b/pulls?x=1',
+      'repos/a/b/pulls/', 'https://api.github.com/repos/a/b/pulls',
+      'https://github.example/api/v3/repos/a/b/pulls/?x=1', 'repos/a/b/%70ulls',
+      'repos/a/b/pulls%2F']) {
+      for (const method of ['-X POST', '--method=POST', '-f head=h', '-X "$M"', '--method=$M', '-X$M',
+        '--method "$M"', '-X "$(echo POST)"']) {
+        const command = `gh api '${endpoint}' ${method}`;
+        expect.soft(decide(command), command).toMatch(/authored-by-actor|expansion/);
+        expect.soft(decide(`RAW_PR_CREATE_OK=1 ${command}`), command).toBeNull();
+      }
+      expect.soft(decide(`gh api '${endpoint}' -X GET -f state=open`), endpoint).toBeNull();
+    }
+  });
+  it('reads API endpoints after preview and clustered value flags and fails closed on bad encoding', () => {
+    for (const command of ['gh api -p nebula repos/a/b/pulls -X POST',
+      'gh api -iH "Accept: application/json" repos/a/b/pulls -X POST',
+      'gh api -sX POST repos/a/b/pulls', 'gh api repos/a/b/%ZZ -X POST']) {
+      expect.soft(decide(command), command).toMatch(/authored-by-actor|expansion/);
+    }
+    expect(decide('gh api -p nebula repos/a/b/pulls -X GET')).toBeNull();
+  });
+  it('denies API option values that can inject a creation method or query', () => {
+    for (const command of ['gh api repos/a/b/pulls -X GET -H $HEADERS',
+      'gh api repos/a/b/pulls -X GET -f $FIELDS',
+      'gh api graphql -f \'query=query { viewer { login } }\' -H $HEADERS']) {
+      expect.soft(decide(command), command).toMatch(/expansion/);
+    }
+    expect(decide('gh api repos/a/b/pulls -X GET -H "$HEADERS"')).toBeNull();
+  });
+  it('allows GraphQL reads containing creation-related text', () => {
+    for (const query of ['query { search(query: "createPullRequest", type: ISSUE, first: 1) { issueCount } }',
+      'query { viewer { login } } # createPullRequest',
+      'mutation { addComment(input: {body: "createPullRequest"}) { clientMutationId } }']) {
+      expect.soft(decide(`gh api graphql -f 'query=${query}'`), query).toBeNull();
+    }
+    expect(decide('gh api graphql -f \'query=query { repository(owner: $owner) { name } }\' -F owner="$OWNER"')).toBeNull();
+  });
+  it('denies opaque GraphQL input without the explicit escape', () => {
+    for (const input of ['--input body.json', '--input=body.json', '--input -', '--input "$BODY"',
+      '-f query=@query.graphql', '-F query=@query.graphql', '-f query="$QUERY"']) {
+      // Isolate creation from the independent guard on opaque PR-body edits.
+      const command = `PR_BODY_STAMP_OK=1 gh api graphql ${input}`;
+      expect.soft(decide(command), command).toMatch(/expansion/);
+      expect.soft(decide(`RAW_PR_CREATE_OK=1 ${command}`), command).toBeNull();
+    }
+  });
+  it('denies GraphQL creation through fragments and ignored tokens', () => {
+    for (const query of ['mutation { createPullRequest , (input: {}) { id } }',
+      'mutation { createPullRequest\uFEFF(input: {}) { id } }',
+      'fragment NewPR on Mutation { createPullRequest(input: {}) { id } } mutation { ...NewPR }',
+      'mutation { other(input: """text \\""" more text""") { id } createPullRequest(input: {}) { id } }']) {
+      const command = `gh api graphql -f 'query=${query}'`;
+      expect.soft(decide(command), query).toMatch(/authored-by-actor/);
+      expect.soft(decide(`RAW_PR_CREATE_OK=1 ${command}`), query).toBeNull();
+    }
+  });
+  it('applies GraphQL body policy after endpoint normalization', () => {
+    for (const endpoint of ['/graphql', 'https://api.github.com/graphql',
+      'https://github.example/api/graphql/?x=1', '%67raphql']) {
+      for (const payload of ["-f 'query=mutation { createPullRequest(input: {}) { id } }'", '--input -']) {
+        const command = `PR_BODY_STAMP_OK=1 gh api '${endpoint}' ${payload}`;
+        expect.soft(decide(command), command).toMatch(/authored-by-actor|expansion/);
+        expect.soft(decide(`RAW_PR_CREATE_OK=1 ${command}`), command).toBeNull();
+      }
+      expect.soft(decide(`gh api '${endpoint}' -f 'query=query { viewer { login } }'`), endpoint).toBeNull();
+    }
+  });
+  it('inspects attached multiline GraphQL queries without treating quoted data as code', () => {
+    for (const flag of ['--raw-field=', '-f']) {
+      const command = `gh api graphql ${flag}'query=mutation {\n createPullRequest(input: {}) { id }\n}'`;
+      expect.soft(decide(command), command).toMatch(/authored-by-actor/);
+      expect.soft(decide(`RAW_PR_CREATE_OK=1 ${command}`), command).toBeNull();
+      expect.soft(decide(`gh api graphql ${flag}'query=query {\n search(query: "createPullRequest") { issueCount }\n}'`), flag).toBeNull();
+    }
+  });
+  it('preserves redirects inside command substitutions', () => {
+    for (const command of ['gh $(echo pr > /dev/null) create', 'gh pr $(echo create > /dev/null)',
+      '$(echo gh > /dev/null) pr create', 'gh -R $(echo a/b > /dev/null) pr create']) {
+      expect.soft(decide(command), command).toMatch(/expansion/);
+      expect.soft(decide(`RAW_PR_CREATE_OK=1 ${command}`), command).toBeNull();
+    }
+  });
   it('denies creation with attached redirects and preserves the explicit escape', () => {
     const cwd = mkdtempSync(join(tmpdir(), 'raw-pr-redirect-'));
     try {
@@ -1454,7 +1578,9 @@ describe('guard-bash — raw PR creation loses the author stamp', () => {
     ]) expect.soft(decide(command), command).toMatch(/authored-by-actor|expansion/);
   });
   it('names unreadable expansions and the operator fallback', () => {
-    for (const command of ['$GH pr create', 'gh pr "$SUB"']) {
+    for (const command of ['$GH pr create', 'gh pr "$SUB"',
+      '$GH api repos/a/b/pulls -X POST',
+      '$GH api graphql -f \'query=mutation { createPullRequest(input: {}) { id } }\'']) {
       expect(decide(command), command).toMatch(/expansion/);
       expect(decide(command), command).toMatch(/RAW_PR_CREATE_OK=1/);
       expect(decide(`RAW_PR_CREATE_OK=1 ${command}`), command).toBeNull();

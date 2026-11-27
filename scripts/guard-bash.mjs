@@ -4503,53 +4503,112 @@ function prePrReviewBypass(head) {
 /** Read raw creation argv without evaluating shell expansions or consulting gh configuration.
  * Keep quote provenance: '$GH' is literal text, while "$GH" is an unreadable command. */
 function rawPrCreation(head) {
-  // Unlike ordinary argv scanning, shellWords keeps whitespace INSIDE command substitutions
-  // in the same raw word (`$(printf gh)` / `\`printf gh\``), without executing it.
-  const tokens = shellWords(head).flatMap(raw => {
+  // Mask expansion-bearing words before stripping redirects across word boundaries. This keeps
+  // substitutions (and redirects inside them) opaque, while `gh > out pr create` retains its argv.
+  // Attached redirects on an opaque word remain unknown and therefore fail closed below.
+  let masked = '';
+  const opaque = new Map();
+  for (const raw of shellWords(head)) {
     const shape = argvWordShape(raw);
-    // Split attached redirects without losing quote/expansion provenance. Substitutions
-    // stay opaque: a redirect inside $(...) belongs to that nested command.
-    if (shape.dynamicAt >= 0 || shape.split) return [shape];
-    return headWords(raw, true).map(word => argvWordShape(raw.slice(word.start, word.end)));
-  });
+    if (shape.dynamicAt >= 0 || shape.split) {
+      opaque.set(masked.length, shape);
+      masked += 'x'.repeat(raw.length) + ' ';
+    } else masked += raw + ' ';
+  }
+  const tokens = headWords(masked, true).map(word => opaque.get(word.start)
+    ?? argvWordShape(masked.slice(word.start, word.end)));
   const start = wrapperPrefixLength(tokens.map(word => word.value));
   const shapes = tokens.slice(start);
   const words = shapes.map(shape => shape.value);
   const hidden = i => shapes[i]?.dynamicAt >= 0 || shapes[i]?.split;
   if (words[0]?.split('/').at(-1) !== 'gh' && !hidden(0)) return null;
   let i = 1;
-  // gh's global value flags may be separate or attached. They precede the command.
-  while (words[i]?.startsWith('-')) {
-    if (hidden(i)) return 'dynamic';
-    const flag = words[i++];
-    if (['-R', '--repo', '--hostname'].includes(flag)) {
-      if (shapes[i]?.split) return 'dynamic';
+  let uncertain = hidden(0);
+  // Persistent flags may precede either command word. A dynamic value marks a creation
+  // as unreadable, but does not turn a known `pr list/view` into a creation command.
+  const skipFlags = () => {
+    while (words[i]?.startsWith('-')) {
+      const flag = words[i];
+      const valueFlag = ['-R', '--repo', '--hostname'].includes(flag);
+      const attachedValue = /^(?:-R.|--(?:repo|hostname)=)/.test(flag);
+      if (hidden(i)) {
+        const prefix = flag.slice(0, shapes[i].dynamicAt);
+        if (!attachedValue || !/^(?:-R|--(?:repo|hostname)=)/.test(prefix)) return false;
+        uncertain = true;
+      }
       i += 1;
+      if (valueFlag) { uncertain ||= hidden(i); i += 1; }
+      if (flag === '--') break;
     }
-    if (flag === '--') break;
-  }
+    return true;
+  };
+  if (!skipFlags() || hidden(i)) return 'dynamic';
   if (words[i] === 'pr') {
-    if (hidden(i + 1)) return 'dynamic';
-    if (['create', 'new'].includes(words[i + 1])) return hidden(0) ? 'dynamic' : 'literal';
+    i += 1;
+    if (!skipFlags() || hidden(i)) return 'dynamic';
+    if (['create', 'new'].includes(words[i])) return uncertain ? 'dynamic' : 'literal';
     return null;
   }
   if (words[i] !== 'api') return null;
-  const args = words.slice(i + 1);
-  if (args.includes('graphql')) {
-    return args.some(arg => /\bcreatePullRequest\b/.test(arg)) ? 'literal' : null;
-  }
-  // Fields/input imply POST unless an explicit method overrides it. Individual-PR endpoints
-  // are edits, not creation; templated owner/repo placeholders are valid gh endpoints.
-  if (!args.some(arg => /^(?:\/)?repos\/[^/]+\/[^/]+\/pulls$/.test(arg))) return null;
+  let endpoint = null;
   let method = null;
+  let dynamicMethod = false;
+  let splitApiValue = false;
   let payload = false;
-  for (let k = 0; k < args.length; k++) {
-    const arg = args[k];
-    if (arg === '-X' || arg === '--method') method = args[++k];
-    else if (/^(?:-X.|--method=)/.test(arg)) method = arg.replace(/^(?:-X|--method=)/, '');
-    else if (/^(?:-[fF]|--(?:raw-field|field|input)(?:=|$))/.test(arg)) payload = true;
+  let opaqueInput = false;
+  const queries = [];
+  for (let k = i + 1; k < words.length; k++) {
+    const arg = words[k];
+    const option = /^(--[\w-]+)(?:=(.*))?$|^-[is]*([XfFRHqtp])(.+)?$/s.exec(arg);
+    const flag = option ? option[1] ?? `-${option[3]}` : arg;
+    const inline = option ? option[2] ?? option[4] : undefined;
+    const takesValue = ['-X', '--method', '-f', '-F', '--field', '--raw-field', '--input',
+      '-R', '--repo', '--hostname', '-H', '--header', '-q', '--jq', '-t', '--template', '--cache', '-p', '--preview'].includes(flag);
+    if (takesValue) {
+      const optionAt = k;
+      const valueAt = inline === undefined ? ++k : k;
+      const value = inline ?? words[valueAt];
+      const unreadable = hidden(optionAt) || hidden(valueAt) || value === undefined;
+      splitApiValue ||= !!shapes[valueAt]?.split;
+      if (flag === '-X' || flag === '--method') {
+        method = value;
+        dynamicMethod ||= unreadable;
+      } else if (flag === '--input') {
+        payload = true;
+        opaqueInput = true;
+      } else if (['-f', '-F', '--field', '--raw-field'].includes(flag)) {
+        payload = true;
+        if (value?.startsWith('query=')) {
+          opaqueInput ||= unreadable || value.startsWith('query=@');
+          queries.push(value.slice('query='.length));
+        } else if (unreadable && !/^[A-Za-z_]\w*=/.test(value ?? '')) opaqueInput = true;
+      }
+    } else if (hidden(k)) return 'dynamic';
+    else if (!arg.startsWith('-') && endpoint === null) endpoint = arg;
   }
-  return (method ? method.toUpperCase() === 'POST' : payload) ? 'literal' : null;
+  // Normalise once before dispatching either API kind, including GH Enterprise URL prefixes.
+  let path;
+  try {
+    path = decodeURIComponent((endpoint ?? '').replace(/^https?:\/\/[^/]+/i, '').split(/[?#]/)[0])
+      .replace(/^\/?api\/v3\//, '/').replace(/\/+$/, '');
+  } catch { return 'dynamic'; } // An unreadable encoded endpoint needs the explicit operator fallback.
+  if (/^\/?(?:api\/)?graphql$/.test(path)) {
+    if (opaqueInput || splitApiValue) return 'dynamic';
+    // GraphQL strings, block strings and comments are data, including creation-related text.
+    // Only a mutation with the actual creation field is a known inline creation.
+    const creates = queries.some(query => {
+      const code = query.replace(/"""(?:\\"""|(?!""")[\s\S])*"""|"(?:\\.|[^"\\])*"|#[^\r\n]*/g, ' ')
+        .replace(/[,\uFEFF]/g, ' ');
+      // Fragments can precede the operation that spreads them. Commas and BOMs are ignored
+      // GraphQL tokens, so neither can hide the field's argument list.
+      return /\bmutation\b/.test(code) && /\bcreatePullRequest\s*\(/.test(code);
+    });
+    return creates ? (uncertain ? 'dynamic' : 'literal') : null;
+  }
+  // Individual PR endpoints are edits; owner/repo placeholders are valid gh endpoints.
+  if (!/^\/?repos\/[^/]+\/[^/]+\/pulls$/.test(path)) return null;
+  if (dynamicMethod || splitApiValue) return 'dynamic';
+  return (method ? method.toUpperCase() === 'POST' : payload) ? (uncertain ? 'dynamic' : 'literal') : null;
 }
 
 
@@ -4816,7 +4875,7 @@ export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLi
   const creation = rawPrCreation(s)
     ?? (/^gh(?:\s|$)/.test(canon) ? rawPrCreation(canon) : null);
   if (!hasLeadingEnvEscape(s, 'RAW_PR_CREATE_OK') && creation === 'dynamic')
-    return 'raw PR creation carries a shell expansion the guard cannot read and may omit the `authored-by-actor` stamp. Write the gh command and subcommand literally and use the open-pr operation. Operator fallback: prefix `RAW_PR_CREATE_OK=1`.';
+    return 'raw PR creation carries a shell expansion or opaque API payload the guard cannot read and may omit the `authored-by-actor` stamp. Write the gh command, subcommand and API query literally, or use the open-pr operation. Operator fallback: prefix `RAW_PR_CREATE_OK=1`.';
   if (!hasLeadingEnvEscape(s, 'RAW_PR_CREATE_OK') && creation === 'literal')
     return 'raw `gh pr create` opens a PR with no `authored-by-actor` stamp, so the review gate cannot prove reviewer independence and the mandatory referral reviewer\'s rulings are ignored (plateau-app #204). Open it with `node <web-everything lane>/scripts/operations/run.mjs open-pr --ref=<branch> …` run from the target repo\'s lane clone (works for plateau-app and frontierui too), or repair an existing PR with `node scripts/pr-body-edit.mjs --pr=<n> --repair`. Escape hatch: prefix `RAW_PR_CREATE_OK=1`.';
 
