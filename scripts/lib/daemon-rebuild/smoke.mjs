@@ -180,12 +180,9 @@ export function rejectRetryDelayMs(env, attempts) {
   return Math.min(base * 2 ** Math.max(0, attempts - 1), max);
 }
 
-/** Default ON: when last-good fails every check the candidate failed, adopt the candidate as no worse.
- *  A harness fix that lives in the candidate can only ever arrive this way when the running harness also
- *  fails last-good. Set to '0' to retain the hold-on-last-good and retry-backoff behavior. */
 /** IO: `rebuildAdoptNotWorse.enabled` (daemons.rebuild.adoptNotWorse). DEFAULT OFF: a failed-smoke candidate is never
- *  adopted (hold on last-good; force-adopt is the fallback). There is NO env override (the former
- *  WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE is ignored), and the key is tighten-only in the safe-direction table.
+ *  adopted (hold on last-good; force-adopt is the fallback). There is no environment override, and the key
+ *  is tighten-only in the safe-direction table.
  *  Strict read: a read error, a duplicate owner or any value other than boolean true means false. Never throws. */
 export function resolveAdoptNotWorse(_env = process.env) {
   try {
@@ -376,10 +373,9 @@ async function resolveDispatchSmoke(opt, env) {
  *       why; `main-staleness.mjs#assertMainNotStale` keeps dispatching from that build (max-age alert, never a
  *       refusal), and the health watch's `daemon-held-on-last-good` sign notifies after 15 min.
  *   (c) to tell (b) apart from a broken HARNESS, the last-good build itself (C = `prevHead`, full smoke, no
- *       skip-unchanged) is smoked as a control: C failing every check A failed means the failure is the smoke's
- *       environment: adopt A as no worse by default so candidate harness fixes can arrive. With
- *       {@link HARNESS_BROKEN_ADOPT_NOT_WORSE_ENV} set to '0', hold as `smoke-harness-broken` with a retry
- *       backoff (never sticky), including across main moves (see `prepareRebuild`). Never blocks.
+ *       skip-unchanged) is smoked as a control: matching executed boot failures hold as `smoke-harness-broken`
+ *       with retry backoff (never sticky), including across main moves (see `prepareRebuild`). Only an explicit
+ *       boolean true from {@link resolveAdoptNotWorse} enables adoption as no worse. There is no environment override.
  * `'transient'` (env noise that survived its retries) keeps today's rule — no reject record — and also holds.
  *
  * #4126 `readyOnly` (the rebuild JOB, `rebuild-job.mjs`): a passing build is recorded as the clone's ready

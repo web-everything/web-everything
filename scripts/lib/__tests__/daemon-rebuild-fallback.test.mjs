@@ -18,18 +18,30 @@ import {
 import { tmpdir, hostname } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import * as settingsFiles from '../settings-files.mjs';
+import * as policyCascade from '../policy-cascade.mjs';
+import * as cloneLocks from '../daemon-clone-lock.mjs';
+import * as candidates from '../daemon-rebuild/candidate.mjs';
+import adoptSettings from '../../settings/rebuild-adopt-not-worse.json';
 
 import {
   rebuildClone, readRebuildState, candidateSmokeEnv, rebuildStatePath,
   candidateWorktreePath, failsSameChecks, DISPATCH_CWD_ROOT_ENV,
 } from '../daemon-rebuild.mjs';
 import { classify, directionFor, isLoosening } from '../settings-safe-direction.mjs';
-import { resolveAdoptNotWorse, budgetedRunChild, smokeCheckOfChild, smokeFailureFiles, attributeSmokeFailure } from '../daemon-rebuild/smoke.mjs';
+import { resolveAdoptNotWorse, budgetedRunChild, smokeCheckOfChild, smokeFailureFiles, attributeSmokeFailure, smokeAndAdopt } from '../daemon-rebuild/smoke.mjs';
 import { runLiveSmoke, SMOKE_CHECKS, DISPATCH_DRY_RUN_SCRIPT } from '../daemon-live-smoke.mjs';
 import { buildEntryBootScript } from '../daemon-boot-smoke.mjs';
 import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs';
 import { defaultPoolRoot } from '../lane-pool-paths.mjs';
 import { DISPATCH_CWD_ENV } from '../../operations/dispatch-lane-io.mjs';
+
+const fileReads = vi.hoisted(() => ({ fixture: null, original: null }));
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal();
+  fileReads.original = actual.readFileSync;
+  return { ...actual, readFileSync: (...args) => (fileReads.fixture ?? fileReads.original)(...args) };
+});
 
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
@@ -457,6 +469,125 @@ const rebuildCloneAdoptOn = async (options) => {
   try { return await rebuildClone(options); } finally { adoptFlag.on = false; }
 };
 
+describe('S2a audit regression guarantees', () => {
+  let root;
+  let settingsDir;
+  beforeEach(() => {
+    root = mktemp('we-s2a-audit-');
+    vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+    settingsDir = join(root, 'settings');
+    mkdirSync(settingsDir);
+    writeFileSync(join(settingsDir, 'adopt.json'), JSON.stringify(adoptSettings));
+    // Exercise the real readers against a private settings tree, never the host or checkout.
+    const checked = settingsFiles.readSettingsChecked;
+    const declared = settingsFiles.readDeclaredSettings;
+    vi.spyOn(settingsFiles, 'readSettingsChecked').mockImplementation(options =>
+      checked({ ...options, dir: settingsDir, legacyPath: null }));
+    vi.spyOn(settingsFiles, 'readDeclaredSettings').mockImplementation(() =>
+      declared({ dir: settingsDir, legacyPath: null }));
+    const cascade = policyCascade.cascadePolicy;
+    vi.spyOn(policyCascade, 'cascadePolicy').mockImplementation((policy, tool, options) =>
+      cascade(policy, tool, { ...options, platform: {}, operatorOverride: {}, log() {} }));
+  });
+  afterEach(() => { fileReads.fixture = null; vi.restoreAllMocks(); });
+
+  it.each([
+    ['tainted read with enabled:true', { value: { enabled: true }, taint: [{ source: 'fixture', reason: 'unreadable' }], duplicates: [] }, 'unreadable'],
+    ['duplicate owners with enabled:true', { value: { enabled: true }, taint: [], duplicates: [{ path: 'enabled', sources: ['a', 'b'] }] }, 'unreadable'],
+    ['reader exception', new Error('fixture read failed'), 'unreadable'],
+    ...['true', 1, '1', false, 0, null, undefined].map(enabled =>
+      [`non-true value ${String(enabled)} (${typeof enabled})`, { value: { enabled }, taint: [], duplicates: [] }, 'file']),
+    ['missing namespace', { value: undefined, taint: [], duplicates: [] }, 'file'],
+  ])('resolveAdoptNotWorse fails closed for invalid settings: %s', (_name, result, source) => {
+    settingsFiles.readSettingsChecked.mockImplementation(() => {
+      if (result instanceof Error) throw result;
+      return result;
+    });
+    expect(resolveAdoptNotWorse({})).toEqual({ enabled: false, source });
+    expect(settingsFiles.readSettingsChecked).toHaveBeenCalledTimes(1);
+    expect(settingsFiles.readSettingsChecked).toHaveBeenCalledWith({ namespace: 'rebuildAdoptNotWorse' });
+  });
+
+  it('only boolean true enables adoption (clean positive control)', () => {
+    settingsFiles.readSettingsChecked.mockReturnValue({ value: { enabled: true }, taint: [], duplicates: [] });
+    expect(resolveAdoptNotWorse({})).toEqual({ enabled: true, source: 'file' });
+  });
+
+  it('enabled setting ignores legacy env zero', () => {
+    settingsFiles.readSettingsChecked.mockReturnValue({ value: { enabled: true }, taint: [], duplicates: [] });
+    expect(resolveAdoptNotWorse({ WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' }))
+      .toEqual({ enabled: true, source: 'file' });
+  });
+
+  it('active adopt-not-worse settings instructions have no retired environment override', () => {
+    expect(adoptSettings.rebuildAdoptNotWorse.enabled).toBe(false);
+    expect(adoptSettings.$comment).not.toContain('WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE');
+    expect(adoptSettings.$comment).toContain('No environment override');
+  });
+
+  it('default-off refused control preserves last-good', async () => {
+    const prevHead = 'a'.repeat(40);
+    const target = 'b'.repeat(40);
+    const headFile = join(root, 'HEAD');
+    writeFileSync(headFile, prevHead);
+    const env = {
+      HOME: root, WE_DAEMON_STATE_DIR: join(root, 'state'),
+      WE_DAEMON_OVERLAY_DIR: join(root, 'overlays'),
+      WE_DAEMON_CLONE_LOCK_ROOT: join(root, 'locks'),
+      LANE_POOL_ROOT: join(root, 'lanes'), LANE_POOL_CANONICAL_ORIGIN: 'https://example.invalid/fixture.git',
+      WE_DISPATCH_CWD_ROOT: join(root, 'dispatch'), WE_REBUILD_SMOKE_REUSE_ENABLED: '0',
+    };
+    expect(resolveAdoptNotWorse(env).enabled).toBe(false);
+    // The real ladder and state writers run. Replace worktree/lock/process IO with bounded fixture adapters.
+    vi.spyOn(cloneLocks, 'withWriteLock').mockImplementation(async (_root, fn) => ({ ok: true, value: await fn() }));
+    vi.spyOn(candidates, 'materializeCandidate').mockImplementation(({ sha }) => ({ ok: true, path: join(root, sha) }));
+    vi.spyOn(candidates, 'removeCandidate').mockReturnValue({ ok: true });
+    const unexpectedReads = [];
+    fileReads.fixture = (file, ...args) => {
+      if (String(file).endsWith('/daemon-rebuild-settings.json')) return '{}';
+      if (!String(file).startsWith(`${root}/`)) {
+        unexpectedReads.push(String(file));
+        throw new Error('read outside fixture refused');
+      }
+      return fileReads.original(file, ...args);
+    };
+    const run = vi.fn((args, options) => {
+      expect(options.cwd).toBe(root);
+      expect(args.slice(0, 3)).toEqual(['rev-parse', '--verify', '--end-of-options']);
+      expect([`${target}^{tree}`, `${prevHead}^{tree}`]).toContain(args[3]);
+      // No tree identity is available in this fixture; never hash the running checkout for reuse.
+      return { status: 1, stdout: '', stderr: 'fixture has no reusable tree identity' };
+    });
+    const runSmoke = vi.fn(async ({ root: cwd, clock }) => {
+      const control = cwd === join(root, prevHead);
+      expect(clock()).toBe(1_000_000);
+      return { verdict: 'code', attempts: 1, smoke: { results: [{
+        ok: false, name: 'daemon-entries-boot', mayBeTransient: false,
+        detail: control ? 'skipped: rebuild smoke budget exhausted (0ms left)' : 'TypeError: fixture failure',
+        ...(control ? { budgetInterrupted: true } : { entries: [{
+          entry: 'fixture.mjs', ok: false, kind: 'import failed', rawError: 'TypeError: fixture failure',
+        }] }),
+      }] } };
+    });
+    const result = await smokeAndAdopt({
+      root, env, stEnv: env, log: { error() {} }, run, runSmoke, now: () => 1_000_000,
+      plan: { ok: true, finalSha: target, mainSha: target, inputsKey: 'fixture-inputs', applied: [] },
+      prevHead, lease: { path: join(root, 'candidate'), token: 'fixture-lease' }, overlaysBefore: [], prepAlerts: [],
+      dispatchSmoke: { settings: { dispatchSmoke: 'off' }, run: vi.fn(), match: vi.fn() },
+    });
+    expect(result).toMatchObject({ moved: false, reason: 'smoke-rejected' });
+    expect(runSmoke.mock.calls.map(([options]) => options.root)).toEqual([join(root, target), join(root, prevHead)]);
+    expect(readFileSync(headFile, 'utf8')).toBe(prevHead);
+    expect(run.mock.calls.map(([args]) => args)).toEqual([
+      ['rev-parse', '--verify', '--end-of-options', `${target}^{tree}`],
+      ['rev-parse', '--verify', '--end-of-options', `${prevHead}^{tree}`],
+    ]);
+    expect(result.alerts.some(alert => alert.kind === 'smoke-harness-broken-adopted-not-worse')).toBe(false);
+    expect(readRebuildState(root, env).held).toMatchObject({ reason: 'smoke-rejected', lastGood: prevHead });
+    expect(unexpectedReads).toEqual([]);
+  });
+});
+
 describe('smoke-harness-broken (x5wbsbc)', () => {
   it('a last-good control whose same-named rows were refused never adopts the candidate', async () => {
     const { originDir, cloneDir, env } = makeFixture();
@@ -800,6 +931,14 @@ describe('failsSameChecks', () => {
   });
 
   const bootRow = (...entries) => ({ ok: false, name: 'daemon-entries-boot', entries: entries.map(([entry, rawError, kind = 'import failed']) => ({ entry, ok: false, kind, errorClass: rawError, rawError })) });
+
+  it.each(['budgetInterrupted', 'budgetSkipped'])('rejects %s controls with otherwise matching boot evidence', flag => {
+    const candidate = bootRow(['fixture.mjs', 'TypeError: identical fixture failure']);
+    const control = bootRow(['fixture.mjs', 'TypeError: identical fixture failure']);
+    expect(failsSameChecks([candidate], [control])).toBe(true);
+    expect(failsSameChecks([candidate], [{ ...control, [flag]: true }])).toBe(false);
+    expect(failsSameChecks([candidate], [{ ...control, [flag]: false }])).toBe(true);
+  });
 
   it('true only for the same boot entry with a byte-identical raw error', () => {
     expect(failsSameChecks([bootRow(['a.mjs', 'TypeError: x at 12'])], [bootRow(['a.mjs', 'TypeError: x at 12'], ['b.mjs', 'Error: y'])])).toBe(true);
