@@ -169,6 +169,8 @@ import { closureHits, collectImportClosure } from '../lib/import-closure.mjs';
 // whole review-dispatch module), byte-identical default behavior (same wording, same `label`).
 export { assertMainNotStale } from '../lib/main-staleness.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
+import { reviewCareFloor, completeThreadReader } from '../lib/fix-review-floor.mjs';
+import { isUnderTest } from '../lib/under-test.mjs';
 import { reviewSessionSlug } from '../conveyor/review-session-slug.mjs';
 // #4194 — the added non-Claude review seats' routing (see `reviewSeatRoutes`).
 import { ADVISORY_LENSES, MANDATE_LENSES } from '../lib/jury-core.mjs';
@@ -618,6 +620,7 @@ export function dispatchReview({
   checkStaleness,
   judgeProvider = 'claude',
   careLevel = 'none', escalationReason = [], scopePaths = [],
+  readThread = isUnderTest() ? () => [] : completeThreadReader(),
   leaseHeld = () => true,
   checkoutExists = existsSync, home = homedir(),
   // #x8mpubm follow-up (live-caught 2026-09-24, review-2591/2593/2600/2599/2594/2582) — THIS FUNCTION NEVER
@@ -695,8 +698,9 @@ export function dispatchReview({
   // every dispatch regardless of what an operator's WE_DISPATCH_AGENT_ARGS sets, not something a caller opts
   // into. See `REVIEW_DISPATCH_DISALLOWED_TOOLS`'s own header for what it denies and why.
   // Operator 2026-09-29: review sessions select an explicit tier before spawning.
+  const floored = reviewCareFloor(readThread, { repo: planned.repo, pr: planned.pr });
   const tierDecision = workerTierFor({ kind: 'review', scopePaths,
-    risk: careLevel === 'high' || careLevelFromReasons(escalationReason) === 'high' ? 'high' : undefined });
+    risk: floored || careLevel === 'high' || careLevelFromReasons(escalationReason) === 'high' ? 'high' : undefined });
   const argv = buildAgentArgv({
     table: { ...tierDecision, model: tierDecision.tier },
     sessionId,
@@ -735,6 +739,7 @@ export function dispatchReview({
         reason: 'review-dispatch: inherited Claude review tier' }),
     });
     assertWrappedClaudeStarted(launched);
+    if (floored) writeLineSync(2, `review-floor: ${planned.repo}#${planned.pr} requires-review → tier ${tierDecision.tier} (handle ${launched.handle})`);
     return {
       sessionId, agentId: launched.handle, sessionSlug: planned.sessionSlug, pr: planned.pr, repo: planned.repo, repoKey: planned.repoKey, prompt,
       unknownTokens, judgeProvider, wrapped: true,
@@ -742,6 +747,7 @@ export function dispatchReview({
   }
   const stdout = String(spawnAgent(argv, { cwd: sessionCwd }) ?? '');
   const agentId = parseBackgroundedId(stdout);
+  if (floored) writeLineSync(2, `review-floor: ${planned.repo}#${planned.pr} requires-review → tier ${tierDecision.tier} (agent ${agentId})`);
   return {
     sessionId, agentId, sessionSlug: planned.sessionSlug, pr: planned.pr, repo: planned.repo, repoKey: planned.repoKey, prompt,
     unknownTokens, judgeProvider,

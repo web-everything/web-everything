@@ -1,5 +1,9 @@
-import { describe, it, expect, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { beforeEach, afterEach, describe, it, expect, vi } from 'vitest';
+import { readFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import * as reviewMarkSafety from '../repeated-finding-reset.mjs';
+import * as reviewMarkSettings from '../../lib/settings-files.mjs';
+import * as reviewMarkChain from '../../lib/fix-executor-chain.mjs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 // Legacy launch assertions use shipped policy with capacity scoring switched off.
@@ -898,4 +902,142 @@ it.each([false, true])('executor null holds reconciliation before resume or disp
   expect(out.refusals).toContainEqual(expect.objectContaining({ pr: 42, kind: 'executor-held', why: 'critical escalation requires Claude' }));
   expect(resume).not.toHaveBeenCalled();
   expect(dispatch).not.toHaveBeenCalled();
+});
+
+
+describe('a requiresReview decision is marked before every launch path and refused on post failure', () => {
+  const modPromise = import('../../lib/fix-slot-borrow.mjs').catch(() => ({}));
+  let root, post, launch, release, options, planned;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'requires-review-routing-'));
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-11-27T12:00:00Z'));
+    vi.spyOn(process, 'cwd').mockReturnValue(root);
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(reviewMarkSettings, 'readSettings').mockReturnValue({});
+    vi.spyOn(reviewMarkSettings, 'readDeclaredSettings').mockReturnValue({ settings: {}, sources: {} });
+    vi.spyOn(reviewMarkChain, 'resolveFixCriticalGlobs').mockReturnValue(['scripts/critical/**']);
+    vi.spyOn(reviewMarkSafety, 'resolveFixSafety').mockReturnValue({ value: { resetOnRepeatedFinding: false } });
+    post = vi.fn(); launch = vi.fn(() => 'pid:123'); release = vi.fn();
+    planned = { pr: 42, itemNum: '42', lane: 7, laneRef: 'lane/42-fixture', scope: ['we:scripts/ordinary.mjs'] };
+    options = { root, repo: 'we', home: root, checkoutExists: () => true, readPackageJson: () => '{}',
+      claimRoot: join(root, 'claims'), claimOwner: 'fixture', readFixClaim: () => null,
+      acquireClaim: () => ({ ok: true }), releaseClaim: release, stampRunner: vi.fn(),
+      readBrief: () => 'Fix {{PR_NUM}} {{LANE_REF}} {{LANE}} {{SCOPE}} {{SESSION_SLUG}}',
+      readPushHold: () => null, readHistoryInputs: () => null, fixSettings: {}, loadLadder: () => ({ rungs: [] }),
+      postNotice: vi.fn(), wrapFix: false, launchWrapped: vi.fn(), spawnBorrowed: launch, spawnAgent: vi.fn(),
+      mintSessionId: () => 'fixture-session', writeBorrowedPrompt: () => {
+        const path = join(root, 'prompt.md'); writeFileSync(path, 'fixture prompt'); return path;
+      },
+    };
+  });
+  afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); rmSync(root, { recursive: true, force: true }); });
+  const decision = requiresReview => ({ executor: 'codex', mode: 'direct', rung: 'codex', requiresReview });
+  const stamp = async () => {
+    const mod = await modPromise;
+    expect(typeof mod.stampAndMarkFixExecutor).toBe('function');
+    return o => mod.stampAndMarkFixExecutor(o, { post });
+  };
+  const before = (first, second) => expect(first.mock.invocationCallOrder[0]).toBeLessThan(second.mock.invocationCallOrder[0]);
+
+  it.each([true, false])('stamp posts exactly when requiresReview=%s', async flag => {
+    const stampExecutor = await stamp();
+    stampExecutor({ repo: 'we', pr: 42, kind: 'ci-heal', owner: 'fixture', lockRoot: options.claimRoot, decision: decision(flag) });
+    expect(post).toHaveBeenCalledTimes(flag ? 1 : 0);
+    if (flag) expect(post).toHaveBeenCalledWith({ repo: 'we', pr: 42, kind: 'ci-heal', rung: 'codex' });
+  });
+  it('stamp rethrows post errors', async () => {
+    const stampExecutor = await stamp(); post.mockImplementation(() => { throw Error('post denied'); });
+    expect(() => stampExecutor({ repo: 'we', pr: 42, lockRoot: options.claimRoot, decision: decision(true) })).toThrow('post denied');
+  });
+  it('cold start marks before spawnBorrowed', async () => {
+    dispatchFix(planned, { ...options, executorDecision: decision(true), stampExecutor: await stamp() });
+    expect(launch).toHaveBeenCalledTimes(1); before(post, launch);
+  });
+  it.each(['direct', 'wrapped'])('post failure releases the claim and prevents a %s launch', async mode => {
+    const stampExecutor = await stamp(); post.mockImplementation(() => { throw Error('post denied'); });
+    expect(() => dispatchFix(planned, { ...options, stampExecutor, executorDecision: { ...decision(true), mode } })).toThrow('post denied');
+    expect(launch).not.toHaveBeenCalled(); expect(options.launchWrapped).not.toHaveBeenCalled();
+    expect(options.spawnAgent).not.toHaveBeenCalled(); expect(release).toHaveBeenCalledTimes(1);
+  });
+  it.each(['codex', 'claude'])('ci-heal %s sink refuses a failed post', async executor => {
+    const mod = await modPromise; const stampExecutor = await stamp();
+    post.mockImplementation(() => { throw Error('post denied'); });
+    const sink = vi.fn();
+    const run = mod.createRoutedCiHealDispatch({ route: () => ({ ...decision(true), executor }),
+      stampExecutor, dispatch: (_p, { sinks }) => sinks.launch({ claimOwner: 'fixture', claimRoot: options.claimRoot }),
+      createSinks: ({ provider }) => ({ launch: provider ?? sink }), launchCodex: launch,
+      writePrompt: () => join(root, 'ci.md'), removePrompt: vi.fn(), profileFor: () => ({ slug: 'o/r', lanePoolRepo: root }),
+    });
+    await expect(run(planned, { repo: 'we', root })).rejects.toThrow('post denied');
+    expect(launch).not.toHaveBeenCalled(); expect(sink).not.toHaveBeenCalled();
+  });
+
+  const reconcile = async (conflict, extra = {}) => {
+    const mod = await import('../reconcile-fix-dispatch.mjs').catch(() => ({}));
+    expect(typeof mod.runReconcileFixDispatch).toBe('function');
+    const resume = vi.fn(() => ({ resumed: true, result: { pr: 42 } }));
+    const cold = vi.fn();
+    const out = mod.runReconcileFixDispatch({ root, repo: 'we', dryRun: false, now: Date.now(), clock: () => Date.now(),
+      stepNow: () => Date.now(), stepLog: vi.fn(), checkStaleness: () => ({ fresh: true, behind: 0 }),
+      reconcile: () => ({ dispatch: [{ kind: 'fix', prNumber: 42, headRefName: planned.laneRef, attempts: 1,
+        files: ['scripts/ordinary.mjs'], ...(conflict ? { labels: ['merge-status:conflicting'] } : {}) }], refusals: [], notes: [] }),
+      findItemFn: () => ({ num: '42', scope: planned.scope, specPath: 'backlog/42-fixture.md' }), loadItems: () => [],
+      resolveProfile: () => ({ capabilities: { fix: true, ciHeal: true }, canonicalPrefix: 'we' }),
+      unsupportedPath: join(root, 'unsupported.json'), readPrView: vi.fn(), resolveFallbackScope: () => planned.scope,
+      fetchItemlessDiffPaths: () => ['scripts/ordinary.mjs'], resolveCardScopeAtRef: () => planned.scope,
+      pickFreeLanes: () => [7], listBuildClaims: () => [], listFixClaims: () => [], priorityShadow: null,
+      netScope: null, prStack: null, landingBlockedState: null, notesDryRun: true,
+      readPushHold: () => null, readMainRedPriorityRecord: () => null, readLaneTips: () => new Map(),
+      fixSettings: {}, loadLadder: () => ({ rungs: [] }),
+      fixExecutorRoute: () => ({ executor: 'claude', mode: 'direct', rung: 'claude', requiresReview: true }),
+      tryResume: resume, tryResumeRound: resume, dispatch: cold, postMark: post, ...extra,
+    });
+    return { out, resume, cold };
+  };
+  it.each([true, false])('marks before successful resume (conflict=%s)', async conflict => {
+    const { out, resume, cold } = await reconcile(conflict);
+    expect(out.dispatched).toHaveLength(1); expect(post).toHaveBeenCalledTimes(1); before(post, resume);
+    expect(cold).not.toHaveBeenCalled();
+  });
+  it.each([true, false])('post failure refuses resume and cold start (conflict=%s)', async conflict => {
+    post.mockImplementation(() => { throw Error('post denied'); });
+    const { out, resume, cold } = await reconcile(conflict);
+    expect(out.refusals).toContainEqual(expect.objectContaining({ kind: 'dispatch-failed', why: expect.stringContaining('requires-review mark not posted: post denied') }));
+    expect(resume).not.toHaveBeenCalled(); expect(cold).not.toHaveBeenCalled(); expect(out.dispatched).toEqual([]);
+  });
+  it('a declined resume marks again before the cold launch, with at most two marks', async () => {
+    const stampExecutor = await stamp();
+    const resume = vi.fn(() => ({ resumed: false }));
+    const { out } = await reconcile(true, { tryResume: resume,
+      fixExecutorRoute: () => ({ ...decision(true), mode: 'wrapped' }),
+      dispatch: (p, o) => dispatchFix(p, { ...options, ...o, executorDecision: decision(true), stampExecutor }),
+    });
+    expect(out.dispatched).toHaveLength(1); expect(post).toHaveBeenCalledTimes(2);
+    before(post, resume); expect(post.mock.invocationCallOrder[1]).toBeLessThan(launch.mock.invocationCallOrder[0]);
+  });
+  it('control: no router keeps the existing resume without a mark', async () => {
+    const { out, resume } = await reconcile(true, { fixExecutorRoute: null });
+    expect(out.dispatched).toHaveLength(1); expect(resume).toHaveBeenCalledOnce(); expect(post).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['critical scope', ['we:scripts/critical/guard.mjs'], null, true, false],
+    ['incoming flag', ['we:scripts/ordinary.mjs'], decision(true), true, false],
+    ['critical post failure', ['we:scripts/critical/guard.mjs'], null, true, true],
+    ['ordinary control', ['we:scripts/ordinary.mjs'], null, false, false],
+    ['unreadable critical classification', ['we:scripts/ordinary.mjs'], null, true, false],
+  ])('repeated finding retains requiresReview: %s', async (name, scope, incoming, flag, fails) => {
+    const stampExecutor = await stamp();
+    vi.spyOn(reviewMarkSafety, 'resolveFixSafety').mockReturnValue({ value: { resetOnRepeatedFinding: true } });
+    vi.spyOn(reviewMarkSafety, 'repeatedFindingPlan').mockReturnValue({ action: 'reset' });
+    if (name === 'unreadable critical classification') reviewMarkChain.resolveFixCriticalGlobs.mockImplementation(() => { throw Error('unreadable policy'); });
+    if (fails) post.mockImplementation(() => { throw Error('post denied'); });
+    const stamped = vi.fn(stampExecutor);
+    const run = () => dispatchFix({ ...planned, scope }, { ...options, executorDecision: incoming, stampExecutor: stamped });
+    if (fails) expect(run).toThrow('post denied'); else run();
+    expect(stamped.mock.calls[0][0].decision.requiresReview).toBe(flag);
+    expect(post).toHaveBeenCalledTimes(flag ? 1 : 0);
+    if (fails) { expect(launch).not.toHaveBeenCalled(); expect(release).toHaveBeenCalledOnce(); }
+    else { expect(launch).toHaveBeenCalledOnce(); if (flag) before(post, launch); }
+  });
 });

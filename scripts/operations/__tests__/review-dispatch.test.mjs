@@ -15,7 +15,9 @@ import { tmpdir } from 'node:os';
 import { dirname, join, posix } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { afterEach, describe, it, expect, vi } from 'vitest';
+import { beforeEach, afterEach, describe, it, expect, vi } from 'vitest';
+import * as floorOutput from '../../lib/write-all-sync.mjs';
+import * as floorSettings from '../../lib/settings-files.mjs';
 import { dispatchReviewJob, runReviewJob, runReviewJobCli, createReviewJobIo } from '../review-job.mjs';
 it('job CLI forwards its high-care model and the loop spawns with that model', () => {
   const runJob = vi.fn(() => ({ refused: true }));
@@ -980,5 +982,116 @@ describe('session expectedHead binding immediately before spawn', () => {
       readBrief: () => REAL_TEMPLATE_STUB, checkStaleness: FRESH, expectedHead: 'a'.repeat(40), readExpectedHead: () => 'a'.repeat(40),
       wrapReview: false, spawnAgent: vi.fn() });
     expect(out.prompt).toContain(`PINNED HEAD: ${'a'.repeat(40)}`);
+  });
+});
+
+
+describe('a requires-review thread raises both dispatch paths to Opus', () => {
+  const mark = '<!-- dispatch requires-review: true -->';
+  const floorPath = '../../lib/fix-review-floor.mjs';
+  const floorPromise = import(floorPath).catch(() => ({}));
+  const requireFloor = async () => expect(typeof (await floorPromise).reviewCareFloor).toBe('function');
+  const head = 'a'.repeat(40);
+  const trusted = { author: { login: 'chalbert' }, body: mark };
+  let root, output;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'review-floor-dispatch-'));
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-11-27T12:00:00Z'));
+    vi.spyOn(process, 'cwd').mockReturnValue(root);
+    vi.spyOn(floorSettings, 'readSettings').mockReturnValue({});
+    vi.spyOn(floorSettings, 'readDeclaredSettings').mockReturnValue({ settings: {}, sources: {} });
+    output = vi.spyOn(floorOutput, 'writeLineSync').mockImplementation(() => {});
+  });
+  afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); rmSync(root, { recursive: true, force: true }); });
+  const fixture = async (kind, read, extra = {}) => {
+    const mod = await import(kind === 'job' ? '../review-job.mjs' : '../review-dispatch.mjs').catch(() => ({}));
+    const fn = kind === 'job' ? 'dispatchReviewJob' : 'dispatchReview';
+    expect(typeof mod[fn]).toBe('function');
+    const spawn = vi.fn(() => kind === 'job' ? 765 : 'backgrounded · abc12345 · review-42\n');
+    const options = { pr: 42, repo: 'we', root, home: root, checkoutExists: () => true, env: {}, now: Date.now(),
+      expectedHead: head, io: { liveHead: () => head, readPrThread: read }, careLevel: 'none', scopePaths: ['src/ordinary.js'],
+      ciGate: () => ({ allowed: true, headSha: head }), checkStaleness: () => ({ fresh: true, behind: 0 }),
+      resolveSettingsEnv: () => null,
+      ...(kind === 'job' ? { dir: join(root, 'jobs'), readCompletion: () => null, isAlive: () => false, spawnJob: spawn }
+        : { readThread: read, readBrief: () => 'Review {{PR}} {{REPO}} {{SESSION_SLUG}}', spawnAgent: spawn, wrapReview: false,
+          mintSessionId: () => 'minted-session', sessionCwdFor: () => join(root, 'session'), ensureSessionCwd: d => d,
+          isolateSession: () => ({ worktreeSettings: null }), resolveRoute: () => ({ provider: 'claude', model: 'sonnet' }) }), ...extra };
+    return { run: () => mod[fn](options), spawn, options };
+  };
+  const isOpus = (kind, spawn) => {
+    const args = kind === 'job' ? spawn.mock.calls[0][0].argv : spawn.mock.calls[0][0];
+    return kind === 'job' ? args.includes('--review-model=opus') : args[args.indexOf('--model') + 1] === 'opus';
+  };
+  const floorLines = () => output.mock.calls.filter(([, text]) => text.startsWith('review-floor:'));
+
+  describe.each(['job', 'session'])('%s', kind => {
+    it.each([
+      ['trusted marked', () => [trusted]], ['throwing', () => { throw Error('timeout'); }], ['non-array', () => null],
+    ])('floors a %s thread and logs after launch', async (_name, read) => {
+      await requireFloor();
+    const { run, spawn } = await fixture(kind, vi.fn(read));
+      run(); expect(spawn).toHaveBeenCalledOnce(); expect(isOpus(kind, spawn)).toBe(true);
+      expect(floorLines()).toEqual([[2, expect.stringContaining(kind === 'job' ? '(job pid 765)' : '(agent abc12345)')]]);
+      expect(output.mock.invocationCallOrder[0]).toBeGreaterThan(spawn.mock.invocationCallOrder[0]);
+      expect(floorLines()[0][1]).toContain('web-everything/web-everything#42');
+      expect(floorLines()[0][1]).not.toContain('minted-session');
+    });
+    it('a throwing spawn writes no review-floor line', async () => {
+      await requireFloor();
+    const { run, spawn } = await fixture(kind, () => [trusted]);
+      spawn.mockImplementation(() => { throw Error('spawn failed'); });
+      expect(run).toThrow('spawn failed'); expect(floorLines()).toEqual([]);
+    });
+    it.each([
+      ['untrusted mark', [{ author: { login: 'outsider' }, body: mark }], 'none', false],
+      ['high care', [], 'high', true], ['ordinary control', [], 'none', false],
+    ])('control: %s retains its current tier', async (_name, thread, careLevel, opus) => {
+      const { run, spawn } = await fixture(kind, () => thread, { careLevel }); run();
+      expect(isOpus(kind, spawn)).toBe(opus); expect(floorLines()).toEqual([]);
+    });
+    it('control: a head refusal never reads the thread or logs a floor', async () => {
+      const read = vi.fn(() => [trusted]);
+      const { run, spawn, options } = await fixture(kind, read);
+      options.io.liveHead = () => 'b'.repeat(40);
+      expect(run().refused).toBe(true); expect(read).not.toHaveBeenCalled();
+      expect(spawn).not.toHaveBeenCalled(); expect(floorLines()).toEqual([]);
+    });
+  });
+  it('control: a red session CI gate never reads the thread', async () => {
+    const read = vi.fn(() => [trusted]);
+    const { run, spawn } = await fixture('session', read, { ciGate: () => ({ allowed: false, reason: 'red', headSha: head }) });
+    expect(run().skipped).toBeTruthy(); expect(read).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled(); expect(floorLines()).toEqual([]);
+  });
+  it('wrapped session receives Opus and logs the launched handle after launch', async () => {
+    await requireFloor();
+    const launchWrapped = vi.fn(() => ({ handle: 'pid:987' }));
+    const { run, spawn } = await fixture('session', () => [trusted], { wrapReview: true, launchWrapped });
+    expect(run().agentId).toBe('pid:987'); expect(spawn).not.toHaveBeenCalled();
+    expect(launchWrapped).toHaveBeenCalledWith(expect.objectContaining({ model: 'opus' }));
+    expect(floorLines()).toEqual([[2, expect.stringContaining('(handle pid:987)')]]);
+    expect(output.mock.invocationCallOrder[0]).toBeGreaterThan(launchWrapped.mock.invocationCallOrder[0]);
+  });
+  it('wrapped refusal logs no review-floor line', async () => {
+    await requireFloor();
+    const { run } = await fixture('session', () => [trusted], { wrapReview: true,
+      launchWrapped: () => ({ refused: 'not started' }) });
+    expect(run).toThrow('not started'); expect(floorLines()).toEqual([]);
+  });
+  it('non-integer job pid never logs successful floor evidence', async () => {
+    await requireFloor();
+    const { run, spawn } = await fixture('job', () => [trusted]); spawn.mockReturnValue(null);
+    expect(run().jobPid).toBeNull(); expect(floorLines()).toEqual([]);
+  });
+  it('window: a mark after the read floors only the next job dispatch', async () => {
+    await requireFloor();
+    const thread = [];
+    const read = vi.fn(() => [...thread]);
+    const { run, spawn } = await fixture('job', read);
+    spawn.mockImplementation(() => { thread.push(trusted); return 765; });
+    run(); expect(isOpus('job', spawn)).toBe(false); expect(floorLines()).toEqual([]);
+    spawn.mockClear(); run(); expect(isOpus('job', spawn)).toBe(true);
+    expect(floorLines()).toHaveLength(1); expect(read).toHaveBeenCalledTimes(2);
+    expect(read).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', pr: 42 });
   });
 });
