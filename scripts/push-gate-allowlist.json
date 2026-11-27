@@ -152,7 +152,7 @@
     "scripts/hooks/sync-guard-clone.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":35},
     "scripts/lane-drain.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":6},
     "scripts/lane-git-diet.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":19},
-    "scripts/lane-pool.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":34},
+    "scripts/lane-pool.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push. Four added unresolved sites in qualifyPoolPrimary are read-only git probes: rev-parse --show-toplevel, rev-parse --git-dir, rev-parse --git-common-dir, and remote get-url origin; they verify primary ownership and origin before binding a named pool.","sites":38},
     "scripts/lane-resume.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":13},
     "scripts/lane-review.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":2},
     "scripts/lane-stack.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":6},
