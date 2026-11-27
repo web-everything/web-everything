@@ -1,4 +1,5 @@
 ---
+bornAs: xowzo8m
 kind: story
 size: 2
 status: open
