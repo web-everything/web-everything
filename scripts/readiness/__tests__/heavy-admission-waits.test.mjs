@@ -9,6 +9,7 @@ import {
 } from '../heavy-admission.mjs';
 
 vi.mock('../forge-remote-health.mjs', () => ({
+  peekRemoteBreaker: () => ({ open: false }),
   checkRemoteHealth: async () => ({ ok: true }),
   peekRemoteTelemetry: () => ({ activeRuns: 0, cores: 8, loadPerCore: 0.1, memFreePct: 90 }),
   recordRemoteResult: async () => {},

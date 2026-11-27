@@ -1346,8 +1346,8 @@ export async function runWithRemoteDecision({
   let targetMissing = false;
   const skipped = [];
   let decision;
-  // Default hosts share the executable probe; preserve the existing single-host health/log lifecycle.
-  decision = route(defaultTargets ? readCapability({root:remoteRoot,host:host ?? hosts[0].alias,clock,unknownOk:!externalClient}) : true);
+  // Check eligibility before target IO; read capability only after breaker and probe selection.
+  decision = route(true);
   if (decision.remote) {
     const denied = confinement();
     if (denied) {
@@ -1355,18 +1355,18 @@ export async function runWithRemoteDecision({
       log(`heavy-admission: remote (${decision.reason})\n`);
       return localFallback('confined-local', `${denied} ${oneLine(basename(remoteRoot))}`);
     }
-    const targetHealth = defaultTargets ? null : await import('./forge-remote-health.mjs');
+    const targetHealth = await import('./forge-remote-health.mjs');
     const targetHosts = defaultTargets ? [{...hosts[0],alias:host ?? hosts[0].alias}] : hosts;
     const target = await pickRemoteTarget({hosts:targetHosts,exec:targetExec,cwd,sshOptions,onSkip:entry=>skipped.push(entry),
+      breaker:alias=>targetHealth.peekRemoteBreaker({root:remoteRoot,host:alias,clock}),
       ...(!defaultTargets ? {
-        breaker:alias=>targetHealth.peekRemoteBreaker({root:remoteRoot,host:alias,clock}),
         admit:({alias})=>targetHealth.checkRemoteHealth({root:remoteRoot,settings:policy.settings.remote,clock,readTelemetry,host:alias}),
       } : {})});
     targetMissing = !target;
     if (target) {
       host = target.alias; root = target.root;
       if (!defaultTargets) log(`heavy-admission: remote.hosts=${JSON.stringify(hosts)} (${policy.sources['remote.hosts'] ?? 'standard'}); selected=${host} skipped=${JSON.stringify(target.skipped)}\n`);
-      if (!defaultTargets) decision = route(readCapability({root:remoteRoot,host,clock,unknownOk:!externalClient}));
+      decision = route(readCapability({root:remoteRoot,host,clock,unknownOk:!externalClient}));
     } else decision = {remote:false,reason:'no-healthy-remote'};
   }
   onDecision?.(decision);
@@ -1378,7 +1378,7 @@ export async function runWithRemoteDecision({
   }
   if (targetMissing) {
     recordRemoteFallback({lockRoot,reason:'no-healthy-remote',detail:JSON.stringify(skipped),cwd,argv,env,clock});
-    log('location=local reason=no-healthy-remote\n');
+    log(`location=local reason=no-healthy-remote skipped=${JSON.stringify(skipped)}\n`);
   }
   if (!decision.remote) return { handled: false };
   // Caller confinement is local evidence, not a Forge health failure. Exercise writes before

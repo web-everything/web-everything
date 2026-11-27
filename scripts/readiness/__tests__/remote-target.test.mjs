@@ -249,15 +249,29 @@ describe('remote target gate, breaker and telemetry order', () => {
     expect(dispatchHost(f)).toBe('mesa-01');
     expect(f.onDecision).toHaveBeenCalledTimes(1); expect(f.onDecision).toHaveBeenCalledWith({remote:true,reason:expect.stringMatching(/host overloaded/)});
   });
-  it('Custom-only: an open custom breaker runs local with no-healthy-remote and never contacts forge', async()=>{
-    const f=fixture({hosts:[{alias:'custom-runner',root:'/srv/forge-exec'}]});seed(f,'custom-runner');
+  it('Mesa-only: an open Mesa breaker runs local with no-healthy-remote and never contacts forge', async()=>{
+    const f=fixture({hosts:[{alias:'mesa-01',root:'/srv/forge-exec'}]});seed(f);
     expect(await runWithRemoteDecision(f)).toEqual({handled:false});
     expect(f.targetExec).not.toHaveBeenCalled();
     expect(f.readTelemetry).not.toHaveBeenCalled();
     expect(f.readCapability).not.toHaveBeenCalled();
     expect(f.remoteExec).not.toHaveBeenCalled();
     expect(logs(f)).toContain('location=local reason=no-healthy-remote');
-    expect(rows(f)).toMatchObject({reason:'no-healthy-remote',detail:JSON.stringify([{alias:'custom-runner',reason:'backoff-maxLoadPerCore'}])});
+    expect(rows(f)).toMatchObject({reason:'no-healthy-remote',detail:JSON.stringify([{alias:'mesa-01',reason:'backoff-maxLoadPerCore'}])});
+    expect(existsSync(remoteHealthFile(remoteRoot(f),'forge'))).toBe(false);
+  });
+  it('default list: an open Mesa breaker prevents every SSH probe and remote dispatch', async()=>{
+    const f=fixture();
+    f.policy=resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always',manifest:'legacy'}}});
+    expect(f.policy.settings.remote.hosts).toEqual(DEFAULT_REMOTE_HOSTS);
+    expect(f.policy.sources['remote.hosts']).toBe('standard');
+    seed(f);
+    expect(await runWithRemoteDecision(f)).toEqual({handled:false});
+    expect(f.targetExec).not.toHaveBeenCalled();
+    expect(f.readTelemetry).not.toHaveBeenCalled();
+    expect(f.remoteExec).not.toHaveBeenCalled();
+    expect(logs(f)).toContain('location=local reason=no-healthy-remote');
+    expect(rows(f)).toMatchObject({reason:'no-healthy-remote',detail:JSON.stringify([{alias:'mesa-01',reason:'backoff-maxLoadPerCore'}])});
     expect(existsSync(remoteHealthFile(remoteRoot(f),'forge'))).toBe(false);
   });
   it('Custom-only: failing telemetry runs local as no-healthy-remote with no forge fallback', async()=>{

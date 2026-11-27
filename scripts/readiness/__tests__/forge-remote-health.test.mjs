@@ -31,6 +31,12 @@ describe('read-only remote breaker peek',()=>{
   it('peekRemoteBreaker reports an open breaker without writing',()=>{
     peekBytes(JSON.stringify(state()),{open:true,reason:'backoff-maxLoadPerCore'});
   });
+  it.each(['missing','closed'])('a %s breaker needs no clock read without a backoff deadline',kind=>{
+    const root=scratch(),clock=vi.fn(()=>now);
+    if(kind==='closed')writeFileSync(remoteHealthFile(root,host),JSON.stringify(state({backoffUntil:0,trigger:''})));
+    expect(peekRemoteBreaker({root,host,clock})).toEqual({open:false});
+    expect(clock).not.toHaveBeenCalled();
+  });
   it('peekRemoteBreaker leaves an unreachable backoff closed for the ping lift',()=>{
     peekBytes(JSON.stringify(state({trigger:'forge-unreachable'})),{open:false});
   });
