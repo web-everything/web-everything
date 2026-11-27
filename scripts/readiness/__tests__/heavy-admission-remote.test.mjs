@@ -667,6 +667,26 @@ describe('runWithRemoteDecision', () => {
       pid:process.pid, ppid:process.ppid, sandbox:null});
   });
 
+  it.each(['EPERM','EACCES','EROFS'])('custom list: confinement %s falls back confined-local before any breaker, probe or telemetry', async code => {
+    const f=fixture({remote:{mode:'always',manifest:'legacy',hosts:[
+      {alias:'mesa-01',root:'/srv/forge-exec'},{alias:'forge',root:'/srv/forge-exec'}]}});
+    const cwd=join(f.lockRoot,'..'),remoteRoot=join(cwd,'remote');
+    const now=Date.parse('2026-11-26T20:00:00-05:00');
+    const targetExec=vi.fn(async()=>({code:0})),readTelemetry=vi.fn(healthyRead),readCapability=vi.fn(()=>true),onDecision=vi.fn();
+    vi.mocked(mkdtempSync).mockImplementationOnce(()=>{throw Object.assign(new Error('denied'),{code});});
+    expect(await runWithRemoteDecision({...f,cwd,clock:()=>now,env:{},hostOverloaded:()=>false,
+      targetExec,readTelemetry,readCapability,onDecision})).toEqual({handled:false});
+    expect(targetExec).not.toHaveBeenCalled();
+    expect(readTelemetry).not.toHaveBeenCalled();
+    expect(readCapability).not.toHaveBeenCalled();
+    expect(f.remoteExec).not.toHaveBeenCalled();
+    expect(readdirSync(remoteRoot)).toEqual([]);
+    expect(onDecision).toHaveBeenCalledTimes(1); expect(onDecision).toHaveBeenCalledWith(expect.objectContaining({remote:true}));
+    expect(f.log).toHaveBeenLastCalledWith(expect.stringContaining('(confined-local)'));
+    const rows=readFileSync(join(f.lockRoot,'remote-fallbacks.jsonl'),'utf8').trim().split('\n').map(JSON.parse);
+    expect(rows).toEqual([expect.objectContaining({reason:'confined-local',detail:`${code} remote`})]);
+  });
+
   it('lets a non-permission probe error fall through to normal remote health and execution', async () => {
     const f = fixture();
     const readTelemetry = vi.fn(healthyRead);

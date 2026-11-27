@@ -4,6 +4,7 @@ import { basename, join } from 'node:path';
 import { guardedPoolRoot } from './lane-pool-paths.mjs';
 import { poolNameFromLanePath } from './lane-alternates.mjs';
 import { laneGitHardeningEnv, scrubGitRepoEnv } from './lane-git-hardening.mjs';
+import { loadRepoRegistry } from './repo-registry.mjs';
 import { LEASE_FILENAME, isLeaseStale } from './lane-lease.mjs';
 
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -28,7 +29,7 @@ export function poolLaneLeased(lease, nowMs) {
 }
 
 /** Only local git metadata reads for resolution; lane evidence uses bounded, checked JSON IO. */
-export function readPoolLaneStatus({ env = process.env, nowMs = Date.now(), cwd = process.cwd(), run, readJson } = {}) {
+export function readPoolLaneStatus({ env = process.env, nowMs = Date.now(), cwd = process.cwd(), run, readJson, readRegistry = loadRepoRegistry } = {}) {
   const options = { cwd, encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024,
     env: laneGitHardeningEnv({ ...scrubGitRepoEnv(env), GIT_OPTIONAL_LOCKS: '0' }),
     stdio: ['ignore', 'pipe', 'pipe'] };
@@ -37,21 +38,31 @@ export function readPoolLaneStatus({ env = process.env, nowMs = Date.now(), cwd 
   const name = poolNameFromLanePath(checkout)
     ?? basename(run('git', ['config', '--get', 'remote.origin.url'], options).trim()).replace(/\.git$/, '');
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(name)) throw Error('invalid lane pool name');
-  const pool = join(guardedPoolRoot(checkout, env), name);
-  const entries = readdirSync(pool, { withFileTypes: true });
-  if (entries.length > 20000) throw Error('oversized lane inventory; inspect lane-pool manually');
-  const lanes = [];
-  for (const entry of entries.filter(entry => /^lane-\d+$/.test(entry.name))) {
-    if (!entry.isDirectory()) throw Error('invalid lane directory; inspect lane-pool manually');
-    const path = join(pool, entry.name);
-    let lease = null;
-    try { lease = readJson(join(path, LEASE_FILENAME)); }
-    catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-      // A disappearing directory is incomplete evidence, not a proven absent lease.
-      if (!lstatSync(path).isDirectory()) throw Error('lane disappeared during inventory');
+  const registry = readRegistry();
+  if (!Array.isArray(registry?.repos) || !registry.repos.length || registry.repos.length > 20000)
+    throw Error('invalid/oversized repo registry; inspect registry manually');
+  const names = registry.repos.map(repo => repo?.name);
+  if (names.some(value => typeof value !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(value))
+    || new Set(names).size !== names.length || !names.includes(name))
+    throw Error('invalid/incomplete repo pool registry; inspect registry manually');
+  const root = guardedPoolRoot(checkout, env), lanes = [];
+  for (const poolName of names) {
+    const pool = join(root, poolName);
+    const entries = readdirSync(pool, { withFileTypes: true });
+    if (entries.length > 20000) throw Error('oversized lane inventory; inspect lane-pool manually');
+    for (const entry of entries.filter(entry => /^lane-\d+$/.test(entry.name))) {
+      if (!entry.isDirectory()) throw Error('invalid lane directory; inspect lane-pool manually');
+      const path = join(pool, entry.name);
+      let lease = null;
+      try { lease = readJson(join(path, LEASE_FILENAME)); }
+      catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        // A disappearing directory is incomplete evidence, not a proven absent lease.
+        if (!lstatSync(path).isDirectory()) throw Error('lane disappeared during inventory');
+      }
+      if (lanes.length >= 20000) throw Error('oversized lane inventory; inspect/archive lane-pool manually');
+      lanes.push({ path, lease, leased: poolLaneLeased(lease, nowMs) });
     }
-    lanes.push({ path, lease, leased: poolLaneLeased(lease, nowMs) });
   }
   return { lanes };
 }

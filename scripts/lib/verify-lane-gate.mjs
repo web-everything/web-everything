@@ -25,6 +25,8 @@
  * discovery. Broad config/dependency/deletion changes, an unknown/empty diff, opt-out, or an oversized
  * target list need broader evidence. Broad selections on a known unsaturated host run `npx vitest run`
  * plus mandatory unscoped `node scripts/check-standards.mjs`, independent of checkout npm scripts.
+ * Checkout-backed selection refuses a missing, empty or unreadable direct validator before running tests;
+ * restore that validator, supply an explicit affected-test gate, or use CI for exhaustive verification.
  * The fallback requires a heavy-admission slot and runs always-run guards with executed-file inventory.
  * On a saturated host they stay `blocked` so ci-only can be used. Opt-out, unreadable saturation, and oversized target lists still refuse with
  * an explicit affected-test gate as the fallback. Push defaults continue to require a shrink selection.
@@ -70,7 +72,7 @@ import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { laneGitHardeningEnv, hardenLaneGitArgs } from './lane-git-hardening.mjs';
 import { SIBLING_PATHS } from '../readiness/forge-exec-siblings.mjs';
-import { readFileSync } from 'node:fs';
+import { readFileSync, opendirSync, openSync, fstatSync, readSync, closeSync, constants, realpathSync, lstatSync } from 'node:fs';
 import { relative, sep, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 // Absolute path of the wrapper beside this module: a daemon verifies a lane checkout that may not contain it yet.
@@ -83,6 +85,7 @@ import { isCardOnlyDiff, isCardPath, isDocsPath } from '../ci-card-only.mjs';
 import { queueLaneOf } from '../readiness/heavy-queue-projection.mjs';
 import { scanCommands } from './repo-scan-tests.mjs';
 import { buildReverseImportGraph, selectRelatedTests, isVitestTestFile, testDepths } from './related-test-selection.mjs';
+import { handoffHome } from './handoff-path.mjs';
 
 const defaultFileConfig = loadVerifySettingsFile();
 
@@ -589,13 +592,25 @@ function resolveGateFromBase({ base, runGit, env, scripts, fileExists, readRepoF
     if (!optOut && host?.saturated === false && host.known === true) {
       // package.json is itself a broad trigger: neither script presence nor its body is trusted here.
       const testCommand = 'npx vitest run';
-      // Sibling repos (plateau-app, frontierui) do not contain WE's check-standards script: when the caller can
+      // The IO shell supplies the checkout reader. A broad fallback must have a readable direct validator;
+      // package.json cannot authorize substituting an arbitrary npm script or omitting validation.
+      // Reader-less legacy decision callers retain their command-only selection contract below.
+      if (typeof readRepoFile === 'function') {
+        try {
+          const validator = readRepoFile('scripts/check-standards.mjs');
+          if (typeof validator !== 'string' || !validator.trim()) throw new Error('missing validator');
+        } catch {
+          return blocked([...local.reasons,
+            'Standards validator missing or unreadable: scripts/check-standards.mjs — restore the validator or supply an explicit affected-test --gate; use CI for exhaustive verification.']);
+        }
+      }
+      // Legacy command-only callers: sibling repos do not contain WE's check-standards script; when the caller can
       // tell the file is absent, use the checkout's own `check:standards` script, else skip with a logged reason.
       // Callers that cannot tell (no fileExists) keep the WE-shaped mandatory command.
       // Fail closed: only a checkout whose origin is a KNOWN non-WE constellation repo may skip or substitute;
       // WE, unknown or unreadable identity keeps the mandatory WE command (a deleted validator then fails loudly).
       const knownSibling = isKnownSiblingCheckout(runGit);
-      const hasWeStandards = !knownSibling || typeof fileExists !== 'function' || fileExists('scripts/check-standards.mjs');
+      const hasWeStandards = typeof readRepoFile === 'function' || !knownSibling || typeof fileExists !== 'function' || fileExists('scripts/check-standards.mjs');
       const ownScript = !hasWeStandards && scripts != null && [...scripts].includes('check:standards');
       const standardsCommand = hasWeStandards ? 'node scripts/check-standards.mjs' : ownScript ? 'npm run check:standards' : null;
       const reason = standardsCommand
@@ -1050,13 +1065,112 @@ export function explicitGateRefusal(gate) {
   return null;
 }
 
-/**
- * One human-readable block describing what the default gate decided — printed by `verify-lane.mjs` before the
- * gate runs, so an agent (and the operator reading its transcript) can see whether this was a SELECTED run or a
- * FULL-SUITE fallback, and why. Pure.
- * @param {{command: string, decision: object}} gate - `resolveDefaultGate`'s return value
- * @returns {string}
- */
+// Advisory evidence only: these readers never choose, run or record a gate.
+const MAX_PREP_BYTES = 128 * 1024;
+const MAX_PREP_ENTRIES = 2048;
+const safeTestPath = path => typeof path === 'string' && path.length <= 240
+  && /^[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*(?![\s\S])/.test(path)
+  && !path.split('/').some(part => part === '.' || part === '..' || part.startsWith('-'))
+  && isVitestTestFile(path);
+const cleanDiagnostic = value => stripVTControlCharacters(String(value)).replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\p{Cf}]/gu, '');
+
+function prepGateHint({ repo, runGit, prepDir }) {
+  let key, step;
+  try {
+    const slug = canonicalRepoSlug(runGit(['remote', 'get-url', 'origin']));
+    key = slug?.startsWith('github.com/') ? repoKeyForSlug(slug.slice('github.com/'.length)) : null;
+    step = /^(?:lane|fix|build|codex)\/([a-z0-9]+(?:-[a-z0-9]+)*)(?![\s\S])/.exec(runGit(['branch', '--show-current']))?.[1];
+    if (!key || !step || step.length > 120) return { reason: 'prep-identity-unavailable' };
+  } catch { return { reason: 'prep-identity-unavailable' }; }
+  try {
+    if (!lstatSync(prepDir).isDirectory()) return { reason: 'prep-unreadable' };
+    const matches = [];
+    const directory = opendirSync(prepDir);
+    try {
+      for (let count = 0; ; count++) {
+        if (count > MAX_PREP_ENTRIES) return { reason: 'prep-limit' };
+        const entry = directory.readSync();
+        if (!entry) break;
+        if (entry.name.startsWith(`${step}-prep-`) && entry.name.endsWith('.md')) matches.push(entry.name);
+      }
+    } finally { directory.closeSync(); }
+    if (matches.length !== 1) return { reason: matches.length ? 'prep-ambiguous' : 'prep-missing' };
+    const path = join(prepDir, matches[0]);
+    // Do not follow a planted link or block reading a FIFO/device. Bound the actual read as well as stat.
+    const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    let text;
+    try {
+      const stat = fstatSync(fd);
+      if (!stat.isFile()) return { reason: 'prep-unreadable' };
+      if (stat.size > MAX_PREP_BYTES) return { reason: 'prep-limit' };
+      const bytes = Buffer.alloc(MAX_PREP_BYTES + 1);
+      const length = readSync(fd, bytes, 0, bytes.length, 0);
+      if (length > MAX_PREP_BYTES) return { reason: 'prep-limit' };
+      if (length !== stat.size || fstatSync(fd).size !== stat.size) return { reason: 'prep-incomplete' };
+      text = bytes.subarray(0, length).toString('utf8');
+    } finally { closeSync(fd); }
+    if (/[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\ufffd\p{Cf}]/u.test(text)) return { reason: 'prep-invalid' };
+    const section = name => text.match(new RegExp(`^## ${name}\\n([\\s\\S]*?)(?=^## |$(?![\\s\\S]))`, 'm'))?.[1];
+    const acceptance = section('Acceptance');
+    const tiers = acceptance?.match(/^\d+\. .*Tier-1[^\n]*\n?(?:(?!^\d+\. )[\s\S])*?(?=^\d+\. |$(?![\s\S]))/gm) ?? [];
+    if (tiers.length !== 1) return { reason: 'prep-invalid' };
+    const commands = [...tiers[0].matchAll(/`([^`\n]*)`/g)].map(match => match[1]).filter(command => command.includes('vitest'));
+    if (commands.length !== 1) return { reason: 'prep-invalid' };
+    const command = commands[0].replace(/^node scripts\/readiness\/heavy-admission\.mjs run -- /, '');
+    const testFile = /^npx vitest run ([A-Za-z0-9_./-]+)(?![\s\S])/.exec(command)?.[1];
+    if (!safeTestPath(testFile)) return { reason: 'prep-invalid' };
+    const file = tiers[0].match(/^\s*File:\s*`?([^`\s]+)`?\.?\s*$/m)?.[1]?.replace(/\.$/, '');
+    if (file && file !== testFile && file !== `${key}:${testFile}`) return { reason: 'prep-invalid' };
+    const scope = section('Scope');
+    if (!scope || !scope.split(/[\s`,]+/).includes(`${key}:${testFile}`)) return { reason: 'prep-repo-mismatch' };
+    const target = join(repo, testFile);
+    const relativeTarget = relative(realpathSync(repo), realpathSync(target));
+    if (relativeTarget !== testFile.split('/').join(sep) || !lstatSync(target).isFile()) return { reason: 'prep-invalid' };
+    return { reason: 'prep-tier-1', testFile, argv: ['npx', 'vitest', 'run', testFile] };
+  } catch { return { reason: 'prep-unreadable' }; }
+}
+
+/** Refusal stays exit 3 regardless of whether advisory prep evidence is available. */
+export function selectionRequiredResult({ sha = null, gate, repo, runGit, prepDir = join(handoffHome(), 'designs') }) {
+  const hint = prepGateHint({ repo, runGit, prepDir });
+  const selectionDetail = cleanDiagnostic(describeGate(gate));
+  return { sha, status: 'selection-required', reason: 'local-selection-bound', ok: false, exitCode: 3,
+    redCause: 'refused', redCauseFiles: [], hint, selectionDetail,
+    detail: `${selectionDetail}\nlocal-selection-bound: supply --gate with an explicit affected-test command.`
+      + (hint.testFile ? ` Suggested Tier-1 gate (advisory only): --gate="npx vitest run ${hint.testFile}".`
+        : ` No prep suggestion (${hint.reason}); inspect the prep and supply --gate manually, or use CI for exhaustive verification.`) };
+}
+
+/** Read either output channel; conflicting/incomplete evidence cannot provide a suggestion. */
+export function selectionRefusalFromOutput({ status, signal, error, stdout = '', stderr = '' } = {}) {
+  if (status !== 3 || signal || error) return null;
+  const records = [];
+  for (const output of [stdout, stderr]) {
+    if (typeof output !== 'string' || output.length > MAX_PREP_BYTES) return null;
+    for (const line of output.split('\n').filter(line => line.trim().startsWith('{'))) {
+      let value;
+      try { value = JSON.parse(line); } catch { return null; }
+      if (value?.reason !== 'local-selection-bound' || value.status !== 'selection-required'
+        || value.ok !== false || value.redCause !== 'refused') return null;
+      records.push(value);
+    }
+  }
+  if (!records.length || records.some(record => JSON.stringify(record) !== JSON.stringify(records[0]))) return null;
+  const value = records[0];
+  const testFile = value.hint?.testFile;
+  const suggested = safeTestPath(testFile) && value.hint.reason === 'prep-tier-1'
+    && JSON.stringify(value.hint.argv) === JSON.stringify(['npx', 'vitest', 'run', testFile]);
+  // Reconstruct the displayed command from validated argv; never echo arbitrary prep/output command text.
+  const hint = suggested ? { reason: 'prep-tier-1', testFile, argv: ['npx', 'vitest', 'run', testFile] }
+    : { reason: /^prep-[a-z0-9-]{1,50}(?![\s\S])/.test(value.hint?.reason ?? '') ? value.hint.reason : 'prep-invalid' };
+  return { status: 'refused', ok: false, exitCode: 3, reason: 'local-selection-bound', redCause: 'refused', hint,
+    detail: (typeof value.selectionDetail === 'string' ? `${cleanDiagnostic(value.selectionDetail)}\n` : '')
+      + 'local-selection-bound: supply --gate with an explicit affected-test command.'
+      + (suggested ? ` Suggested Tier-1 gate (advisory only): --gate="npx vitest run ${testFile}".`
+        : ` No prep suggestion (${hint.reason}); inspect the prep and supply --gate manually, or use CI for exhaustive verification.`) };
+}
+
+/** Human-readable default selection and its reasons, before execution. Pure. */
 export function describeGate(gate) {
   const text = describeGateBody(gate);
   // #xgqwuq5 — say which diff the selection came from and why, right under the selected/fallback line (xpnhz4o).
@@ -1139,8 +1253,10 @@ export function alwaysRunPlan({ declared = [], fileExists, scanCommands = [], te
 /**
  * #99 — which planned guard files appear in vitest's executed-file inventory (its JSON report). Pure. A planned file
  * missing from the report was excluded or matched no test; an absent / unparseable report proves nothing, so every
- * file is missing (`reason: 'inventory-unavailable'`). A file counts as executed when it has a result entry, whatever
- * its outcome — a red guard is reported by the run's own exit code, not here.
+ * file is missing (`reason: 'inventory-unavailable'`). Supported Vitest 1.x JSON evidence requires a nonempty
+ * `assertionResults` array containing only known statuses, with at least one passed or failed assertion. Missing,
+ * malformed, unknown-status and entirely skipped/pending/todo inventories prove no execution. File status alone
+ * proves nothing; a failed assertion counts as executed, while the run's own exit code keeps verification red.
  * @param {{reportText: string|null|undefined, files: string[], cwd: string}} a
  * @returns {{executed: string[], missing: string[], reason: 'ok'|'inventory-unavailable'}}
  */
@@ -1149,9 +1265,9 @@ export function alwaysRunInventory({ reportText, files = [], cwd }) {
   try {
     const parsed = JSON.parse(String(reportText ?? ''));
     if (!parsed || !Array.isArray(parsed.testResults)) throw new Error('no testResults');
-    // A file whose every assertion was skipped / todo ran nothing: only an entry with a real result counts.
-    const ranSomething = (r) => !Array.isArray(r?.assertionResults) || !r.assertionResults.length
-      || r.assertionResults.some(a => a?.status !== 'skipped' && a?.status !== 'pending' && a?.status !== 'todo');
+    const ranSomething = (r) => Array.isArray(r?.assertionResults) && r.assertionResults.length > 0
+      && r.assertionResults.every(a => ['passed', 'failed', 'skipped', 'pending', 'todo'].includes(a?.status))
+      && r.assertionResults.some(a => a.status === 'passed' || a.status === 'failed');
     names = new Set(parsed.testResults.filter(ranSomething)
       .map(r => relative(cwd, String(r?.name ?? '')).split(sep).join('/').replace(/^\.\//, '')));
   } catch {

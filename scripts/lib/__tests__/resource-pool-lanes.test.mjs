@@ -10,7 +10,7 @@ const nowMs = 2000;
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'pool-lanes-')); pool = join(root, 'pools', 'web-everything');
   dir = join(pool, 'lane-1'); mkdirSync(dir, { recursive: true });
-  options = { env: { LANE_POOL_ROOT: join(root, 'pools') }, nowMs,
+  options = { cwd: root, readRegistry: () => ({ repos: [{ name: 'web-everything' }] }), env: { LANE_POOL_ROOT: join(root, 'pools') }, nowMs,
     run: vi.fn((command, args) => {
       if (command !== 'git') throw Error('unexpected CLI');
       return args.includes('--show-toplevel') ? join(root, '.lanes', 'web-everything', 'lane-9') : 'unused';
@@ -47,4 +47,20 @@ it('refuses malformed lease fields and clocks before expiry or reservation filte
     { ttlMinutes: null }, { ttlMinutes: 1e308 }, { renewedAt: new Date(0).toISOString() }])
     expect(() => poolLaneLeased({ ...lease, ...patch }, nowMs)).toThrow(/inspect/);
   for (const clock of [NaN, -1]) expect(() => poolLaneLeased(null, clock)).toThrow(/clock/);
+});
+
+it('all repo pools counted, including a live fixer outside the checkout pool', () => {
+  const sibling = join(root, 'pools', 'sibling', 'lane-7'); mkdirSync(sibling, { recursive: true });
+  writeFileSync(join(sibling, '.lane-lease'), JSON.stringify({ session: 'fix-7', acquiredAt: new Date(1000).toISOString() }));
+  const readRegistry = () => ({ repos: [{ name: 'web-everything' }, { name: 'sibling' }] });
+  expect(readPoolLaneStatus({ ...options, readRegistry }).lanes).toMatchObject([
+    { path: dir, leased: false }, { path: sibling, leased: true },
+  ]);
+});
+it('missing configured pool and unreadable or malformed registry refuse with an inspect fallback', () => {
+  for (const readRegistry of [() => ({ repos: [{ name: 'absent' }] }),
+    () => { throw Error('unreadable registry; inspect registry manually'); },
+    () => ({}), () => ({ repos: [] }), () => ({ repos: [{ name: '../escape' }] }),
+    () => ({ repos: [{ name: 'web-everything' }, { name: 'web-everything' }] })])
+    expect(() => readPoolLaneStatus({ ...options, readRegistry })).toThrow(/inspect|ENOENT/);
 });
