@@ -33,6 +33,7 @@ const fs = await vi.importActual('node:fs');
 const { mkdirSync, writeFileSync } = fs;
 import { execFileSync } from 'node:child_process';
 import { readPoolSource, readPoolJson, readPoolHeavyHeld, poolPidAlive, poolSourcePaths,
+  collectResourcePool, appendShadowRows,
   SOURCES, RED_TEAM_HARD_LEASE_CEILING_MS, loadPoolSettings, readPoolSettingsChecked, readPoolOverrides } from '../resource-pool-io.mjs';
 import { POOL_DEFAULTS, grantDecision, summarize } from '../resource-pool.mjs';
 import { readPoolLaneStatus } from '../resource-pool-lanes.mjs';
@@ -452,4 +453,158 @@ it('per-source dedupe retains independent fix-claim and worker evidence for the 
   expect(fix.holders).toHaveLength(1);
   expect(workers.holders[0].jobId).toBe(session);
   expect(summarize([...fix.holders, ...workers.holders])['studio.units'].held).toBe(4);
+});
+
+const validPoolSource = source => ({ source, ok: true, holders: [],
+  ...(source === 'snapshot' ? { budget: { unknown: false, units: 30 } } : {}) });
+const collectPool = (options = {}) => collectResourcePool({ env: {}, coord, paths, nowMs, host: 'fixture-host',
+  settings: { value: structuredClone(POOL_DEFAULTS), configuredMode: 'shadow', unknown: false },
+  readSource: validPoolSource, legacy: () => ({ verdict: 'admit', unknown: false }), ...options });
+const expectPoolClosed = report => {
+  expect(report.unknown).toBe(true);
+  expect(report.rows).toHaveLength(3);
+  expect(report.rows.every(row => row.unknown && row.poolDecision === 'hold')).toBe(true);
+  expect(report.digest).toContain('?/?');
+};
+
+it.each(Object.keys(SOURCES))('collector fails closed for failing, malformed or missing %s even with no holders', source => {
+  for (const broken of [() => { throw Error('source unreadable'); },
+    () => { throw Object.assign(Error('missing source'), { code: 'ENOENT' }); },
+    () => { throw Object.assign(Error('source timed out'), { code: 'ETIMEDOUT' }); },
+    () => undefined, () => null, () => ({}),
+    () => ({ source, ok: false, holders: [], error: 'bad source' }),
+    () => ({ source, ok: true, holders: null }),
+    () => ({ source: 'wrong', ok: true, holders: [] })]) {
+    const readSource = vi.fn(name => name === source ? broken() : validPoolSource(name));
+    const report = collectPool({ readSource });
+    expectPoolClosed(report);
+    expect(report.holders).toEqual([]);
+    expect(report.sources.find(row => row.source === source).ok).toBe(false);
+    expect(readSource.mock.calls.map(([name]) => name)).toEqual(Object.keys(SOURCES));
+  }
+});
+
+it.each([
+  ['null', null, 'null'], ['undefined', undefined, 'undefined'], ['str', 'str', 'str'], ['object', {}, '[object Object]'],
+  ['throwing message getter', { get message() { throw Error('getter failed'); } }, 'unprintable error'],
+  ['throwing string conversion', { toString() { throw Error('conversion failed'); } }, 'unprintable error'],
+  ['control characters', Error('bad\x1b[31m\nsource'), 'bad [31m source'],
+])('a readSource that throws %s gives an unknown report', (_label, value, error) => {
+  const readSource = vi.fn(source => { if (source === 'rounds') throw value; return validPoolSource(source); });
+  let report;
+  expect(() => { report = collectPool({ readSource }); }).not.toThrow();
+  expectPoolClosed(report);
+  expect(report.sources.find(row => row.source === 'rounds')).toMatchObject({ ok: false, error });
+  expect(readSource.mock.calls.map(([name]) => name)).toEqual(Object.keys(SOURCES));
+});
+
+it.each([{ class: 0 }, { class: 4 }, { class: '3' }, { size: 0 }, { size: 3 }, { size: '2' }, { source: 'wrong' }])(
+  'collector invalidates a source with malformed holder %j', patch => {
+    const report = collectPool({ readSource: source => ({ ...validPoolSource(source), holders: source === 'fix'
+      ? [{ resource: 'studio.units', source, kind: 'fix', class: 3, size: 2, ...patch }] : [] }) });
+    expectPoolClosed(report);
+    expect(report.sources.find(row => row.source === 'fix').ok).toBe(false);
+    expect(report.holders).toEqual([]);
+  });
+
+it.each([
+  ['missing budget', undefined], ['null budget', null], ['empty budget', {}],
+  ['unknown', { unknown: true, units: 30 }], ['missing unknown', { units: 30 }],
+  ['null unknown', { unknown: null, units: 30 }], ['false-like unknown', { unknown: 0, units: 30 }],
+  ...[undefined, null, -1, 31, 999, 1.5, NaN, Infinity, '30'].map(units =>
+    [`invalid units ${String(units)}`, { unknown: false, units }]),
+])('collector fails closed for snapshot budget: %s', (_label, budget) => {
+  const report = collectPool({ readSource: source => ({ ...validPoolSource(source),
+    ...(source === 'snapshot' ? { budget } : {}) }) });
+  expectPoolClosed(report);
+  expect(report.sources.find(row => row.source === 'snapshot'))
+    .toMatchObject({ ok: false, error: 'invalid source result' });
+  expect(report.sources.filter(row => row.source !== 'snapshot').every(row => row.ok)).toBe(true);
+  expect(report.holders).toEqual([]);
+});
+
+it.each([0, 30])('collector accepts snapshot budget endpoint %i as known evidence', units => {
+  const report = collectPool({ readSource: source => ({ ...validPoolSource(source),
+    ...(source === 'snapshot' ? { budget: { unknown: false, units } } : {}) }) });
+  expect(report.unknown).toBe(false);
+  expect(report.sources.every(row => row.ok)).toBe(true);
+  expect(report.budgets['studio.units']).toBe(units);
+  expect(report.rows.every(row => !row.unknown && row.poolDecision === (units === 0 ? 'hold' : 'grant'))).toBe(true);
+});
+
+it('unknown settings hold every pool decision even with complete sources', () => {
+  expectPoolClosed(collectPool({ settings: { value: structuredClone(POOL_DEFAULTS), unknown: true } }));
+});
+
+it('duplicate fix jobId across claim and workers counts once while unrelated and unidentified jobs remain', () => {
+  const report = collectPool({ readSource: source => ({ ...validPoolSource(source),
+    holders: ['fix', 'workers'].includes(source) ? [
+      { resource: 'studio.units', source, kind: 'fix', class: 3, size: 2, jobId: 'same-job' },
+      { resource: 'studio.units', source, kind: 'fix', class: 3, size: 2, jobId: `${source}-other` },
+      { resource: 'studio.units', source, kind: 'fix', class: 3, size: 2 },
+    ] : [] }) });
+  expect(report.unknown).toBe(false);
+  expect(report.holders).toHaveLength(5);
+  expect(report.summary['studio.units'].classes[3]).toBe(10);
+});
+
+it('same fix jobId in different repos stays counted while each claim/worker pair deduplicates', () => {
+  const report = collectPool({ readSource: source => ({ ...validPoolSource(source),
+    holders: ['fix', 'workers'].includes(source) ? ['owner/first', 'owner/second'].map(repo => ({
+      resource: 'studio.units', source, kind: 'fix', class: 3, size: 2, jobId: 'same-job', repo,
+    })) : [] }) });
+  expect(report.unknown).toBe(false);
+  expect(report.holders.map(holder => holder.repo)).toEqual(['owner/first', 'owner/second']);
+  expect(report.summary['studio.units'].classes[3]).toBe(4);
+});
+
+it('legacy throw produces unknown comparison without changing pool admission', () => {
+  const normal = collectPool(), legacy = vi.fn(() => { throw Error('legacy unavailable'); });
+  const failed = collectPool({ legacy });
+  expect(failed.unknown).toBe(false);
+  expect(failed.rows).toEqual(normal.rows.map(row => ({ ...row, legacyDecision: 'unknown' })));
+  expect(legacy.mock.calls.map(([args]) => args)).toEqual(['review', 'review', 'fix']
+    .map(kind => ({ kind, env: {}, nowMs, root: coord })));
+});
+
+it('collector emits exactly review, redTeam, fix and appends three rows', () => {
+  const report = collectPool();
+  expect(report.unknown).toBe(false);
+  expect(report.rows.map(row => row.kind)).toEqual(['review', 'redTeam', 'fix']);
+  expect(report.rows.map(row => [row.class, row.host, row.ts])).toEqual([2, 2, 3]
+    .map(priority => [priority, 'fixture-host', new Date(nowMs).toISOString()]));
+  expect(report.rows.every(row => row.poolDecision === 'grant' && row.legacyDecision === 'grant')).toBe(true);
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(nowMs);
+  try { expect(appendShadowRows(report.rows, { coord, env: {}, mode: report.mode })).toBe(true); }
+  finally { clock.mockRestore(); }
+  const lines = fs.readFileSync(join(coord, 'resource', 'pool-shadow.jsonl'), 'utf8').trimEnd().split('\n');
+  expect(lines).toHaveLength(3);
+  expect(lines.map(line => JSON.parse(line))).toEqual(report.rows);
+});
+
+it('off mode appends nothing', () => {
+  const append = vi.fn();
+  expect(appendShadowRows(collectPool().rows, { coord, env: {}, mode: 'off', append })).toBe(false);
+  expect(append).not.toHaveBeenCalled();
+  expect(fs.existsSync(join(coord, 'resource', 'pool-shadow.jsonl'))).toBe(false);
+});
+
+it.each([['false result', () => false], ['throw', () => { throw Error('disk full'); }]])(
+  'append failure returns false without throwing or continuing: %s', (_label, fail) => {
+    const append = vi.fn(fail);
+    expect(appendShadowRows(collectPool().rows, { coord, env: {}, append })).toBe(false);
+    expect(append).toHaveBeenCalledTimes(1);
+  });
+
+it.each([false, true])('collector performs zero writes with a pre-existing shadow ledger=%s', present => {
+  const ledger = join(coord, 'resource', 'pool-shadow.jsonl');
+  if (present) fs.writeFileSync(ledger, 'malformed ledger; never admission evidence');
+  guard.active = true;
+  try {
+    expect(collectPool()).toEqual(collectPool());
+    expect(guard.writes).toEqual([]);
+    expect(guard.children).toEqual([]);
+    expect(fs.existsSync(ledger)).toBe(present);
+    if (present) expect(fs.readFileSync(ledger, 'utf8')).toBe('malformed ledger; never admission evidence');
+  } finally { guard.active = false; }
 });
