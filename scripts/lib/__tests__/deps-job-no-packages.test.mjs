@@ -125,6 +125,33 @@ describe('bounded dependency syntax evidence (hermetic fixtures)', () => {
     expect(packageImports('entry.mjs', f.read, f)).toEqual(['entry.mjs -> external']);
   });
 
+  it.each(['require', 'import'])('reports an absolute node_modules startup load through %s as a package', (load) => {
+    const f = syntaxFixture({ 'entry.mjs': '', 'node_modules/external/index.mjs': '' });
+    const specifier = resolve(f.root, 'node_modules/external/index.mjs');
+    writeFileSync(resolve(f.root, 'entry.mjs'), `${load}(${JSON.stringify(specifier)});`);
+    expect(inspectImports('entry.mjs', f).packages).toEqual([`entry.mjs -> ${specifier}`]);
+    expect(f.read).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['require', 'import'])('reports a file URL node_modules startup load through %s as a package', (load) => {
+    const f = syntaxFixture({ 'entry.mjs': '', 'node_modules/external/index.mjs': '' });
+    const specifier = pathToFileURL(resolve(f.root, 'node_modules/external/index.mjs')).href;
+    writeFileSync(resolve(f.root, 'entry.mjs'), `${load}(${JSON.stringify(specifier)});`);
+    expect(inspectImports('entry.mjs', f).packages).toEqual([`entry.mjs -> ${specifier}`]);
+    expect(f.read).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['absolute path', 'file URL'])('reports a non-local startup package loaded by %s without reading outside the root', (form) => {
+    const f = syntaxFixture({ 'repo/entry.mjs': '', 'packages/external/index.mjs': '' });
+    const target = resolve(f.root, 'packages/external/index.mjs');
+    const specifier = form === 'file URL' ? pathToFileURL(target).href : target;
+    const repoRoot = resolve(f.root, 'repo');
+    writeFileSync(resolve(repoRoot, 'entry.mjs'), `require(${JSON.stringify(specifier)}); import(${JSON.stringify(specifier)});`);
+    const read = vi.fn((path) => readFileSync(resolve(repoRoot, path), 'utf8'));
+    expect(inspectImports('entry.mjs', { ...f, root: repoRoot, read }).packages).toEqual([`entry.mjs -> ${specifier}`]);
+    expect(read.mock.calls).toEqual([['entry.mjs', 4 * 1024 * 1024]]);
+  });
+
   it.each([
     "import('external' + '');",
     'import(packageName);',

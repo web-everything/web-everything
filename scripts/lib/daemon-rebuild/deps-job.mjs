@@ -83,14 +83,22 @@ export function inspectDepsImports(entry, { root: repoRoot, read, now, syntax: t
     if (!path || path === '..' || path.startsWith('../') || isAbsolute(path)) refuse(`outside-root: ${absolute}`);
     return path;
   };
+  const classifyAbsolute = (absolute, name) => {
+    const path = relative(repoRoot, absolute);
+    // Installed packages and external sources are dependencies, even when their
+    // specifier is a path or URL. Report them without reading outside the closure.
+    if (path === '..' || path.startsWith('../') || isAbsolute(path)
+      || resolve(absolute).split(/[\\/]/).includes('node_modules')) return { package: name };
+    return { local: localPath(absolute) };
+  };
   const classify = (name, path) => {
     if (isBuiltin(name)) return { builtin: true };
     if (name.startsWith('./') || name.startsWith('../')) return { local: localPath(resolve(repoRoot, dirname(path), name)) };
-    if (isAbsolute(name)) return { local: localPath(name) };
+    if (isAbsolute(name)) return classifyAbsolute(name, name);
     if (name.startsWith('file:')) {
       let absolute;
       try { absolute = fileURLToPath(name); } catch (error) { refuse(`invalid-file-url: ${error.message}`); }
-      return { local: localPath(absolute) };
+      return classifyAbsolute(absolute, name);
     }
     if (!name || /^[a-zA-Z][\w+.-]*:/.test(name)) refuse(`unsupported-specifier: ${name}`);
     return { package: name };
