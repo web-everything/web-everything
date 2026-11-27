@@ -2174,7 +2174,7 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     let elapsed = 0;
     const planner = vi.spyOn(reconcilePass, 'runReconcilePass').mockImplementation(() => {
       elapsed += 1000;
-      return planOf({ dispatch: [{ kind: 'ci-heal', prNumber: 7, headRefOid: 'abc' },
+      return planOf({ dispatch: [{ kind: 'ci-heal', admission: { admitted: true }, prNumber: 7, headRefOid: 'abc' },
         { kind: 'promote-draft', prNumber: 8, headRefOid: 'def', baseRefName: 'main' }] });
     });
     return { planner, dispatch, promote, checkStaleness, timeoutHold, readHeadCheckState, live,

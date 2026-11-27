@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createDispatchThrottle, resolveFixBorrowSettings } from '../dispatch-throttle.mjs';
-import { createFixBorrowGate, BORROW_REASON } from '../fix-slot-borrow.mjs';
+import { createFixBorrowGate, createRoutedCiHealDispatch, BORROW_REASON } from '../fix-slot-borrow.mjs';
 import { runReconcileFixDispatch } from '../../conveyor/reconcile-fix-dispatch.mjs';
 import { acquireFixDispatchClaim, releaseFixDispatchClaim } from '../../conveyor/fix-dispatch-claim.mjs';
 import { planBuildDispatch, BUILD_DISPATCH_POLICY } from '../../conveyor/build-dispatch-policy.mjs';
@@ -228,4 +228,22 @@ describe('routed Codex outcomes', () => {
     expect(mergeOntoFor({ isConflict: true, baseRefName: '' })).toBe('@pr-base');
     expect(mergeOntoFor({})).toBeNull();
   });
+});
+
+
+it('an admitted row launches through createRoutedCiHealDispatch', async () => {
+  const launch = vi.fn(() => ({ pr: 7, sessionSlug: 'ci-heal-7' }));
+  const stampExecutor = vi.fn();
+  const dispatch = vi.fn(async (planned, { sinks }) => sinks.launch({ claimOwner: 'fixture', planned }));
+  const routed = createRoutedCiHealDispatch({ dispatch,
+    route: () => ({ executor: 'claude', mode: 'native', reason: 'fixture' }),
+    createSinks: () => ({ launch }), stampExecutor,
+  });
+  const row = { pr: 7, laneRef: 'lane/7-repair', headRefOid: 'a'.repeat(40), scope: [],
+    admission: { admitted: true, classes: ['real'], basis: 'real' } };
+  expect(await routed(row, { root: '/repo', repo: 'we' })).toEqual({ pr: 7, sessionSlug: 'ci-heal-7' });
+  expect(dispatch).toHaveBeenCalledWith(row, expect.objectContaining({ sinks: expect.any(Object) }));
+  expect(launch).toHaveBeenCalledTimes(1);
+  expect(launch).toHaveBeenCalledWith(expect.objectContaining({ planned: row }));
+  expect(stampExecutor).toHaveBeenCalledWith(expect.objectContaining({ pr: 7, kind: 'ci-heal' }));
 });
