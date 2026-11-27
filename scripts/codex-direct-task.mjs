@@ -719,8 +719,8 @@ export function detachedGateExecFn(bin, args, opts = {}) {
       ...spawnOpts } = opts;
     const child = nodeSpawn(bin, args, { ...spawnOpts, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
     process.emit('lane-lease-worker-started', child.pid);
-    child.once('exit', () => process.emit('lane-lease-worker-stopped', child.pid));
-    const output = { stdout: [], stderr: [] };
+    child.on('exit', () => process.emit('lane-lease-worker-stopped', child.pid));
+    const output ={ stdout: [], stderr: [] };
     const sizes = { stdout: 0, stderr: 0 };
     let failure;
     let timer;
@@ -1087,7 +1087,8 @@ export async function runCodexDirectExec({
       return;
     }
     process.emit('lane-lease-worker-started', child.pid);
-    child.once('exit', () => process.emit('lane-lease-worker-stopped', child.pid));
+    // `on`, not `once`: injected test doubles implement only `on`, and a child emits `exit` at most once.
+    child.on('exit', () => process.emit('lane-lease-worker-stopped', child.pid));
     let out = '';
     let err = '';
     let timer = null;
