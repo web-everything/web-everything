@@ -80,17 +80,45 @@ const wellFormed = (r) => !!r && typeof r === 'object' && !Array.isArray(r) && t
   && (r.phase !== 'operator-reset' || resetValid(r))
   && (!['would-do', 'intent', 'did'].includes(r.phase) || (prHeadValid(r.prHead)
     && typeof r.key === 'string' && r.key.startsWith(`${r.prHead}:`) && typeof r.action === 'string' && r.action !== ''));
+// Lifetime evidence cannot be truncated to a recent tail. Exhaustion holds for operator reconciliation.
+const AUDIT_MAX_BYTES = 8 * 1024 * 1024;
 /** EVERY audit record (all months: the per-head cap and once-per-head asks are lifetime rules). `complete:false` when a
- *  file or line cannot be read: the caller then plans nothing. @returns {{records:object[], complete:boolean}} */
+ *  file or line cannot be read: the caller then plans nothing. Issues name physical lines, including blank rows.
+ *  @returns {{records:object[], complete:boolean, issues:string[]}} */
 export function readAuditHistory(dir) {
-  const records = []; let complete = true; let names = [];
-  try { names = readdirSync(dir).filter((n) => /^\d{4}-\d{2}\.jsonl$/.test(n)).sort(); } catch (e) { if (e?.code !== 'ENOENT') complete = false; }
+  const records = [], issues = []; let complete = true; let names = []; let bytes = 0; let omitted = 0;
+  const issue = text => { complete = false; if (issues.length < 20) issues.push(text); else omitted += 1; };
+  try { names = readdirSync(dir).filter((n) => /^\d{4}-\d{2}\.jsonl$/.test(n)).sort(); }
+  catch (e) { if (e?.code !== 'ENOENT') issue('audit directory: unreadable listing'); }
   for (const n of names) {
-    let text = '';
-    try { text = readFileSync(join(dir, n), 'utf8'); } catch { complete = false; continue; }
-    for (const l of text.split('\n').filter((x) => x.trim())) { try { const r = JSON.parse(l); if (wellFormed(r)) records.push(r); else complete = false; } catch { complete = false; } }
+    let text = ''; let fd;
+    try {
+      fd = fs.openSync(join(dir, n), 'r');
+      const stat = fs.fstatSync(fd);
+      if (!stat.isFile()) { issue(`${n}: unreadable audit file (not a regular file)`); continue; }
+      if (stat.size > AUDIT_MAX_BYTES - bytes) { issue(`${n}: oversized input; inspect full lifetime audit (${AUDIT_MAX_BYTES} byte limit)`); break; }
+      // Bound the actual read too: growth after stat must never turn into an unbounded allocation/read.
+      const buffer = Buffer.alloc(AUDIT_MAX_BYTES - bytes + 1); let length = 0;
+      while (length < buffer.length) {
+        const got = fs.readSync(fd, buffer, length, buffer.length - length, null);
+        if (!got) break;
+        length += got;
+      }
+      bytes += length;
+      if (bytes > AUDIT_MAX_BYTES) { issue(`${n}: oversized input; inspect full lifetime audit (${AUDIT_MAX_BYTES} byte limit)`); break; }
+      text = buffer.subarray(0, length).toString('utf8');
+    } catch { issue(`${n}: unreadable audit file`); continue; }
+    finally { if (fd !== undefined) fs.closeSync(fd); }
+    for (const [index, l] of text.split('\n').entries()) {
+      if (!l.trim()) continue;
+      try {
+        const r = JSON.parse(l);
+        if (wellFormed(r)) records.push(r); else issue(`${n}:${index + 1}: invalid audit record`);
+      } catch { issue(`${n}:${index + 1}: invalid JSON`); }
+    }
   }
-  return { records, complete };
+  if (omitted) issues.push(`${omitted} additional corrupt rows; inspect full audit`);
+  return { records, complete, issues };
 }
 export function appendAudit(dir, now, records) {
   if (!records.length) return;
@@ -348,7 +376,22 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
   finally { if (locked) { try { unlinkSync(lock); } catch (e) { failed(e); } } }
   async function commit() {
   // Fail closed: an unreadable PR, file list or audit history means NO action this pass.
-  const { records: history, complete: historyOk } = readAuditHistory(outDir);
+  const { records: history, complete: historyOk, issues: historyIssues } = readAuditHistory(outDir);
+  if (!historyOk) {
+    const location = String(outDir).replace(/[\x00-\x1f\x7f-\x9f]/g, '');
+    const reason = `audit history incomplete: ${historyIssues.join('; ')}; operator must inspect and repair the audit in ${location}, preserving all lifetime action records, then rerun the sweep; actions remain blocked until history is complete`;
+    base.errors.push(reason);
+    // The digest consumes operator items, independently of effect admission. Bind the hold to each observed PR head.
+    for (const pr of raw.prs.filter(readable)) {
+      const head = pr.headRefOid.toLowerCase(); const prHead = `${pr.repo}#${pr.number}@${head}`;
+      items.push({ repo: pr.repo, pr: pr.number, head, prHead, title: pr.title, state: 'audit-history-incomplete',
+        lane: 'operator', action: 'repair-audit-history', key: `${prHead}:audit-history-incomplete`,
+        // Feed reasons are capped including the state prefix. Keep repair guidance visible there;
+        // physical locations belong in evidence, while the pass error above retains the complete diagnostic list.
+        reason: 'audit history incomplete; operator must repair, preserve counts, rerun',
+        evidence: historyIssues.slice(0, 3) });
+    }
+  }
   for (const { context, metadata, status, ownerAlive } of pending) {
     const restarts = spending(afterRestartResets(history)).filter(h => h.prHead === metadata.prHead && h.action === 'restart-red-team');
     const latest = restarts.length ? restarts.reduce((latest, h) => Math.max(latest, Date.parse(h.ts)), -Infinity) : null;
@@ -386,7 +429,7 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
       lanes: Object.fromEntries(['system', 'policy', 'operator'].map((l) => [l, items.filter((i) => i.lane === l).length])) },
     ...plan.act.filter(i => !live(i)).map((i) => ({ ts, phase: 'would-do', mode: cfg.mode, ...note, ...i })),
     ...plan.held.map((i) => ({ ts, phase: 'would-skip', mode: cfg.mode, ...i })).filter(fresh),
-    ...items.filter((i) => i.lane === 'operator' && (!incomplete || i.fileList?.state === 'file-list-over-cap'))
+    ...items.filter((i) => i.lane === 'operator' && (!incomplete || i.fileList?.state === 'file-list-over-cap' || i.action === 'repair-audit-history'))
       .map((i) => ({ ts, phase: 'operator', mode: cfg.mode, ...i })).filter(fresh),
   ];
   // An action that is not durably recorded would escape the rate limits next pass: an unwritten log plans nothing.

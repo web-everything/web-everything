@@ -3,12 +3,14 @@
  *   rate limits, and the hard rule that shadow mode makes ZERO GitHub writes.
  */
 import { AUTOMATION_LOGINS } from '../../lib/marker-authorship.mjs';
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import * as redTeamGate from '../../lib/red-team-gate.mjs';
+import * as roundJudge from '../round-judge-shadow.mjs';
 import fs from 'node:fs';
 import { mkdtempSync, rmSync, readFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { resolveStallSweepSettings, runStallSweep, planStallActions, stallSweepDir, strictGh, strictDrainText, STALL_SWEEP_DEFAULTS } from '../pr-stall-sweep.mjs';
+import { resolveStallSweepSettings, runStallSweep, readAuditHistory, planStallActions, stallSweepDir, strictGh, strictDrainText, STALL_SWEEP_DEFAULTS } from '../pr-stall-sweep.mjs';
 import { resetCascadeLogForTest } from '../../lib/policy-cascade.mjs';
 import { judgeRound } from '../../lib/round-judge.mjs';
 import { createPrSweepReader } from '../../operations/pr-sweep-io.mjs';
@@ -1328,5 +1330,117 @@ describe('R804 restart-only live acceptance', () => {
     const { dispatchRestart } = await run({ dir });
     expect(dispatchRestart).toHaveBeenCalledTimes(1);
     expect(lines(dir).filter(r => r.phase === 'did' && r.ts === new Date(NOW).toISOString())).toMatchObject([{ key, prHead }]);
+  });
+});
+
+
+describe('audit history repair digest (BLD-8039)', () => {
+  const prHead = `${REPO}#11@${HEAD}`;
+  const receipt = (n) => ({ ts: old, phase: 'intent', action: n === 1 ? 'restart-red-team' : 'tooling-card', prHead,
+    key: `${prHead}:historical-${n}` });
+  beforeEach(() => {
+    vi.useFakeTimers(); vi.setSystemTime(NOW);
+    // These resolvers otherwise read the live checkout/platform policy, even with sweep settings injected.
+    vi.spyOn(redTeamGate, 'readConfirmedBreaks').mockReturnValue({ value: {}, source: 'fixture' });
+    vi.spyOn(roundJudge, 'resolveRoundJudgeMode').mockReturnValue({ maxGrants: 1, line: 'fixture' });
+  });
+  afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
+  const fixture = () => {
+    const dir = auditDir(); mkdirSync(dir, { recursive: true });
+    const file = join(dir, '2026-09.jsonl');
+    const valid = [receipt(1), receipt(2)];
+    const write = middle => writeFileSync(file, `${JSON.stringify(valid[0])}\n${middle}\n${JSON.stringify(valid[1])}\n`);
+    const dispatchRestart = vi.fn(async () => ({ status: 'dispatched', jobPid: 24680 }));
+    const run = () => runStallSweep({ now: NOW, env: {}, dir, force: true, log: () => {},
+      settings: shadow({ actionModes: { 'restart-red-team': 'on' }, maxActionsPerPrHead: 2, maxRedTeamRestartsPerHead: 2 }),
+      gh: () => { throw Error('unexpected gh'); }, readFiles: () => ['fixture.mjs'],
+      read: () => ({ now: NOW, stalledAfterSource: 'fixture', unreadable: [], liveJobs: [], drainSkips: [],
+        prs: [{ ...PRS[0], repo: REPO, labels: [{ name: 'red-team:pending' }], comments: [], labelEvents: [], headCommittedAt: old }] }),
+      readRedTeamStatus: () => ({ repo: REPO, pr: 11, head: HEAD, status: 'running', startedAt: old,
+        host: 'fixture-host', pidNamespace: 'fixture-ns', pid: 12345, pidStart: 'fixture-start' }),
+      readStatusAt: () => NOW,
+      probe: { host: 'fixture-host', namespace: 'fixture-ns', isAlive: () => false, readPidStart: () => 'fixture-start' },
+      readPrHead: () => HEAD, abandonStaleRun: () => ({ ok: true }), planRestartRecovery: () => ({ abandon: false, mode: 'fresh' }),
+      dispatchRestart });
+    const digest = out => publishStalledDigest(out, { now: NOW, env: {}, stateDir: join(dir, 'digest'),
+      feedPath: join(dir, '..', 'needs-you-events.jsonl'), traceStateDir: null,
+      notify: () => ({ ok: true }), enqueue: () => {}, drain: () => {} });
+    const held = out => {
+      expect(out.incomplete).toBe(true); expect(out.act).toEqual([]);
+      expect(dispatchRestart).not.toHaveBeenCalled();
+      expect(out.records.some(r => ['intent', 'did', 'would-do'].includes(r.phase))).toBe(false);
+      const emitted = digest(out);
+      expect(emitted.errors).toEqual([]);
+      expect(emitted.lines.join(' ')).toMatch(/audit history incomplete.*operator must.*repair.*rerun/i);
+      return emitted.lines.join(' ');
+    };
+    return { dir, file, valid, write, run, held, dispatchRestart };
+  };
+  it('torn audit line preserves valid history and emits actionable incomplete digest', async () => {
+    const f = fixture(); f.write('{"phase":');
+    const history = readAuditHistory(f.dir);
+    expect(history.records).toEqual(f.valid); expect(history.complete).toBe(false);
+    const emitted = f.held(await f.run());
+    expect(emitted).toContain('2026-09.jsonl:2');
+    expect(emitted).toContain('invalid JSON');
+  });
+  it('malformed interior row keeps history incomplete', async () => {
+    const f = fixture(); f.write(JSON.stringify({ ts: old, phase: 'intent' }));
+    expect(readAuditHistory(f.dir).records).toEqual(f.valid);
+    expect(f.held(await f.run())).toContain('2026-09.jsonl:2');
+  });
+  it('audit read failure emits repair guidance', async () => {
+    const f = fixture();
+    // A directory with a monthly audit filename deterministically fails the regular-file check.
+    mkdirSync(f.file);
+    expect(f.held(await f.run())).toContain('2026-09.jsonl');
+  });
+  it('repaired history retains lifetime cap', async () => {
+    const f = fixture(); f.write('{torn'); f.held(await f.run());
+    // Repair only the torn row, retaining both older-month lifetime spends.
+    f.write(JSON.stringify({ ts: old, phase: 'pass' }));
+    const out = await f.run();
+    expect(out.incomplete).toBe(false);
+    expect(readAuditHistory(f.dir).records.filter(r => r.phase === 'intent')).toEqual(f.valid);
+    expect(out.held).toEqual([expect.objectContaining({ held: 'per-PR-head cap' })]);
+    expect(f.dispatchRestart).not.toHaveBeenCalled();
+  });
+  it('oversized audit input holds with operator guidance', async () => {
+    const f = fixture(); writeFileSync(f.file, ''); fs.truncateSync(f.file, 8 * 1024 * 1024 + 1);
+    expect(f.held(await f.run())).toMatch(/oversized.*full.*audit/i);
+  });
+  it('audit growth after fstat stops reads at the remaining byte budget plus one and blocks actions', async () => {
+    const f = fixture();
+    const limit = 8 * 1024 * 1024, remaining = 4096;
+    writeFileSync(join(f.dir, '2026-08.jsonl'), ' '.repeat(limit - remaining));
+    writeFileSync(f.file, '');
+    const initial = fs.statSync(f.file);
+    const fstat = fs.fstatSync, read = fs.readSync;
+    let growingFd; const snapshots = [], reads = [];
+    const statSpy = vi.spyOn(fs, 'fstatSync').mockImplementation(fd => {
+      const stat = fstat(fd);
+      if (stat.ino === initial.ino && stat.dev === initial.dev) {
+        growingFd = fd; snapshots.push(stat.size);
+        // The returned snapshot passes the size check, but the file has already grown.
+        fs.truncateSync(f.file, remaining * 2);
+      }
+      return stat;
+    });
+    const readSpy = vi.spyOn(fs, 'readSync').mockImplementation((fd, buffer, offset, length, position) => {
+      if (fd !== growingFd) return read(fd, buffer, offset, length, position);
+      // Short reads force the production loop to spend its remaining budget incrementally.
+      const got = read(fd, buffer, offset, Math.min(length, 1024), position);
+      reads.push({ offset, length, position, got });
+      return got;
+    });
+    const out = await f.run();
+    statSpy.mockRestore(); readSpy.mockRestore();
+    expect(snapshots).toEqual([0]);
+    expect(fs.statSync(f.file).size).toBe(remaining * 2);
+    expect(reads).toEqual([0, 1024, 2048, 3072, 4096].map(offset => ({
+      offset, length: remaining + 1 - offset, position: null, got: Math.min(1024, remaining + 1 - offset),
+    })));
+    expect(reads.reduce((total, r) => total + r.got, 0)).toBe(remaining + 1);
+    expect(f.held(out)).toMatch(/oversized.*full.*audit/i);
   });
 });
