@@ -6,6 +6,7 @@ import fs from 'node:fs/promises';
 import { constants } from 'node:fs';
 import * as childProcess from 'node:child_process';
 import { randomBytes } from 'node:crypto';
+import { platform } from 'node:os';
 import { dirname, join, resolve, relative, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -34,7 +35,7 @@ const MAX_SOURCES = 50000;
 // pathname component atomically. Node does not expose the constant. This
 // Homebrew-pinned operator tool must refuse persistence on other substrates
 // rather than fall back to a check-then-open walk (operator: rerun on macOS).
-const NOFOLLOW_ANY = process.platform === 'darwin' ? 0x20000000 : null;
+const NOFOLLOW_ANY = 0x20000000;
 const DAY = 86400000;
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const roots = () => ['user', 'memberships', ...ORGS.flatMap(o =>
@@ -232,7 +233,7 @@ export async function emit(c, kind, value, path) {
     text = JSON.stringify(value) + '\n';
   }
   if (path) {
-    if (NOFOLLOW_ANY === null) refuse('COHORT');
+    if (platform() !== 'darwin') refuse('COHORT');
     await containment(c, false);
     const directory = dirname(path), st = await c.fs.lstat(directory);
     if (st.isSymbolicLink() || !st.isDirectory() || await c.fs.realpath(directory) !== directory) refuse('COHORT');

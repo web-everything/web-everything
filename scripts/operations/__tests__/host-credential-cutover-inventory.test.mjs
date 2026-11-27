@@ -1,11 +1,21 @@
 // Imported source is a direct test input, so Vitest related selects this test without a repository scan.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import productionSource from '../host-credential-cutover.mjs?raw';
 import * as production from '../host-credential-cutover.mjs';
 import { VARIANTS } from './__fixtures__/inventory-unsafe.mjs';
+
+// Model the supported writer on every CI host, without changing the worker's platform.
+const persistencePlatform = vi.hoisted(() => ({ value: 'darwin' }));
+vi.mock('node:os', async importOriginal => ({
+  ...await importOriginal(), platform: () => persistencePlatform.value,
+}));
+const nativePlatform = process.platform;
+const NOFOLLOW_ANY = 0x20000000;
 
 const spawnControl = vi.hoisted(() => ({ adapter: false }));
 vi.mock('node:child_process', async importOriginal => {
@@ -70,7 +80,8 @@ function runner(overrides = () => undefined) {
   };
 }
 beforeEach(async () => {
-  temp = await fs.realpath(await fs.mkdtemp(join(process.env.TMPDIR, 'hca-')));
+  persistencePlatform.value = 'darwin';
+  temp = await fs.realpath(await fs.mkdtemp(join(tmpdir(), 'hca-')));
   home = join(temp, 'home');
   await fs.mkdir(home);
   lines = { stdout: [], stderr: [] };
@@ -82,6 +93,7 @@ beforeEach(async () => {
         ioCalls.push([key, args[0]]);
         expect(args[0] === temp || args[0].startsWith(temp + '/'), `fixture IO ${String(key)}`).toBe(true);
       }
+      if (key === 'open') return fixtureOpen(...args);
       return target[key](...args);
     };
   } });
@@ -90,6 +102,28 @@ beforeEach(async () => {
   spawnControl.adapter = false;
   vi.mocked(spawn).mockClear();
 });
+async function fixtureOpen(path, flags, mode) {
+  if (flags & constants.O_CREAT) {
+    // Assert the production syscall contract even when the host cannot execute it.
+    expect(flags).toBe(constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | NOFOLLOW_ANY);
+    expect(mode).toBe(0o600);
+    if (nativePlatform !== 'darwin') {
+      // Test-only model: injected ancestor swaps happen before this open boundary.
+      // This walk is NOT atomic and must never be used as a production fallback.
+      let component = path;
+      while (component !== temp) {
+        try {
+          if ((await fs.lstat(component)).isSymbolicLink()) {
+            throw Object.assign(new Error('fixture symlink'), { code: 'ELOOP' });
+          }
+        } catch (error) { if (error.code !== 'ENOENT') throw error; }
+        component = dirname(component);
+      }
+      flags = (flags & ~NOFOLLOW_ANY) | constants.O_NOFOLLOW;
+    }
+  }
+  return fs.open(path, flags, mode);
+}
 afterEach(async () => {
   vi.unstubAllEnvs();
   spawnControl.adapter = false;
@@ -117,6 +151,14 @@ const actorResponse = (actor_type, actor_id, bypass_mode = 'always', source_type
 const detail = `/repos/${O}/repo/rulesets/7`;
 
 describe('pinned transport and bounded adapter', () => {
+  it.each(['linux', 'win32'])('unsupported %s persistence refuses before opening evidence', async platform => {
+    persistencePlatform.value = platform;
+    const out = await collect();
+    expect(out).toEqual({ exitCode: 1, result: 'ERROR', reasons: ['COHORT'] });
+    expect(ioCalls.some(([operation]) => operation === 'open')).toBe(false);
+    expect(lines.stdout.join('')).toContain('reason=COHORT action=RERUN');
+    expect(await fs.readdir(join(temp, 'state/credential-cutover/runs/20261127T110000-12345678'))).toEqual([]);
+  });
   test('shell-true', 'spawn uses argv literally and shell false', async () => {
     spawnControl.adapter = true;
     const pwned = join(temp, 'pwned');
