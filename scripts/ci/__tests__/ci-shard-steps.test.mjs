@@ -29,7 +29,17 @@ function runStep(run, nodeStub) {
     const bin = join(dir, 'bin');
     mkdirSync(bin);
     const marker = join(dir, 'npm-invoked');
-    writeFileSync(join(bin, 'node'), `#!/bin/bash\n${nodeStub}\n`);
+    writeFileSync(join(bin, 'node'), `#!/bin/bash
+case "$1" in
+  scripts/ci/job-profile.mjs)
+    shift
+    while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
+    [ "$#" -gt 0 ] || exit 2
+    shift
+    exec "$@" ;;
+  scripts/ci/quarantine-skip.mjs) exit 0 ;;
+esac
+${nodeStub}\n`);
     writeFileSync(join(bin, 'npm'), `#!/bin/bash\necho "$@" > "${marker}"\n`);
     chmodSync(join(bin, 'node'), 0o755);
     chmodSync(join(bin, 'npm'), 0o755);
@@ -74,5 +84,28 @@ describe.each(STEPS)('ci.yml test-shard %s', (_label, prefix) => {
 describe('ci.yml test-shard steps — no fail-open list construction', () => {
   it.each(STEPS)('%s does not build the file list from a process substitution', (_label, prefix) => {
     expect(stepRun(prefix)).not.toMatch(/<\s*<\(/);
+  });
+});
+
+describe('ci.yml job profile', () => {
+  it.each(STEPS)('%s prefixes only the final npm invocation and preserves guards and arguments', (_label, prefix) => {
+    const step = steps.find(x => x.name?.startsWith(prefix));
+    const lines = step.run.split('\n');
+    const wrapped = lines.filter(line => line.startsWith('node scripts/ci/job-profile.mjs '));
+    expect(wrapped).toHaveLength(1);
+    const task = prefix === 'Unit suite shard' ? 'test:coverage:shard' : 'test:unit';
+    const job = '--job="test-shard (${{ matrix.shard }})"';
+    expect(wrapped[0]).toBe(`node scripts/ci/job-profile.mjs ${job} --out=job-profile.jsonl -- npm run ${task} -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-\${{ matrix.shard }}.json "\${files[@]}" $(node scripts/ci/quarantine-skip.mjs) # red-main quarantine (xx7ckd6): skip args from ops/quarantine, empty unless redMainMode=quarantine`);
+    const group = prefix === 'Unit suite shard' ? 'covered --shard=${{ matrix.shard }}/9' : 'nocov --shard=1/1';
+    expect(lines).toContain(`list=$(node scripts/ci/shard-assign.mjs --suite=unit --group=${group}) || { echo "::error::shard-assign failed; refusing to run an unfiltered suite"; exit 1; }`);
+    expect(lines).toContain('[ -n "$list" ] || { echo "::error::shard-assign returned an empty file list"; exit 1; }');
+    expect(lines).toContain('while IFS= read -r f; do [ -z "$f" ] || files+=("$f"); done <<< "$list"');
+  });
+
+  it('uploads a unique optional artifact even when the shard failed', () => {
+    expect(steps.find(x => x.name === 'Upload job profile')).toEqual({
+      name: 'Upload job profile', if: 'always()', 'continue-on-error': true, uses: 'actions/upload-artifact@v4',
+      with: { name: 'job-profile-unit-${{ matrix.shard }}', path: 'web-everything/job-profile.jsonl', 'if-no-files-found': 'ignore' },
+    });
   });
 });
