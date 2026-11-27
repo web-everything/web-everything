@@ -4,6 +4,7 @@ import * as fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { checkoutState, sharedRunEnv, sharedSmokeIdentity, readSharedPass, publishSharedPass,
   sharedSmoke, SHARED_SMOKE_ENV_DELETED, SHARED_SMOKE_ENV_PINNED, SHARED_SMOKE_ENV_LOCATION,
   SHARED_SMOKE_ENV_CREDENTIAL, SHARED_SMOKE_FS_EXCLUDED, SHARED_SMOKE_IGNORED_STATE,
@@ -54,6 +55,7 @@ function fixture() {
     if (a[0] === 'rev-parse' && a.at(-1).endsWith('^{tree}')) stdout = repo.tree + '\n';
     else if (a[0] === 'diff') stdout = repo.diff;
     else if (a[0] === 'status') stdout = repo.status;
+    else if (a[0] === 'ls-tree' || (a[0] === 'ls-files' && (a.includes('--stage') || a.includes('-v')))) stdout = '';
     else if (a[0] === 'ls-files') stdout = a.includes('--ignored') ? repo.ignored : repo.untracked;
     else if (a.join(' ') === '--version') stdout = 'git version fixture';
     else throw new Error(`unexpected fixture git argv: ${a.join(' ')}`);
@@ -70,13 +72,13 @@ function fixture() {
   const treeOf = value => { expect(value).toBe(sha); return tree; };
   const common = { stateDir, now, treeOf, alert, host: 'fixture-host', pid: 123, stateKey: 'fixture-daemon' };
   const store = extra => ({ ...common, identity: key(), reuseHours: 12, passTtlMs: settings.passTtlMs, ...extra });
-  const run = vi.fn(async () => pass());
-  const smoke = extra => sharedSmoke({ ...common, env, root, identity: () => key(), run, canPublish, settings,
+  const run = vi.fn(async () => pass()), runEnvironment = vi.fn(async () => pass());
+  const smoke = extra => sharedSmoke({ ...common, env, root, identity: () => key(), run, runEnvironment, canPublish, settings,
     reuseEnabled: true, gateEnabled: true, changedFiles: null, reuseHours: 12,
     deadline: now() + 3000000, sleep: async ms => advance(ms), pidAlive: () => true,
     log: line => logs.push(line), ...extra });
   return { ...options, root, candidatePath, runningRoot, bins, deps, operator, platform, repos, env,
-    key, stateDir, now, advance, alerts, logs, store, smoke, run, common };
+    key, stateDir, now, advance, alerts, logs, store, smoke, run, runEnvironment, common };
 }
 beforeEach(() => { base = fs.mkdtempSync(join(tmpdir(), 'shared-smoke-')); f = fixture(); });
 afterEach(() => { vi.useRealTimers(); fs.rmSync(base, { recursive: true, force: true }); });
@@ -497,7 +499,9 @@ describe('F2: bounded single-flight with token ownership', () => {
       if (a === lockPath() && b.includes('.stale-')) { owner({ token: 'B' }); replaced = true; }
       fs.renameSync(a, b);
     } };
-    const result = await f.smoke({ fs: injected }); expect(replaced).toBe(true); expect(result.role).toBe('leader');
+    const result = await f.smoke({ fs: injected, settings: { ...settings, followerMaxWaitMs: 0 } });
+    expect(replaced).toBe(true); expect(result.role).toBe('own');
+    expect(JSON.parse(fs.readFileSync(join(lockPath(), 'owner.json'))).token).toBe('B');
     expect(publishSharedPass({ ...f.store(), result: pass(), canPublish })).toBe(true);
     expect(readSharedPass(f.store())).not.toBeNull();
   });
@@ -505,5 +509,119 @@ describe('F2: bounded single-flight with token ownership', () => {
     const result = await f.smoke({ fs: ioFault('mkdirSync', p => p.includes('smoke-shared')) });
     expect(result.result).toEqual(pass()); expect(result.published).toBe(false);
     expect(f.alerts.some(x => x.name === 'smoke-shared-store-error')).toBe(true);
+  });
+});
+
+
+// Each audit regression uses only private fixture IO; Git never reads host configuration.
+function realRepo(dir, files) {
+  const env = { PATH: process.env.PATH, HOME: base, TMPDIR: base, GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_GLOBAL: '/dev/null', GIT_AUTHOR_NAME: 'Fixture', GIT_AUTHOR_EMAIL: 'fixture@example.invalid',
+    GIT_COMMITTER_NAME: 'Fixture', GIT_COMMITTER_EMAIL: 'fixture@example.invalid' };
+  const git = args => {
+    const r = spawnSync('git', ['-C', dir, ...args], { env, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024 });
+    if (r.error || r.status !== 0) throw new Error(`fixture git ${args[0]} failed: ${r.stderr}`);
+    return r;
+  };
+  git(['init', '--quiet']);
+  for (const [name, bytes] of Object.entries(files)) write(join(dir, name), bytes);
+  git(['add', '.']); git(['commit', '--quiet', '-m', 'fixture']);
+  const original = f.git.getMockImplementation();
+  f.git.mockImplementation((args, opts) => args[0] === '-C' && args[1] === dir ? git(args.slice(2)) : original(args, opts));
+  return git;
+}
+
+describe('audit: shared evidence never bypasses current inputs or ownership', () => {
+  it('rechecks the environment on an hour-old hit and preserves refusals and missing-runner fallback', async () => {
+    expect(publishSharedPass({ ...f.store(), result: pass(), canPublish })).toBe(true);
+    f.advance(3600000);
+    const refused = { verdict: 'auth-broken', smoke: { results: [{ name: 'env', ok: false }] } };
+    f.runEnvironment.mockResolvedValue(refused);
+    const result = await f.smoke();
+    expect(f.runEnvironment).toHaveBeenCalledTimes(1);
+    expect(f.runEnvironment).toHaveBeenCalledWith({ role: 'follower', reuseCode: true });
+    expect(result.result).toEqual(refused); expect(result.published).toBe(false);
+    expect(f.run).not.toHaveBeenCalled();
+    await f.smoke({ runEnvironment: undefined });
+    expect(f.run).toHaveBeenCalledWith({ role: 'follower', reuseCode: false });
+  });
+  it('refuses untracked node_modules even when its dependency target matches', () => {
+    expect(f.key()).not.toBeNull();
+    f.repos.get(f.candidatePath).status = '?? node_modules\0';
+    expect(f.key()).toBeNull(); expect(f.logs.at(-1)).toContain('candidate-dirty');
+  });
+  it('refuses tracked harness symlinks whose external executable bytes are unbound', () => {
+    const git = realRepo(f.runningRoot, { 'entry.mjs': 'export const x = 1;' });
+    const target = write(join(base, 'outside.mjs'), 'export const x = 2;');
+    fs.symlinkSync(target, join(f.runningRoot, 'linked.mjs')); git(['add', 'linked.mjs']);
+    git(['commit', '--quiet', '-m', 'link']);
+    const before = f.key(); write(target, 'export const x = 3;');
+    expect(before).toBeNull(); expect(f.key()).toBeNull();
+    expect(f.logs.at(-1)).toContain('harness-tracked-type');
+  });
+  it('refuses submodules instead of treating distinct dirty contents as identical evidence', () => {
+    const git = realRepo(f.runningRoot, { 'entry.mjs': 'export const x = 1;' });
+    const sub = join(f.runningRoot, 'module'); fs.mkdirSync(sub);
+    const subGit = realRepo(sub, { 'entry.mjs': 'export const x = 2;' });
+    const commit = subGit(['rev-parse', 'HEAD']).stdout.trim();
+    git(['update-index', '--add', '--cacheinfo', `160000,${commit},module`]);
+    git(['commit', '--quiet', '-m', 'gitlink']);
+    write(join(sub, 'entry.mjs'), 'export const x = 3;'); const before = f.key();
+    write(join(sub, 'entry.mjs'), 'export const x = 4;');
+    expect(before).toBeNull(); expect(f.key()).toBeNull();
+    expect(f.logs.at(-1)).toContain('harness-tracked-type');
+  });
+  it('refuses hidden candidate changes for both index flags and verifies actual candidate bytes', () => {
+    const git = realRepo(f.candidatePath, { '.gitignore': 'node_modules\n', 'entry.mjs': 'export const x = 1;' });
+    const candidateTree = git(['rev-parse', 'HEAD^{tree}']).stdout.trim();
+    f.repos.get(f.root).tree = candidateTree;
+    expect(f.key()).not.toBeNull();
+    for (const flag of ['assume-unchanged', 'skip-worktree']) {
+      git(['update-index', `--${flag}`, 'entry.mjs']);
+      write(join(f.candidatePath, 'entry.mjs'), 'export const x = 2;');
+      expect(git(['status', '--porcelain']).stdout).toBe('');
+      expect(f.key()).toBeNull(); expect(f.logs.at(-1)).toContain('candidate-index-flags');
+      write(join(f.candidatePath, 'entry.mjs'), 'export const x = 1;');
+      git(['update-index', `--no-${flag}`, 'entry.mjs']);
+    }
+    // Even an incorrectly clean porcelain response cannot substitute for byte verification.
+    write(join(f.candidatePath, 'entry.mjs'), 'export const x = 3;');
+    const original = f.git.getMockImplementation();
+    f.git.mockImplementation((args, opts) => args[1] === f.candidatePath && args[2] === 'status'
+      ? { status: 0, stdout: '!! node_modules\0' } : original(args, opts));
+    expect(f.key()).toBeNull(); expect(f.logs.at(-1)).toContain('candidate-bytes-mismatch');
+  });
+  it('preserves replacement owners at reclaim, release and heartbeat mutation boundaries', async () => {
+    vi.useFakeTimers();
+    const lock = join(f.stateDir, 'smoke-shared', `${f.key().key}.lock`), path = join(lock, 'owner.json');
+    const replace = () => write(path, JSON.stringify({ token: 'replacement', host: 'fixture-host', pid: 456,
+      heartbeatAt: f.now(), startedAt: f.now() }));
+    write(path, JSON.stringify({ token: 'old', host: 'fixture-host', pid: 456,
+      heartbeatAt: f.now() - settings.leaderStaleMs, startedAt: f.now() }));
+    let raced = false;
+    const io = { ...fs, renameSync: (a, b) => {
+      if (a === lock && b.includes('.stale-')) { replace(); raced = true; }
+      fs.renameSync(a, b);
+    } };
+    const first = await f.smoke({ fs: io, settings: { ...settings, followerMaxWaitMs: 0 } });
+    expect(raced).toBe(true); expect(first.role).toBe('own');
+    expect(JSON.parse(fs.readFileSync(path)).token).toBe('replacement');
+    // Clear only fixture-owned state and record: force new leadership for each mutation boundary.
+    fs.rmSync(f.stateDir, { recursive: true });
+    await f.smoke({ fs: io });
+    expect(JSON.parse(fs.readFileSync(path)).token).toBe('replacement');
+    fs.rmSync(f.stateDir, { recursive: true }); raced = false;
+    await f.smoke({ fs: io, run: async () => {
+      f.advance(settings.leaderHeartbeatMs); await vi.advanceTimersByTimeAsync(settings.leaderHeartbeatMs);
+      expect(raced).toBe(true); expect(JSON.parse(fs.readFileSync(path)).token).toBe('replacement');
+      return pass();
+    } });
+    expect(JSON.parse(fs.readFileSync(path)).token).toBe('replacement');
+    expect(vi.getTimerCount()).toBe(0);
+    fs.rmSync(f.stateDir, { recursive: true });
+    fs.mkdirSync(`${lock}.guard`, { recursive: true });
+    const held = await f.smoke({ settings: { ...settings, followerMaxWaitMs: 0 } });
+    expect(held.role).toBe('own'); expect(fs.existsSync(`${lock}.guard`)).toBe(true);
+    expect(f.alerts.some(row => row.reason?.includes('operator may inspect abandoned guard'))).toBe(true);
   });
 });

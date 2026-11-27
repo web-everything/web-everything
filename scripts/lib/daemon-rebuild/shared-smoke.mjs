@@ -21,16 +21,46 @@ export function sharedRunEnv(env) { const out = { ...env, ...SHARED_SMOKE_ENV_PI
 function gitRead(git, dir, args, env) { const r = git(['-C', dir, ...args], { env }); if (r?.status !== 0 || r.error || r.stdout == null) fail('git-unreadable'); return String(r.stdout); }
 function rev(git, dir, value, env) { const s = gitRead(git, dir, ['rev-parse', '--verify', '--end-of-options', value], env).trim(); if (!hex(s, 40)) fail('git-tree-malformed'); return s; }
 function nul(s) { if (s && !s.endsWith('\0')) fail('git-list-malformed'); return s ? s.slice(0, -1).split('\0') : []; }
+// Index flags and Git's stat cache are hints, never byte evidence. Unknown entry kinds
+// (notably symlinks and submodules) deliberately fall back to the ordinary smoke.
+function trackedEntries(read, args) {
+  return nul(read(args)).map(row => {
+    const m = row.match(/^(100644|100755|120000|160000) (?:blob |commit )?([a-f0-9]{40})(?: 0)?\t([\s\S]+)$/);
+    if (!m || isAbsolute(m[3]) || m[3].split('/').some(p => !p || p === '..' || p === '.')) fail('tracked-list-malformed');
+    return { mode: m[1], oid: m[2], rel: m[3] };
+  });
+}
+function trackedBytes(dir, entry, fs, readFile, kind) {
+  if (!['100644', '100755'].includes(entry.mode)) fail(`${kind}-tracked-type: run full smoke; inspect symlinks or submodules`);
+  const p = join(dir, entry.rel);
+  // Refuse directory symlinks too, including an index entry whose on-disk type changed.
+  if (!inside(fs.realpathSync(dir), fs.realpathSync(dirname(p)))) fail(`${kind}-tracked-type`);
+  const st = fs.lstatSync(p);
+  if (!st.isFile()) fail(`${kind}-tracked-type`);
+  const b = readFile(p);
+  if (b.length !== st.size) fail('file-changed');
+  return { bytes: b, mode: st.mode & 0o111 ? '100755' : '100644' };
+}
 export function checkoutState(dir, { git, fs = FS, withPath = false, runEnv, check = () => {}, readFile = p => fs.readFileSync(p) } = {}) {
   const read = args => { check(); return gitRead(git, dir, args, runEnv); }, tree = rev(git, dir, 'HEAD^{tree}', runEnv);
   const ignored = nul(read(['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory']));
   if (ignored.some(p => !SHARED_SMOKE_IGNORED_STATE.includes(p.replace(/\/$/, '')))) fail('harness-ignored');
   const dirty = digest(read(['diff', 'HEAD', '--binary', '--no-ext-diff', '--no-textconv']));
+  const tracked = trackedEntries(read, ['ls-files', '--stage', '-z']).map(entry => {
+    check();
+    // A tracked deletion remains represented by Git's diff; all other unreadable inputs refuse reuse.
+    if (!maybe(() => fs.lstatSync(join(dir, entry.rel)))) {
+      if (!['100644', '100755'].includes(entry.mode)) fail('harness-tracked-type');
+      return [entry.rel, 'absent'];
+    }
+    const { bytes, mode } = trackedBytes(dir, entry, fs, readFile, 'harness');
+    return [entry.rel, mode, digest(bytes)];
+  });
   const files = nul(read(['ls-files', '-z', '--others', '--exclude-standard'])).sort().map(rel => {
     check(); if (!rel || isAbsolute(rel) || rel.split('/').includes('..')) fail('harness-untracked-path');
     const p = join(dir, rel), st = fs.lstatSync(p); if (!st.isFile()) fail('harness-untracked-type'); return [rel, st.mode, digest(readFile(p))];
   });
-  return withPath ? [fs.realpathSync(dir), tree, dirty, files] : [tree, dirty, files];
+  return withPath ? [fs.realpathSync(dir), tree, dirty, files, tracked] : [tree, dirty, files, tracked];
 }
 /** null always means run the ordinary smoke; no content, secret or path escapes in diagnostics. */
 export function sharedSmokeIdentity(o) {
@@ -80,7 +110,15 @@ export function sharedSmokeIdentity(o) {
     if (!hex(sha, 40)) fail('sha-malformed'); const tree = rev(git, root, `${sha}^{tree}`, runEnv);
     if (rev(git, candidatePath, 'HEAD^{tree}', runEnv) !== tree) fail('candidate-tree-mismatch');
     const status = nul(gitRead(git, candidatePath, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching'], runEnv));
-    if (status.some(p => p !== '!! node_modules' && p !== '?? node_modules')) fail('candidate-dirty');
+    if (status.some(p => p !== '!! node_modules')) fail('candidate-dirty');
+    const candidateRead = args => { check(); return gitRead(git, candidatePath, args, runEnv); };
+    const flags = nul(candidateRead(['ls-files', '-v', '-z']));
+    if (flags.some(row => !/^H [\s\S]+$/.test(row))) fail('candidate-index-flags: run full smoke; inspect index flags');
+    for (const entry of trackedEntries(candidateRead, ['ls-tree', '-r', '-z', '--full-tree', 'HEAD'])) {
+      const { bytes: content, mode } = trackedBytes(candidatePath, entry, fs, read, 'candidate');
+      const oid = createHash('sha1').update(`blob ${content.length}\0`).update(content).digest('hex');
+      if (mode !== entry.mode || oid !== entry.oid) fail('candidate-bytes-mismatch: run full smoke; inspect candidate files');
+    }
     const ownerDeps = join(root, 'node_modules'), candidateDeps = join(candidatePath, 'node_modules'), a = stat(ownerDeps), b = stat(candidateDeps);
     if (a || b) { if (!a || !b?.isSymbolicLink() || fs.realpathSync(ownerDeps) !== fs.realpathSync(candidateDeps)) fail('candidate-deps-mismatch'); }
     const harness = pack(state(runningRoot)), nodeModules = pack([deps(ownerDeps), ...(fs.realpathSync(root) === fs.realpathSync(runningRoot) ? [] : [deps(join(runningRoot, 'node_modules'))])]);
@@ -153,7 +191,11 @@ function eligibility(o, fs) {
   try { const root = fs.realpathSync(o.root); if (!env.LANE_POOL_ROOT) return 'lane-root-unknown'; if (root.split(sep).some(x => /^lane-\d+$/.test(x)) || inside(fs.realpathSync(env.LANE_POOL_ROOT), root)) return 'lane'; } catch { return 'root-unreadable'; }
   return null;
 }
-/** run receives {reuseCode, role}; canPublish is S2's complete local-write predicate, never a default approval. */
+/** run receives {reuseCode, role}; canPublish is S2's complete local-write predicate, never a default approval.
+ * runEnvironment, when provided, must be the ordinary smoke runner with code-only reuse;
+ * its full current result (including every environment refusal) is returned on cache hits.
+ * Omitting that port runs full smoke even on a hit.
+ */
 export async function sharedSmoke(o) {
   const { fs = FS, now = Date.now, sleep = ms => new Promise(r => setTimeout(r, ms)), host = hostname(), pid = process.pid, settings: s } = o;
   const started = now(), reason = eligibility(o, fs), announce = (role, i, extra = {}) => { const data = { role, key: i?.key, components: i?.components, waitedMs: now() - started, ...extra }; o.log?.(`daemon-rebuild: smoke-shared ${JSON.stringify(data)}`); return data; };
@@ -161,32 +203,95 @@ export async function sharedSmoke(o) {
   const fresh = () => { try { return typeof o.identity === 'function' ? o.identity() : fail('identity-recompute-required'); } catch { notice(o, 'smoke-shared-off', { reason: 'identity-unreadable; run full smoke' }); return null; } }; let i = fresh();
   if (!validIdentity(i)) { notice(o, 'smoke-shared-off', { reason: 'identity-unavailable' }); return { ...announce('off'), reason: 'identity-unavailable', result: await o.run({ role: 'off', reuseCode: false }), published: false }; }
   let lock, token, timer, role = 'own', storeError = false; const opts = () => ({ ...o, fs, now, host, pid, identity: i, passTtlMs: s.passTtlMs, reuseHours: o.reuseHours ?? 12 });
-  const owner = () => { try { return JSON.parse(fs.readFileSync(join(lock, 'owner.json'), 'utf8')); } catch (e) { if (e.code === 'ENOENT') return undefined; notice(o, 'smoke-shared-lock-held', { reason: 'owner-unreadable; wait bounded then run own' }); return null; } };
-  const matches = () => owner()?.token === token;
-  const release = () => { try { if (matches()) fs.rmSync(lock, { recursive: true }); } catch { notice(o, 'smoke-shared-store-error', { reason: 'release-failed; inspect lock or await stale reclaim' }); } };
+  const ownerAt = path => { try { return JSON.parse(fs.readFileSync(join(path, 'owner.json'), 'utf8')); } catch (e) { if (e.code === 'ENOENT') return undefined; notice(o, 'smoke-shared-lock-held', { reason: 'owner-unreadable; wait bounded then run own' }); return null; } };
+  // Every cooperating acquisition, reclamation, heartbeat and release holds this mutex.
+  // Never steal it by age: a crashed mutation forces bounded own-smoke fallback until
+  // an operator verifies no writer remains and removes the abandoned .guard directory.
+  const guarded = action => {
+    const guard = `${lock}.guard`;
+    try { fs.mkdirSync(guard); } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      notice(o, 'smoke-shared-lock-held', { reason: 'mutation-held; run own at bound; operator may inspect abandoned guard' });
+      return false;
+    }
+    try { return action(); } finally { fs.rmdirSync(guard); }
+  };
+  const observation = path => {
+    const st = fs.lstatSync(path);
+    if (!st.isDirectory() || st.isSymbolicLink()) fail('lock-type');
+    return { dev: st.dev, ino: st.ino, owner: ownerAt(path) };
+  };
+  const sameOwner = (a, b) => a.dev === b.dev && a.ino === b.ino && a.owner !== null && b.owner !== null
+    && JSON.stringify(a.owner) === JSON.stringify(b.owner);
+  // Move first, then verify the actual moved directory before mutating it. A replacement
+  // at the rename boundary is restored intact while still holding the mutation mutex.
+  const mutateObserved = (observed, action) => {
+    const moved = `${lock}.stale-${randomBytes(4).toString('hex')}`;
+    if (!sameOwner(observed, observation(lock))) return false;
+    fs.renameSync(lock, moved);
+    let restore = true;
+    try {
+      if (!sameOwner(observed, observation(moved))) return false;
+      action(moved); restore = false; return true;
+    } finally {
+      if (restore) {
+        if (maybe(() => fs.lstatSync(lock))) fail('lock-restore-conflict: operator must inspect quarantined owner');
+        fs.renameSync(moved, lock);
+      }
+    }
+  };
+  const release = () => { try { guarded(() => {
+    const observed = observation(lock);
+    if (observed.owner?.token === token) mutateObserved(observed, moved => fs.rmSync(moved, { recursive: true }));
+  }); } catch { notice(o, 'smoke-shared-store-error', { reason: 'release-failed; inspect lock or await stale reclaim' }); } };
+  const useHit = async hit => {
+    // The environment runner must run the ordinary smoke with code-only reuse. Without
+    // that explicit port, run every check. Never synthesize a pass from the stored row.
+    const result = typeof o.runEnvironment === 'function'
+      ? await o.runEnvironment({ role: 'follower', reuseCode: true })
+      : await o.run({ role: 'follower', reuseCode: false });
+    notice(o, 'smoke-shared-hit', { passedAt: hit.passedAt, timings: hit.timings });
+    return { ...announce('follower', i), hit: true, record: hit, result, published: false };
+  };
   const until = started + Math.max(0, Math.min(s.followerMaxWaitMs, o.deadline - started - s.ownRunMinMs));
   try {
     for (let polls = 0; polls <= Math.ceil(s.followerMaxWaitMs / s.followerPollMs) + 2; polls++) {
       const current = fresh(); if (!validIdentity(current) || current.key !== i.key) { notice(o, 'smoke-shared-inputs-changed', { names: [] }); break; }
-      i = current; const hit = readSharedPass(opts()); if (hit) { notice(o, 'smoke-shared-hit', { passedAt: hit.passedAt, timings: hit.timings }); return { ...announce('follower', i), hit: true, record: hit, published: false }; }
+      i = current; const hit = readSharedPass(opts()); if (hit) return useHit(hit);
       lock = join(storeDir(o), `${i.key}.lock`); const prepared = `${lock}.${randomBytes(4).toString('hex')}.tmp`; token = randomBytes(16).toString('hex');
       try {
         fs.mkdirSync(prepared, { recursive: true }); fs.writeFileSync(join(prepared, 'owner.json'), JSON.stringify({ token, host, pid, stateKey: o.stateKey, startedAt: now(), heartbeatAt: now() }));
-        if (fs.existsSync(lock) || maybe(() => fs.lstatSync(lock))) throw Object.assign(new Error('lock-held'), { code: 'EEXIST' }); fs.renameSync(prepared, lock); role = 'leader';
-      } catch (e) {
-        if (!['EEXIST', 'ENOTEMPTY'].includes(e.code)) throw e;
-        const st = fs.lstatSync(lock), own = owner(); let stale = own === undefined && now() - st.mtimeMs >= 60000;
-        if (own && typeof own.token === 'string' && typeof own.host === 'string' && Number.isInteger(own.pid) && own.pid > 0 && Number.isFinite(own.heartbeatAt) && own.heartbeatAt <= now()) {
-          stale = now() - own.heartbeatAt >= s.leaderStaleMs; if (!stale && own.host === host) { try { stale = (o.pidAlive ?? (p => { try { process.kill(p, 0); return true; } catch (e) { if (e.code === 'ESRCH') return false; throw e; } }))(own.pid) === false; } catch { notice(o, 'smoke-shared-lock-held', { reason: 'pid-unknown; wait bounded then run own' }); } }
-        }
-        if (stale) { try { const moved = `${lock}.stale-${randomBytes(4).toString('hex')}`; fs.renameSync(lock, moved); fs.rmSync(moved, { recursive: true }); } catch (e) { if (e.code !== 'ENOENT') throw e; } continue; }
+        guarded(() => {
+          if (!maybe(() => fs.lstatSync(lock))) { fs.renameSync(prepared, lock); role = 'leader'; return; }
+          const observed = observation(lock), own = observed.owner, st = fs.lstatSync(lock);
+          let stale = own === undefined && now() - st.mtimeMs >= 60000;
+          if (own && typeof own.token === 'string' && typeof own.host === 'string' && Number.isInteger(own.pid) && own.pid > 0 && Number.isFinite(own.heartbeatAt) && own.heartbeatAt <= now()) {
+            stale = now() - own.heartbeatAt >= s.leaderStaleMs;
+            if (!stale && own.host === host) {
+              try { stale = (o.pidAlive ?? (p => { try { process.kill(p, 0); return true; } catch (e) { if (e.code === 'ESRCH') return false; throw e; } }))(own.pid) === false; }
+              catch { notice(o, 'smoke-shared-lock-held', { reason: 'pid-unknown; wait bounded then run own' }); }
+            }
+          }
+          if (stale && mutateObserved(observed, moved => fs.rmSync(moved, { recursive: true }))) {
+            fs.renameSync(prepared, lock); role = 'leader';
+          }
+        });
       } finally { fs.rmSync(prepared, { recursive: true, force: true }); }
-      if (role === 'leader') { const hit = readSharedPass({ ...opts(), identity: fresh() }); if (hit) { release(); notice(o, 'smoke-shared-hit', { passedAt: hit.passedAt, timings: hit.timings }); return { ...announce('follower', i), hit: true, record: hit, published: false }; } break; }
+      if (role === 'leader') { const hit = readSharedPass({ ...opts(), identity: fresh() }); if (hit) { release(); return useHit(hit); } break; }
       if (now() >= until) break; await sleep(Math.min(s.followerPollMs, until - now()));
     }
   } catch { storeError = true; notice(o, 'smoke-shared-store-error', { reason: 'coordination-unreadable: run full smoke; inspect store' }); }
   const data = announce(role, i); notice(o, role === 'leader' ? 'smoke-shared-lead' : 'smoke-shared-wait-timeout', { key: i.key });
-  if (role === 'leader') { timer = setInterval(() => { try { if (!matches()) return clearInterval(timer); const own = owner(); if (own?.token !== token) return clearInterval(timer); atomic(fs, join(lock, 'owner.json'), { ...own, heartbeatAt: now() }); } catch { clearInterval(timer); notice(o, 'smoke-shared-store-error', { reason: 'heartbeat-failed; follower may run own' }); } }, s.leaderHeartbeatMs); timer.unref?.(); }
+  if (role === 'leader') { timer = setInterval(() => { try {
+    guarded(() => {
+      const observed = observation(lock);
+      if (observed.owner?.token !== token) { clearInterval(timer); return; }
+      if (!mutateObserved(observed, moved => {
+        atomic(fs, join(moved, 'owner.json'), { ...observed.owner, heartbeatAt: now() });
+        fs.renameSync(moved, lock);
+      })) clearInterval(timer);
+    });
+  } catch { clearInterval(timer); notice(o, 'smoke-shared-store-error', { reason: 'heartbeat-failed; follower may run own' }); } }, s.leaderHeartbeatMs); timer.unref?.(); }
   try {
     const result = await o.run({ role, reuseCode: false }), after = fresh(), drift = !validIdentity(after) || after.key !== i.key;
     if (drift) notice(o, 'smoke-shared-inputs-changed', { names: [] });
