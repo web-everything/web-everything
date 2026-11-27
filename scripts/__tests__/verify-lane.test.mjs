@@ -35,7 +35,9 @@ import { resolveOperation } from '../operations/run.mjs';
 import { runOperationCli } from '../operations/cli-adapter.mjs';
 import { createMemoryRunStore } from '../operations/run-store.mjs';
 
-const namedSuitesCommand = `npx vitest run ${JSON.parse(readFileSync(resolve(process.cwd(), 'scripts/verify-settings.json'), 'utf8')).alwaysRunTests.slice().sort().map(shellQuote).join(' ')} --passWithNoTests`;
+const SOURCE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+
+const namedSuitesCommand = `npx vitest run ${JSON.parse(readFileSync(resolve(SOURCE_ROOT, 'scripts/verify-settings.json'), 'utf8')).alwaysRunTests.slice().sort().map(shellQuote).join(' ')} --passWithNoTests`;
 
 // Selection fixtures explicitly opt into the related-selection policy.
 beforeEach(() => {
@@ -44,7 +46,7 @@ beforeEach(() => {
 });
 afterEach(() => vi.unstubAllEnvs());
 
-const VERIFY_LANE = resolve(process.cwd(), 'scripts/verify-lane.mjs');
+const VERIFY_LANE = resolve(SOURCE_ROOT, 'scripts/verify-lane.mjs');
 const OTHER_SHA = 'b'.repeat(40); // "Y" — the sha the overlapping run's marker belongs to (never this HEAD)
 
 function seedVerifyServer(root, options = {}) {
@@ -83,10 +85,10 @@ const marker = () => join(dir, '.git', '.lane-verify');
 function withoutFixtureGuardsEnv() {
   const settings = join(dir, '.git', 'verify-settings.json');
   writeFileSync(settings, JSON.stringify({
-    ...JSON.parse(readFileSync(resolve(process.cwd(), 'scripts/verify-settings.json'), 'utf8')),
+    ...JSON.parse(readFileSync(resolve(SOURCE_ROOT, 'scripts/verify-settings.json'), 'utf8')),
     alwaysRunTests: [],
   }));
-  const url = pathToFileURL(resolve(process.cwd(), 'scripts/lib/verify-settings.mjs')).href;
+  const url = pathToFileURL(resolve(SOURCE_ROOT, 'scripts/lib/verify-settings.mjs')).href;
   const original = JSON.stringify(url + '?fixture-original');
   const source = `export * from ${original}; import { loadVerifySettingsFile as load } from ${original};
 export function loadVerifySettingsFile(path = ${JSON.stringify(settings)}, options) { return load(path, options); }`;
@@ -102,6 +104,13 @@ export function loadVerifySettingsFile(path = ${JSON.stringify(settings)}, optio
  *  selection and standards variables would otherwise leak into the child processes and change what they decide. */
 const GATE_ONLY_ENV = /^(WE_HEAVY_|WE_VERIFY_|VERIFY_|WE_BUILD_FINAL_|WE_LOAD_|WE_QUEUE_|WE_REQUIRE_VERIFIED$|WE_LAND_UNVERIFIED$|WE_FORGE_|FORGE_)/;
 const gateScrubbedEnv = () => Object.fromEntries(Object.entries(process.env).filter(([k]) => !GATE_ONLY_ENV.test(k)));
+// Empty registry is complete no-soak evidence, so cache tests do not depend on
+// a missing-registry deferral (which correctly refuses reuse).
+function seedEmptySoakRegistry() {
+  mkdirSync(join(dir, 'scripts/conveyor/soak/breaks'), { recursive: true });
+  writeFileSync(join(dir, 'vitest.soak.config.ts'), 'export default { test: {} };\n');
+}
+
 const headSha = () => execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, encoding: 'utf8' }).trim();
 
 // MQ-SOAK-PULLS: registry, commands, settings, admission and host observations are fixture-owned.
@@ -697,8 +706,8 @@ describe('verify-lane — slot heartbeat while the gate runs (verify-admission, 
     // Before: no refresh, so heartbeatAt stayed at acquire time and the lease expired under a long gate.
     const samples = join(dir, 'samples.json');
     const gateScript = join(dir, 'sample.mjs');
-    const admissionModule = resolve(process.cwd(), 'scripts/readiness/heavy-admission.mjs');
-    const locksModule = resolve(process.cwd(), 'scripts/readiness/file-locks.mjs');
+    const admissionModule = resolve(SOURCE_ROOT, 'scripts/readiness/heavy-admission.mjs');
+    const locksModule = resolve(SOURCE_ROOT, 'scripts/readiness/file-locks.mjs');
     writeFileSync(gateScript, `import { writeFileSync } from 'node:fs';
 import { admissionLockRoot, slotPath } from ${JSON.stringify(admissionModule)};
 import { readLockEntry } from ${JSON.stringify(locksModule)};
@@ -1947,6 +1956,7 @@ it('an opted-out default request refuses before stamping a runnable marker', () 
 
 describe('local timeout-only retry under admission', () => {
   function fixture({ edited = false, mixed = false, retryExit = 0, standardsExit = 0, truncated = false, tooMany = false, live = false, phaseAdmission, scan = false, scanExit = 0, importsSource = false, guard = false, guardExit = 0, guardExcluded = false, guardReport = true, guardEntry = { assertionResults: [{ status: guardExit ? 'failed' : 'passed' }] }, liveGuard = null, retrySkipped = false, passingNamesake = false, outputLines = 148 } = {}) {
+    seedEmptySoakRegistry();
     const files = (truncated || tooMany) ? Array.from({ length: truncated ? 21 : 4 }, (_, i) => `untouched-${i}.test.mjs`) : ['untouched-a.test.mjs', 'untouched-b.test.mjs'];
     // No trailing newline: a gate may end its stderr mid-line, and dispatch's markers must still start a line.
     const stderr = files.map((f, i) => ` FAIL  ${f} > case ${i}\n${mixed && i === 1 ? 'AssertionError: wrong value' : 'Error: Test timed out in 5000ms.'}\n`).join('').trimEnd();
@@ -1958,7 +1968,7 @@ describe('local timeout-only retry under admission', () => {
     if (scan) { mkdirSync(join(dir, 'scripts/lib/__tests__'), { recursive: true }); writeFileSync(join(dir, scanTest), '// scanner\n'); }
     for (const file of files) writeFileSync(join(dir, file), live ? `
 import './source.mjs';
-import { it } from ${JSON.stringify(resolve(process.cwd(), 'node_modules/vitest/dist/index.js'))};
+import { it } from ${JSON.stringify(resolve(SOURCE_ROOT, 'node_modules/vitest/dist/index.js'))};
 import { existsSync, writeFileSync } from 'node:fs';
 it('first attempt times out', async () => {
   const attempt = ${JSON.stringify(file + '.attempt')};
@@ -1974,18 +1984,18 @@ it('first attempt times out', async () => {
     mkdirSync(join(dir, 'tmp'));
     if (live || liveGuard !== null) writeFileSync(join(dir, 'vitest.config.mjs'), 'export default { test: { environment: "node", include: ["*.test.mjs"] } };\n');
     writeFileSync(join(dir, 'package.json'), JSON.stringify({ type: 'module', scripts: { 'test:unit': 'node scripts/readiness/heavy-admission.mjs run -- vitest run', 'check:standards': 'true' } }));
-    const admissionModule = resolve(process.cwd(), 'scripts/readiness/heavy-admission.mjs');
+    const admissionModule = resolve(SOURCE_ROOT, 'scripts/readiness/heavy-admission.mjs');
     // Stub commands exit immediately too; drain their pipe writes before exiting.
     const fake = `#!/usr/bin/env node
 import { appendFileSync, writeFileSync } from 'node:fs';
 import { admissionLockRoot, heldSlots } from ${JSON.stringify(admissionModule)};
-import { writeAllSync } from ${JSON.stringify(resolve(process.cwd(), 'scripts/lib/write-all-sync.mjs'))};
+import { writeAllSync } from ${JSON.stringify(resolve(SOURCE_ROOT, 'scripts/lib/write-all-sync.mjs'))};
 const args = process.argv.slice(2);
 const held = heldSlots({ lockRoot: admissionLockRoot(process.cwd()), cap: 1, fastSlots: 1 });
 appendFileSync('calls.jsonl', JSON.stringify({ args, held, inherited: process.env.WE_HEAVY_ADMISSION_HELD, nonce: process.env.WE_VERIFY_MARKER_NONCE ?? null, scanFiles: process.env.VERIFY_SCAN_FILES ?? null, scanRoot: process.env.VERIFY_SCAN_ROOT ?? null }) + '\\n');
 if (args[0] === 'vitest' && (${live} || (${liveGuard !== null} && args.includes('guard.test.mjs')))) {
   const { spawnSync } = await import('node:child_process');
-  const result = spawnSync(process.execPath, [${JSON.stringify(resolve(process.cwd(), 'node_modules/vitest/vitest.mjs'))}, ...args.slice(1), ...(!args.includes('--maxWorkers=1') ? ['--maxWorkers=1', '--minWorkers=1'] : [])], { stdio: 'inherit', timeout: 20000, killSignal: 'SIGKILL' });
+  const result = spawnSync(process.execPath, [${JSON.stringify(resolve(SOURCE_ROOT, 'node_modules/vitest/vitest.mjs'))}, ...args.slice(1), ...(!args.includes('--maxWorkers=1') ? ['--maxWorkers=1', '--minWorkers=1'] : [])], { stdio: 'inherit', timeout: 20000, killSignal: 'SIGKILL' });
   if (result.error) throw result.error;
   if (result.signal) throw new Error('live Vitest terminated: ' + result.signal);
   if (!Number.isInteger(result.status)) throw new Error('live Vitest returned no exit status');
@@ -2127,8 +2137,8 @@ process.exit(${standardsExit});
   });
 
   function idleFallbackEnv({ timeout = false, standardsExit = 0, scripts = { 'test:unit': 'true' } } = {}) {
-    const saturationUrl = pathToFileURL(resolve(process.cwd(), 'scripts/lib/verify-ci-only.mjs')).href;
-    const admissionUrl = pathToFileURL(resolve(process.cwd(), 'scripts/readiness/heavy-admission.mjs')).href;
+    const saturationUrl = pathToFileURL(resolve(SOURCE_ROOT, 'scripts/lib/verify-ci-only.mjs')).href;
+    const admissionUrl = pathToFileURL(resolve(SOURCE_ROOT, 'scripts/readiness/heavy-admission.mjs')).href;
     const loader = join(dir, 'fallback-loader.mjs');
     writeFileSync(loader, `
 export async function load(url, context, nextLoad) {
@@ -2618,7 +2628,7 @@ export async function load(url, context, nextLoad) {
       ['one passing assertion', "it('guard', () => { expect(true).toBe(true); });", true, true],
       ['one failing assertion', "it('guard', () => { expect(true).toBe(false); });", true, false],
     ])('actual Vitest JSON for %s flows through the guard consumer and terminal marker', (_, source, executed, green) => {
-      const liveGuard = source ? `import { it, expect } from ${JSON.stringify(resolve(process.cwd(), 'node_modules/vitest/dist/index.js'))};\n${source}\n` : '';
+      const liveGuard = source ? `import { it, expect } from ${JSON.stringify(resolve(SOURCE_ROOT, 'node_modules/vitest/dist/index.js'))};\n${source}\n` : '';
       const f = fixture({ guard: true, liveGuard });
       const result = f.invoke();
       expect(result.code, result.stdout + result.stderr).toBe(green ? 0 : 2);
@@ -2784,6 +2794,7 @@ describe('verify-lane request refuses fast when no verify daemon is alive (#4161
 describe('verify phase telemetry (#5141)', () => {
   let previousPoolRoot;
   beforeEach(() => {
+    seedEmptySoakRegistry();
     previousPoolRoot = process.env.LANE_POOL_ROOT;
     process.env.LANE_POOL_ROOT = join(dir, '.git', 'pool');
   });
@@ -2794,7 +2805,8 @@ describe('verify phase telemetry (#5141)', () => {
   const explicitPhases = { admissionWaitMs: expect.any(Number), gateMs: expect.any(Number), executedTests: null,
     vitestMs: null, scanMs: null, standardsMs: null, targetFileCount: null, changedFileCount: null,
     importGraphTargetCount: null, literalReferenceTargetCount: null, relatedMode: null, testTimeoutFactor: null, standardsPolicy: null, settingsSource: null, admissionMode: 'gate', admissionPhases: null, selection: null,
-    outcomes: { vitest: { result: 'skipped' }, scan: { result: 'skipped' }, standards: { result: 'skipped' } } };
+    outcomes: { vitest: { result: 'skipped' }, scan: { result: 'skipped' }, standards: { result: 'skipped' } },
+    soak: { status: 'skipped', reason: 'explicit-gate', path: 'whole-gate', files: [], estSeconds: 0, selectMs: expect.any(Number) } };
   function invoke(args) {
     const result = spawnSync('node', [VERIFY_LANE, ...args, '--json'], { cwd: dir, encoding: 'utf8' });
     return { code: result.status, json: JSON.parse(result.stdout.trim().split('\n').at(-1)), stderr: result.stderr };
@@ -2810,6 +2822,9 @@ describe('verify phase telemetry (#5141)', () => {
     }
   });
   it('preserves phases on cached verify and request results', () => {
+    // Registry infrastructure belongs to the baseline, not the diff whose gate is cached.
+    execFileSync('git', ['add', 'vitest.soak.config.ts'], { cwd: dir });
+    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'soak fixture'], { cwd: dir });
     execFileSync('git', ['branch', 'origin/main'], { cwd: dir });
     const first = runVerify('true');
     expect(first.json.phases).toEqual(explicitPhases);
@@ -3126,6 +3141,7 @@ describe('full build gate default', () => {
     ['selected', 'always', 'scripts/lib/zz-std.mjs', '1', true, true],
   ])(
     'a child under finalGateStandards=%2$s runs its own standards policy for a gate stamped under %1$s (%3$s, child skip=%4$s, requester verified=%6$s)', (requester, child, path, childSkip, standardsRun, requesterVerified = false) => {
+      seedEmptySoakRegistry();
       const git = (...a) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', ...a], { cwd: dir, encoding: 'utf8' });
       git('update-ref', 'refs/remotes/origin/main', 'HEAD');
       mkdirSync(join(dir, 'node_modules', '.bin'), { recursive: true });
