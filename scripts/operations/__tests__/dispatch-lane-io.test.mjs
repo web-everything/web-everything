@@ -3,10 +3,160 @@ import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createTickReader, createDispatchSinks, reserveBuildLane, resolveDispatchSettingsEnv, DISPATCH_BASH_TIMEOUT_ENV } from '../dispatch-lane-io.mjs';
+import { buildAgentArgv, defaultClaudeProvider, createTickReader, createDispatchSinks, reserveBuildLane, resolveDispatchSettingsEnv, DISPATCH_BASH_TIMEOUT_ENV } from '../dispatch-lane-io.mjs';
 import { spawnPreventionLandingJob } from '../../lib/prevention-landing-job.mjs';
 import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
 import { shapeDispatchRead, DISPATCH_EFFECT } from '../dispatch-lane.mjs';
+
+describe('LEAN-DAEMON background sessions', () => {
+  function fixture(kind = 'fix') {
+    const root = mkdtempSync(join(tmpdir(), 'lean-daemon-'));
+    const options = {
+      root, sessionId: 'fixture-session',
+      payload: { launchKind: kind, prompt: 'Repair the fixture.', sessionSlug: `${kind}-fixture` },
+      table: { model: 'sonnet', effort: 'high', reason: 'fixture-routing' },
+    };
+    return { root, options, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+  }
+
+  it('fix and ci-heal background argv carries lean flags and an explicit routed model', () => {
+    for (const kind of ['fix', 'ci-heal']) {
+      const f = fixture(kind);
+      try {
+        const argv = buildAgentArgv(f.options);
+        for (const flag of ['--bg', '--restricted', '--tools', '--strict-mcp-config', '--disable-slash-commands']) expect(argv).toContain(flag);
+        expect(argv[argv.indexOf('--model') + 1]).toBe('sonnet');
+        const settings = JSON.parse(argv[argv.indexOf('--settings') + 1]);
+        expect(JSON.stringify(settings.hooks)).toContain('guard-bash.mjs');
+        expect(JSON.stringify(settings.hooks)).toContain('guard-lane.mjs');
+        expect(JSON.stringify(settings)).not.toMatch(/MEMORY|check-memory|user-hooks/);
+      } finally { f.cleanup(); }
+    }
+  });
+
+  it.each(['fix', 'ci-heal'])('%s resume retains the lean profile and the explicit routed model', kind => {
+    const f = fixture(kind);
+    try {
+      const argv = buildAgentArgv({ ...f.options, resumeSessionId: 'existing' });
+      expect(argv).toContain('--restricted');
+      expect(argv.slice(argv.indexOf('--resume'), argv.indexOf('--resume') + 2)).toEqual(['--resume', 'existing']);
+      expect(argv[argv.indexOf('--model') + 1]).toBe('sonnet');
+      expect(argv).not.toContain('-n');
+    } finally { f.cleanup(); }
+  });
+
+  it.each(['--settings=personal.json', '--bare', '--safe-mode', '--append-system-prompt-file=MEMORY.md'])('refuses a profile override %s before launch', flag => {
+    const f = fixture();
+    try { expect(() => buildAgentArgv({ ...f.options, extraArgs: [flag] })).toThrow(/lean.*override/i); }
+    finally { f.cleanup(); }
+  });
+
+  it('missing model refuses a lean resume with an operator recovery message', () => {
+    const f = fixture();
+    try { expect(() => buildAgentArgv({ ...f.options, table: { model: null, effort: 'high' }, resumeSessionId: 'existing' })).toThrow(/resolvable --model/); }
+    finally { f.cleanup(); }
+  });
+
+  it.each(['rejected flags', 'foreign resume', 'unknown resume', 'supported resume'].flatMap(scenario =>
+    [false, true].map(wrapped => ({ scenario, wrapped }))))('$scenario with wrapped=$wrapped never retries with a broader session and stops any reported replacement', ({ scenario, wrapped }) => {
+    const f = fixture();
+    const active = new Set(['existing']);
+    const stop = vi.fn(({ handle }) => {
+      active.delete(handle);
+      return { stopped: true };
+    });
+    const spawnAgent = vi.fn(() => {
+      if (scenario === 'rejected flags') throw new Error('CLI rejected restricted/background combination; operator intervention required');
+      if (scenario === 'foreign resume') active.add('foreign');
+      return scenario === 'unknown resume' ? '' : `backgrounded · ${scenario === 'foreign resume' ? 'foreign' : 'existing'}`;
+    });
+    const request = {
+      root: f.root, cwd: f.root, prompt: f.options.payload.prompt, launchKind: 'fix',
+      sessionId: 'new', resumeSessionId: 'existing', table: f.options.table,
+      advisorFor: () => ({ enabled: false, reason: 'kind-not-in-trial' }),
+      spawnEnv: { HOME: join(f.root, 'foreign-home'), CLAUDE_CONFIG_DIR: 'personal', CLAUDE_CODE_SETTINGS: 'user-hooks', PATH: '/fixture/bin' },
+    };
+    const launchWrapped = vi.fn(() => { throw new Error('background resume must not start a wrapper'); });
+    try {
+      const run = () => defaultClaudeProvider(request, { spawnAgent, stop, wrapKind: () => wrapped, launchWrapped });
+      if (scenario === 'supported resume') expect(run()).toBe('existing');
+      else expect(run).toThrow(/rejected|resume.*operator/i);
+      expect(spawnAgent).toHaveBeenCalledTimes(1);
+      expect(launchWrapped).not.toHaveBeenCalled();
+      expect(spawnAgent.mock.calls[0][0]).toContain('--restricted');
+      expect(spawnAgent.mock.calls[0][1].env).not.toHaveProperty('CLAUDE_CONFIG_DIR');
+      expect(spawnAgent.mock.calls[0][1].env).not.toHaveProperty('CLAUDE_CODE_SETTINGS');
+      expect([...active]).toEqual(['existing']);
+      if (scenario === 'foreign resume') {
+        expect(stop).toHaveBeenCalledTimes(1);
+        expect(stop).toHaveBeenCalledWith({ handle: 'foreign' });
+      } else expect(stop).not.toHaveBeenCalled();
+    } finally { f.cleanup(); }
+  });
+
+  it.each(['fix', 'ci-heal'].flatMap(kind => [false, true].map(wrapped => ({ kind, wrapped }))))('$kind foreign resume with wrapped=$wrapped leaves no replacement active or untracked before reporting failure', ({ kind, wrapped }) => {
+    const f = fixture(kind);
+    const active = new Set(['existing']);
+    const events = [];
+    const launchWrapped = vi.fn(() => {
+      active.add('unchecked-wrapper');
+      return { handle: 'pid:1234', wrapperPid: 1234, sessionId: 'unchecked-wrapper' };
+    });
+    const spawnAgent = vi.fn(() => {
+      active.add('foreign');
+      events.push('spawn');
+      return 'backgrounded · foreign';
+    });
+    const stop = vi.fn(({ handle }) => {
+      expect(handle).toBe('foreign');
+      active.delete(handle);
+      events.push('stop');
+      return { stopped: true };
+    });
+    try {
+      let failure;
+      try {
+        defaultClaudeProvider({
+          ...f.options, ...f.options.payload, cwd: f.root, resumeSessionId: 'existing',
+          advisorFor: () => ({ enabled: false, reason: 'kind-not-in-trial' }),
+        }, { spawnAgent, stop, wrapKind: () => wrapped, launchWrapped });
+      } catch (error) { events.push('failure'); failure = error; }
+      expect(failure).toMatchObject({ foreignSessionId: 'foreign', foreignSessionStopped: true });
+      expect(failure.message).toMatch(/foreign.*stopped.*operator/);
+      expect(events).toEqual(['spawn', 'stop', 'failure']);
+      expect([...active]).toEqual(['existing']);
+      expect(spawnAgent).toHaveBeenCalledTimes(1);
+      expect(stop).toHaveBeenCalledTimes(1);
+      expect(launchWrapped).not.toHaveBeenCalled();
+    } finally { f.cleanup(); }
+  });
+
+  it.each(['throws', 'unconfirmed'].flatMap(outcome => [false, true].map(wrapped => ({ outcome, wrapped })) ))('foreign resume with wrapped=$wrapped and a stop that $outcome reports the live handle and operator recovery without retrying', ({ outcome, wrapped }) => {
+    const f = fixture();
+    const spawnAgent = vi.fn(() => 'backgrounded · foreign');
+    const stop = vi.fn(() => {
+      if (outcome === 'throws') throw new Error('stop unavailable');
+      return { stopped: false };
+    });
+    const launchWrapped = vi.fn(() => { throw new Error('background resume must not start a wrapper'); });
+    try {
+      let failure;
+      try {
+        defaultClaudeProvider({
+          ...f.options, ...f.options.payload, cwd: f.root, resumeSessionId: 'existing',
+          advisorFor: () => ({ enabled: false, reason: 'kind-not-in-trial' }),
+        }, { spawnAgent, stop, wrapKind: () => wrapped, launchWrapped });
+      } catch (error) { failure = error; }
+      expect(failure).toMatchObject({ foreignSessionId: 'foreign', foreignSessionStopped: false });
+      expect(failure.message).toContain('operator must run claude stop foreign before retrying');
+      expect(failure).not.toHaveProperty('notApplied');
+      expect(stop).toHaveBeenCalledTimes(1);
+      expect(stop).toHaveBeenCalledWith({ handle: 'foreign' });
+      expect(spawnAgent).toHaveBeenCalledTimes(1);
+      expect(launchWrapped).not.toHaveBeenCalled();
+    } finally { f.cleanup(); }
+  });
+});
 
 describe('the tick reader handoff', () => {
   const at = '2026-10-06T12:00:00.000Z';

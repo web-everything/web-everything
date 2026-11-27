@@ -1,4 +1,6 @@
 import { NO_PROMPT_SESSION_KINDS } from '../lib/no-prompt-command-rules.mjs';
+import { RESTRICTED_PROVIDER_TOOLS } from './minimal-context-provider.mjs';
+import { stopSession } from './dispatch-abort.mjs';
 import { appendBuildRequirements, resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { applyTestsFirstPolicy } from '../lib/tests-first-policy.mjs';
 import { readPreparePolicy } from '../conveyor/prepare-policy-settings.mjs';
@@ -1961,6 +1963,7 @@ export function defaultClaudeProvider(request, {
   wrapKind = (kind) => WRAPPABLE_LAUNCH_KINDS.includes(kind) && workerWrapperEnabledFor(kind),
   launchWrapped = launchWrappedClaudeWorker,
   resolveRoute = resolveOperationRoute,
+  stop = stopSession,
 } = {}) {
   if (request?.groupMembers?.length) {
     throw notApplied('dispatch-lane: grouped requests require a group-capable worker provider');
@@ -2019,9 +2022,15 @@ export function defaultClaudeProvider(request, {
   request.reportModel?.(reportedModel);
   request.reportEffort?.(argv.find(arg => arg.startsWith('--effort='))?.slice(9) ?? argv[argv.indexOf('--effort') + 1]);
   const kind = String(request.launchKind || 'build');
-  if (wrapKind(kind)) {
+  const lean = isLeanDaemonKind(kind);
+  const spawnEnv = lean ? leanDaemonEnv(request.spawnEnv ?? process.env) : request.spawnEnv;
+  // A background-session resume must stay on the background provider, even when new workers are wrapped.
+  // wrappedArgvFromBg only supports fresh launches; sending a resume there either refuses it or lets an
+  // alternate launcher return an unchecked replacement. Wrapped-worker continuation uses requestWrappedResume.
+  // Keep every resume below, behind the same identity check and foreign-session cleanup.
+  if (wrapKind(kind) && !request.resumeSessionId) {
     const launched = launchWrapped({
-      role: kind, session: request.sessionSlug, bgArgv: argv, cwd: request.cwd, env: workerSpawnEnv(request.spawnEnv ?? process.env), pr: request.pr ?? null,
+      role: kind, session: request.sessionSlug, bgArgv: argv, cwd: request.cwd, env: workerSpawnEnv(spawnEnv ?? process.env), pr: request.pr ?? null,
       item: request.num ?? null, model: launchedModel, sessionId: request.sessionId,
       route: claudeLaunchRouteFor({ policyRoute: request.policyRoute ?? request.route ?? resolveRoute({ operation: kind }),
         executor, reason: request.modelReason || request.table?.reason || `inherited ${kind} Claude tier route` }),
@@ -2031,8 +2040,25 @@ export function defaultClaudeProvider(request, {
     // `pid:<wrapper>` is the detached-handle shape the run store and liveness already read (route `detached`).
     return launched.handle || request.sessionId;
   }
-  const stdout = String(spawnAgent(argv, request.spawnEnv ? { cwd: request.cwd, env: request.spawnEnv } : { cwd: request.cwd }) ?? '');
-  return parseBackgroundedId(stdout) || request.sessionId;
+  const stdout = String(spawnAgent(argv, spawnEnv ? { cwd: request.cwd, env: spawnEnv } : { cwd: request.cwd }) ?? '');
+  const handle = parseBackgroundedId(stdout);
+  if (lean && request.resumeSessionId && handle !== String(request.resumeSessionId)) {
+    if (handle) {
+      // Added resume flags can make the CLI fork. Deregister that exact replacement before reporting
+      // failure; never stop the requested session or start another attempt here. A failed stop stays
+      // indeterminate, with the known handle in the error the dispatch sink records for the operator.
+      let stopped = false;
+      try { stopped = stop({ handle })?.stopped === true; } catch { /* report the known live handle below */ }
+      const error = new Error(stopped
+        ? `dispatch-lane: lean resume forked foreign session ${handle}, which was stopped; operator must inspect the requested session before retrying`
+        : `dispatch-lane: lean resume forked foreign session ${handle}, which may still be active; operator must run claude stop ${handle} before retrying`);
+      error.foreignSessionId = handle;
+      error.foreignSessionStopped = stopped;
+      throw error;
+    }
+    throw new Error('dispatch-lane: lean resume could not confirm the requested session; operator must inspect the session before retrying');
+  }
+  return handle || request.sessionId;
 }
 
 /** 117 S3b — the launch kinds this provider can run through the detached worker wrapper (review has its own call site). */
@@ -2591,6 +2617,25 @@ export function ensureDispatchSessionCwd(dir, {
   return dir;
 }
 
+function isLeanDaemonKind(kind) {
+  return kind === 'fix' || kind === 'ci-heal';
+}
+
+/** Keep subscription authentication and PATH, but never inherit a personal settings override. */
+function leanDaemonEnv(env) {
+  return Object.fromEntries(Object.entries(env).filter(([key]) =>
+    !['CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_SETTINGS'].includes(key)));
+}
+
+/** Only the tool safety hooks belong in the daemon profile. Resolve them independently of its scratch cwd. */
+function leanDaemonHooks() {
+  const command = (script) => `node '${join(REPO_ROOT, 'scripts', script).replaceAll("'", "'\\''")}'`;
+  return { PreToolUse: [
+    { matcher: 'Edit|Write', hooks: [{ type: 'command', command: command('guard-lane.mjs') }] },
+    { matcher: 'Bash', hooks: [{ type: 'command', command: command('guard-bash.mjs') }] },
+  ] };
+}
+
 export function buildAgentArgv({
   sessionId, payload, extraArgs = [], systemPromptFile = null, resumeSessionId = null, settingsEnv = null,
   // #x9fbg1x — an OPT-IN `worktree` patch folded into the SAME `--settings` JSON `settingsEnv` already rides
@@ -2607,18 +2652,25 @@ export function buildAgentArgv({
   // Never applied on resume (a resume must stay a bare `--bg --resume`). The worker's `--model` is untouched.
   advisor = null,
 }) {
+  const lean = isLeanDaemonKind(payload?.launchKind);
+  if (lean && ((systemPromptFile && systemPromptFile !== DISPATCHED_AGENT_SYSTEM_PROMPT_FILE) || extraArgs.some(arg =>
+    /^--(?:settings(?:-sources)?|bare|safe-mode|restricted|tools|allowedTools|disallowedTools|mcp-config|strict-mcp-config|disable-slash-commands|append-system-prompt(?:-file)?|system-prompt(?:-file)?|plugin-dir)(?:=|$)/.test(String(arg))))) {
+    throw notApplied('dispatch-lane: lean profile override refused; operator must use the fixed daemon profile');
+  }
   const prompt = String(payload?.prompt || '');
   if (!prompt.trim()) throw notApplied('dispatch-lane: refusing to start an agent with an empty prompt');
   if (prompt.trimStart().startsWith('-')) {
     throw notApplied('dispatch-lane: refusing a brief that begins with `-` — an argument parser can read it as a flag');
   }
-  // `settingsEnv` (#x8mpubm) is DELIBERATELY NEVER EMITTED HERE — the resume branch's own docblock (above)
+  // Legacy kinds retain the bare resume below. Lean repair kinds reassert the full profile and model;
+  // defaultClaudeProvider refuses an unconfirmed resume and stops any reported foreign replacement.
+  // `settingsEnv` (#x8mpubm) is DELIBERATELY NEVER EMITTED for a legacy resume — the resume docblock (above)
   // measured live that adding ANY flag beside `--resume` makes the CLI silently fork a fresh copy instead of
   // truly resuming. A resumed session does not need it anyway: it is the SAME still-running process its first,
   // fresh dispatch already gave a `--settings` PATH override to (see the non-resume branch below), and the
   // shim that override points at re-reads the shared token cache fresh on every `gh` call regardless of how
   // long the session has been running — so nothing is lost by never re-asserting it on resume.
-  if (resumeSessionId) return ['--bg', '--resume', String(resumeSessionId), prompt];
+  if (resumeSessionId && !lean) return ['--bg', '--resume', String(resumeSessionId), prompt];
   if (!table && payload?.launchKind) {
     const policy = readRoutingPolicy();
     const configured = resolveOperationRoute({ operation: payload.launchKind, available: ['claude'], gateClosed: policy.criticalWorkGate.kinds.includes(payload.launchKind), policy });
@@ -2629,7 +2681,7 @@ export function buildAgentArgv({
   // xgqz204 — the worker marker ALWAYS rides in `--settings`' env: `claude --bg` drops the spawner's ambient
   // env, so `markWorkerEnv` on the spawn call never reaches the session, and the #x36vidg wait-poll guard read
   // every dispatched session as the operator's own. See `workerMarkerSettingsEnv`.
-  const sessionEnv = workerMarkerSettingsEnv(settingsEnv);
+  const sessionEnv = workerMarkerSettingsEnv(lean ? leanDaemonEnv(settingsEnv ?? {}) : settingsEnv);
   // #3857 — the decided model goes FIRST as exactly one `--model <id>`; a hand-set one in `extraArgs` is
   // honoured only with a reason (see {@link resolveWorkerModel}), and never left riding alongside.
   let args = extraArgs.map(String);
@@ -2658,14 +2710,14 @@ export function buildAgentArgv({
     args = explicit.rest;
     if (model) modelArgs.push('--model', model);
   }
-  // Operator rule 2026-09-29: a fresh session must never inherit the CLI default.
-  // Resume returns above and retains the existing session's model.
+  // Fresh launches and lean resumes must never inherit the CLI default.
   if (typeof modelArgs[1] !== 'string' || !modelArgs[1].trim() || modelArgs[1].startsWith('-')) {
-    throw notApplied('dispatch-lane: refusing to start an agent without a resolvable --model');
+    throw notApplied('dispatch-lane: refusing to start an agent without a resolvable --model; operator must repair the routing decision before retrying');
   }
   return [
     '--bg',
-    '-n', String(payload.sessionSlug || `conveyor-${payload.num}`),
+    ...(resumeSessionId ? ['--resume', String(resumeSessionId)] : ['-n', String(payload.sessionSlug || `conveyor-${payload.num}`)]),
+    ...(lean ? ['--restricted', '--tools', RESTRICTED_PROVIDER_TOOLS, '--strict-mcp-config', '--disable-slash-commands'] : []),
     // #x8mpubm — a `PATH` (or other) override, folded into `--settings '{"env":{...}}'`. THIS is how a
     // dispatched session's own `gh` calls end up authenticating as the App installation: `claude --bg` does
     // NOT inherit the spawning process's ambient env (live-confirmed — see gh-app-shim.mjs's own header), but
@@ -2675,7 +2727,7 @@ export function buildAgentArgv({
     // xgqz204: never omitted any more — it always carries at least the worker marker (see above).
     // #x9fbg1x — `worktree` rides in the SAME object, never a second `--settings` flag (the CLI would only
     // honour the last one anyway).
-    '--settings', JSON.stringify(worktreeSettings ? { env: sessionEnv, worktree: worktreeSettings } : { env: sessionEnv }),
+    '--settings', JSON.stringify({ env: sessionEnv, ...(worktreeSettings ? { worktree: worktreeSettings } : {}), ...(lean ? { hooks: leanDaemonHooks() } : {}) }),
     ...(systemPromptFile ? ['--append-system-prompt-file', String(systemPromptFile)] : []),
     ...(table ? [...effortArgs, ...modelArgs] : []),
     ...args,
