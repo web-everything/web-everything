@@ -79,6 +79,95 @@ describe('last-good hold alarm contract', () => {
     expect(sink(next)[0].episodeId).not.toBe(firstId);
   });
 
+  it.each([2, 32].flatMap(sampleMinute => [false, true].flatMap(incomplete => ['open', 'flapping']
+    .flatMap(status => ['abc123', 'new-head'].map(head => ({ sampleMinute, incomplete, status, head }))))))
+  ('recovery between samples gives the next hold a fresh alarm (%j)', ({ sampleMinute, incomplete, status, head }) => {
+    const dir = mkdtempSync(join(tmpdir(), 'last-good-between-samples-'));
+    const key = 'daemon-held-on-last-good::clone:recovered-daemon';
+    const sample = (rebuild, state, now) => {
+      writeFileSync(join(dir, 'recovered-daemon.rebuild.json'), JSON.stringify(rebuild));
+      return tick(probeSelfSync(dir), state, now);
+    };
+    try {
+      const first = sample({ held: { ...held(600), since: incomplete ? 'invalid' : new Date(NOW - 10 * HOUR).toISOString(),
+        lastGood: incomplete ? null : 'abc123' } },
+        emptyHealthState(), NOW);
+      const firstId = sink(first)[0].episodeId;
+      first.state.episodes[key].status = status;
+      // Historical health state may not carry the hold timestamp.
+      if (incomplete) delete first.state.episodes[key].measure.heldSinceIso;
+      const rebuild = {
+        adopted: { at: new Date(NOW + 30_000).toISOString(), head },
+        held: { ...held(0), since: new Date(NOW + MINUTE).toISOString() },
+      };
+      const next = sample(rebuild, first.state, NOW + sampleMinute * MINUTE);
+      expect(next.transitions.filter(t => t.type === 'closed').map(t => t.episode.measure.episodeId))
+        .toEqual([firstId]);
+      if (sampleMinute === 2) {
+        expect(next.state.episodes[key]).toBeUndefined();
+        expect(sink(next)).toEqual([]);
+      }
+      const alarm = sampleMinute === 2 ? sample(rebuild, next.state, NOW + 32 * MINUTE) : next;
+      expect(sink(alarm)).toEqual([expect.objectContaining({ daemon: 'recovered-daemon', heldMs: 31 * MINUTE })]);
+      expect(sink(alarm)[0].episodeId).not.toBe(firstId);
+      const repeated = sample(rebuild, alarm.state, NOW + 33 * MINUTE);
+      expect(sink(repeated)).toEqual([]);
+      expect(repeated.state.episodes[key].measure.episodeId).toBe(sink(alarm)[0].episodeId);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    { adopted: null },
+    { adopted: { at: NOW - HOUR, head: 'recovered' } },
+    { adopted: { at: NOW, head: 'recovered' } },
+    { adopted: { at: NOW + 90_000, head: 'recovered' } },
+    { adopted: { at: NOW + 3 * MINUTE, head: 'recovered' } },
+    { adopted: { at: 'invalid', head: 'recovered' } },
+    { adopted: { at: NOW + 30_000, head: '' } },
+    { adopted: { at: NOW + 30_000 } },
+    { adopted: { at: NOW + 30_000, head: 'recovered' }, since: null },
+    { adopted: { at: NOW + 30_000, head: 'recovered' }, since: NOW + 3 * MINUTE },
+  ])('changing held.since without confirmed intervening adoption retains the owed episode (%j)', ({ adopted, since = NOW + MINUTE }) => {
+    const first = tick([clone('one', held(600))]);
+    const key = 'daemon-held-on-last-good::clone:one';
+    const result = tick([{ cloneKey: 'one', rebuild: { held: held(0, { since }), adopted } }],
+      first.state, NOW + 2 * MINUTE);
+    expect(result.evaluations[0].error).toBeUndefined();
+    expect(result.transitions.some(t => t.type === 'closed')).toBe(false);
+    expect(result.state.episodes[key].measure.episodeId).toBe(first.state.episodes[key].measure.episodeId);
+    expect(sink(result)).toEqual([]);
+  });
+
+  it.each([null, { at: NOW - HOUR, head: 'stale-adoption' }])
+  ('delayed adoption evidence still separates consecutive hold episodes (%j)', (adopted) => {
+    const first = tick([clone('one', held(600))]);
+    const key = 'daemon-held-on-last-good::clone:one';
+    const newHold = held(0, { since: NOW + MINUTE });
+    const uncertain = tick([{ cloneKey: 'one', rebuild: { held: newHold, adopted } }],
+      first.state, NOW + 2 * MINUTE);
+    expect(uncertain.transitions).toEqual([]);
+    expect(uncertain.state.episodes[key].measure.episodeId).toBe(first.state.episodes[key].measure.episodeId);
+    const rows = [{ cloneKey: 'one', rebuild: { held: newHold,
+      adopted: { at: NOW + 30_000, head: 'abc123' } } }];
+    const confirmed = tick(rows, uncertain.state, NOW + 3 * MINUTE);
+    expect(confirmed.transitions.filter(t => t.type === 'closed')).toHaveLength(1);
+    expect(confirmed.state.episodes[key]).toBeUndefined();
+    const alarm = tick(rows, confirmed.state, NOW + 32 * MINUTE);
+    expect(sink(alarm)).toHaveLength(1);
+    expect(sink(alarm)[0].episodeId).not.toBe(first.state.episodes[key].measure.episodeId);
+    expect(sink(tick(rows, alarm.state, NOW + 33 * MINUTE))).toEqual([]);
+  });
+
+  it('an unrelated recovery identity cannot retire an owed episode in the episode engine', () => {
+    const first = tick([clone('one', held(600))]);
+    const key = 'daemon-held-on-last-good::clone:one';
+    const result = stepEpisodes(first.state, [{ smell: daemonHeldOnLastGood,
+      results: [{ subject: 'clone:one', breach: true, resolvedEpisodeId: 'unrelated-episode',
+        measure: first.state.episodes[key].measure }] }], NOW + MINUTE);
+    expect(result.transitions).toEqual([]);
+    expect(result.state.episodes[key].id).toBe(first.state.episodes[key].id);
+  });
+
   it('malformed non-array selfSync advances the evaluator-error streak and exposes the failure', () => {
     const first = tick([clone('fixture-daemon', held(31))]);
     const errorKey = `smell:${daemonHeldOnLastGood.id}`;

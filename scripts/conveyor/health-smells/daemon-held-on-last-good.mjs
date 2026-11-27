@@ -51,16 +51,19 @@ export default {
       const subject = `clone:${c.cloneKey}`;
       const prior = previous.find(ep => ep.subject === subject);
       const held = c.rebuild?.held ?? null;
+      const adopted = c.rebuild?.adopted;
+      // Old persisted episodes may lack heldSinceIso: use their first observation then.
+      const recordedSince = Date.parse(prior?.measure?.heldSinceIso ?? '');
+      const after = Number.isFinite(recordedSince) ? recordedSince : prior?.firstBreachAt;
+      const validAdoption = Number.isFinite(adopted?.at)
+        && adopted.at <= now && typeof adopted.head === 'string'
+        && adopted.head.length > 0;
+      const confirmedAdoption = !!prior && validAdoption && adopted.at > after;
       if (!held && prior) {
-        const adopted = c.rebuild?.adopted;
-        // Old persisted episodes may lack heldSinceIso: require adoption after first observation then.
-        const recordedSince = Date.parse(prior.measure?.heldSinceIso ?? '');
-        const after = Number.isFinite(recordedSince) ? recordedSince : prior.firstBreachAt;
         // Confirm recovery from current adoption evidence even if the original hold lacked a SHA.
-        const resolved = c.rebuild?.held === null && Number.isFinite(adopted?.at)
-          && adopted.at > after && adopted.at <= now && typeof adopted.head === 'string'
-          && adopted.head.length > 0;
+        const resolved = c.rebuild?.held === null && confirmedAdoption;
         return { subject, breach: !resolved,
+          resolvedEpisodeId: resolved ? prior.id : undefined,
           measure: { ...prior.measure, daemon: c.cloneKey,
             episodeId: prior.measure?.episodeId ?? prior.id,
             uncertainty: resolved ? [] : ['unconfirmed-adoption'] },
@@ -76,7 +79,13 @@ export default {
       if (held && !validSince) uncertainty.push('invalid-since');
       const heldMs = since != null ? now - since : null;
       const heldMin = heldMs != null ? Math.round(heldMs / MINUTE) : null;
-      const breach = !!held && (since == null || heldMs > this.heldForMs || !!prior);
+      // A timestamp change alone cannot prove recovery. Require adoption between the old
+      // episode and this hold, and keep deduping when that adoption belongs to this episode.
+      // firstBreachAt survives samples whose adoption evidence was temporarily incomplete.
+      const replacesPrior = !!held && since != null && !!prior && validAdoption
+        && adopted.at > prior.firstBreachAt && adopted.at <= since;
+      const continuing = replacesPrior ? null : prior;
+      const breach = !!held && (since == null || heldMs > this.heldForMs || !!continuing);
       const failed = held?.failed == null ? null : String(held.failed);
       if (failed?.length > 4096) uncertainty.push('oversized-failed');
       const failedChecks = failed ? failed.slice(0, 4096).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ') : null;
@@ -88,9 +97,10 @@ export default {
       return {
         subject,
         breach,
+        resolvedEpisodeId: replacesPrior ? prior.id : undefined,
         measure: {
           daemon: c.cloneKey,
-          episodeId: prior?.measure?.episodeId ?? prior?.id ?? `${this.id}:${c.cloneKey}:${since ?? now}`,
+          episodeId: continuing?.measure?.episodeId ?? continuing?.id ?? `${this.id}:${c.cloneKey}:${since ?? now}`,
           heldMs,
           uncertainty,
           heldReason: held?.reason ?? null,
