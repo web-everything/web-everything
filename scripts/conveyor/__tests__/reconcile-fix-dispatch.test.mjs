@@ -139,6 +139,18 @@ describe('launchUncertain reports only provably-unlaunched refusals', () => {
       expect(dispatch).not.toHaveBeenCalled();
     }
   });
+  it('a malformed truthy resume never cold-launches', () => {
+    for (const resumed of ['false', 1, {}, []]) {
+      for (const shape of [round, conflict]) {
+        const dispatch = vi.fn(() => ({ pr: 7 }));
+        const resume = () => ({ resumed, resumeAttempt: { attempted: true } });
+        const result = run({ pickFreeLanes: () => [9], tryResume: resume, tryResumeRound: resume, dispatch }, shape);
+        expect(dispatch).not.toHaveBeenCalled();
+        expect(result).toMatchObject({ launchUncertain: [7], dispatched: [],
+          refusals: [{ pr: 7, kind: 'dispatch-failed', why: expect.stringContaining('resume') }] });
+      }
+    }
+  });
   it('held after an uncertain resume lists the PR; held with no resume leaves it out', () => {
     const extra = { pickFreeLanes: () => [9], dispatch: () => ({ held: true }) };
     expect(run(extra).launchUncertain).toEqual([]);

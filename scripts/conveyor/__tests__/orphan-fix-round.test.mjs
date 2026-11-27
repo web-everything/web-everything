@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import * as atomicJson from '../../lib/atomic-json-file.mjs';
 import * as processIdentity from '../../lib/pid-alive.mjs';
+import * as fileLocks from '../../readiness/file-locks.mjs';
 import { acquireLockDir, lockDirFor, readLockEntry } from '../../readiness/file-locks.mjs';
 import {
   planOrphanFixRound, runOrphanFixRoundPass, formatOrphanFixRoundLines, buildOrphanGuardComment, verdictReviewedHead,
@@ -234,6 +235,27 @@ describe('durable orphan redispatch attempts', () => {
     expect((await runOrphanFixRoundPass(options)).rows[0].result).toContain('unreadable attempt ledger: ENOSPC');
     expect(options.redispatch).not.toHaveBeenCalled();
     expect(options.escalate).toHaveBeenCalledOnce();
+  });
+  it('a throwing release on PR A still processes PR B', async () => {
+    const options = setup({
+      listBounced: () => [pr4715([]), pr4715([], { number: 4716 })],
+      redispatch: vi.fn(async () => ({ ok: true })), postComment: vi.fn(async () => {}),
+    });
+    const { path, resource } = seed(options);
+    writeFileSync(path, JSON.stringify({ version: 1, resource, confirmed: 2, pending: false }));
+    const release = vi.spyOn(fileLocks, 'releaseLockDir').mockImplementationOnce(() => {
+      throw new Error('fixture release failed');
+    });
+    const result = await runOrphanFixRoundPass(options);
+    expect(result.rows).toMatchObject([
+      { pr: 4715, decision: 'escalate', result: expect.stringMatching(/escalated:.*release failed: fixture release failed/) },
+      { pr: 4716, decision: 'redispatch', result: 're-dispatched' },
+    ]);
+    expect(options.escalate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ pr: 4715 }));
+    expect(options.redispatch).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ pr: 4716 }));
+    expect(release).toHaveBeenCalledTimes(2);
+    expect(readLockEntry(attemptRoot, resource)).not.toBeNull();
+    expect(ledgers().map(record => record.confirmed).sort()).toEqual([1, 2]);
   });
   it.each(['read', 'close'])('a %s ENOENT is not proof of a missing ledger', async failure => {
     const options = setup({ redispatch: vi.fn(async () => ({ ok: true })), attemptFs: {
