@@ -2,9 +2,9 @@ import { describe, expect, it } from 'vitest';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { redTeamGateMarker, liveResultGateState } from '../../lib/red-team-gate.mjs';
 import { buildVerdictCarriedMarker } from '../../lib/review-verdict-carried-marker.mjs';
-import { eligibility, POPULATIONS, REASONS } from '../dispatch-eligibility.mjs';
+import { eligibility, POPULATIONS, REASONS, ELIGIBILITY_PR_FIELDS } from '../dispatch-eligibility.mjs';
 import { planRedTeamStatusLabels } from '../../lib/red-team-status-labels.mjs';
-import { buildEligibilityFacts, redTeamFact } from '../dispatch-eligibility-facts.mjs';
+import { buildEligibilityFacts, redTeamFact, ELIGIBILITY_FACT_PR_FIELDS } from '../dispatch-eligibility-facts.mjs';
 import { enrichPrsWithAlreadyLandedFacts } from '../reconcile-pass.mjs';
 
 const head = 'a'.repeat(40), oldHead = 'b'.repeat(40), pr = 6001;
@@ -225,3 +225,39 @@ describe('reconcile-pass shadow fact', () => {
   });
 });
 
+
+
+describe('eligibility consumer PR field contract', () => {
+  const gateFields = ['commentsComplete', 'number', 'headRefOid', 'state', 'labels', 'isDraft'];
+  const factFields = ['alreadyLandedInMain', 'labels', 'number', 'headRefOid'];
+  const pinned = (value, fields, seen) => new Proxy(value, {
+    get(target, key) {
+      expect(fields).toContain(key);
+      seen.add(key);
+      return target[key];
+    },
+  });
+  it('pins every field read by the gate and fact builder using real consumers', () => {
+    expect(ELIGIBILITY_PR_FIELDS).toEqual(gateFields);
+    expect(ELIGIBILITY_FACT_PR_FIELDS).toEqual(factFields);
+    const seenGate = new Set(), seenFacts = new Set();
+    const comments = [result(head)];
+    comments.push(gateFor(comments, head, 'sent-back'));
+    for (const overrides of [{}, { isDraft: true }, { state: 'CLOSED' },
+      { labels: ['merge-status:conflicting'] }, { alreadyLandedInMain: true }]) {
+      const state = { ...prState, commentsComplete: true, ...overrides };
+      const facts = buildEligibilityFacts({ pr: pinned(state, factFields, seenFacts), comments,
+        commentsComplete: true, population: 'fix', locals: goodLocals() });
+      eligibility(pinned(state, gateFields, seenGate), facts);
+    }
+    expect([...seenGate].sort()).toEqual([...gateFields].sort());
+    expect([...seenFacts].sort()).toEqual([...factFields].sort());
+  });
+  it.each([undefined, null, false, 'true', 'false', 1, 0])('commentsComplete=%s never supplies red-team facts or gate clearance', commentsComplete => {
+    const comments = [result(head)];
+    comments.push(gateFor(comments, head, 'sent-back'));
+    const facts = buildEligibilityFacts({ pr: prState, comments, commentsComplete, population: 'fix', locals: goodLocals() });
+    expect(facts.redTeam).toEqual({ status: 'unread' });
+    expect(eligibility({ ...prState, commentsComplete }, facts)).toEqual({ unknown: 'thread' });
+  });
+});

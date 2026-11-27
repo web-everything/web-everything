@@ -268,6 +268,7 @@ export const LOCK_USERS = Object.freeze([
   // destructured dynamic import.
   'scripts/conveyor/health-watch.mjs', 'scripts/conveyor/liveness-sweep.mjs', 'scripts/conveyor/pass-daemons/pr-postmortem-pass.mjs',
   'scripts/conveyor/poc-branch-sync.mjs', 'scripts/conveyor/soak/breaks/postmortem-poison-merge.mjs',
+  'scripts/conveyor/soak/breaks/no-code-rearm-active-claim.mjs',
   'scripts/conveyor/soak/breaks/rebuild-coordination-noop-events.mjs', 'scripts/conveyor/soak/breaks/stale-ruling-report-and-rebuild-wait.mjs',
   'scripts/conveyor/stand-down.mjs', 'scripts/drain-followup-job.mjs', 'scripts/lane-git-diet.mjs', 'scripts/lib/card-number-allocator.mjs',
   'scripts/lib/clone-maintenance.mjs', 'scripts/lib/daemon-rebuild/rebuild.mjs', 'scripts/lib/daemon-rebuild/smoke.mjs',
