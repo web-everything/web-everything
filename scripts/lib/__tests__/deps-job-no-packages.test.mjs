@@ -1,104 +1,17 @@
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { closeSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, rmSync, writeFileSync } from 'node:fs';
-import { isBuiltin } from 'node:module';
 import { tmpdir } from 'node:os';
-import { dirname, isAbsolute, relative, resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import ts from 'typescript';
 import { parseSupersedes } from '../../conveyor/supersede-rule.mjs';
+import { inspectDepsImports } from '../daemon-rebuild/deps-job.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 
-const SYNTAX_LIMITS = Object.freeze({ maxFiles: 128, maxBytes: 4 * 1024 * 1024, maxMs: 10_000 });
-const NON_CLAIMS = Object.freeze([
-  'invoked-function loads', 'eval', 'aliased createRequire', 'computed specifiers',
-  'local require/import calls are classified but not followed',
-]);
-
-/**
- * Bounded syntax evidence, never a proof of the runtime import closure. Follow import/re-export
- * declarations; additionally flag literal require/import calls on non-indented lines. Parse calls
- * as syntax so quoted eval text is not mistaken for a load. No source is executed.
- * All IO, paths and time are supplied by the caller; incomplete evidence throws, never returns [].
- */
-function inspectImports(entry, { root: repoRoot, read, now, ...limits }) {
-  const { maxFiles, maxBytes, maxMs } = { ...SYNTAX_LIMITS, ...limits };
-  const refuse = (reason) => {
-    throw new Error(`Incomplete dependency syntax evidence: ${reason}; repair the input or inspection budget and retry; runtime assurance requires a separate isolated import trace.`.replace(/[\x00-\x1f\x7f-\x9f]/g, ' '));
-  };
-  if (typeof repoRoot !== 'string' || !isAbsolute(repoRoot) || typeof read !== 'function' || typeof now !== 'function') refuse('required-input-missing');
-  if (![maxFiles, maxBytes, maxMs].every((n) => Number.isSafeInteger(n) && n > 0)) refuse('invalid-budget');
-  const started = now();
-  let last = started;
-  const checkTime = () => {
-    const tick = now();
-    if (!Number.isFinite(started) || !Number.isFinite(tick) || tick < last) refuse('invalid-clock');
-    last = tick;
-    if (tick - started >= maxMs) refuse('time-budget');
-  };
-  const localPath = (absolute) => {
-    const path = relative(repoRoot, absolute);
-    if (!path || path === '..' || path.startsWith('../') || isAbsolute(path)) refuse(`outside-root: ${absolute}`);
-    return path;
-  };
-  const classify = (name, path) => {
-    if (isBuiltin(name)) return { builtin: true };
-    if (name.startsWith('./') || name.startsWith('../')) return { local: localPath(resolve(repoRoot, dirname(path), name)) };
-    if (isAbsolute(name)) return { local: localPath(name) };
-    if (name.startsWith('file:')) {
-      let absolute;
-      try { absolute = fileURLToPath(name); } catch (error) { refuse(`invalid-file-url: ${error.message}`); }
-      return { local: localPath(absolute) };
-    }
-    if (!name || /^[a-zA-Z][\w+.-]*:/.test(name)) refuse(`unsupported-specifier: ${name}`);
-    return { package: name };
-  };
-  const seen = new Set();
-  const packages = [];
-  let bytes = 0;
-  function walk(path, chain) {
-    checkTime();
-    if (seen.has(path)) return;
-    if (seen.size >= maxFiles) refuse('file-budget');
-    seen.add(path);
-    let text;
-    try { text = read(path, maxBytes - bytes); } catch (error) { refuse(`read-failed: ${path}: ${error.message}`); }
-    checkTime();
-    if (typeof text !== 'string') refuse(`read-failed: ${path}: missing source text`);
-    bytes += Buffer.byteLength(text, 'utf8');
-    if (bytes > maxBytes) refuse('byte-budget');
-    const source = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
-    if (source.parseDiagnostics.length) refuse(`malformed-module: ${path}`);
-    const lines = text.split('\n');
-    const calls = [source];
-    while (calls.length) {
-      checkTime();
-      const node = calls.pop();
-      if (ts.isCallExpression(node) && (node.expression.kind === ts.SyntaxKind.ImportKeyword
-        || (ts.isIdentifier(node.expression) && node.expression.text === 'require'))) {
-        const line = lines[source.getLineAndCharacterOfPosition(node.getStart(source)).line];
-        const argument = node.arguments[0];
-        if (/^\S/.test(line) && argument && ts.isStringLiteral(argument)) {
-          const target = classify(argument.text, path);
-          if (target.package) packages.push([...chain, path, target.package].join(' -> '));
-        }
-      }
-      ts.forEachChild(node, (child) => { calls.push(child); });
-    }
-    for (const statement of source.statements) {
-      checkTime();
-      if (!ts.isImportDeclaration(statement) && !ts.isExportDeclaration(statement)) continue;
-      const specifier = statement.moduleSpecifier;
-      if (!specifier) continue;
-      if (!ts.isStringLiteral(specifier)) refuse(`unreadable-import: ${path}`);
-      const target = classify(specifier.text, path);
-      if (target.local) walk(target.local, [...chain, path]);
-      else if (target.package) packages.push([...chain, path, target.package].join(' -> '));
-    }
-  }
-  walk(localPath(resolve(repoRoot, entry)), []);
-  checkTime();
-  return { packages, visited: [...seen], nonClaims: NON_CLAIMS, assurance: 'bounded syntax only; runtime import closure unproven' };
+// Exercise the production inspector with the installed parser, without adding it to the job's imports.
+function inspectImports(entry, options) {
+  return inspectDepsImports(entry, { ...options, syntax: ts });
 }
 
 // The two existing entry probes use bounded local IO; fixture tests supply their own root/read/clock.
@@ -194,13 +107,50 @@ describe('bounded dependency syntax evidence (hermetic fixtures)', () => {
   });
 
   it.each([
+    'eval("import(\'external\')");',
+    'eval("require(\'external\')");',
+    'new Function("return import(\'external\')")();',
+    'const source = "import(\'external\')";',
+  ])('retains the previous heuristic refusal for quoted package loads: %s', (source) => {
+    const f = syntaxFixture({ 'entry.mjs': source });
+    expect(packageImports('entry.mjs', f.read, f)).toEqual(['entry.mjs -> external']);
+  });
+
+  it.each([
+    "loader.require('external');",
+    "loader?.require('external');",
+    "loader['require']('external');",
+  ])('rejects member-call require package loads: %s', (source) => {
+    const f = syntaxFixture({ 'entry.mjs': source });
+    expect(packageImports('entry.mjs', f.read, f)).toEqual(['entry.mjs -> external']);
+  });
+
+  it.each([
+    "import('external' + '');",
+    'import(packageName);',
+    'import(`external`);',
+    'import(`external/${name}`);',
+    'import(getSpecifier());',
+    "import('node:' + 'fs');",
+    "require('external' + '');",
+    'require(packageName);',
+    'require();',
+    'loader.require(packageName);',
+    "loader['require']('external' + '');",
+  ])('refuses UNKNOWN nonliteral specifiers without following another path: %s', (source) => {
+    const f = syntaxFixture({ 'entry.mjs': `${source}\nimport './unread.mjs';` });
+    expect(() => inspectImports('entry.mjs', f)).toThrow(/incomplete.*unknown-specifier.*repair.*retry/i);
+    expect(f.read).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
     ['invoked-function loads', "function load() {\n  return import('external');\n}\nload();"],
     ['eval', 'eval("import(\'external\')");'],
     ['aliased createRequire', "import { createRequire as makeRequire } from 'node:module';\nconst load = makeRequire(import.meta.url);\nload('external');"],
-  ])('explicitly excludes %s from its proof, even when the fixture invokes the load', (nonClaim, source) => {
+  ])('states the %s runtime non-claim without exempting heuristic refusals', (nonClaim, source) => {
     const f = syntaxFixture({ 'entry.mjs': source });
     const evidence = inspectImports('entry.mjs', f);
-    expect(evidence.packages).toEqual([]);
+    expect(evidence.packages).toEqual(nonClaim === 'eval' ? ['entry.mjs -> external'] : []);
     expect(evidence.visited).toEqual(['entry.mjs']);
     expect(evidence.nonClaims).toContain(nonClaim);
     expect(evidence.assurance).toBe('bounded syntax only; runtime import closure unproven');
