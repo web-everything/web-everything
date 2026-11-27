@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import * as fixer from '../fix-run.mjs';
 import * as procedure from '../../conveyor/fix-procedure.mjs';
 import { decideEmptyFixRound, decideRearm, buildNoChangeComment } from '../../conveyor/rearm-review.mjs';
+import { buildStandDownComment } from '../../conveyor/stand-down.mjs';
+import { buildOperatorAnswer } from '../../conveyor/stand-down-answer-core.mjs';
 const { isNothingToRearmRefusal, resolveRearmRefusalPolicy } = fixer;
 
 describe('isNothingToRearmRefusal', () => {
@@ -26,6 +28,15 @@ const RUN = 'd69c8366-cc58-4312-b080-2e7189fdc399';
 const binding = { repo: 'fixture/example', pr: 7, head: HEAD, runId: RUN, claimId: 'fixture-lease-unique' };
 const reason = 'The requested repair is already present';
 const trusted = body => ({ id: 'fixture-comment', author: { login: 'web-everything' }, body });
+const claim = id => ({ ...trusted(`🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/fixture\` at \`${HEAD}\``), id });
+const authorizedComments = () => [
+  trusted(`🔁 review — changes requested\nAlready repaired\n<!-- reviewed-sha: ${HEAD} -->`),
+  claim('initial'),
+  { ...trusted(buildStandDownComment({ reason: 'needs-judgment', detail: 'Is repair owed?', head: HEAD })), id: 'stop' },
+  { id: 'answer', author: { login: 'chalbert' }, body: buildOperatorAnswer({ standDownId: 'stop', actor: 'chalbert',
+    channel: 'fixture', reason, disposition: 'rearm-review', noCodeOwed: true, head: HEAD }) },
+  claim('resume'),
+];
 const dirs = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
@@ -52,7 +63,8 @@ function noChangeExit({ moved = false, reasonText = reason } = {}) {
     throw Error(`unexpected fixture command: ${cmd} ${args.join(' ')}`);
   });
   const io = { run, weRoot: root, readPrompt: () => 'Apply the fixture review finding.', removePrompt: () => {},
-    readComments: async () => [trusted('🔁 review — changes requested\nAlready repaired')],
+    readComments: async () => authorizedComments(),
+    readNoCodeSnapshot: () => ({ headRefOid: HEAD, labels: [{ name: 'review:changes' }], reviews: [] }),
     resolveProvider: async () => ({ spawn: async () => { completed = true; return { finalMessage: reasonText }; } }),
     readLease: () => ({ holder: binding.claimId }), renewLease: () => { throw Error('unexpected heartbeat'); },
     heartbeatMs: 60_000, clock: () => 1234, sleep: () => { throw Error('unexpected wait'); },
@@ -80,9 +92,10 @@ describe('FIXER-NOCODE-TRAILER', () => {
     expect(procedure.parseNoCodeOwedStandDown(trusted(standDown), binding)).toEqual({ version: 1, ...binding, reason });
     expect(output.match(/<!-- conveyor-no-code-owed:/g)).toHaveLength(1);
     expect(fixture.calls.some(([cmd, args]) => cmd === 'gh' && args.includes('comment'))).toBe(false);
-    const comments = [trusted(standDown)];
-    expect(decideEmptyFixRound({ comments, liveHead: HEAD, noCodeBinding: binding })).toEqual({ empty: false, noCodeResume: true });
-    expect(decideEmptyFixRound({ comments, liveHead: 'b'.repeat(40), noCodeBinding: binding })).toMatchObject({ empty: true });
+    const comments = [...authorizedComments(), trusted(standDown)];
+    const facts = { comments, noCodeBinding: binding, labels: ['review:changes'], reviews: [] };
+    expect(decideEmptyFixRound({ ...facts, liveHead: HEAD })).toEqual({ empty: false, noCodeResume: true });
+    expect(decideEmptyFixRound({ ...facts, liveHead: 'b'.repeat(40) })).toMatchObject({ empty: true });
     const rearm = decideRearm({ currentLabels: ['review:changes', 'review:human'] });
     expect(rearm.addLabel).not.toBe('review:accepted');
     expect(rearm.removeLabels).not.toContain('review:human');

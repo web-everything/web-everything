@@ -597,16 +597,20 @@ describe('runFixCli', () => {
     expect(comments[0]).toContain(diagnosis);
   });
   // card 5947 (live #5045, 2026-10-13): CI context and durable outcomes precede lane acquisition.
-  it('launches a ci-heal without a finding and records no-change as real repair evidence', async () => {
-    const m = mk(['aaa', 'aaa']);
+  it.each(['aaa', 'a'.repeat(40)])('launches a ci-heal without a finding and records no-change as real repair evidence (%s)', async head => {
+    const m = mk([head, head]);
     const readComments = vi.fn(async () => []), appendLoopRow = vi.fn();
+    const readNoCodeSnapshot = vi.fn(() => { throw Error('CI-heal must not read review authorization'); });
+    const write = vi.fn();
     const readCiHeal = vi.fn(() => ({ title: 'CI red', body: 'B', checks: [{ name: 'unit', detailsUrl: 'https://github.com/o/r/actions/runs/1/job/42' }],
       jobs: [{ name: 'unit', filtered: true, log: '2026-10-13T13:19:27.2719622Z FAIL  scripts/conveyor/soak/__tests__/shard-files.test.mjs > coverage\nAssertionError: expected 0.796875 to be greater than 0.8' }] }));
-    expect((await runFixCli([...argv, '--repair-kind=ci-heal'], { ...m.io, readComments, readCiHeal, appendLoopRow })).code).toBe(0);
+    expect((await runFixCli([...argv, '--repair-kind=ci-heal'], { ...m.io, readComments, readNoCodeSnapshot, readCiHeal, appendLoopRow, write })).code).toBe(0);
     expect(readComments).not.toHaveBeenCalled();
+    expect(readNoCodeSnapshot).not.toHaveBeenCalled();
+    expect(write.mock.calls.flat().join('')).not.toMatch(/conveyor-no-code-owed|no-code evidence withheld/);
     const prompt = m.spawn.mock.calls[0][0].prompt;
     for (const text of ['## CI FAILURE CONTEXT (fetched by the launcher)', 'scripts/conveyor/soak/__tests__/shard-files.test.mjs', 'AssertionError: expected 0.796875 to be greater than 0.8']) expect(prompt).toContain(text);
-    expect(appendLoopRow).toHaveBeenCalledWith(expect.objectContaining({ kind: 'outcome', head: 'aaa', outcome: 'no-change', infra: false }));
+    expect(appendLoopRow).toHaveBeenCalledWith(expect.objectContaining({ kind: 'outcome', head, outcome: 'no-change', infra: false }));
   });
   it.each(['ci-heal', 'fix'])('records a pre-lane %s refusal against the PR head', async repairKind => {
     const m = mk([]), recordRouted = vi.fn(() => ({})), appendLoopRow = vi.fn(), writeErr = vi.fn();

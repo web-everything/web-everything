@@ -1262,7 +1262,7 @@ export async function runFixCli(argv = [], {
           reason = evidence.reason ?? `missing or unverified fix evidence: ${evidence.missing.join(', ')}`;
         }
       }
-      if (!openSendBacks.length && !evidence.reason) {
+      if (launch.repairKind !== 'ci-heal' && !openSendBacks.length && !evidence.reason) {
         try {
           // Absence of send-backs proves nothing about the outstanding review finding. Re-read the operator
           // window and live forge holds while the lane is still owned, immediately before terminal emission.
