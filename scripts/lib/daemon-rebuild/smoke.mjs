@@ -28,6 +28,9 @@ import { runBounded } from '../bounded-child.mjs';
 import { SMOKE_CHECKS, SMOKE_BUDGET_ENV, resolveSmokeBudgets, isDispatchDryRunScript } from '../daemon-live-smoke.mjs';
 import { readDeclaredSettings } from '../settings-files.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
+import { smokeEvidenceProblem } from './smoke-classify/evidence.mjs';
+import { rateLimitOnly, holdRateLimited } from './smoke-classify/rate-limited.mjs';
+import { transient } from './smoke-classify/transient.mjs';
 
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 
@@ -509,6 +512,13 @@ export async function smokeAndAdopt({
       }
       smokeResult = await runSmoke({ root: candidate.path, env: freshComparison ? fallbackEnv : smokeEnv,
         changedFiles: proven ? null : changedFiles, reuseCode: !!proven, reuseRows, runChild, clock: now });
+      const evidenceReason = smokeEvidenceProblem(smokeResult);
+      if (evidenceReason) smokeResult = {
+        verdict: 'transient', evidenceReason,
+        smoke: { results: Array.isArray(smokeResult?.smoke?.results)
+          ? smokeResult.smoke.results.slice(0, SMOKE_CHECKS.length)
+            .filter(row => row && SMOKE_CHECKS.some(check => check.name === row.name) && row.ok === false) : [] },
+      };
       if (!freshComparison) {
         firstSmoke = smokeResult;
         const base = resolveSmokeBudgets(smokeEnv);
@@ -726,6 +736,12 @@ export async function smokeAndAdopt({
     alert('smoke-threw', redactDetail(String(a.threw?.message || a.threw)));
     await hold('smoke-threw', []);
     return { moved: false, reason: 'smoke-threw', plan, alerts: [...prepAlerts, ...alertsList] };
+  }
+  if (a.smokeResult.evidenceReason) {
+    return transient.run({ a, failedA: failedRows(a.smokeResult), alert, hold, plan, prepAlerts, alertsList });
+  }
+  if (rateLimitOnly(a.smokeResult)) {
+    return holdRateLimited({ failedA: failedRows(a.smokeResult), hold, alert, env, log, now, plan, prepAlerts, alertsList });
   }
   if (a.smokeResult.verdict === 'pass') {
     if (a.dispatch && !a.dispatch.result.ok) return dispatchFailed(a.dispatch);

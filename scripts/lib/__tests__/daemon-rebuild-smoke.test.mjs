@@ -11,6 +11,18 @@ import { dispatchSmokeSuspects, smokeFailureFiles } from '../daemon-rebuild/smok
 import { checkDaemonEntriesBoot, DAEMON_ENTRIES_ENV } from '../daemon-boot-smoke.mjs';
 import { runRealDispatchSmoke } from '../daemon-load-overlay.mjs';
 import { alertsFilePath } from '../daemon-rebuild/state.mjs';
+import fs from 'node:fs';
+import os from 'node:os';
+import { syncBuiltinESMExports } from 'node:module';
+import * as locks from '../daemon-clone-lock.mjs';
+import * as edgeFetch from '../daemon-rebuild/edge-fetch.mjs';
+import * as planner from '../daemon-rebuild/plan.mjs';
+import * as audit from '../daemon-rebuild/audited-tip.mjs';
+import * as adoption from '../daemon-rebuild/adopt.mjs';
+import * as slots from '../daemon-smoke-slots.mjs';
+import * as settingsFiles from '../settings-files.mjs';
+import { SMOKE_CHECKS, runLiveSmoke, classifySmokeFailure } from '../daemon-live-smoke.mjs';
+import { rateLimitOnly } from '../daemon-rebuild/smoke-classify/rate-limited.mjs';
 
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
@@ -408,5 +420,216 @@ describe('dispatchSmokeSuspects', () => {
     expect(dispatchSmokeSuspects({
       git: okGit(['q']), applied, adoptedApplied: null, patterns: ['p'], match,
     })).toEqual([]);
+  });
+});
+
+describe('BLD-5539 — rate-limited overlay recovery', () => {
+  const at = ms => new Date(ms).toISOString();
+  const throttle = 'gh-throttle: throttled — no gh slot within 8s (class=background); retry next tick';
+  const passed = () => ({ verdict: 'pass', smoke: { pass: true,
+    results: SMOKE_CHECKS.map(({ name, mayBeTransient }) => ({ name, mayBeTransient, ok: true, ms: 1 })) } });
+  const limited = () => {
+    const result = passed();
+    result.verdict = 'code'; result.smoke.pass = false;
+    Object.assign(result.smoke.results.find(r => r.name === 'gh-api-repo'), {
+      ok: false, detail: 'gh api --method GET repos/o/r failed: exited 1: HTTP 403: API rate limit exceeded',
+    });
+    return result;
+  };
+  let f;
+  beforeEach(() => {
+    const base = mktemp('we-rate-limit-');
+    const root = join(base, 'clone'); mkdirSync(root);
+    const env = {
+      PATH: '/usr/bin:/bin', HOME: join(base, 'home'), TMPDIR: base,
+      GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(base, 'gitconfig'),
+      GIT_AUTHOR_NAME: 'fixture', GIT_AUTHOR_EMAIL: 'fixture@example.invalid',
+      GIT_COMMITTER_NAME: 'fixture', GIT_COMMITTER_EMAIL: 'fixture@example.invalid',
+      GIT_AUTHOR_DATE: '@1800000000 +0000', GIT_COMMITTER_DATE: '@1800000000 +0000',
+      WE_DAEMON_STATE_DIR: join(base, 'state'), WE_DAEMON_OVERLAY_DIR: join(base, 'overlays'),
+      WE_DAEMON_CLONE_LOCK_ROOT: join(base, 'locks'), WE_PLATFORM_PREFERENCES_FILE: join(base, 'preferences.json'),
+      LANE_POOL_ROOT: join(base, 'lanes'), LANE_POOL_CANONICAL_ORIGIN: join(base, 'origin.git'),
+      WE_DISPATCH_CWD_ROOT: join(base, 'dispatch'), WE_DAEMON_AUTO_REBASE: '0', WE_OVERLAY_STALE: '0',
+      WE_DAEMON_RECOVERY_ENV_TIMEOUT_BASE_MS: '1000', WE_DAEMON_RECOVERY_ENV_TIMEOUT_MAX_MS: '4000',
+      WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0', WE_DAEMON_EVENTS: join(base, 'events.jsonl'),
+      WE_SMOKE_LOAD_SCALE: '0',
+    };
+    vi.spyOn(os, 'homedir').mockReturnValue(env.HOME);
+    vi.spyOn(os, 'hostname').mockReturnValue('fixture-host');
+    vi.spyOn(os, 'loadavg').mockImplementation(() => { throw new Error('host load probe forbidden'); });
+    vi.spyOn(os, 'cpus').mockImplementation(() => { throw new Error('host CPU probe forbidden'); });
+    syncBuiltinESMExports();
+    mkdirSync(env.HOME); writeFileSync(env.GIT_CONFIG_GLOBAL, ''); writeFileSync(env.WE_PLATFORM_PREFERENCES_FILE, '{}');
+    const run = vi.fn((args, opts = {}) => {
+      if (['fetch', 'push', 'remote'].includes(args[0])) throw new Error(`forbidden remote call: ${args[0]}`);
+      const r = spawnSync('git', args, { cwd: opts.cwd ?? root, env: { ...env, ...opts.env },
+        encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024 });
+      if (r.error || r.signal) throw r.error ?? new Error(`git killed: ${r.signal}`);
+      return r;
+    });
+    const git = args => {
+      const r = run(args); if (r.status !== 0) throw new Error(`fixture git ${args[0]}: ${r.stderr}`);
+      return r.stdout.trim();
+    };
+    git(['init', '-q', '-b', 'main']);
+    writeFileSync(join(root, 'file'), 'last-good'); git(['add', '.']); git(['commit', '-qm', 'last-good']);
+    const lastGood = git(['rev-parse', 'HEAD']); git(['update-ref', 'refs/remotes/origin/main', lastGood]);
+    writeFileSync(join(root, 'file'), 'overlay'); git(['commit', '-qam', 'overlay']);
+    const target = git(['rev-parse', 'HEAD']); git(['update-ref', 'refs/remotes/origin/lane/rate-limit', target]);
+    git(['reset', '--hard', lastGood]);
+    let clock = 1_800_000_000_000;
+    vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(clock);
+    addOverlay(root, { ref: 'lane/rate-limit', pr: 77, addedBy: 'fixture', now: at(clock) }, { env });
+    const applied = [{ ref: 'lane/rate-limit', pr: 77, sha: target }];
+    const plan = { ok: true, upToDate: false, finalSha: target, mainSha: lastGood, inputsKey: 'rate-limit-inputs',
+      applied, decisions: [], alerts: [] };
+    // All external/host evidence is injected; only local Git and fixture files are real.
+    const read = fs.readFileSync;
+    vi.spyOn(fs, 'readFileSync').mockImplementation((path, ...args) => {
+      if (String(path).startsWith(base)) return read(path, ...args);
+      if (String(path).endsWith('.json')) return '{}';
+      throw new Error(`non-fixture read refused: ${String(path)}`);
+    });
+    vi.spyOn(settingsFiles, 'readDeclaredSettings').mockReturnValue({ settings: {} });
+    vi.spyOn(edgeFetch, 'fetchMainAndOverlays').mockReturnValue({ ok: true, goneRefs: [], refEvidence: new Map() });
+    vi.spyOn(planner, 'planRebuild').mockImplementation(async ({ overlays }) => overlays.length ? plan
+      : { ...plan, finalSha: lastGood, inputsKey: 'plain-main', applied: [] });
+    vi.spyOn(audit, 'makeAuditedTipGate').mockReturnValue(() => true);
+    vi.spyOn(locks, 'withWriteLock').mockImplementation(async (_root, fn) => ({ ok: true, value: await fn() }));
+    vi.spyOn(slots, 'acquireSmokeSlot').mockResolvedValue({ acquired: true, release: async () => {} });
+    const adopt = vi.spyOn(adoption, 'finalizeRebuild');
+    const smoke = vi.fn(async () => limited());
+    const rebuild = () => rebuildClone({ root, env, run, runSmoke: smoke, now: () => clock, log: { error() {} },
+      versions: null, asJob: false, skipCheck: null, spawnerOwners: () => [], readerStartTimeOf: () => 0,
+      emitEvent: async () => {}, prState: async () => 'OPEN', lockOpts: { waitMs: 0 },
+      dispatchSmoke: { settings: { dispatchSmoke: 'off' }, run: async () => ({ ok: true }), match: () => [] } });
+    f = { root, env, git, plan, lastGood, target, smoke, rebuild, adopt,
+      state: () => readRebuildState(root, env), refs: () => refs({ cloneDir: root, env }),
+      advance: ms => { clock = ms; vi.setSystemTime(clock); }, now: () => clock };
+  });
+  afterEach(() => { vi.restoreAllMocks(); syncBuiltinESMExports(); vi.useRealTimers(); });
+
+  const expectKept = () => {
+    expect(f.git(['rev-parse', 'HEAD'])).toBe(f.lastGood);
+    expect(f.refs()).toEqual(['lane/rate-limit']);
+    expect(f.adopt).not.toHaveBeenCalled();
+    expect(f.state().rejected).toBeNull();
+  };
+
+  it('rate-limit-only overlay smoke keeps overlay and retries unchanged target after backoff', async () => {
+    const first = await f.rebuild();
+    expect(first.adopted).toBeFalsy(); expectKept();
+    const held = f.state().held;
+    expect(held).toMatchObject({ target: f.target, inputsKey: f.plan.inputsKey, attempts: 1, retryAt: at(f.now() + 1000) });
+    f.advance(Date.parse(held.retryAt)); f.smoke.mockResolvedValue(passed());
+    const retried = await f.rebuild();
+    expect(retried.adopted).toBe(true); expect(retried.head).toBe(f.target);
+    expect(retried.plan.inputsKey).toBe(first.plan.inputsKey);
+    expect(retried.plan.applied).toEqual(first.plan.applied);
+    expect(f.refs()).toEqual(['lane/rate-limit']); expect(f.smoke).toHaveBeenCalledTimes(2);
+  });
+
+  it('before retryAt launches no smoke', async () => {
+    await f.rebuild(); const retryAt = f.state().held.retryAt;
+    expect(retryAt).toBe(at(f.now() + 1000));
+    f.advance(Date.parse(retryAt) - 1); await f.rebuild();
+    expect(f.smoke).toHaveBeenCalledTimes(1); expectKept();
+  });
+
+  it('restart preserves retry target', async () => {
+    await f.rebuild(); const held = JSON.parse(JSON.stringify(f.state().held));
+    expect(held.retryAt).toBe(at(f.now() + 1000));
+    f.advance(Date.parse(held.retryAt)); f.smoke.mockResolvedValue(passed());
+    // Each public call reconstructs the plan and reads persisted state, without a retry closure.
+    const retried = await f.rebuild();
+    expect(retried.plan.finalSha).toBe(held.target); expect(retried.plan.inputsKey).toBe(held.inputsKey);
+    expect(retried.adopted).toBe(true);
+  });
+
+  it('retry ceiling holds and escalates', async () => {
+    for (const [attempts, delay] of [[1, 1000], [2, 2000], [3, 4000], [4, 4000]]) {
+      const result = await f.rebuild(); expectKept();
+      expect(f.state().held).toMatchObject({ attempts, retryAt: at(f.now() + delay), target: f.target });
+      if (delay === 4000) expect(result.alerts).toContainEqual(expect.objectContaining({ kind: 'smoke-rate-limit-retry-ceiling' }));
+      f.advance(Date.parse(f.state().held.retryAt));
+    }
+    expect(f.smoke).toHaveBeenCalledTimes(4);
+  });
+
+  it('mixed rate-limit and code failure does not classify transient', async () => {
+    const mixed = limited();
+    Object.assign(mixed.smoke.results.find(r => r.name === 'dispatch-dry-run'), { ok: false, detail: 'TypeError: invalid dispatch' });
+    f.smoke.mockResolvedValue(mixed);
+    const result = await f.rebuild();
+    expect(result.adopted).toBeFalsy(); expect(f.state().rejected).toMatchObject({ inputsKey: f.plan.inputsKey });
+    expect(result.alerts.some(a => a.kind === 'smoke-rate-limited')).toBe(false);
+  });
+
+  it.each(['missing', 'ambiguous', 'duplicate', 'oversized', 'malformed', 'empty'])('%s required smoke evidence refuses adoption without overlay attribution', async kind => {
+    const result = passed();
+    if (kind === 'missing') result.smoke.results.pop();
+    else if (kind === 'ambiguous') result.smoke.results[0].ok = 'unknown';
+    else if (kind === 'duplicate') result.smoke.results.push(result.smoke.results[0]);
+    else if (kind === 'oversized') result.smoke.results[0].detail = 'x'.repeat(4001);
+    else if (kind === 'malformed') result.smoke.results = null;
+    else result.smoke.results = [];
+    f.smoke.mockResolvedValue(result);
+    const held = await f.rebuild(); expect(held.adopted).toBeFalsy(); expectKept();
+    expect(f.state().held.evidenceReason).toBe(['ambiguous', 'duplicate'].includes(kind) ? 'indeterminate-evidence' : 'incomplete-evidence');
+    expect(f.smoke).toHaveBeenCalledTimes(1);
+    expect(held.alerts.some(a => a.kind.includes('overlay-dropped') || a.kind === 'smoke-rejected')).toBe(false);
+    expect(held.alerts.find(a => a.kind === 'smoke-evidence-held').detail.message).toContain('repair the smoke producer and rerun');
+  });
+
+  it.each(['stdout', 'stderr', 'both'])('smoke producer retains %s-only throttle diagnostics through overlay recovery', async channel => {
+    let produced;
+    f.smoke.mockImplementation(async ({ root, env }) => {
+      const smoke = await runLiveSmoke({ root, env, repos: [], clock: f.now, now: f.now(), load: () => 0, cores: () => 1,
+        shadow: () => null, admit: () => null, hostBusy: () => false,
+        makeReadMemoDir: () => { const dir = join(f.env.TMPDIR, 'memo'); mkdirSync(dir); return dir; },
+        runChild: async (cmd, args, options) => {
+          if (cmd === 'gh') throw Object.assign(new Error(channel === 'stderr' ? 'exited 1' : `exited 1: ${throttle}`), {
+            status: 1, signal: null, stdout: channel !== 'stderr' ? throttle : '', stderr: channel !== 'stdout' ? throttle : '',
+          });
+          if (args[1] === 'list') return '[]';
+          if (args[1] === 'acquire') return JSON.stringify({ lane: 39 });
+          if (options.env.GH_CALLER === 'rebuild-smoke:dispatch-dry-run') {
+            return JSON.stringify([{ kind: options.env.WE_SMOKE_DRYRUN_ONLY, ok: true, ms: 1 }]);
+          }
+          return cmd === 'node' ? JSON.stringify({ ok: true }) : '';
+        } });
+      produced = smoke;
+      return { verdict: classifySmokeFailure(smoke.results), smoke };
+    });
+    const result = await f.rebuild();
+    expect(produced?.results.filter(row => row.ok === false).map(row => ({ name: row.name, detail: row.detail })))
+      .toEqual([expect.objectContaining({ name: 'gh-api-repo' }), expect.objectContaining({ name: 'gh-pr-list' })]);
+    expect(result.adopted).toBeFalsy(); expectKept();
+    expect(f.state().held).toMatchObject({ target: f.target, attempts: 1, retryAt: at(f.now() + 1000) });
+  });
+});
+
+describe('BLD-5539 — rate-limit proof boundaries', () => {
+  const result = (patch = {}) => ({ verdict: 'code', smoke: { pass: false,
+    results: SMOKE_CHECKS.map(({ name, mayBeTransient }) => name === 'gh-api-repo'
+      ? { name, mayBeTransient, ok: false, detail: 'gh api --method GET repos/o/r failed: exited 1: HTTP 403: API rate limit exceeded', ...patch }
+      : { name, mayBeTransient, ok: true }) } });
+  it.each([
+    { detail: 'gh api failed: rate limit exceeded; TypeError: invalid code' },
+    { stderrTail: 'TypeError: invalid code' },
+    { mayBeTransient: false },
+    { mayBeTransient: undefined },
+    { detail: 'x'.repeat(4001) },
+    { detail: 'gh api failed: HTTP 403: permission denied' },
+  ])('unknown, oversized or mixed diagnostics cannot prove rate-limit-only failure: %#', patch => {
+    expect(rateLimitOnly(result(patch))).toBe(false);
+  });
+  it('a tree-code check printing a rate limit cannot impersonate an external check', () => {
+    const evidence = result();
+    evidence.smoke.results.find(row => row.name === 'gh-api-repo').ok = true;
+    Object.assign(evidence.smoke.results.find(row => row.name === 'dispatch-dry-run'), {
+      ok: false, mayBeTransient: true, detail: 'HTTP 403: API rate limit exceeded',
+    });
+    expect(rateLimitOnly(evidence)).toBe(false);
   });
 });

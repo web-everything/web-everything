@@ -7,10 +7,13 @@ export const transient = Object.freeze({
   name: 'transient',
   matches(verdict) { return verdict !== 'code'; },
   async run(ctx) {
-    const { failedA, alert, hold, plan, prepAlerts, alertsList } = ctx;
+    const { a, failedA, alert, hold, plan, prepAlerts, alertsList } = ctx;
+    const evidenceReason = a?.smokeResult?.evidenceReason;
+    if (evidenceReason) alert('smoke-evidence-held', { evidenceReason,
+      message: 'Required smoke evidence is incomplete or indeterminate; repair the smoke producer and rerun; overlays retained without attribution' });
     // 'transient' — never poison the reject-cache; hold on last-good (still dispatching), retry next tick.
     alert('smoke-transient');
-    await hold('smoke-transient', failedA);
+    await hold('smoke-transient', failedA, evidenceReason ? { evidenceReason } : {});
     return { moved: false, reason: 'smoke-transient', plan, alerts: [...prepAlerts, ...alertsList] };
   },
 });
