@@ -164,7 +164,8 @@ import { sessionSlugFor } from '../operations/dispatch-lane.mjs';
 // and an advisory-fix round on a `needs-human` PR carrying `advisory:changes`. Both are true leaves — no fs, no
 // clock, no process, no network — so importing them keeps this file PURE and leaf-light exactly as its own
 // header requires.
-import { countStaleConflictFixRounds, CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
+import { countStaleConflictFixRounds, conflictFixBudget, CONFLICT_FIX_COMMENT_MARKER,
+  CONFLICT_FIX_ROUND_CAP, CONFLICT_FIX_ABSOLUTE_CEILING } from './conflict-fix-round-count.mjs';
 import {
   countCompletedAdvisoryEpisodes, ADVISORY_FIX_COMMENT_MARKER,
   isLatestAdvisoryFindingAddressed, isAdvisoryMechanismStandDownSuperseded,
@@ -350,7 +351,7 @@ export const REFUSAL_KINDS = Object.freeze([
   'gate-hold', 'takeover-awaiting-review',
   // `thread-truncated` — the PR's comment list may be cut at the list page (exactly 100, not marked complete by its
   // reader), so nothing is decided for it this tick (`takeover-budget.mjs#threadMayBeTruncated`).
-  'thread-truncated',
+  'thread-truncated', 'conflict-evidence-unreadable',
 ]);
 
 /**
@@ -608,7 +609,7 @@ export const BLOCKED_CANCELLED_RERUN_CAP = 2;
  * ever ran — see that leaf's own header for the full incident). A PR that ALSO exhausts three
  * conflict-resolution rounds still needs a person, exactly as an exhausted `roundCap` does.
  */
-export const CONFLICT_FIX_ROUND_CAP = 3;
+export { CONFLICT_FIX_ROUND_CAP };
 
 /**
  * we:scripts/conveyor/reconcile-core.mjs#CONFLICT_FIX_ABSOLUTE_CEILING — PR #2787 live incident (2026-09-27):
@@ -629,7 +630,7 @@ export const CONFLICT_FIX_ROUND_CAP = 3;
  * finite: a PR that needed this many rounds, of ANY kind, is exactly the "a person must take it over" case
  * {@link CONFLICT_FIX_ROUND_CAP} already exists to name.
  */
-export const CONFLICT_FIX_ABSOLUTE_CEILING = CONFLICT_FIX_ROUND_CAP * 3;
+export { CONFLICT_FIX_ABSOLUTE_CEILING };
 
 /**
  * we:scripts/conveyor/reconcile-core.mjs#ADVISORY_FIX_ROUND_CAP — the durable cap an ADVISORY-FIX round on a
@@ -2488,6 +2489,15 @@ export function planReconcile({
     const refuse = (kind, extra) => { refusals.push({ ...base, kind, ...extra,
       ...(kind === 'no-findings' ? { head: pr?.headRefOid ?? null,
         readAt: pr?.readAt ?? new Date(now).toISOString() } : {}) }); };
+    const conflictBudget = conflictFixBudget(pr.comments, {
+      currentRef: pr.baseRefName && pr.baseRefName !== defaultBranch ? pr.baseRefName : defaultBranch,
+      currentSha: pr.baseRefName && pr.baseRefName !== defaultBranch ? pr.baseRefSha ?? null : mainSha,
+      cap: conflictFixCapHere,
+    });
+    if ((labelNames(pr.labels).includes(CONFLICT_LABEL) || pr.mergeable === 'CONFLICTING') && conflictBudget.hold) {
+      refuse('conflict-evidence-unreadable', { why: conflictBudget.hold });
+      continue;
+    }
     // A comment list that may be cut at the list page (exactly 100, not marked complete by the reader) hides every
     // marker after comment 100: the rearm count reads low, a stand-down or a spent takeover reads absent — each one
     // fails OPEN. Nothing is decided for this PR on such a view; the reconcile pass's readers re-read the thread in
@@ -3984,11 +3994,11 @@ export function planReconcile({
     if (staleBase) {
       if (refuseReferralHold({ pr, refuse, withPhase })) continue;
       if (refuseUnreviewable({ pr, requiredChecks, refuse, withPhase })) continue;
-      const { stale: attempts, total } = countStaleConflictFixRounds(pr.comments, {
-        currentRef: defaultBranch, currentSha: mainSha,
-      });
+      const budget = conflictFixBudget(pr.comments, { currentRef: defaultBranch, currentSha: mainSha, cap: conflictFixCapHere });
+      if (budget.hold) { refuse('conflict-evidence-unreadable', { ...withPhase, why: budget.hold }); continue; }
+      const { stale: attempts, total } = budget;
       const why = `PR base predates required job(s) ${staleBase.missing.join(', ')} — rebase onto current ${defaultBranch}`;
-      if (attempts >= conflictFixCapHere || total >= CONFLICT_FIX_ABSOLUTE_CEILING) {
+      if (budget.exhausted) {
         refuseCapExhausted({ ...withPhase, attempts, cap: conflictFixCapHere, capKind: 'stale-base-rebase',
           why: `${why}; durable conflict-fix count ${attempts}/${conflictFixCapHere}, total ${total}/${CONFLICT_FIX_ABSOLUTE_CEILING} — mechanical repair exhausted; a person must take it` });
       } else {
@@ -4050,10 +4060,8 @@ export function planReconcile({
         // smaller per-target cap even though each repair genuinely targeted a NEW tip. `base.baseRefSha` is
         // this PR's OWN base ref's current tip, resolved the SAME way (a plain local `git rev-parse`) as
         // `mainSha` is for the main-base branch — see `reconcile-pass.mjs#enrichPrsWithBaseRefFacts`.
-        const { stale: conflictAttempts, total: conflictTotal } = countStaleConflictFixRounds(pr?.comments, {
-          currentRef: baseRefName, currentSha: base.baseRefSha,
-        });
-        if (conflictAttempts >= conflictFixCapHere || conflictTotal >= CONFLICT_FIX_ABSOLUTE_CEILING) {
+        const { stale: conflictAttempts, total: conflictTotal } = conflictBudget;
+        if (conflictBudget.exhausted) {
           refuseCapExhausted({
             ...withPhase, attempts: conflictAttempts, cap: conflictFixCapHere, capKind: 'stacked-rebase',
             why: conflictTotal >= CONFLICT_FIX_ABSOLUTE_CEILING
@@ -4149,10 +4157,8 @@ export function planReconcile({
       // {@link CONFLICT_FIX_ABSOLUTE_CEILING}'s own docblock). A round that resolved against an EARLIER main —
       // main moved and created a genuinely NEW conflict since — does not count against the smaller per-target
       // cap below, only the hard ceiling.
-      const { stale: conflictAttempts, total: conflictTotal } = countStaleConflictFixRounds(pr?.comments, {
-        currentRef: defaultBranch, currentSha: mainSha,
-      });
-      if (conflictAttempts >= conflictFixCapHere || conflictTotal >= CONFLICT_FIX_ABSOLUTE_CEILING) {
+      const { stale: conflictAttempts, total: conflictTotal } = conflictBudget;
+      if (conflictBudget.exhausted) {
         refuseCapExhausted({
           ...withPhase, attempts: conflictAttempts, cap: conflictFixCapHere, capKind: 'conflict-fix',
           why: conflictTotal >= CONFLICT_FIX_ABSOLUTE_CEILING

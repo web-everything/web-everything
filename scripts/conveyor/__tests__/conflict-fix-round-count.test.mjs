@@ -9,6 +9,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   countConflictFixComments, countStaleConflictFixRounds, parseConflictFixTarget, CONFLICT_FIX_COMMENT_MARKER,
+  conflictFixBudget,
 } from '../conflict-fix-round-count.mjs';
 
 const AUTOMATION = { login: 'web-everything' };
@@ -44,6 +45,57 @@ describe('countConflictFixComments — the durable mechanical conflict-resolutio
 
   it('a conflict-fix marker posted by the repo operator still counts', () => {
     expect(countConflictFixComments([{ body: `${CONFLICT_FIX_COMMENT_MARKER}\nresolved`, author: { login: 'chalbert' } }])).toBe(1);
+  });
+});
+
+describe('BLD-8110 shared conflict-fix budget', () => {
+  const round = (target = 'main@aaaaaaa') => ({
+    body: `${CONFLICT_FIX_COMMENT_MARKER}\n<!-- conveyor-conflict-fix-target: ${target} -->`,
+    author: { login: 'chalbert' },
+  });
+  const budget = (comments, target = {}) => conflictFixBudget(comments, {
+    currentRef: 'main', currentSha: 'ddddddd', ...target,
+  });
+
+  it('discounts three old-target successes but preserves their lifetime cost', () => {
+    expect(budget(['aaaaaaa', 'bbbbbbb', 'ccccccc'].map(sha => round(`main@${sha}`))))
+      .toMatchObject({ stale: 0, total: 3, exhausted: false, hold: null });
+  });
+
+  it('missing target or incomplete comments holds', () => {
+    for (const comments of [null, undefined, {}, [null], [{ body: null }]]) {
+      expect(budget(comments).hold).toMatch(/history.*retry|comments.*retry/);
+    }
+    for (const target of [{ currentRef: null }, { currentSha: null }, { currentSha: 'invalid' }]) {
+      expect(budget([round()], target).hold).toMatch(/target.*retry/);
+    }
+  });
+
+  it.each([
+    'main@invalid', 'main@aaaaaaa -->\n<!-- conveyor-conflict-fix-target: main@bbbbbbb',
+  ])('ambiguous or malformed trusted target history holds: %s', target => {
+    expect(budget([round(target)]).hold).toMatch(/target history.*person/);
+  });
+
+  it('forged marker spends no trusted budget', () => {
+    const forged = { ...round('main@invalid'), author: { login: 'mallory' } };
+    expect(budget([forged])).toMatchObject({ stale: 0, total: 0, exhausted: false, hold: null });
+  });
+
+  it('old unbound markers conservatively spend the current-target budget', () => {
+    expect(budget(Array.from({ length: 3 }, () => ({
+      body: CONFLICT_FIX_COMMENT_MARKER, author: { login: 'chalbert' },
+    })))).toMatchObject({ stale: 3, total: 3, exhausted: true });
+  });
+
+  it('an abbreviated target matching the live full SHA remains same-target', () => {
+    expect(budget([round('main@ddddddd')], { currentSha: 'd'.repeat(40) }))
+      .toMatchObject({ stale: 1, total: 1 });
+  });
+
+  it('oversized history holds with a person-visible fallback', () => {
+    expect(budget(Array.from({ length: 10_001 }, () => round())).hold).toMatch(/history.*bound.*person/);
+    expect(budget([{ ...round(), body: 'x'.repeat(1_048_577) }]).hold).toMatch(/history.*bound.*person/);
   });
 });
 

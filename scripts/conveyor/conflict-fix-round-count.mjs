@@ -47,6 +47,9 @@
  */
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 
+export const CONFLICT_FIX_ROUND_CAP = 3;
+export const CONFLICT_FIX_ABSOLUTE_CEILING = CONFLICT_FIX_ROUND_CAP * 3;
+
 /**
  * we:scripts/conveyor/conflict-fix-round-count.mjs#CONFLICT_FIX_COMMENT_MARKER — the stable FIRST LINE of the
  * durable comment a completed mechanical conflict-resolution round posts. Single-sourced HERE:
@@ -157,8 +160,54 @@ export function countStaleConflictFixRounds(comments, { currentRef, currentSha =
     total += 1;
     const { ref, sha } = parseConflictFixTarget(body, currentRef);
     if (ref !== currentRef) continue; // resolved a DIFFERENT target — fresh work, never a repeat failure.
-    if (sha != null && currentSha != null && sha !== currentSha) continue; // same ref, but it has since moved.
+    if (sha != null && currentSha != null
+      && !sha.startsWith(currentSha.toLowerCase()) && !currentSha.toLowerCase().startsWith(sha)) continue;
     stale += 1;
   }
   return { stale, total };
+}
+
+/** BLD-8110: the watch and reconcile share both budgets and their closed paths.
+ * Historical unbound markers retain the conservative ref-only count. A recorded SHA
+ * can free budget only against a known current target. Incomplete or oversized evidence
+ * holds for a retry or human inspection; it never supplies a zero attempt count.
+ * Limits bound pure work in addition to the IO readers' page/timeout/output bounds.
+ * @returns {{stale:number|null,total:number|null,exhausted:boolean,hold:string|null,targetBound?:boolean}}
+ */
+export function conflictFixBudget(comments, {
+  currentRef, currentSha = null, cap = CONFLICT_FIX_ROUND_CAP,
+} = {}) {
+  const held = hold => ({ stale: null, total: null, exhausted: false, hold });
+  if (!Array.isArray(comments)) return held('conflict comments history unreadable — retry a complete read');
+  if (comments.length > 10_000) return held('conflict history exceeds inspection bound — a person must inspect the full thread');
+  if (typeof currentRef !== 'string' || !currentRef.trim() || /\s|[\x00-\x1f\x7f]/.test(currentRef)
+    || (currentSha !== null && (typeof currentSha !== 'string' || !/^[0-9a-f]{7,40}$/i.test(currentSha)))) {
+    return held('conflict target unreadable — retry with the current ref and SHA');
+  }
+  if (!Number.isSafeInteger(cap) || cap < 0) return held('conflict cap invalid — a person must repair the configuration');
+  let bytes = 0;
+  let boundTarget = false;
+  for (const comment of comments) {
+    if (!comment || typeof comment !== 'object' || typeof comment.body !== 'string') {
+      return held('conflict comments history malformed — retry a complete read');
+    }
+    bytes += comment.body.length;
+    if (comment.body.length > 1_048_576 || bytes > 8_388_608) {
+      return held('conflict history exceeds inspection bound — a person must inspect the full thread');
+    }
+    if (!comment.body.trimStart().startsWith(CONFLICT_FIX_COMMENT_MARKER) || !isTrustedMarkerAuthor(comment)) continue;
+    const trailers = comment.body.match(/conveyor-conflict-fix-target:/gi) ?? [];
+    if (trailers.length > 1 || (trailers.length && !CONFLICT_FIX_TARGET_TRAILER_RE.test(comment.body))) {
+      return held('conflict target history ambiguous or malformed — a person must repair the recorded target');
+    }
+    boundTarget ||= trailers.length === 1;
+  }
+  const { stale, total } = countStaleConflictFixRounds(comments, { currentRef, currentSha });
+  const exhausted = stale >= cap || total >= CONFLICT_FIX_ABSOLUTE_CEILING;
+  // A missing SHA cannot discount recorded targets. Retain legacy exhausted-cap
+  // evidence so persisted histories still surface their established cap refusal.
+  if (boundTarget && currentSha === null && !exhausted) {
+    return { ...held('conflict target SHA unknown — retry with the current target before granting another round'), targetBound: true };
+  }
+  return { stale, total, exhausted, hold: null, targetBound: boundTarget };
 }

@@ -66,6 +66,7 @@ import { mintSessionSlug } from '../session-slug.mjs';
 import { UNOWNED_REBASE_ATTEMPT_MARKER, UNOWNED_REBASE_ATTEMPT_CAP, countUnownedRebaseAttempts } from '../unowned-rebase-attempt-count.mjs';
 import { NOTE_COMMENT_MARKER, postNoteComment } from '../reconcile-note-comment.mjs';
 import { notifyDesktopChecked } from '../branch-sync.mjs';
+import { planReconcile, CONFLICT_FIX_ABSOLUTE_CEILING } from '../reconcile-core.mjs';
 
 // #xu38vlf — the two new operator-visible-escalation call sites (the round-cap-exhausted note on the unowned
 // rebase-drop cap, and the liveness-wait-exhausted note on a rearm withheld past its bound) both go through
@@ -92,6 +93,145 @@ vi.mock('../branch-sync.mjs', async (importOriginal) => ({
 // injects a no-op fake for both, exactly as it already fakes `provider` — no real `node`/`gh` process runs from
 // this file.
 const noopRouting = () => ({ postFinding: () => {}, postStandDown: () => {} });
+
+describe('BLD-8110 watcher/reconcile target budget replay', () => {
+  const now = Date.parse('2026-11-26T12:00:00Z');
+  const sha = letter => letter.repeat(40);
+  const round = target => ({
+    body: `${CONFLICT_FIX_COMMENT_MARKER}\n<!-- conveyor-conflict-fix-target: main@${target} -->`,
+    author: { login: 'chalbert' }, createdAt: '2026-11-25T12:00:00Z',
+  });
+  function replay(history, alter = () => {}) {
+    const root = mkdtempSync(join(tmpdir(), 'bld-8110-'));
+    const path = join(root, 'pr.json');
+    let locked = false;
+    const events = [];
+    const live = {
+      number: 8110, state: 'OPEN', headRefName: 'lane/fixture-conflict', headRefOid: sha('e'),
+      baseRefName: 'main', baseRefOid: sha('d'), mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY',
+      labels: [{ name: 'review:pending' }, { name: CONFLICT_LABEL }],
+    };
+    writeFileSync(path, JSON.stringify({ live, history }));
+    const readFixture = () => JSON.parse(readFileSync(path, 'utf8'));
+    const readConflictState = vi.fn(() => {
+      expect(locked).toBe(true);
+      events.push('state');
+      return readFixture().live;
+    });
+    const comments = vi.fn(() => {
+      events.push('comments');
+      return readFixture().history;
+    });
+    const postFinding = vi.fn(() => { expect(locked).toBe(true); events.push('write'); });
+    const options = {
+      repo: 'we', now, sameLineConflict: 'stand-down', queueScope: { enabled: false },
+      listPrs: () => [readFixture().live], listPrComments: comments, readConflictState,
+      withConflictLock: (_key, action) => {
+        locked = true;
+        try { return action(); } finally { locked = false; }
+      },
+      inCardGroupFn: () => false, cardGroupStateUnreadable: () => false,
+      listAgents: () => [], listPrFiles: () => [], listPrPatches: () => ({}),
+      listMainStatutePatches: () => ({}), computeConflictingPaths: () => [],
+      labelAgeMs: () => 0, labelRemovedAtMs: () => null,
+      provider: { currentRepo: () => 'we', postComment: vi.fn(), setLabels: vi.fn(), ensureLabel: vi.fn() },
+      postFinding, postStandDown: vi.fn(), postRearm: vi.fn(), postSupersedeComment: vi.fn(),
+    };
+    try {
+      alter({ options, readFixture, save: fixture => writeFileSync(path, JSON.stringify(fixture)), events });
+      postNoteComment.mockClear();
+      notifyDesktopChecked.mockClear();
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      let watched, diagnostics;
+      try {
+        watched = watchParkedPrConflicts(options);
+        diagnostics = stderr.mock.calls.map(([line]) => line).join('');
+      } finally { stderr.mockRestore(); }
+      const finding = { body: buildConflictFindingBody({ num: 8110, headRefName: live.headRefName }), author: { login: 'chalbert' } };
+      const pr = { ...live, labels: [{ name: 'review:changes' }, { name: CONFLICT_LABEL }],
+        rowsComplete: true, rowsHead: live.headRefOid, commentsComplete: true,
+        statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }],
+        comments: Array.isArray(history) ? [finding, ...history] : history };
+      const reconciled = planReconcile({
+        repo: 'we', prs: [pr], agents: [], now, mainSha: live.baseRefOid,
+        requiredChecks: ['gate'], reviewTiming: { startAfter: 'ci-green' }, reviewLabelHeal: 'off',
+        ciHealBudget: { cap: 3, resetOnFixHead: false }, ciHealBudgetRestore: { value: false },
+        verdictSettings: {}, codeqlOwnBudget: { value: false }, shadowDeps: { mode: 'off' },
+      });
+      return { watched, reconciled, postFinding, events, diagnostics, notes: [...postNoteComment.mock.calls] };
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }
+
+  it('watch and reconcile permit a new target after three old-target successes', () => {
+    const out = replay(['aaaaaaa', 'bbbbbbb', 'ccccccc'].map(round));
+    expect(out.watched[0]).toMatchObject({ conflictFixRoundsSpent: 0, conflictFixRoundsTotal: 3 });
+    expect(out.postFinding).toHaveBeenCalledTimes(1);
+    expect(out.reconciled.dispatch).toMatchObject([{ kind: 'fix', attempts: 0, isConflict: true }]);
+    expect(out.events.slice(-4)).toEqual(['state', 'comments', 'state', 'write']);
+  });
+
+  it('same-target cap agrees in both paths', () => {
+    const out = replay(Array.from({ length: 3 }, () => round('ddddddd')));
+    expect(out.watched[0].routedTo).toContain('cap-exhausted');
+    expect(out.postFinding).not.toHaveBeenCalled();
+    expect(out.reconciled.dispatch).toEqual([]);
+    expect(out.reconciled.refusals).toMatchObject([{ kind: 'cap-exhausted', attempts: 3 }]);
+  });
+
+  it('lifetime ceiling still escalates', () => {
+    const out = replay(Array.from({ length: CONFLICT_FIX_ABSOLUTE_CEILING }, () => round('aaaaaaa')));
+    expect(out.watched[0].routedTo).toContain('cap-exhausted');
+    expect(out.postFinding).not.toHaveBeenCalled();
+    expect(out.notes[0][0].body).toMatch(/hard ceiling.*9|9.*hard ceiling/);
+    expect(out.reconciled.dispatch).toEqual([]);
+    expect(out.reconciled.refusals[0].why).toContain('hard ceiling');
+  });
+
+  it('forged marker spends no trusted budget', () => {
+    const out = replay(Array.from({ length: 3 }, () => ({ ...round('ddddddd'), author: { login: 'mallory' } })));
+    expect(out.postFinding).toHaveBeenCalledTimes(1);
+    expect(out.reconciled.dispatch).toMatchObject([{ kind: 'fix', attempts: 0 }]);
+  });
+
+  it.each([null, { truncated: true }, [null]])('missing target or incomplete comments holds: %j', history => {
+    const out = replay(history);
+    expect(out.postFinding).not.toHaveBeenCalled();
+    expect(out.diagnostics).toMatch(/history|comments/);
+    expect(out.reconciled.dispatch).toEqual([]);
+  });
+
+  it.each(['baseRefOid', 'headRefOid', 'baseRefName'])('missing live %s holds', field => {
+    const out = replay([round('aaaaaaa')], ({ options, readFixture }) => {
+      options.readConflictState = () => { const pr = readFixture().live; delete pr[field]; return pr; };
+    });
+    expect(out.postFinding).not.toHaveBeenCalled();
+    expect(out.watched[0]?.error ?? out.watched[0]?.routedTo).toMatch(/target|head|state/);
+  });
+
+  it.each(['baseRefOid', 'headRefOid', 'labels'])('moving %s during history read holds before the write', field => {
+    const out = replay(['aaaaaaa', 'bbbbbbb', 'ccccccc'].map(round), ({ options, readFixture, save, events }) => {
+      options.listPrComments = () => {
+        const fixture = readFixture();
+        if (events.includes('state')) {
+          if (field === 'labels') fixture.live.labels.push({ name: 'review:changes' });
+          else fixture.live[field] = sha('f');
+        }
+        save(fixture);
+        return fixture.history;
+      };
+    });
+    expect(out.postFinding).not.toHaveBeenCalled();
+    expect(out.watched[0]?.error ?? out.watched[0]?.routedTo).toMatch(/changed|moved/);
+    expect(out.notes).toEqual([]);
+  });
+
+  it('oversized history holds and asks a person to inspect it', () => {
+    const out = replay(Array.from({ length: 10_001 }, () => round('aaaaaaa')));
+    expect(out.postFinding).not.toHaveBeenCalled();
+    expect(out.watched[0]?.error ?? out.watched[0]?.routedTo).toMatch(/bound.*person/);
+    expect(out.reconciled.dispatch).toEqual([]);
+  });
+});
 
 describe('the real incident that motivated this pass — WE PR #1920, captured live 2026-09-04T23:26Z', () => {
   // The EXACT `gh pr view 1920 --json ...` payload shape observed while diagnosing this gap (before the

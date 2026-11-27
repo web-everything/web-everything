@@ -144,7 +144,9 @@ import { parseMergeTree, manifestConflictDisposition, rebaseDropManifest } from 
 import { planNoteComment, postNoteComment } from './reconcile-note-comment.mjs';
 import { notifyDesktopChecked } from './branch-sync.mjs';
 import { UNOWNED_REBASE_ATTEMPT_MARKER, UNOWNED_REBASE_ATTEMPT_CAP, countUnownedRebaseAttempts } from './unowned-rebase-attempt-count.mjs';
-import { countConflictFixComments, CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
+import { conflictFixBudget, CONFLICT_FIX_COMMENT_MARKER, CONFLICT_FIX_ROUND_CAP,
+  CONFLICT_FIX_ABSOLUTE_CEILING } from './conflict-fix-round-count.mjs';
+import { withLedgerAppendLock } from '../lib/ledger-append-lock.mjs';
 // #4118 (c) — the SAME name-based, gh-agents-truth liveness check `review-status-tag.mjs` already uses, and for
 // the identical reason its own docblock states: staying independent of `reconcile-core.mjs#assessLiveness`'s
 // much heavier transitive import graph (`rearm-review.mjs` → `review-set-label.mjs` → `merge-ai-prs.mjs`, which
@@ -536,19 +538,14 @@ export function latestConflictAlertCreatedAtMs(comments) {
 }
 
 /**
- * we:scripts/conveyor/parked-pr-conflict-watch.mjs#CONFLICT_FIX_ROUND_CAP — DUPLICATED, not imported, from
- * `we:scripts/conveyor/reconcile-core.mjs#CONFLICT_FIX_ROUND_CAP` (3) — same value, same reasoning that file's
- * own docblock gives, mirrored here for the SAME reason `reconcile-core.mjs` itself duplicates rather than
- * imports `CI_HEAL_ROUND_CAP` from `tick-core.mjs`: importing `reconcile-core.mjs` here would pull its own wide,
- * heavy import graph (`progress-board.mjs`, `pr-status.mjs`, `jury-core.mjs`, `rearm-review.mjs`, …) into a file
- * that (per this file's own header) deliberately stays lighter. The two floors move together by hand; a test in
- * each file pins its own copy so a drift between them fails loud rather than silently diverging. ONE CAP, ONE
+ * we:scripts/conveyor/parked-pr-conflict-watch.mjs#CONFLICT_FIX_ROUND_CAP — shared with reconcile through the
+ * leaf counter, avoiding reconcile's heavy import graph. ONE CAP, ONE
  * POPULATION regardless of which code path is driving the round — {@link watchParkedPrConflicts}'s own
  * idle-conflict-bounce re-assertion (below) and `reconcile-core.mjs`'s `isConflictBounce` dispatch both bind on
  * this same number, so a PR can never get more mechanical conflict-resolution attempts by however many times its
  * ownership ping-pongs between the two passes (landing-freeze fix, web-everything/web-everything#2793, 2026-09-27).
  */
-export const CONFLICT_FIX_ROUND_CAP = 3;
+export { CONFLICT_FIX_ROUND_CAP };
 
 /**
  * we:scripts/conveyor/parked-pr-conflict-watch.mjs#latestConflictFixMarkerCreatedAtMs — the MOST RECENT
@@ -1353,6 +1350,18 @@ export function defaultPostConflictRearm({ pr, repo, exec = execFileSync }) {
   exec('node', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
 }
 
+/** Live evidence for target-scoped retries. Never a cached PR snapshot: the target,
+ * exact head and labels are read together, under the same lock as the ensuing write.
+ */
+export function defaultReadConflictState({ pr, repo, exec = execFileSyncThrottled, cwd = REPO_ROOT }) {
+  const out = exec('gh', ['pr', 'view', String(pr.number), '--repo', repo, '--json',
+    'number,state,headRefName,headRefOid,baseRefName,baseRefOid,mergeable,labels'], {
+    cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024,
+    timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+  });
+  return JSON.parse(out);
+}
+
 /**
  * THE IO SHELL. Lists open PRs, classifies each, applies the label change + posts the one-time comment when a
  * PR newly transitions into conflict, and reports what happened. Never throws on a per-PR write failure — one
@@ -1388,6 +1397,8 @@ export function watchParkedPrConflicts({
   listPrPatches = defaultListPrPatches,
   listMainStatutePatches = defaultListMainStatutePatchesSinceMergeBase,
   listPrComments = defaultListPrComments,
+  readConflictState = defaultReadConflictState,
+  withConflictLock = (key, action) => withLedgerAppendLock(key, action, { waitMs: 0 }),
   labelAgeMs = defaultConflictLabelAgeMs,
   labelRemovedAtMs = defaultConflictLabelRemovedAtMs,
   computeConflictDisposition = defaultComputeConflictDisposition,
@@ -1495,48 +1506,93 @@ export function watchParkedPrConflicts({
     // Same round cap, same once-per-round guard, same `postFinding` (which keeps `review:human`). Pushes `entry`.
     const reassertIdleConflict = (comments, variant) => {
       try {
-        const conflictFixRoundsSpent = countConflictFixComments(comments);
-        if (conflictFixRoundsSpent >= CONFLICT_FIX_ROUND_CAP) {
-          // Never loop forever past the shared cap — surface it once via the same reconcile-notes channel the
-          // unowned population's own rebase-attempt cap already uses, then leave it (a person must take it).
-          const note = {
-            kind: 'round-cap-exhausted', prNumber: pr?.number, attempts: conflictFixRoundsSpent, cap: CONFLICT_FIX_ROUND_CAP,
-            capKind: 'conflict-fix',
-            text: `PR #${pr?.number}: mechanical conflict-fix rounds exhausted (${conflictFixRoundsSpent}/${CONFLICT_FIX_ROUND_CAP}) while still conflicting and idle (no live review:changes bounce) — a person must take it over`,
+        withConflictLock(`conflict-bounce:${resolvedRepo}:${pr.number}`, () => {
+          // Legacy unbound history retains its conservative cap. Discounting a
+          // recorded target requires fresh, exact head/target evidence, never the
+          // cached listing. The lock covers the read, decision and confirmed effect.
+          const preflight = conflictFixBudget(comments, { currentRef: pr.baseRefName || 'main' });
+          if (preflight.hold && !preflight.targetBound) throw Error(preflight.hold);
+          const boundHistory = preflight.targetBound;
+          let current = pr;
+          let currentSha = null;
+          const fingerprint = state => {
+            if (!state || state.number !== pr.number || state.state !== 'OPEN'
+              || !/^[0-9a-f]{40}$/i.test(state.headRefOid ?? '')
+              || !/^[0-9a-f]{40}$/i.test(state.baseRefOid ?? '')
+              || typeof state.baseRefName !== 'string' || !state.baseRefName
+              || !Array.isArray(state.labels) || state.labels.some(l => typeof l?.name !== 'string')
+              || !isParkedConflictTarget(state) || !hasReviewLabel(state.labels, CONFLICT_LABEL)
+              || hasReviewLabel(state.labels, REVIEW_LABELS.changes)) {
+              throw Error('conflict target/head/state unreadable or changed from idle — held; retry next sweep');
+            }
+            return JSON.stringify([state.headRefOid, state.baseRefName, state.baseRefOid,
+              state.labels.map(l => l.name).sort()]);
           };
-          const notePlan = planNoteComment(note, comments);
-          if (!notePlan.alreadyPosted && !dryRun) {
-            if (resolvedRepo == null) resolvedRepo = provider.currentRepo();
-            postNoteComment({ repo: resolvedRepo, pr: pr?.number, body: notePlan.body });
-            try { notifyDesktopChecked({ title: 'Conveyor: conflict-fix cap exhausted', body: note.text }); } catch { /* best-effort */ }
+          let initialState;
+          if (boundHistory) {
+            current = readConflictState({ pr, repo: resolvedRepo });
+            initialState = fingerprint(current);
+            if (pr.headRefOid && pr.headRefOid !== current.headRefOid) {
+              throw Error('conflict head moved since listing — held; retry next sweep');
+            }
+            currentSha = current.baseRefOid;
+            comments = listPrComments({ number: pr.number, repo: resolvedRepo });
           }
-          entry.routedTo = `cap-exhausted (conflict-fix, idle${variant ? `, ${variant}` : ''})`;
+          const budget = conflictFixBudget(comments, {
+            currentRef: current.baseRefName || 'main', currentSha,
+          });
+          if (budget.hold) throw Error(budget.hold);
+          const conflictFixRoundsSpent = budget.stale;
+          if (boundHistory) {
+            entry.conflictFixRoundsTotal = budget.total;
+            // Re-read after history, immediately before either write. No target,
+            // label or head change can reuse the decision made for the first read.
+            const fresh = readConflictState({ pr, repo: resolvedRepo });
+            if (fingerprint(fresh) !== initialState) throw Error('conflict target/head/labels changed during read — held; retry next sweep');
+            if (cardGroupStateUnreadable() || inCardGroupFn({ num: pr.number, repo: resolvedRepo, headRef: fresh.headRefName })) {
+              throw Error('conflict ownership changed or unreadable — held; retry next sweep');
+            }
+            current = fresh;
+          }
+          if (budget.exhausted) {
+            const ceiling = budget.total >= CONFLICT_FIX_ABSOLUTE_CEILING;
+            const note = {
+              kind: 'round-cap-exhausted', prNumber: pr.number,
+              attempts: ceiling ? budget.total : conflictFixRoundsSpent,
+              cap: ceiling ? CONFLICT_FIX_ABSOLUTE_CEILING : CONFLICT_FIX_ROUND_CAP, capKind: 'conflict-fix',
+              text: ceiling
+                ? `PR #${pr.number}: mechanical conflict-fix hard ceiling exhausted (${budget.total}/${CONFLICT_FIX_ABSOLUTE_CEILING}) — a person must take it over`
+                : `PR #${pr.number}: mechanical conflict-fix rounds exhausted (${conflictFixRoundsSpent}/${CONFLICT_FIX_ROUND_CAP}) while still conflicting and idle (no live review:changes bounce) — a person must take it over`,
+            };
+            const notePlan = planNoteComment(note, comments);
+            if (!notePlan.alreadyPosted && !dryRun) {
+              const posted = postNoteComment({ repo: resolvedRepo, pr: pr.number, body: notePlan.body });
+              if (posted?.ok !== true) throw Error(`conflict cap escalation failed — retry next sweep: ${posted?.error ?? 'unconfirmed write'}`);
+              const notified = notifyDesktopChecked({ title: 'Conveyor: conflict-fix cap exhausted', body: note.text });
+              if (notified?.ok === false) process.stderr.write('parked-pr-conflict-watch: desktop escalation failed; durable cap note posted\n');
+            }
+            entry.routedTo = `cap-exhausted (conflict-fix, idle${variant ? `, ${variant}` : ''})`;
+            entry.conflictFixRoundsSpent = conflictFixRoundsSpent;
+            results.push(entry);
+            return;
+          }
+          const lastRearmAtMs = latestConflictFixMarkerCreatedAtMs(comments);
+          const sinceMs = Number.isFinite(lastRearmAtMs) ? lastRearmAtMs : -Infinity;
+          if (hasRecentConflictFindingComment(comments, { now, sinceMs })) {
+            entry.routedTo = `reconcile-finding (idle conflict-bounce${variant ? `, ${variant}` : ''}, already re-asserted this round)`;
+            results.push(entry);
+            return;
+          }
+          if (!dryRun) postFinding({ pr: current, repo: resolvedRepo });
+          entry.routedTo = variant
+            ? `reconcile-finding (idle conflict-bounce re-asserted, ${variant} — xkugvzd)`
+            : 'reconcile-finding (idle conflict-bounce re-asserted — #2793)';
           entry.conflictFixRoundsSpent = conflictFixRoundsSpent;
           results.push(entry);
-          return;
-        }
-        // The episode boundary for THIS narrow population is the last completed conflict-fix round (if any) —
-        // never the label-removal boundary `sinceMs` uses elsewhere in this file, because the label here has
-        // never been removed at all (still conflicting). No prior round at all → `-Infinity` (the function's own
-        // "no boundary, judge the whole window" default), so a first-ever idle bounce (finding never posted, no
-        // rearm either) behaves exactly like a fresh episode.
-        const lastRearmAtMs = latestConflictFixMarkerCreatedAtMs(comments);
-        const sinceMs = Number.isFinite(lastRearmAtMs) ? lastRearmAtMs : -Infinity;
-        if (hasRecentConflictFindingComment(comments, { now, sinceMs })) {
-          // Already re-asserted for this round within the retry window — avoid reposting every tick.
-          entry.routedTo = `reconcile-finding (idle conflict-bounce${variant ? `, ${variant}` : ''}, already re-asserted this round)`;
-          results.push(entry);
-          return;
-        }
-        if (resolvedRepo == null) resolvedRepo = provider.currentRepo();
-        if (!dryRun) postFinding({ pr, repo: resolvedRepo });
-        entry.routedTo = variant
-          ? `reconcile-finding (idle conflict-bounce re-asserted, ${variant} — xkugvzd)`
-          : 'reconcile-finding (idle conflict-bounce re-asserted — #2793)';
-        entry.conflictFixRoundsSpent = conflictFixRoundsSpent;
-        results.push(entry);
+        });
       } catch (e) {
-        entry.error = String((e && e.message) || e).split('\n')[0];
+        entry.error = String(e?.message ?? e).replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 500);
+        process.stderr.write(`parked-pr-conflict-watch: #${pr.number} held — ${entry.error}\n`);
         results.push(entry);
       }
     };
@@ -1572,6 +1628,7 @@ export function watchParkedPrConflicts({
       let comments = null;
       try { const listed = recoveryComments ?? listPrComments({ number: pr?.number, repo }); if (Array.isArray(listed)) comments = listed; } catch { comments = null; }
       if (comments) reassertIdleConflict(comments, null);
+      else process.stderr.write(`parked-pr-conflict-watch: #${pr.number} held — conflict comments history unreadable; retry next sweep\n`);
       continue;
     }
     if (recheckCandidate && !graceDue) {
