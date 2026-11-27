@@ -359,6 +359,7 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
   async function commit() {
   // Fail closed: an unreadable PR, file list or audit history means NO action this pass.
   const { records: history, complete: historyOk, issues } = readAuditHistory(outDir);
+  const suppressed = [];
   if (historyOk) for (const { context, metadata, status, ownerAlive } of pending) {
     const restarts = spending(afterRestartResets(history)).filter(h => h.prHead === metadata.prHead && h.action === 'restart-red-team');
     const latest = restarts.length ? restarts.reduce((latest, h) => Math.max(latest, Date.parse(h.ts)), -Infinity) : null;
@@ -370,10 +371,13 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
   if (!historyOk) {
     for (const pr of raw.prs.filter(readable)) {
       const head = pr.headRefOid.toLowerCase(); const prHead = `${pr.repo}#${pr.number}@${head}`;
+      const replaced = items.filter(i => i.lane === 'operator' && i.prHead === prHead);
+      suppressed.push(...replaced);
       for (let i = items.length - 1; i >= 0; i--) if (items[i].lane === 'operator' && items[i].prHead === prHead) items.splice(i, 1);
       items.push({ repo: pr.repo, pr: pr.number, head, prHead, title: pr.title, lane: 'operator',
         action: 'repair-audit-history', state: 'audit-history-incomplete', key: `${prHead}:audit-history-incomplete`,
-        reason: 'audit history incomplete; operator must repair, preserve counts, rerun', evidence: issues.slice(0, 3) });
+        reason: 'audit history incomplete; operator must repair, preserve counts, rerun', replaced: replaced.map(i => i.key),
+        evidence: [...issues.slice(0, 3), ...replaced.map(i => `replaced ${i.key}: ${i.reason}`)] });
     }
     const safeDir = String(outDir).replace(/[\x00-\x1f\x7f-\x9f]/g, '');
     base.errors.push(`audit history incomplete: ${issues.join('; ')}; operator must inspect and repair the audit in ${safeDir}, preserving all lifetime action records, then rerun the sweep`);
@@ -407,7 +411,7 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
       lanes: Object.fromEntries(['system', 'policy', 'operator'].map((l) => [l, items.filter((i) => i.lane === l).length])) },
     ...plan.act.filter(i => !live(i)).map((i) => ({ ts, phase: 'would-do', mode: cfg.mode, ...note, ...i })),
     ...plan.held.map((i) => ({ ts, phase: 'would-skip', mode: cfg.mode, ...i })).filter(fresh),
-    ...items.filter((i) => i.lane === 'operator' && (!incomplete || i.fileList?.state === 'file-list-over-cap' || i.action === 'repair-audit-history'))
+    ...[...items, ...suppressed].filter((i) => i.lane === 'operator' && (!incomplete || i.fileList?.state === 'file-list-over-cap' || i.action === 'repair-audit-history'))
       .map((i) => ({ ts, phase: 'operator', mode: cfg.mode, ...i })).filter(fresh),
   ];
   // An action that is not durably recorded would escape the rate limits next pass: an unwritten log plans nothing.

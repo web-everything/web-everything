@@ -1400,9 +1400,16 @@ describe('audit history repair digest (BLD-8039)', () => {
     const overCap = fakeGh({ prs: [{ ...PRS[0], labels: [{ name: 'status:at-round-limit' }] }], changedFiles: 3001 });
     const run = () => f.run({ gh: overCap.gh, read: fixtureRead(overCap.gh) });
     const first = await run();
+    const replacedKey = `${prHead}:file-list-over-cap`;
+    const suppressed = expect.objectContaining({ phase: 'operator', lane: 'operator', action: 'ruling-needed',
+      key: replacedKey, prHead, fileList: expect.objectContaining({ state: 'file-list-over-cap' }) });
+    expect(first.out.records).toContainEqual(suppressed);
+    expect(lines(f.dir)).toContainEqual(suppressed);
     expect(repair(first.out)).toHaveLength(1);
     expect(repair(first.out)[0]).toMatchObject({ repo: REPO, pr: 11, head: HEAD, prHead,
-      action: 'repair-audit-history', key: `${prHead}:audit-history-incomplete`, evidence: ['2026-09.jsonl:2: invalid JSON'] });
+      action: 'repair-audit-history', key: `${prHead}:audit-history-incomplete`, replaced: [replacedKey],
+      evidence: ['2026-09.jsonl:2: invalid JSON', expect.stringContaining(replacedKey)] });
+    expect(first.out.records.some(r => ['intent', 'did', 'would-do'].includes(r.phase))).toBe(false);
     actionable(first.digest);
     seed(f.dir, [valid, valid, valid]);
     const recovered = await run();
