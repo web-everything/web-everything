@@ -92,6 +92,7 @@ import { resolveFixScopePolicy, resolveOperatorPriorityPrs, createRegionReader, 
 import { DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES } from './fix-claim-store.mjs';
 import { execFileSyncThrottled, runGhSync } from '../lib/gh-throttle.mjs';
 import { PUSH_HOLD_LABELS } from '../lib/review-hold-model.mjs';
+import { FIX_HOLD_LABEL, fixDispatchKillFile, hasFixHoldLabel } from './fix-loop-ledger.mjs';
 import { isSmokeSentinelPr } from '../lib/smoke-real-worker.mjs';
 
 /** Old daemon smoke runners set this marker even when empty. Reads only; never authorizes a launch. */
@@ -140,14 +141,38 @@ function pendingExemptRoute(repair, labels, view) {
  * field is a refusal, never a spawn. A hold seen here is read-only: it grants nothing, it only stops a launch.
  * Hermetic under a test runner unless a test injects its own reader.
  */
-export function readLivePushHold({ repo, pr, repair }, { run = runGhSync, hermetic = isUnderTestEnv() } = {}) {
+export function readLivePushHold({ repo, pr, repair }, {
+  run = runGhSync, hermetic = isUnderTestEnv(), env = process.env,
+  killFile = fixDispatchKillFile(env), stat = lstatSync,
+} = {}) {
   if (hermetic || isSmokeDryRunPr(pr)) return null;
+  // BLD-8102: existence stops every fixer route; only ENOENT proves an absent sentinel.
+  // existsSync hides permission/IO errors, which must retain the operator hold.
+  const unreadableKill = { code: 'kill-unreadable',
+    reason: 'Cannot read fix-dispatch.kill status; restore sentinel access before retrying' };
+  const readKillHold = () => {
+    if (typeof killFile !== 'string' || !killFile.trim()) return unreadableKill;
+    try {
+      const status = stat(killFile);
+      if (!status || typeof status !== 'object') return unreadableKill;
+      return { code: 'fix-dispatch-killed', reason: 'fix-dispatch.kill is present; operator must clear it before retrying' };
+    } catch (error) {
+      if (error?.code !== 'ENOENT') return unreadableKill;
+      return null;
+    }
+  };
+  const killed = readKillHold();
+  if (killed) return killed;
   const view = JSON.parse(run(['pr', 'view', String(pr), '--repo', ghRepoSlug(repo), '--json', 'labels,state,mergeable,baseRefName,headRefOid'],
     { encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024, throttle: { noMemo: true } }));
   if (!view || !Array.isArray(view.labels) || view.labels.some(l => typeof l?.name !== 'string')
-    || !['OPEN', 'CLOSED', 'MERGED'].includes(view.state)) return { code: 'unreadable', reason: 'Incomplete PR evidence' };
+    || !['OPEN', 'CLOSED', 'MERGED'].includes(view.state)) return { code: 'unreadable', reason: 'Incomplete PR labels/state evidence; restore evidence before retrying' };
   if (view.state !== 'OPEN') return { code: 'pr-not-open', reason: 'PR is not open' };
   const labels = view.labels.map(l => l.name);
+  // Operator fix holds never inherit the review/landing exceptions below.
+  if (labels.includes(FIX_HOLD_LABEL) || hasFixHoldLabel(labels, env)) {
+    return { code: 'hold-label', reason: labels.includes(FIX_HOLD_LABEL) ? FIX_HOLD_LABEL : env.WE_FIX_HOLD_LABEL };
+  }
   // These labels hold landing/review, but the planner can owe a repair while they remain present.
   // Exempt carried holds or the pending red-team check that stale-base repair unblocks. A newly added
   // unrelated hold still stops it. MQ refresh supplies no repair context and receives no exceptions.
@@ -165,12 +190,13 @@ export function readLivePushHold({ repo, pr, repair }, { run = runGhSync, hermet
     && !(name === 'review:held-mechanical' && repair?.labels?.includes(name) && labels.includes('review:changes'))
     && !(name === 'red-team:blocked' && repair?.labels?.includes(name)
       && (labels.includes('review:changes') || humanRepair)));
-  return label ? { code: 'hold-label', reason: label } : null;
+  // The GitHub read can take 30s; a kill created during it must still stop this launch.
+  return label ? { code: 'hold-label', reason: label } : readKillHold();
 }
 import { execFileSync } from 'node:child_process';
 import { describeDispatchFailure, describeSpawnFailure } from '../lib/describe-spawn-failure.mjs';
 import { randomUUID } from 'node:crypto';
-import { readFileSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, realpathSync, writeFileSync, lstatSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1018,6 +1044,8 @@ export function tryResumeFix(planned, {
   acquireClaim = acquireFixDispatchClaim,
   releaseClaim = releaseFixDispatchClaim,
   claimRoot,
+  readPushHold = readLivePushHold,
+  readPushHoldOptions,
   // #4174 — the resume TRIGGER is a short synchronous `claude --bg --resume <id>` invocation of its own (a
   // fresh OS process), so it gets the same "never `root` itself" cwd as `dispatchFix`'s fresh spawn, keyed on
   // the candidate id being resumed rather than a freshly minted one (nothing else needs to address it).
@@ -1095,6 +1123,7 @@ export function tryResumeFix(planned, {
     },
     prompt: renderNoPromptCommandRules(withPlannedContext(buildResumePrompt({ pr: planned.pr, itemNum: planned.itemNum, cwd: candidateCwd }), planned), 'fix'),
     repo, spawnAgent, listAgentsAll, stop, wait, claimOwner, acquireClaim, releaseClaim, claimRoot, sessionCwdFor, ensureSessionCwd,
+    readPushHold, readPushHoldOptions,
   });
 }
 
@@ -1111,6 +1140,8 @@ export function resumeBgSession(planned, {
   releaseClaim = releaseFixDispatchClaim, claimRoot, sessionCwdFor = (id) => dispatchSessionCwd(id, { root: REPO_ROOT }),
   ensureSessionCwd = ensureDispatchSessionCwd,
   prepareResume = () => {},
+  readPushHold = readLivePushHold,
+  readPushHoldOptions,
 } = {}) {
   // #x0jphk5 — TAKE THE CLAIM before ever issuing `--resume`. Ownership is confirmed above (both HEAD-sha and
   // name), so what remains is a genuine race: two dispatchers reading the same stale listing could BOTH reach
@@ -1149,6 +1180,18 @@ export function resumeBgSession(planned, {
   // param comment. The resumed AGENT keeps running in whatever cwd its own session already occupies (its
   // lane, by the time a resume is attempted) — this only affects where THIS one-shot trigger process starts.
   const resumeCwd = ensureSessionCwd(sessionCwdFor(candidate));
+  // The same claim owns preparation and the final uncached authority read. A held resume
+  // is terminal for this tick, never permission to try a cold launch instead.
+  let hold;
+  try { hold = readPushHold({ repo, pr: planned.pr, branch: planned.laneRef, repair: planned }, readPushHoldOptions); }
+  catch { hold = { code: 'unreadable', reason: 'Cannot read live labels/push authority; restore evidence before retrying' }; }
+  if (hold) {
+    const released = releaseOurClaim();
+    const cleanup = released?.released === true ? '' : '; claim-release-unconfirmed: inspect the reservation before retrying';
+    return { resumed: false, refused: true, outcome: 'push-hold', hold,
+      reason: `push-hold: PR #${planned.pr} not launched: ${hold.code} (${hold.reason})${cleanup}`,
+      resumeAttempt: { attempted: false, candidate, refused: 'push-hold' } };
+  }
   let stdout = '';
   try { stdout = String(spawnAgent(resumeArgv, { cwd: resumeCwd }) ?? ''); } catch { stdout = ''; }
   const printedId = parseBackgroundedId(stdout);
@@ -1223,6 +1266,8 @@ export function tryResumeRoundFix(planned, {
   postNotice = postRulingNotice,
   resume = resumeBgSession,
   resumeOptions = {},
+  readPushHold = readLivePushHold,
+  readPushHoldOptions,
   scratchRoot = dispatchScratchRoot({ root }),
   realpath = realpathSync,
   isolateSession = (cwd) => {
@@ -1286,6 +1331,7 @@ export function tryResumeRoundFix(planned, {
     candidate: decision.sessionId, prompt, repo,
     listAgentsAll,
     sessionCwdFor: () => priorCwd,
+    readPushHold, readPushHoldOptions,
   });
   if (attempt.resumed) {
     console.error(`reconcile-fix-dispatch: PR #${planned.pr} round ${decision.round} resumed ${decision.sessionId} in lane-${decision.lane.lane} (no cold start)`);
@@ -1738,25 +1784,28 @@ export function dispatchFix(planned, {
       console.error(`reconcile-fix-dispatch: PR #${planned.pr} ruling-not-addressed rung ${planned.rulingNotAddressed.rung.at} (${planned.rulingNotAddressed.rung.id}) model=${decision.executor === 'claude' ? ladderTable?.model ?? 'default-fix-route' : decision.policyRoute?.model ?? 'codex default'}`);
     }
     console.error(`reconcile-fix-dispatch: PR #${planned.pr} ${formatFixExecutorLog(decision)}`);
-    // PUSH-GATE-S4 — re-read the live hold AFTER the slow brief, notice and takeover work, right before any launch.
+    // PUSH-GATE-S4 — re-read after brief/notice work, then again at each actual launch
+    // after provider-specific preparation. Both reads stay inside the owned claim.
     // Unwind through the common cleanup, then return a per-row refusal so land-advance can keep dispatching.
-    {
+    const assertLaunchAllowed = () => {
       let hold;
       try { hold = readPushHold({ repo, pr: planned.pr, branch: planned.laneRef, repair: planned }, readPushHoldOptions); }
-      catch { hold = { code: 'unreadable', reason: 'Cannot read push authority' }; }
+      catch { hold = { code: 'unreadable', reason: 'Cannot read live labels/push authority; restore evidence before retrying' }; }
       if (hold) {
         pushHoldRefused = { refused: true, outcome: 'push-hold', hold,
           reason: `push-hold: PR #${planned.pr} not launched: ${hold.code} (${hold.reason})`,
           pr: planned.pr, itemNum: planned.itemNum, lane: planned.lane };
         throw new Error(pushHoldRefused.reason);
       }
-    }
+    };
+    assertLaunchAllowed();
     stampExecutor({ repo, pr: planned.pr, owner: claimOwner, lockRoot: claimRoot, decision });
     if (decision.executor !== 'claude' && decision.mode !== 'wrapped') {
       // Routed and borrowed non-Claude repairs share the same claim/brief/launcher path.
       const promptFile = writeBorrowedPrompt(sessionSlug, withPlannedContext(prompt, planned));
       let handle;
       try {
+        assertLaunchAllowed();
         launchAttempted = true;
         handle = spawnBorrowed({
           pr: planned.pr, num: planned.itemNum, sessionSlug, cwd: root,
@@ -1822,6 +1871,7 @@ export function dispatchFix(planned, {
       // 117 S3b — same argv, run as `claude -p` to completion by the detached wrapper. The handle is the wrapper's pid
       // (`pid:<n>`), stamped on the claim so the claim's liveness is that process (`isClaimRunnerDead`); the wrapper's
       // v2 record stands in for the `claude agents` row (`listWrappedWorkerAgents`). Claim kept, as for `--bg`.
+      assertLaunchAllowed();
       launchAttempted = true;
       const launched = launchWrapped({
         role: 'fix', session: sessionSlug, bgArgv: argv, cwd: sessionCwd, env: workerSpawnEnv(), pr: planned.pr, item: planned.itemNum,
@@ -1841,6 +1891,7 @@ export function dispatchFix(planned, {
     // #3331 — READ THE REAL ID BACK OFF STDOUT, exactly as the resume branch above already does. `claude --bg`
     // discards `--session-id` and assigns its own, so the minted uuid addresses nothing; `agentId` is what
     // `claude agents`/`logs`/`stop` take. `sessionId` stays on the result for callers that already read it.
+    assertLaunchAllowed();
     launchAttempted = true;
     const stdout = String(spawnAgent(argv, { cwd: sessionCwd }) ?? '');
     // #x0jphk5 — the claim is DELIBERATELY NOT released here on success: see this function's own docblock for
@@ -1864,7 +1915,8 @@ export function dispatchFix(planned, {
     }
     // #x0jphk5 — nothing was actually spawned: release so a legitimate retry for this same PR is never blocked
     // by our own failed attempt.
-    releaseClaim({ repo, pr: planned.pr, kind: 'fix', owner: claimOwner, lockRoot: claimRoot });
+    const released = releaseClaim({ repo, pr: planned.pr, kind: 'fix', owner: claimOwner, lockRoot: claimRoot });
+    if (pushHoldRefused && released?.released !== true) pushHoldRefused.reason += '; claim-release-unconfirmed: inspect the reservation before retrying';
     if (pushHoldRefused) return pushHoldRefused;
     // #3850 — the CLI's own stderr proves no agent started AND names a fault the dispatcher can heal (trust
     // the scratch root). Re-grant now and surface it as a transient environment fault, never a dispatch failure.
@@ -2203,7 +2255,7 @@ export function runReconcileFixDispatch({
     let hold;
     try { hold = readPushHold({ repo: repoKey, pr: Number(entry.pr ?? entry.prNumber), branch: entry.laneRef ?? entry.headRefName,
       ...(!mechanicalRefresh ? { repair: entry } : {}) }, readPushHoldOptions); }
-    catch { hold = { code: 'unreadable', reason: 'Cannot read push authority; restore evidence before retrying' }; }
+    catch { hold = { code: 'unreadable', reason: 'Cannot read live labels/push authority; restore evidence before retrying' }; }
     return hold ? { pr: Number(entry.pr ?? entry.prNumber), kind: 'push-hold',
       why: `PR #${entry.pr ?? entry.prNumber} not launched: ${hold.code} (${hold.reason})` } : null;
   };
@@ -2518,9 +2570,13 @@ export function runReconcileFixDispatch({
     if (entry.isConflict && !borrowed && (!executorDecision || executorDecision.executor === 'claude' || executorDecision.mode === 'wrapped') && !entry.restack) {
       let attempt;
       try {
-        attempt = fixStep('resume', () => tryResume(entry, { root, repo: repoKey }), entry.pr);
+        attempt = fixStep('resume', () => tryResume(entry, { root, repo: repoKey, readPushHold, readPushHoldOptions }), entry.pr);
       } catch (e) {
         refusals.push({ pr: entry.pr, kind: 'dispatch-failed', why: describeDispatchFailure(e) });
+        continue;
+      }
+      if (attempt?.refused) {
+        refusals.push({ pr: entry.pr, kind: attempt.outcome, why: attempt.reason });
         continue;
       }
       if (attempt.resumed) {
@@ -2536,9 +2592,13 @@ export function runReconcileFixDispatch({
     if ((!executorDecision || executorDecision.executor === 'claude' || executorDecision.mode === 'wrapped') && tryResumeRound && !entry.isConflict && !borrowed && !entry.restack && !entry.takeover && roundOf(entry) >= 2) {
       let attempt = null;
       try {
-        attempt = fixStep('resume-round', () => tryResumeRound(entry, { root, repo: repoKey }), entry.pr);
+        attempt = fixStep('resume-round', () => tryResumeRound(entry, { root, repo: repoKey, readPushHold, readPushHoldOptions }), entry.pr);
       } catch (e) {
         attempt = { resumed: false, resumeAttempt: { attempted: false, roundResume: true, refused: 'error', why: describeDispatchFailure(e) } };
+      }
+      if (attempt?.refused) {
+        refusals.push({ pr: entry.pr, kind: attempt.outcome, why: attempt.reason });
+        continue;
       }
       if (attempt?.resumed) {
         console.error(`reconcile-fix-dispatch: PR #${entry.pr} ${formatFixExecutorLog(executorDecision ?? { executor: 'claude', reason: 'resuming existing session', source: 'default' })}`);

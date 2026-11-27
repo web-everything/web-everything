@@ -17,7 +17,7 @@ import { FIX_OVERLAP_PROSE_GLOBS, stripProseScope } from '../fix-scope-policy.mj
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { probeHeldLandAdvanceBatch } from '../soak/breaks/fix-push-hold-repair-starvation.mjs';
+import pushHoldBreak, { probeHeldLandAdvanceBatch } from '../soak/breaks/fix-push-hold-repair-starvation.mjs';
 import * as ghThrottle from '../../lib/gh-throttle.mjs';
 import {
   createFixPassPrReader, fetchPrFilesPaginated, replayFixLaunch, withStaleBase, withPlannedContext, dispatchFix, readLivePushHold, isSmokeDryRunPr, fetchCardScopeAtRef, fetchPrDiffPaths, isDiffTooLargeError, PermanentScopeReadError, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
@@ -27,6 +27,13 @@ import { CONFLICT_LABEL } from '../parked-pr-conflict-watch.mjs';
 import { resolvePrWorkUnit } from '../pr-work-unit.mjs';
 import { DISPATCHED_AGENT_SYSTEM_PROMPT_FILE, dispatchSessionCwd } from '../../operations/dispatch-lane-io.mjs';
 import { buildAuthorActorMarker } from '../../lib/review-independence.mjs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, lstatSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import * as settingsFiles from '../../lib/settings-files.mjs';
+import * as policyCascade from '../../lib/policy-cascade.mjs';
+import * as conflictWakes from '../../lib/overlay-conflict-wake.mjs';
+import * as routingPolicy from '../../lib/dispatch-routing-policy-io.mjs';
+import { repoProfile } from '../../lib/repo-profile.mjs';
 
 // Existing resume fixtures have no completion record; never consult the host store.
 vi.mock('../../operations/completion-store.mjs', async (importOriginal) => ({
@@ -46,6 +53,263 @@ const item3438 = { num: '3438', slug: 'wire-reconcile-pass', specPath: 'backlog/
 // #4295 — a second, scope-DISJOINT item so multi-PR dispatch tests aren't (correctly) serialized by the overlap filter.
 const item3439 = { num: '3439', slug: 'other-thing', specPath: 'backlog/3439-other-thing.md', scope: ['we:scripts/other.mjs'] };
 const findItemStub = (key, _loadItems) => (key === '3438' ? item3438 : key === '3439' ? item3439 : null);
+
+describe('BLD-8102 — operator holds at every fixer launch', () => {
+  // All mutable evidence belongs to this temporary fixture. Policy readers are injected too:
+  // these regressions must not depend on checkout settings, operator preferences or live claims.
+  const fixture = (test) => {
+    const root = mkdtempSync(join(tmpdir(), 'bld-8102-'));
+    const cwd = join(root, 'session');
+    mkdirSync(cwd);
+    const killFile = join(root, 'fix-dispatch.kill');
+    const head = 'a'.repeat(40);
+    const session = '33333333-3333-4333-8333-333333333333';
+    const planned = { pr: 1764, itemNum: '3438', lane: 4, laneRef: 'lane/3438-fixture',
+      headRefOid: head, baseRefName: 'main', labels: ['review:changes'], scope: ['we:src/fixture.mjs'] };
+    const state = { labels: ['review:changes'], claimed: false };
+    const spies = [
+      vi.spyOn(settingsFiles, 'readSettings').mockReturnValue({}),
+      vi.spyOn(settingsFiles, 'readDeclaredSettings').mockReturnValue({ settings: {} }),
+      vi.spyOn(policyCascade, 'platformPreference').mockReturnValue({}),
+      vi.spyOn(policyCascade, 'readPlatformPreferences').mockReturnValue({ prefs: {} }),
+      vi.spyOn(policyCascade, 'cascadePolicy').mockImplementation((_policy, tool, options) => ({
+        ...policyCascade.resolveCascade({ ...options, tool, platform: {}, operatorOverride: {}, log: () => {} }),
+        layered: {},
+      })),
+      vi.spyOn(conflictWakes, 'readOverlayConflictWakes').mockReturnValue(new Map()),
+      vi.spyOn(routingPolicy, 'resolvePolicyModel').mockImplementation((_provider, model) => model),
+      vi.spyOn(ghThrottle, 'execFileSyncThrottled').mockImplementation(() => { throw Error('unexpected external call'); }),
+      vi.spyOn(ghThrottle, 'runGhSync').mockImplementation(() => { throw Error('unexpected gh call'); }),
+    ];
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-11-26T12:00:00Z'));
+    const runGh = vi.fn(() => JSON.stringify({ state: 'OPEN', headRefOid: head,
+      baseRefName: 'main', mergeable: 'MERGEABLE', labels: state.labels.map(name => ({ name })) }));
+    const readPushHoldOptions = { hermetic: false, env: {}, run: runGh, killFile, stat: lstatSync };
+    const acquireClaim = vi.fn(() => {
+      expect(state.claimed).toBe(false);
+      state.claimed = true;
+      return { ok: true };
+    });
+    const releaseClaim = vi.fn(() => {
+      expect(state.claimed).toBe(true);
+      state.claimed = false;
+      return { released: true };
+    });
+    const spawnAgent = vi.fn(() => {
+      expect(state.claimed).toBe(true);
+      return `Backgrounded agent: ${session}`;
+    });
+    const fixSettings = { roundHistory: 'off', strongerModelFromRound: 0,
+      conflictFixesPerPass: 2, conflictFixExemptPerPass: 0, resumeAcrossRounds: 'on' };
+    const options = { root, home: root, checkoutExists: () => true, readPackageJson: () => ({}),
+      claimOwner: 'fixture-owner', claimRoot: join(root, 'claims'), acquireClaim, releaseClaim,
+      readFixClaim: () => null, readCompletion: () => null, readBrief: () => REAL_TEMPLATE_STUB, readHistoryInputs: () => null,
+      readTakeoverDiff: () => null, postNotice: () => {}, grantConflictHelper: () => ({ ok: true }),
+      mintSessionId: () => session, sessionCwdFor: () => cwd, ensureSessionCwd: () => cwd,
+      isolateSession: () => ({ worktreeSettings: {} }), resolveSettingsEnv: () => null,
+      advisorFor: () => ({ enabled: false }), recordAdvisor: () => {}, stampExecutor: () => {},
+      executorDecision: { executor: 'claude', mode: 'direct', source: 'fixture', reason: 'fixture' },
+      spawnAgent, wrapFix: false, fixSettings, loadLadder: () => [], readPushHoldOptions };
+    const run = (extra = {}) => runReconcileFixDispatch({
+      root, repo: 'we', dryRun: false, checkStaleness: FRESH,
+      reconcile: () => ({ dispatch: [{ ...planned, kind: 'fix', prNumber: planned.pr,
+        headRefName: planned.laneRef }], refusals: [] }),
+      findItemFn: () => ({ num: '3438', scope: planned.scope }), loadItems: () => [],
+      pickFreeLanes: () => [planned.lane], fetchItemlessDiffPaths: () => ['src/fixture.mjs'],
+      resolveProfile: key => ({ ...repoProfile(key, { home: root }), checkoutPath: root, lanePoolRepo: root }),
+      priorityShadow: null, listBuildClaims: () => [], listFixClaims: () => [],
+      prStack: null, prStackSettings: {}, netScope: null, tryResumeRound: null,
+      tryResume: () => ({ resumed: false }), readMainRedPriorityRecord: () => null,
+      landingBlockedState: { read: () => new Map(), write: () => {} },
+      now: Date.now(), clock: Date.now, stepNow: Date.now, stepLog: () => {}, fixSettings,
+      readPushHoldOptions, dispatch: (p, o) => dispatchFix(p, { ...options, ...o }), ...extra,
+    });
+    const hold = () => readLivePushHold({ repo: 'we', pr: planned.pr, repair: planned }, readPushHoldOptions);
+    try { test({ root, cwd, killFile, head, session, planned, state, options, run, hold,
+      runGh, readPushHoldOptions, spawnAgent, acquireClaim, releaseClaim }); }
+    finally {
+      vi.useRealTimers();
+      for (const spy of spies.reverse()) spy.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+    }
+  };
+
+  it('preserves the soak fixPresent invariant in the exported production functions', () => fixture(f => {
+    // Materialize imported code in the fixture: the probe never reads the real checkout or ambient cwd.
+    const repoRoot = f.root;
+    const source = join(repoRoot, 'scripts/conveyor/reconcile-fix-dispatch.mjs');
+    mkdirSync(dirname(source), { recursive: true });
+    writeFileSync(source, [readLivePushHold, runReconcileFixDispatch, dispatchFix].map(String).join('\n'));
+    expect(pushHoldBreak.fixPresent(repoRoot)).toBe(true);
+  }));
+
+  it.each(['hold-label', 'unreadable'].flatMap(hold => [
+    ['confirmed', { released: true }], ['unreleased', { released: false }],
+    ['missing', undefined], ['null', null], ['malformed', { released: 'true' }],
+  ].map(([release, evidence]) => [hold, release, evidence])))(
+    'push-hold refusal never launches or falls through (%s, claim release %s)', (hold, _release, evidence) => fixture(f => {
+      if (hold === 'hold-label') f.state.labels.push('hold:fix');
+      else f.runGh.mockImplementation(() => { throw Object.assign(Error('fixture gh timeout'), { code: 'ETIMEDOUT' }); });
+      const releaseClaim = vi.fn(args => evidence?.released === true ? f.releaseClaim(args) : evidence);
+      const healTrust = vi.fn(), spawnBorrowed = vi.fn(), launchWrapped = vi.fn();
+      const result = dispatchFix(f.planned, { ...f.options, repo: 'we', releaseClaim,
+        healTrust, spawnBorrowed, launchWrapped });
+      const holdReason = hold === 'hold-label' ? 'hold:fix'
+        : 'Cannot read live labels/push authority; restore evidence before retrying';
+      const suffix = evidence?.released === true ? ''
+        : '; claim-release-unconfirmed: inspect the reservation before retrying';
+      expect(result).toEqual({ refused: true, outcome: 'push-hold', hold: { code: hold, reason: holdReason },
+        reason: `push-hold: PR #${f.planned.pr} not launched: ${hold} (${holdReason})${suffix}`,
+        pr: f.planned.pr, itemNum: f.planned.itemNum, lane: f.planned.lane });
+      expect(f.acquireClaim).toHaveBeenCalledTimes(1);
+      expect(releaseClaim).toHaveBeenCalledTimes(1);
+      expect(releaseClaim).toHaveBeenCalledWith({ repo: 'we', pr: f.planned.pr,
+        kind: 'fix', owner: f.options.claimOwner, lockRoot: f.options.claimRoot });
+      expect(f.state.claimed).toBe(evidence?.released !== true);
+      for (const launch of [f.spawnAgent, spawnBorrowed, launchWrapped, healTrust]) expect(launch).not.toHaveBeenCalled();
+    }));
+
+  it('review changes dispatch refuses hold label and kill sentinel independently', () => fixture(f => {
+    f.state.labels.push('hold:fix');
+    const labelHeld = f.run();
+    expect(labelHeld.dispatched).toEqual([]);
+    expect(labelHeld.refusals).toContainEqual(expect.objectContaining({ kind: 'push-hold', why: expect.stringContaining('hold:fix') }));
+    expect(f.spawnAgent).not.toHaveBeenCalled();
+    f.state.labels = ['review:changes'];
+    writeFileSync(f.killFile, 'operator stop');
+    const killed = f.run();
+    expect(killed.dispatched).toEqual([]);
+    expect(killed.refusals).toContainEqual(expect.objectContaining({ kind: 'push-hold', why: expect.stringContaining('fix-dispatch-killed') }));
+    expect(f.spawnAgent).not.toHaveBeenCalled();
+    rmSync(f.killFile);
+    expect(f.run().dispatched).toHaveLength(1);
+    expect(f.spawnAgent).toHaveBeenCalledTimes(1);
+  }));
+
+  it.each(['label', 'kill'])('hold added while capacity occupied blocks launch (%s)', kind => fixture(f => {
+    const tryAdmit = vi.fn(() => {
+      if (kind === 'label') f.state.labels.push('hold:fix');
+      else writeFileSync(f.killFile, 'stop during capacity wait');
+      return { admit: true };
+    });
+    const result = f.run({ dispatchThrottle: { tryAdmit } });
+    expect(tryAdmit).toHaveBeenCalledTimes(1);
+    expect(result.dispatched).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'push-hold',
+      why: expect.stringContaining(kind === 'label' ? 'hold:fix' : 'fix-dispatch-killed') }));
+    expect(f.spawnAgent).not.toHaveBeenCalled();
+    expect(f.state.claimed).toBe(false);
+  }));
+
+  it.each(['EACCES', 'EIO', 'ETIMEDOUT', 'ENOTDIR'])('kill read error fails closed (%s)', code => fixture(f => {
+    f.readPushHoldOptions.stat = () => { throw Object.assign(Error('unreadable sentinel'), { code }); };
+    const result = dispatchFix(f.planned, f.options);
+    expect(result).toMatchObject({ refused: true, outcome: 'push-hold', hold: { code: 'kill-unreadable' } });
+    expect(result.reason).toContain('restore');
+    expect(f.spawnAgent).not.toHaveBeenCalled();
+    expect(f.releaseClaim).toHaveBeenCalledTimes(1);
+    expect(f.state.claimed).toBe(false);
+  }));
+
+  it('a kill created during the live label read blocks launch', () => fixture(f => {
+    f.runGh.mockImplementation(() => {
+      writeFileSync(f.killFile, 'stop while gh is occupied');
+      return JSON.stringify({ state: 'OPEN', labels: [] });
+    });
+    expect(dispatchFix(f.planned, f.options)).toMatchObject({ refused: true, hold: { code: 'fix-dispatch-killed' } });
+    expect(f.spawnAgent).not.toHaveBeenCalled();
+    expect(f.releaseClaim).toHaveBeenCalledTimes(1);
+  }));
+
+  it('label read failure refuses dispatch and releases reservation', () => fixture(f => {
+    f.runGh.mockImplementation(() => {
+      expect(f.state.claimed).toBe(true);
+      throw Error('label read timed out');
+    });
+    const result = dispatchFix(f.planned, f.options);
+    expect(result).toMatchObject({ refused: true, outcome: 'push-hold', hold: { code: 'unreadable' } });
+    expect(result.reason).toContain('labels');
+    expect(result.reason).toContain('restore');
+    expect(f.acquireClaim).toHaveBeenCalledTimes(1);
+    expect(f.releaseClaim).toHaveBeenCalledTimes(1);
+    expect(f.spawnAgent).not.toHaveBeenCalled();
+    expect(f.state.claimed).toBe(false);
+  }));
+
+  it.each(['not json', '{}', '{"state":"OPEN","labels":null}', '{"state":"OPEN","labels":[{}]}'])(
+    'malformed labels refuse without a fallback (%s)', evidence => fixture(f => {
+      f.runGh.mockReturnValue(evidence);
+      expect(dispatchFix(f.planned, f.options)).toMatchObject({ refused: true, hold: { code: 'unreadable', reason: expect.stringContaining('labels') } });
+      expect(f.spawnAgent).not.toHaveBeenCalled();
+      expect(f.state.claimed).toBe(false);
+    }));
+
+  it('hold release preserves other gates', () => fixture(f => {
+    f.state.labels = ['review:changes', 'hold:fix', 'review:held-mechanical'];
+    expect(f.run().dispatched).toEqual([]);
+    f.state.labels = ['review:changes', 'review:held-mechanical'];
+    expect(f.run().dispatched).toEqual([]);
+    f.state.labels = ['review:changes'];
+    const result = f.run({ dispatchThrottle: { tryAdmit: () => ({ admit: false, kind: 'host-load', why: 'fixture capacity occupied' }) } });
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'host-load' }));
+    expect(f.spawnAgent).not.toHaveBeenCalled();
+    expect(f.run().dispatched).toHaveLength(1);
+  }));
+
+  it.each(['ordinary', 'review-changes', 'conflict-resume', 'round-resume'].flatMap(route =>
+    ['label', 'kill'].map(kind => [route, kind])))(
+    'held attempt releases reservation (%s, %s)', (route, kind) => fixture(f => {
+      const addHold = () => {
+        expect(f.state.claimed).toBe(true);
+        if (kind === 'label') f.state.labels.push('hold:fix');
+        else writeFileSync(f.killFile, 'late stop');
+        return f.cwd;
+      };
+      let result;
+      if (route.endsWith('resume')) {
+        const resumeOptions = { ...f.options, ensureSessionCwd: addHold,
+          listAgentsAll: () => [{ sessionId: f.session, name: 'fix-1764', state: 'done', cwd: f.cwd }],
+          resolveHead: () => f.head, stop: vi.fn(), wait: vi.fn() };
+        result = route === 'conflict-resume'
+          ? tryResumeFix({ ...f.planned, isConflict: true, body: buildAuthorActorMarker(f.session) }, resumeOptions)
+          : tryResumeRoundFix({ ...f.planned, attempts: 1 }, { ...resumeOptions,
+            scratchRoot: f.root, realpath: p => p, isolateSession: () => ({ hooks: { ok: true } }),
+            readInputs: () => ({ prior: { sessionId: f.session, name: 'fix-1764', state: 'done', cwd: f.cwd },
+              job: { template: 'bg', respawnFlags: ['--model', 'sonnet'] }, transcript: true,
+              lane: { lane: 4, path: join(f.root, 'lane-4'), held: 'free', head: f.head, sessionHead: f.head }, base: { rebased: false } }),
+            resumeOptions,
+          });
+      } else {
+        if (route === 'ordinary') f.state.labels = [];
+        result = dispatchFix(f.planned, { ...f.options, grantConflictHelper: () => { addHold(); return { ok: true }; } });
+      }
+      expect(result).toMatchObject({ refused: true, outcome: 'push-hold' });
+      expect(f.acquireClaim).toHaveBeenCalledTimes(1);
+      expect(f.releaseClaim).toHaveBeenCalledTimes(1);
+      expect(f.spawnAgent).not.toHaveBeenCalled();
+      expect(f.state.claimed).toBe(false);
+    }));
+
+  it.each([true, false])('a refused resume never falls through to a cold launch (conflict=%s)', isConflict => fixture(f => {
+    const dispatch = vi.fn();
+    const refuse = (_p, o) => {
+      // A real resume can observe a hold after the pass's last read and return it.
+      expect(o.readPushHold).toBe(readLivePushHold);
+      expect(o.readPushHoldOptions).toBe(f.readPushHoldOptions);
+      return { resumed: false, refused: true, outcome: 'push-hold', reason: 'hold:fix during resume' };
+    };
+    const result = f.run({
+      reconcile: () => ({ dispatch: [{ kind: 'fix', prNumber: f.planned.pr, headRefName: f.planned.laneRef,
+        headRefOid: f.head, labels: ['review:changes'], attempts: 1,
+        ...(isConflict ? { labels: ['review:changes', CONFLICT_LABEL] } : {}) }], refusals: [] }),
+      tryResume: refuse, tryResumeRound: refuse, dispatch,
+    });
+    expect(result.dispatched).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'push-hold', why: 'hold:fix during resume' }));
+    expect(dispatch).not.toHaveBeenCalled();
+  }));
+});
 
 describe('planFixesFromReconcile', () => {
   it('narrows to `kind:\'fix\'` entries and plans one per dispatchable PR', () => {
