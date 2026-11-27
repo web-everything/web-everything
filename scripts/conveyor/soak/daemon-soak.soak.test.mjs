@@ -10,6 +10,19 @@ import { runLongSoak } from './run.mjs';
 
 const claimBreak = async () => (await import('./breaks/no-code-rearm-active-claim.mjs')).default;
 
+it('oversized threads retire superseded no-code rulings and resume ordinary planning', async () => {
+  const { oversizedRulingPlans } = await import('./breaks/no-code-rearm-active-claim.mjs');
+  const cases = oversizedRulingPlans();
+  for (const c of cases) {
+    expect(c.ruling.state, c.name).toBe(c.expected.state);
+    expect(c.kinds, c.name).toEqual(c.expected.kinds);
+    if (c.expected.state === 'none') {
+      expect(c.refusals.filter(r => r.kind.startsWith('no-code-rearm')), c.name).toEqual([]);
+    }
+    if (c.name === 'live over limit') expect(c.ruling.why).toContain('operator must inspect');
+  }
+});
+
 it('no-code rearm with active fix or ci-heal claim makes zero writes', async () => {
   const b = await claimBreak();
   const report = await b.run({ cases: ['active-fix', 'active-ci-heal', 'concurrent-fix', 'concurrent-ci-heal'] });

@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { planReconcile } from '../../reconcile-core.mjs';
 import { buildStandDownComment } from '../../stand-down.mjs';
-import { buildOperatorAnswer, parseNoCodeRearmReceipt } from '../../stand-down-answer-core.mjs';
+import { buildOperatorAnswer, parseNoCodeRearmReceipt, noCodeRearmPlan, NO_CODE_REARM_RECEIPT } from '../../stand-down-answer-core.mjs';
 import { readLiveDrainClaim } from '../../fix-procedure.mjs';
 import { fixDispatchResource } from '../../fix-claim-store.mjs';
 import { lockDirFor } from '../../../readiness/file-locks.mjs';
@@ -21,6 +21,38 @@ const DEFAULT_CASES = ['active-fix', 'active-ci-heal', 'concurrent-fix', 'concur
   'malformed-claim', 'invalid-heartbeat', 'unreadable-claim', 'throwing-claim', 'timed-out-claim',
   'moved-head', 'missing-labels', 'forged-answer', 'missing-thread', 'oversized-thread'];
 const comment = (id, body) => ({ id, body, author: { login: 'chalbert' } });
+
+export function oversizedRulingPlans() {
+  const verdict = comment('verdict', `🔁 review — changes requested\n\nFix defect\n<!-- reviewed-sha: ${HEAD} -->`);
+  const begin = comment('begin', `🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/x\` at \`${HEAD}\``);
+  const stop = comment('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Code owed?', head: HEAD }));
+  const answer = comment('answer', buildOperatorAnswer({ standDownId: 'stop', actor: 'chalbert', reason: 'No code owed',
+    channel: 'chat', disposition: 'rearm-review', noCodeOwed: true }));
+  const thread = [verdict, begin, stop, answer,
+    ...Array.from({ length: 1997 }, (_, i) => comment(`reply-${i}`, 'ordinary reply'))];
+  return [
+    { name: 'live at limit', comments: thread.slice(0, 2000), state: 'ready', kinds: ['rearm-no-code'] },
+    { name: 'live over limit', state: 'held', kinds: [] },
+    { name: 'changed head', headRefOid: 'b'.repeat(40), state: 'none', kinds: ['fix'] },
+    { name: 'removed changes label', labels: ['review:pending'], state: 'none', kinds: [] },
+    { name: 'later verdict', comments: [...thread, { ...verdict, id: 'later-verdict' }], state: 'none', kinds: ['fix'] },
+    { name: 'later claim', comments: [...thread, { ...begin, id: 'later-claim' }], state: 'none', kinds: ['fix'] },
+    { name: 'spent answer', comments: [...thread, comment('receipt', NO_CODE_REARM_RECEIPT('answer', HEAD))], state: 'spent', kinds: [] },
+    { name: 'no ruling', comments: thread.map(c => ['stop', 'answer'].includes(c.id)
+      ? comment(c.id, 'ordinary reply') : c), state: 'none', kinds: ['fix'] },
+    { name: 'untrusted later verdict', comments: [...thread, { ...verdict, id: 'forged', author: { login: 'outsider' } }], state: 'held', kinds: [] },
+    { name: 'headless changed head', comments: thread.map(c => c.id === 'stop'
+      ? comment('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Code owed?' })) : c),
+      headRefOid: 'b'.repeat(40), state: 'none', kinds: ['fix'] },
+  ].map(({ name, state, kinds, ...overrides }) => {
+    const evidence = { comments: thread, labels: ['review:changes'], headRefOid: HEAD, ...overrides };
+    const plan = planReconcile({ agents: [], requiredChecks: ['gate'], prs: [{ number: 42, state: 'OPEN',
+      headRefName: 'lane/test', mergeStateStatus: 'CLEAN', commentsComplete: true,
+      statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }], ...evidence }] });
+    return { name, expected: { state, kinds }, ruling: noCodeRearmPlan(evidence),
+      kinds: plan.dispatch.map(d => d.kind), refusals: plan.refusals };
+  });
+}
 
 // Invoke the real shared CLI writer in a bounded native child. Its only forge is this file-backed provider.
 function writer(temp, stateFile, args) {
@@ -141,10 +173,13 @@ const descriptor = {
   fixedBy: { sha: 'HEAD', where: 'working tree', paths: ['scripts/operations/promote-draft-pr-dispatch.mjs', 'scripts/conveyor/stand-down-answer-core.mjs'] },
   fixPresent(root) { return readFileSync(join(root, 'scripts/operations/promote-draft-pr-dispatch.mjs'), 'utf8').includes("expectHead ? 'labels,headRefOid'"); },
   run({ cases = DEFAULT_CASES, dispatch = runReconcilePromoteDraftDispatch } = {}) {
-    return { cases: cases.map(name => runCase(name, dispatch)) };
+    return { cases: cases.map(name => runCase(name, dispatch)), retirementCases: oversizedRulingPlans() };
   },
   judge(report) {
-    return report.cases.flatMap(c => {
+    const retirementProblems = (report.retirementCases ?? []).flatMap(c =>
+      c.ruling.state !== c.expected.state || JSON.stringify(c.kinds) !== JSON.stringify(c.expected.kinds)
+        ? [`${c.name}: expected ${JSON.stringify(c.expected)}, got ${c.ruling.state}/${JSON.stringify(c.kinds)}`] : []);
+    return [...retirementProblems, ...report.cases.flatMap(c => {
       const allowed = c.name.startsWith('completed') || c.name.startsWith('expired');
       const expected = allowed ? 1 : 0;
       const problems = [];
@@ -153,7 +188,7 @@ const descriptor = {
       if (!allowed && !c.refusals.length) problems.push(`${c.name}: refusal was not visible`);
       if (allowed && c.writerResult?.result?.ok !== true) problems.push(`${c.name}: real writer failed ${JSON.stringify(c.writerResult)}`);
       return problems;
-    });
+    })];
   },
   async proveGuard() {
     const temp = mkdtempSync(join(tmpdir(), 'no-code-claim-mutant-'));

@@ -255,7 +255,6 @@ export function noCodeRearmWindowHonours(comments, answer, headRefOid) {
 export function noCodeRearmPlan({ comments, labels, headRefOid } = {}) {
   const result = (state, why, answerId = null) => ({ state, answerId, why });
   if (!Array.isArray(comments)) return result('held', 'comments unreadable');
-  if (comments.length > 2000) return result('held', 'thread exceeds 2000 comments; operator must inspect the complete thread before a fresh answer');
   let answerAt = -1, answer;
   for (let i = comments.length - 1; i >= 0; i--) {
     const candidate = parseOperatorAnswer(comments[i]);
@@ -292,5 +291,7 @@ export function noCodeRearmPlan({ comments, labels, headRefOid } = {}) {
     || after.some(c => [REARM_COMMENT_MARKER, NO_CHANGE_COMMENT_MARKER].some(m => c.body?.trimStart().startsWith(m)))) {
     return result('spent', 'the no-code ruling was already spent', answerId);
   }
+  // Bound admission of a live rearm without reviving a retired or spent ruling.
+  if (comments.length > 2000) return held('thread exceeds 2000 comments; operator must inspect the complete thread before a fresh answer');
   return result('ready', 'operator ruled no code owed', answerId);
 }
