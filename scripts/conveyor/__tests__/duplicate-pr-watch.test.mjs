@@ -324,6 +324,50 @@ prFileContract({
   fields: 'number,headRefName,title,body,labels,files',
 });
 
+describe('repeatable CLI error paths', () => {
+  it('refuses an unknown verb before reading PRs', async () => {
+    const { execFileSync } = await import('node:child_process');
+    const { writeAllSync, writeLineSync } = await import('../../lib/write-all-sync.mjs');
+    const savedExitCode = process.exitCode;
+    execFileSync.mockClear();
+    writeAllSync.mockClear();
+    writeLineSync.mockClear();
+    try {
+      runDuplicateWatchCli(['unknown']);
+      expect(process.exitCode).toBe(2);
+      expect(execFileSync).not.toHaveBeenCalled();
+      expect(writeAllSync).not.toHaveBeenCalled();
+      expect(writeLineSync).toHaveBeenCalledWith(2, expect.stringContaining('usage:'));
+    } finally {
+      process.exitCode = savedExitCode;
+    }
+  });
+
+  it('treats an unreadable snapshot as an empty sweep without falling back to gh', async () => {
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { execFileSync } = await import('node:child_process');
+    const { writeAllSync, writeLineSync } = await import('../../lib/write-all-sync.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'duplicate-pr-cli-error-'));
+    const savedExitCode = process.exitCode;
+    execFileSync.mockClear();
+    writeAllSync.mockClear();
+    writeLineSync.mockClear();
+    try {
+      runDuplicateWatchCli(['sweep', '--dry-run', `--prs-file=${join(dir, 'missing.json')}`]);
+      expect(process.exitCode).toBe(savedExitCode);
+      expect(execFileSync).not.toHaveBeenCalled();
+      expect(writeAllSync).toHaveBeenCalledWith(1,
+        `${JSON.stringify({ checked: true, flagged: 0, results: [] })}\n`);
+      expect(writeLineSync).not.toHaveBeenCalled();
+    } finally {
+      process.exitCode = savedExitCode;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 it('the callable CLI rejects an invalid verb without discovering PRs', async () => {
   const { execFileSync } = await import('node:child_process');
   const { writeAllSync, writeLineSync } = await import('../../lib/write-all-sync.mjs');

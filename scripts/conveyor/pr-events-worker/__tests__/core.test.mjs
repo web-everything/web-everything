@@ -4,6 +4,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import * as core from '../core.mjs';
+import { isRelevantEvent } from '../../../lib/pr-events.mjs';
 import {
   verifySignature, signBody, parseGithubEvent, createEventLog, createMemoryStorage, handleRequest, timingSafeEqual,
 } from '../core.mjs';
@@ -15,6 +16,157 @@ const runtime = (overrides = {}) => ({
   head: 'a'.repeat(40), action: 'review', cause: 1, writer: { role: 'decider' }, ...overrides,
 });
 const runtimeFact = (id) => ({ id, type: 'pull_request', action: 'opened', repo: REPO.full_name, prs: [5453] });
+
+describe('SD4 shadow occurrence receipts', () => {
+  const check = (id = 136943346985) => ({ action: 'completed', repository: REPO,
+    check_run: { id, name: 'test', head_sha: 'a'.repeat(40), conclusion: 'failure', pull_requests: [{ number: 5453 }] } });
+  const parse = (payload, deliveryId = 'A', type = 'check_run') => parseGithubEvent(type, payload, { deliveryId, receivedAt: 100 });
+  const request = async (payload, id = 'A', type = 'check_run', signed = true) => {
+    const body = JSON.stringify(payload);
+    return new Request('https://fixture.test/github/webhook', { method: 'POST', body, headers: {
+      'x-github-event': type, ...(id === null ? {} : { 'x-github-delivery': id }),
+      ...(signed ? { 'x-hub-signature-256': await signBody('fixture-secret', body) } : {}),
+    } });
+  };
+  const env = { GITHUB_WEBHOOK_SECRET: 'fixture-secret', PR_EVENTS_BOOTSTRAP_TOKEN: 'writer' };
+
+  it('shadow marks a redelivered check_run duplicate after its event row is pruned', async () => {
+    const storage = createMemoryStorage();
+    let log = createEventLog(storage, { maxEvents: 1 });
+    await handleRequest(await request(check()), env, { getLog: () => log, now: () => 100 });
+    const first = log.read(0).events[0];
+    log.append(parse(check(2), 'B'), 101);
+    expect(storage.hasDelivery('A')).toBe(false);
+    log = createEventLog(storage, { maxEvents: 1 });
+    const response = await handleRequest(await request(check()), env, { getLog: () => log, now: () => 102 });
+    expect(response.status).toBe(202);
+    expect(log.read(2).events[0]).toMatchObject({ seq: 3, occ: first.occ, occDuplicate: true });
+    expect(first.occ).toBe('gh/check_run/136943346985/completed');
+    expect(storage.getMeta('occDuplicates')).toBe('1');
+  });
+
+  it('one check_run occurrence via two deliveries and the REST object has one occurrence id', () => {
+    expect(core.occurrenceId('check_run', check().check_run)).toBe('gh/check_run/136943346985/completed');
+    const log = createEventLog(createMemoryStorage());
+    log.append(parse(check()), 100);
+    log.append(parse(check(), 'B'), 101);
+    expect(log.read(0).events).toMatchObject([
+      { occ: core.occurrenceId('check_run', check()), native: { id: 136943346985, type: 'check_run' }, occDuplicate: false },
+      { occ: core.occurrenceId('check_run', check()), occDuplicate: true },
+    ]);
+  });
+
+  it('preserves native review/comment/open/synchronize identities and level observations', () => {
+    expect(core.occurrenceId('pull_request_review', { action: 'submitted', review: { id: 7 } })).toBe('gh/review/7/submitted');
+    expect(core.occurrenceId('pull_request_review', { action: 'dismissed', review: { id: 7 } })).toBe('gh/review/7/dismissed');
+    expect(core.occurrenceId('issue_comment', { id: 8 })).toBe('gh/comment/8/created');
+    expect(core.occurrenceId('pull_request', { action: 'opened', pull_request: { id: 9 } })).toBe('gh/pr/9/opened');
+    expect(core.occurrenceId('pull_request', { action: 'synchronize', pull_request: { id: 9 }, before: 'a', after: 'b' })).toBe('gh/pr/9/sync/a..b');
+    expect(core.occurrenceId('pull_request', { action: 'synchronize', pull_request: { id: 9 }, before: 'b', after: 'a' })).toBe('gh/pr/9/sync/b..a');
+    for (const action of ['labeled', 'unlabeled', 'closed', 'reopened', 'ready_for_review', 'converted_to_draft']) {
+      expect(core.occurrenceId('pull_request', { action, pull_request: { id: 9 } })).toBeNull();
+    }
+    expect(core.occurrenceId('check_suite', { action: 'completed', check_suite: { id: 9 } })).toBeNull();
+    const log = createEventLog(createMemoryStorage(), { maxEvents: 1 });
+    const level = parse({ action: 'labeled', repository: REPO, number: 5453, pull_request: {} }, 'level', 'pull_request');
+    log.append(level, 1); log.append(parse(check()), 2); log.append(level, 3);
+    expect(log.read(2).events[0]).toMatchObject({ occ: null, level: true, occDuplicate: true });
+    log.append({ ...level, id: 'another-observation' }, 4);
+    expect(log.read(3).events[0]).toMatchObject({ occ: null, level: true, occDuplicate: false });
+  });
+
+  it('missing native id is unknown; delivery identity never invents an edge occurrence', () => {
+    const storage = createMemoryStorage(), log = createEventLog(storage);
+    for (const id of [undefined, null, 0, -1, 'bad', Number.MAX_SAFE_INTEGER + 1]) {
+      const payload = check(id); delete payload.check_run.id;
+      if (id !== undefined) payload.check_run.id = id;
+      log.append(parse(payload, `missing-${String(id)}`), 100);
+    }
+    expect(log.read(0).events.every((e) => e.occ === null && e.occMissing === true && e.occDuplicate === false)).toBe(true);
+    expect(storage.getMeta('occMissing')).toBe('6');
+  });
+
+  it('genuine rerun retained and runtime cause distinguishes repeat; no delivery header still uses native identity', () => {
+    const log = createEventLog(createMemoryStorage());
+    log.append(parse(check(), null), 1); log.append(parse(check(), null), 2); log.append(parse(check(2), null), 3);
+    expect(log.read(0).events.map((e) => e.occDuplicate)).toEqual([false, true, false]);
+    expect(log.appendRuntime(runtime(), 4)).toEqual({ seq: 4, duplicate: false });
+    expect(log.appendRuntime(runtime(), 5)).toEqual({ seq: null, duplicate: true });
+    expect(log.appendRuntime(runtime({ cause: 2 }), 6)).toEqual({ seq: 5, duplicate: false });
+  });
+
+  it('concurrent duplicate append is atomic', async () => {
+    const storage = nonNestingStorage(), log = createEventLog(storage);
+    await Promise.all(['A', 'B'].map((id) => Promise.resolve().then(() => log.append(parse(check(), id), 1))));
+    expect(log.read(0).events.map((e) => e.occDuplicate)).toEqual([false, true]);
+    expect(storage.hasReceipt('gh/check_run/136943346985/completed')).toBe(true);
+    expect(storage.getMeta('occDuplicates')).toBe('1');
+  });
+
+  it.each(['hasReceipt', 'putReceipt', 'pruneReceipts', 'insert'])('receipt %s failure rolls back atomically and remains retryable', (method) => {
+    const storage = createMemoryStorage(), log = createEventLog(storage);
+    const original = storage[method];
+    storage[method] = (...args) => { original(...args); throw new Error('injected receipt failure'); };
+    expect(() => log.append(parse(check()), 1)).toThrow('injected receipt failure');
+    expect(log.read(0).head).toBe(0);
+    expect(storage.hasDelivery('A')).toBe(false);
+    storage[method] = original;
+    expect(storage.hasReceipt('gh/check_run/136943346985/completed')).toBe(false);
+    expect(log.append(parse(check()), 2)).toEqual({ seq: 1, duplicate: false });
+    expect(log.read(0).events[0].occDuplicate).toBe(false);
+  });
+
+  it('receipt read failure returns retryable failure; unsigned webhook denied before storage', async () => {
+    const storage = createMemoryStorage(), log = createEventLog(storage);
+    storage.hasReceipt = () => { throw new Error('unreadable'); };
+    const opts = { getLog: () => log, now: () => 100 };
+    expect((await handleRequest(await request(check(), 'A', 'check_run', false), env, opts)).status).toBe(401);
+    expect((await handleRequest(await request(check()), env, opts)).status).toBe(503);
+    expect(log.read(0).head).toBe(0);
+  });
+
+  it('storage overflow evicts oldest receipt by sequence; operator fallback is replay/reconcile beyond the receipt window', () => {
+    const storage = createMemoryStorage(), log = createEventLog(storage, { maxReceipts: 2, receiptRetentionMs: 10 });
+    log.append(parse(check(1), 'A'), 5); log.append(parse(check(2), 'B'), 4); log.append(parse(check(3), 'C'), 6);
+    expect(storage.hasReceipt('gh/check_run/1/completed')).toBe(false);
+    expect(storage.hasReceipt('gh/check_run/2/completed')).toBe(true);
+    log.append(parse(check(2), 'D'), 15);
+    expect(log.read(3).events[0].occDuplicate).toBe(false);
+    expect(storage.getMeta('occReceiptEvictions')).toBe('2');
+  });
+
+  it('refuses unsupported on mode and invalid receipt bounds', () => {
+    for (const options of [{ occDedupe: 'on' }, { occDedupe: '' }, { maxReceipts: 0 }, { maxReceipts: Infinity }, { receiptRetentionMs: -1 }]) {
+      expect(() => createEventLog(createMemoryStorage(), options)).toThrow();
+    }
+  });
+
+  it('shadow occurrence fields leave consumer outputs and gate decisions unchanged', async () => {
+    const replay = async (occDedupe) => {
+      const log = createEventLog(createMemoryStorage(), { maxEvents: 2, occDedupe });
+      const steps = [], diagnostics = [];
+      const level = { action: 'labeled', repository: REPO, number: 5453, label: { name: 'review:accepted' }, pull_request: {} };
+      const fixtures = [[check(), 'A', 'check_run'], [check(), 'B', 'check_run'], [level, 'L', 'pull_request'],
+        [check(), 'A', 'check_run'], [check(null), 'M', 'check_run'], [level, 'L', 'pull_request']];
+      let clock = 100;
+      for (const [payload, id, type] of fixtures) {
+        const response = await handleRequest(await request(payload, id, type), env, { getLog: () => log, now: () => clock++ });
+        const events = log.read(0).events;
+        diagnostics.push(...events);
+        steps.push({ status: response.status, admission: await response.json(), projection: log.readPrs(0, 100, clock),
+          actions: events.map((e) => ['review', 'fix', 'drain'].map((role) => isRelevantEvent(e, role))) });
+      }
+      for (const cause of [1, 1, 2]) steps.push(log.appendRuntime(runtime({ cause }), clock++));
+      steps.push(log.read(0));
+      // Only these fields are diagnostics. Everything else, including sequence/gaps, must be identical.
+      const clean = JSON.parse(JSON.stringify(steps, (key, value) => ['occ', 'native', 'level', 'occMissing', 'occDuplicate'].includes(key) ? undefined : value));
+      return { clean, diagnostics };
+    };
+    const off = await replay('off'), shadow = await replay('shadow');
+    expect(shadow.diagnostics.some((e) => e.occDuplicate === true)).toBe(true);
+    expect(shadow.clean).toEqual(off.clean);
+  });
+});
 
 // Match Durable Object transactionSync: even a synchronous nested transaction is forbidden.
 function nonNestingStorage() {
@@ -660,6 +812,25 @@ describe('advisory and operator-ruling PR comments', () => {
   const advisory = '**Verdict:** changes requested\nNet basis: `abc123..def456`\nPRIVATE comment text';
   const payload = (body, overrides = {}) => ({ action: 'created', repository: REPO,
     issue: { number: 4624, pull_request: { url: 'https://example.invalid/pr/4624' } }, comment: { body }, ...overrides });
+
+  it.each([
+    ['advisory', advisory], ['ruling', '<!-- mandatory-referral-operator-ruling-v1 -->\nPRIVATE comment text'],
+  ])('preserves the legacy %s parser shape for missing native ids while shadow storage reports unknown', (kind, body) => {
+    for (const id of [undefined, null, 0, -1, '8', Number.MAX_SAFE_INTEGER + 1]) {
+      const event = parseGithubEvent('issue_comment', payload(body, { comment: { body, id } }),
+        { deliveryId: 'comment-1', receivedAt: 0 });
+      expect(event).toEqual({ id: 'comment-1', at: '1970-01-01T00:00:00.000Z', type: 'issue_comment',
+        action: 'created', repo: REPO.full_name, prs: [4624], sha: null, kind });
+      const log = createEventLog(createMemoryStorage());
+      log.append(event, 0);
+      expect(log.read(0).events[0]).toEqual({ ...event, seq: 1, occ: null, level: false,
+        occMissing: true, occDuplicate: false });
+    }
+    const event = parseGithubEvent('issue_comment', payload(body, { comment: { body, id: 8 } }),
+      { deliveryId: 'comment-native', receivedAt: 0 });
+    expect(event).toMatchObject({ occ: 'gh/comment/8/created', native: { id: 8, type: 'comment' } });
+    expect(JSON.stringify(event)).not.toContain('PRIVATE');
+  });
 
   it('classifies only the advisory shape or ruling marker', async () => {
     const { classifyPrComment, OPERATOR_RULING_COMMENT_MARKER } = await import('../core.mjs');

@@ -93,9 +93,10 @@ export async function ciDefinitionGuard(sha, readers) {
     // CI entrypoints transitively import across scripts/, including shared writers, cache
     // hooks and admission/dispatch helpers. Protect the tooling tree, not a filename list
     // of today's direct imports. Such edits must use the normal merge path.
+    // Full-build tests are CI entrypoints too, including future tests in tests/build/.
     // The CI import-closure regression also covers build hooks and executable skill helpers;
     // it must stay green before RS-HP-2 wires admission. The guard itself remains IO-free.
-    return paths.some(p => /^(?:\.github\/(?:workflows|actions)\/|scripts\/|eleventy\/|skills-src\/(?:conveyor|inspect-agent-health|inspect-codex-transcript)\/|src\/_data\/site\.js$|(?:vitest|playwright|vite)[^/]*\.[^/]+$|package(?:-lock)?\.json$|\.(?:npmrc|nvmrc|node-version|tool-versions|eleventy\.[^/]+)$|tsconfig(?:\.[^/]+)?\.json$)/.test(p))
+    return paths.some(p => /^(?:\.github\/(?:workflows|actions)\/|scripts\/|tests\/build\/|eleventy\/|skills-src\/(?:conveyor|inspect-agent-health|inspect-codex-transcript)\/|src\/_data\/site\.js$|(?:vitest|playwright|vite)[^/]*\.[^/]+$|package(?:-lock)?\.json$|\.(?:npmrc|nvmrc|node-version|tool-versions|eleventy\.[^/]+)$|tsconfig(?:\.[^/]+)?\.json$)/.test(p))
       ? result('fail', 'hotpatch-ci-definition-change') : result('pass', 'hotpatch-ci-definition-unchanged');
   } catch { return unknown(); }
 }

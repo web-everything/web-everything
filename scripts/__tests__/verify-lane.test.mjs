@@ -31,6 +31,9 @@ import { readLockEntry } from '../readiness/file-locks.mjs';
 import { verifyFinishBody } from '../lib/lane-verify.mjs';
 import { GATE_STARTED_MARKER, GATE_QUEUED_MARKER } from '../conveyor/verify-dispatch.mjs';
 import { CARD_ONLY_SKIP_GATE, shellQuote } from '../lib/verify-lane-gate.mjs';
+import { resolveOperation } from '../operations/run.mjs';
+import { runOperationCli } from '../operations/cli-adapter.mjs';
+import { createMemoryRunStore } from '../operations/run-store.mjs';
 
 const namedSuitesCommand = `npx vitest run ${JSON.parse(readFileSync(resolve(process.cwd(), 'scripts/verify-settings.json'), 'utf8')).alwaysRunTests.slice().sort().map(shellQuote).join(' ')} --passWithNoTests`;
 
@@ -1527,6 +1530,111 @@ describe('request with an explicit --gate when the default selection is blocked'
   });
 });
 
+describe('selection-bound gate hints', () => {
+  const testFile = 'src/repos/create.test.ts';
+  const prepText = (command = `npx vitest run ${testFile}`) => `# REPOS-CREATE\n\n## Scope\n- plateau-app:package.json\n- plateau-app:${testFile}\n\n## Acceptance\n1. **Tier-1 named failing regression test:** create a repository.\n   File: plateau-app:${testFile}.\n   Command (from plateau-app): \`${command}\`.\n2. Other acceptance.\n`;
+  function setup(text = prepText()) {
+    execFileSync('git', ['branch', 'origin/main'], { cwd: dir });
+    execFileSync('git', ['checkout', '-qb', 'lane/repos-create'], { cwd: dir });
+    execFileSync('git', ['remote', 'add', 'origin', 'https://github.com/plateauapp/plateau-app.git'], { cwd: dir });
+    mkdirSync(join(dir, 'src/repos'), { recursive: true });
+    writeFileSync(join(dir, testFile), '// the proposed Tier-1 test\n');
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts: { test: 'vitest run' } }));
+    const designs = join(dir, 'workspace/.operations/handoff/designs');
+    mkdirSync(designs, { recursive: true });
+    if (text !== null) writeFileSync(join(designs, 'repos-create-prep-2026-11-26.md'), text);
+    return designs;
+  }
+  function refusal(json = true) {
+    const r = spawnSync(process.execPath, [VERIFY_LANE, 'request', ...(json ? ['--json'] : [])], {
+      cwd: dir, env: { ...process.env, HOME: dir, WE_DIFF_TEST_SELECTION: '0' },
+      encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024,
+    });
+    expect(r.error).toBeUndefined();
+    expect(r.status, r.stderr).toBe(3);
+    expect(existsSync(marker())).toBe(false);
+    return r;
+  }
+  async function format(raw, json) {
+    const spawnHome = vi.fn(() => raw);
+    const { declaration, registry, sinks, finish } = resolveOperation('verify', { verifyIO: { spawn: spawnHome } });
+    const outcome = await runOperationCli({ declaration, registry, sinks,
+      argv: [`--checkout=${dir}`, ...(json ? ['--json'] : [])],
+      store: createMemoryRunStore(), newRunId: () => 'verify-hint-replay',
+    });
+    expect(spawnHome).toHaveBeenCalledTimes(1);
+    expect(spawnHome.mock.calls[0][1]).toEqual([VERIFY_LANE, `--repo=${dir}`, '--json']);
+    const formatted = finish ? finish({ ...outcome, json }) : outcome;
+    expect(formatted.code).toBe(3);
+    return formatted.lines.join('\n');
+  }
+  it('local-selection-bound output says supply --gate and suggests the matching prep tier-1 file', async () => {
+    setup();
+    const raw = refusal();
+    const result = JSON.parse(raw.stdout);
+    expect(result.detail).toContain('supply --gate');
+    expect(result.hint).toMatchObject({ reason: 'prep-tier-1', testFile, argv: ['npx', 'vitest', 'run', testFile] });
+    expect(refusal(false).stderr).toContain(`--gate="npx vitest run ${testFile}"`);
+    for (const json of [false, true]) {
+      const output = await format(raw, json);
+      expect(output).toContain('local-selection-bound');
+      expect(output).toContain('WE_DIFF_TEST_SELECTION=0');
+      expect(output).toContain('supply --gate');
+      expect(output).toContain(testFile);
+    }
+  });
+  it('a suggested prep gate preserves exit 3 and refused status', async () => {
+    setup();
+    const raw = refusal();
+    expect(JSON.parse(raw.stdout)).toMatchObject({ status: 'selection-required', ok: false,
+      reason: 'local-selection-bound', redCause: 'refused', exitCode: 3,
+      hint: { reason: 'prep-tier-1', testFile } });
+    const output = JSON.parse(await format(raw, true));
+    expect(output.verdict).toMatchObject({ ok: false, status: 'refused', exitCode: 3,
+      reason: 'local-selection-bound', redCause: 'refused', passed: 0, unrun: 1 });
+    expect(output.verdict.checks[0].outcome).toBe('unrun');
+    expect(await format(raw, false)).not.toContain('verified green');
+    expect(existsSync(marker())).toBe(false);
+  });
+  it.each(['stdout', 'stderr', 'both'])('malicious prep gate text never executes while rendering a hint (%s)', async channel => {
+    setup();
+    const sideEffect = join(dir, 'executed');
+    const bad = [`npx vitest run ${testFile}; touch ${sideEffect}`, `npx vitest run $(touch ${sideEffect})`,
+      `npx vitest run \`touch ${sideEffect}\``, `npx vitest run ${testFile}\u001b[2J`,
+      `npx vitest run ${testFile}\u202e`, `npx vitest run ${testFile}\nnode -e 'process.exit(0)'`];
+    for (const command of bad) {
+      writeFileSync(join(dir, 'workspace/.operations/handoff/designs/repos-create-prep-2026-11-26.md'), prepText(command));
+      const raw = refusal();
+      expect(JSON.parse(raw.stdout).hint.argv).toBeUndefined();
+      expect(JSON.parse(raw.stdout).hint.reason).toBe('prep-invalid');
+      const replay = { status: 3, stdout: channel === 'stderr' ? '' : raw.stdout,
+        stderr: channel === 'stdout' ? '' : raw.stdout };
+      for (const json of [false, true]) {
+        const output = await format(replay, json);
+        expect(output).toContain('supply --gate');
+        expect(output).not.toContain(sideEffect);
+        expect(output).not.toContain('\u001b');
+      }
+      expect(existsSync(sideEffect)).toBe(false);
+    }
+  });
+  it.each(['missing', 'ambiguous', 'sibling', 'invalid'])('missing ambiguous or invalid prep gates produce only a generic explicit-gate hint (%s)', async kind => {
+    const designs = setup(kind === 'missing' ? null : kind === 'sibling'
+      ? prepText().replaceAll('plateau-app:', 'we:') : kind === 'invalid'
+        ? prepText('npx vitest run ../frontierui/escape.test.ts') : prepText());
+    if (kind === 'ambiguous') writeFileSync(join(designs, 'repos-create-prep-2026-11-25.md'), prepText());
+    const raw = refusal();
+    const result = JSON.parse(raw.stdout);
+    expect(result.detail).toContain('supply --gate');
+    expect(result.hint.argv).toBeUndefined();
+    expect(result.hint.reason).toBe({ missing: 'prep-missing', ambiguous: 'prep-ambiguous',
+      sibling: 'prep-invalid', invalid: 'prep-invalid' }[kind]);
+    expect(result).toMatchObject({ ok: false, redCause: 'refused', exitCode: 3 });
+    expect(JSON.parse(await format(raw, true)).verdict.status).toBe('refused');
+    expect(existsSync(marker())).toBe(false);
+  });
+});
+
 it('an opted-out default request refuses before stamping a runnable marker', () => {
   vi.stubEnv('WE_DIFF_TEST_SELECTION', '0');
   execFileSync('git', ['branch', 'origin/main'], { cwd: dir });
@@ -1538,7 +1646,7 @@ it('an opted-out default request refuses before stamping a runnable marker', () 
 });
 
 describe('local timeout-only retry under admission', () => {
-  function fixture({ edited = false, mixed = false, retryExit = 0, standardsExit = 0, truncated = false, tooMany = false, live = false, phaseAdmission, scan = false, scanExit = 0, importsSource = false, guard = false, guardExit = 0, guardExcluded = false, guardReport = true, retrySkipped = false, passingNamesake = false, outputLines = 148 } = {}) {
+  function fixture({ edited = false, mixed = false, retryExit = 0, standardsExit = 0, truncated = false, tooMany = false, live = false, phaseAdmission, scan = false, scanExit = 0, importsSource = false, guard = false, guardExit = 0, guardExcluded = false, guardReport = true, guardEntry = { assertionResults: [{ status: guardExit ? 'failed' : 'passed' }] }, liveGuard = null, retrySkipped = false, passingNamesake = false, outputLines = 148 } = {}) {
     const files = (truncated || tooMany) ? Array.from({ length: truncated ? 21 : 4 }, (_, i) => `untouched-${i}.test.mjs`) : ['untouched-a.test.mjs', 'untouched-b.test.mjs'];
     // No trailing newline: a gate may end its stderr mid-line, and dispatch's markers must still start a line.
     const stderr = files.map((f, i) => ` FAIL  ${f} > case ${i}\n${mixed && i === 1 ? 'AssertionError: wrong value' : 'Error: Test timed out in 5000ms.'}\n`).join('').trimEnd();
@@ -1559,12 +1667,12 @@ it('first attempt times out', async () => {
   await new Promise(() => {});
 }, 40);
 ` : importsSource ? "import './source.mjs';\n" : '// source.mjs fixture (literal reference, no import)\n');
-    if (guard) writeFileSync(join(dir, 'guard.test.mjs'), '// repo-wide guard\n');
+    if (guard) writeFileSync(join(dir, 'guard.test.mjs'), liveGuard ?? '// repo-wide guard\n');
     // A second declared guard the stub vitest "excludes by config": it is dropped from the executed-file report
     // while the other guard passes — the run still exits 0.
     if (guardExcluded) writeFileSync(join(dir, 'excluded.test.mjs'), '// guard vitest config excludes\n');
     mkdirSync(join(dir, 'tmp'));
-    if (live) writeFileSync(join(dir, 'vitest.config.mjs'), 'export default { test: { environment: "node", include: ["*.test.mjs"] } };\n');
+    if (live || liveGuard !== null) writeFileSync(join(dir, 'vitest.config.mjs'), 'export default { test: { environment: "node", include: ["*.test.mjs"] } };\n');
     writeFileSync(join(dir, 'package.json'), JSON.stringify({ type: 'module', scripts: { 'test:unit': 'node scripts/readiness/heavy-admission.mjs run -- vitest run', 'check:standards': 'true' } }));
     const admissionModule = resolve(process.cwd(), 'scripts/readiness/heavy-admission.mjs');
     // Stub commands exit immediately too; drain their pipe writes before exiting.
@@ -1575,10 +1683,13 @@ import { writeAllSync } from ${JSON.stringify(resolve(process.cwd(), 'scripts/li
 const args = process.argv.slice(2);
 const held = heldSlots({ lockRoot: admissionLockRoot(process.cwd()), cap: 1, fastSlots: 1 });
 appendFileSync('calls.jsonl', JSON.stringify({ args, held, inherited: process.env.WE_HEAVY_ADMISSION_HELD, nonce: process.env.WE_VERIFY_MARKER_NONCE ?? null, scanFiles: process.env.VERIFY_SCAN_FILES ?? null, scanRoot: process.env.VERIFY_SCAN_ROOT ?? null }) + '\\n');
-if (${live} && args[0] === 'vitest') {
+if (args[0] === 'vitest' && (${live} || (${liveGuard !== null} && args.includes('guard.test.mjs')))) {
   const { spawnSync } = await import('node:child_process');
-  const result = spawnSync(process.execPath, [${JSON.stringify(resolve(process.cwd(), 'node_modules/vitest/vitest.mjs'))}, ...args.slice(1), ...(!args.includes('--maxWorkers=1') ? ['--maxWorkers=1', '--minWorkers=1'] : [])], { stdio: 'inherit' });
-  process.exit(result.status ?? 2);
+  const result = spawnSync(process.execPath, [${JSON.stringify(resolve(process.cwd(), 'node_modules/vitest/vitest.mjs'))}, ...args.slice(1), ...(!args.includes('--maxWorkers=1') ? ['--maxWorkers=1', '--minWorkers=1'] : [])], { stdio: 'inherit', timeout: 20000, killSignal: 'SIGKILL' });
+  if (result.error) throw result.error;
+  if (result.signal) throw new Error('live Vitest terminated: ' + result.signal);
+  if (!Number.isInteger(result.status)) throw new Error('live Vitest returned no exit status');
+  process.exit(result.status);
 }
 if (args[0] === 'vitest' && args.includes('--reporter=json') && args.includes('--maxWorkers=1')) {
   const files = args.filter(a => a.startsWith('./') && a.endsWith('.test.mjs')).map(a => a.slice(2));
@@ -1611,9 +1722,9 @@ if (args[0] === 'vitest' && args.some(a => a.includes('guard.test'))) {
     writeAllSync(1, ' Test Files  1 failed\\n Tests  1 failed\\n Duration  1.0s\\n');
   }
   const report = args.find(a => a.startsWith('--outputFile.json='));
-  if (report && ${guardReport}) {
+  if (report && ${guardReport !== false}) {
     const names = args.filter(a => a.endsWith('.test.mjs') && !a.includes('excluded')).map(a => process.cwd() + '/' + a);
-    writeFileSync(report.slice('--outputFile.json='.length), JSON.stringify({ testResults: names.map(name => ({ name, status: 'passed' })) }));
+    writeFileSync(report.slice('--outputFile.json='.length), ${typeof guardReport === 'string' ? JSON.stringify(guardReport) : `JSON.stringify({ testResults: names.map(name => ({ name, status: ${guardExit} ? 'failed' : 'passed', ...${JSON.stringify(guardEntry)} })) })`});
   }
   process.exit(${guardExit});
 }
@@ -2146,6 +2257,78 @@ export async function load(url, context, nextLoad) {
 
   // item 99 — the always-run guard set is wired into the runner independent of the related selection.
   describe('always-run guard tests', () => {
+    it.each([
+      ['zero assertions', { assertionResults: [] }],
+      ['omitted assertions', {}],
+      ['malformed assertions', { assertionResults: 'passed' }],
+      ['skipped', { assertionResults: [{ status: 'skipped' }] }],
+      ['pending', { assertionResults: [{ status: 'pending' }] }],
+      ['todo', { assertionResults: [{ status: 'todo' }] }],
+      ['unknown', { assertionResults: [{ status: 'running' }] }],
+    ])('a nominally green guard with %s writes a red marker with missing execution', (_, guardEntry) => {
+      const f = fixture({ guard: true, guardEntry });
+      const result = f.invoke();
+      expect(result.code, result.stdout + result.stderr).toBe(2);
+      expect(result.json).toMatchObject({ status: 'red', redCause: 'scan', redCauseFiles: ['guard.test.mjs'] });
+      expect(f.invoke(['check']).json).toMatchObject({ status: 'red', ok: false });
+      const finished = JSON.parse(readFileSync(marker(), 'utf8'));
+      expect(finished).toMatchObject({ status: 'red', exitCode: 1 });
+      expect(finished.phases.alwaysRun).toMatchObject({ ran: [], missing: ['guard.test.mjs'], result: 'failed' });
+      expect(finished.phases.outcomes.guard).toMatchObject({ result: 'fail', reason: 'guard.test.mjs' });
+      expect(result.stderr).toContain('did not execute these declared guard files');
+      expect(result.stderr).not.toContain('no readable executed-file report');
+      expect(result.stderr).toContain('Restore an executable guard and rerun verify-lane');
+    });
+
+    it.each([false, 'not json', '{}', '{"testResults":null}'])('an unreadable inventory (%s) refuses the guard and preserves the report-availability diagnosis', guardReport => {
+      const f = fixture({ guard: true, guardReport });
+      const result = f.invoke();
+      expect(result.code, result.stdout + result.stderr).toBe(2);
+      expect(result.json.status).toBe('red');
+      expect(f.invoke(['check']).json).toMatchObject({ status: 'red', ok: false });
+      const finished = JSON.parse(readFileSync(marker(), 'utf8'));
+      expect(finished.status).toBe('red');
+      expect(finished.phases.alwaysRun).toMatchObject({ ran: [], missing: ['guard.test.mjs'], result: 'failed' });
+      expect(result.stderr).toContain('no readable executed-file report');
+      expect(result.stderr).toContain('Restore an executable guard and rerun verify-lane');
+    });
+
+    it('a failed assertion counts as executed while verification remains failed', () => {
+      const f = fixture({ guard: true, guardExit: 1 });
+      const result = f.invoke();
+      expect(result.code, result.stdout + result.stderr).toBe(2);
+      expect(result.json.status).toBe('red');
+      expect(f.invoke(['check']).json).toMatchObject({ status: 'red', ok: false });
+      expect(result.json.phases.alwaysRun).toMatchObject({ ran: ['guard.test.mjs'], missing: [], result: 'failed' });
+      expect(result.json.phases.outcomes.guard.result).toBe('fail');
+      const finished = JSON.parse(readFileSync(marker(), 'utf8'));
+      expect(finished).toMatchObject({ status: 'red', exitCode: 1 });
+      expect(finished.phases.alwaysRun).toMatchObject({ ran: ['guard.test.mjs'], missing: [], result: 'failed' });
+      expect(result.stderr).toContain('AssertionError: guard rejected change');
+      expect(result.stdout).toContain('Tests  1 failed');
+      expect(result.json.failureDetails.tests).toContainEqual(expect.objectContaining({ file: 'guard.test.mjs', name: 'repo-wide guard' }));
+    });
+
+    it.each([
+      ['empty file', '', false, false],
+      ['skipped-only', "it.skip('guard', () => { expect(true).toBe(true); });", false, false],
+      ['one passing assertion', "it('guard', () => { expect(true).toBe(true); });", true, true],
+      ['one failing assertion', "it('guard', () => { expect(true).toBe(false); });", true, false],
+    ])('actual Vitest JSON for %s flows through the guard consumer and terminal marker', (_, source, executed, green) => {
+      const liveGuard = source ? `import { it, expect } from ${JSON.stringify(resolve(process.cwd(), 'node_modules/vitest/dist/index.js'))};\n${source}\n` : '';
+      const f = fixture({ guard: true, liveGuard });
+      const result = f.invoke();
+      expect(result.code, result.stdout + result.stderr).toBe(green ? 0 : 2);
+      expect(result.json.status).toBe(green ? 'green' : 'red');
+      expect(f.invoke(['check']).json).toMatchObject({ status: green ? 'green' : 'red', ok: green });
+      const coverage = { ran: executed ? ['guard.test.mjs'] : [], missing: executed ? [] : ['guard.test.mjs'], result: green ? 'passed' : 'failed' };
+      expect(result.json.phases.alwaysRun).toMatchObject(coverage);
+      const finished = JSON.parse(readFileSync(marker(), 'utf8'));
+      expect(finished.status).toBe(green ? 'green' : 'red');
+      expect(finished.phases.alwaysRun).toMatchObject(coverage);
+      expect(result.stdout).toContain('JSON report written to');
+    }, 30000);
+
     it('runs the declared guard though the related selection did not pick it, and a red guard turns the gate red as a `scan` cause', () => {
       const f = fixture({ guard: true, guardExit: 1 });
       const result = f.invoke();
