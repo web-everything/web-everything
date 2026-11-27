@@ -33,6 +33,15 @@ const checkPaths = diffPaths => mergePathNaCheck({ base: 'b'.repeat(40), head, r
 const gatesFor = assessment => Object.fromEntries(['security', 'correctness'].map(lens => [lens,
   assessSeat({ ...input(lens), assessment: assessment === null ? null : data(lens).assessment, mode: 'enforce' }).gateOutcome]));
 
+it('explicit enforce cannot be downgraded by configured shadow', () => {
+  const result = assessReviewSeats({ mode: 'enforce', head: 'a'.repeat(40), runId: 'isolated', at: '2026-11-26T12:00:00Z',
+    cwd: '/unused-injected-cwd', env: {}, expectedRubric: null, assessments: {},
+    settings: { mode: 'shadow', modeValid: true, problems: ['policy deliberately unavailable'] },
+    readFileAtHead: () => { throw new Error('no evidence available'); } });
+  expect(result.seatGates).toEqual({ security: 'not-pass', correctness: 'not-pass' });
+  expect(derivePanelVerdict({ lensVerdicts: { security: 'accept', correctness: 'accept' }, findings: [], seatGates: result.seatGates })).toBe('changes');
+});
+
 it("a mandatory seat's plain accept with no assessment is a failed seat under an enforced rubric policy", () => {
   expect(derivePanelVerdict({ ...panel, seatGates: gatesFor(null) })).toBe('changes');
   expect(derivePanelVerdict({ ...panel, seatGates: gatesFor('7236') })).toBe('accept');
