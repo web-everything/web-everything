@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { ensureCommitReadable } from './carry-equivalence.mjs';
 import { parseReviewedSha, findAcceptVerdictComment } from './review-escalation.mjs';
-import { latestAcceptRecord, isLaterVerdictBody } from './accept-carry-forward.mjs';
+import { latestAcceptRecord, isLaterVerdictBody, isKnownMachineBody } from './accept-carry-forward.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { gateOutcomesForHead, parseRedTeamGateMarker, parseRedTeamComment, RED_TEAM_COMMENT_MARKER } from './red-team-gate.mjs';
 import { parseVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
@@ -40,13 +40,20 @@ export function findCarriableVerdict({ comments, headSha, pr, reviews } = {}) {
   // A post-accept red team may still be running on the old head. Until it has
   // posted a record, moving the accept would strand any later old-head break.
   if (!gates.length && !advisory) return null;
+  const thread = Array.isArray(comments) ? comments : [];
+  const needsChainProof = c => parseVerdictCarriedMarker(c?.body) && /Head `[0-9a-f]{12}`/.test(c?.body ?? '');
+  // Prove head-labelled envelopes against the COMPLETE thread before dropping
+  // provenance: a standalone advisory or gate can supersede a chain link even
+  // when it precedes the latest restamp. Filtering must never erase that hold.
+  if (thread.some((c, index) => needsChainProof(c)
+    && !isKnownMachineBody(c.body, c, { earlier: thread.slice(0, index), reviews }))) return null;
   // Only this carry path treats trusted, same-sha provenance as informational.
   // Keep every other comment for the shared approval guard, including untrusted holds.
-  const verdictComments = (Array.isArray(comments) ? comments : []).filter(c => {
+  const verdictComments = thread.filter(c => {
     if (!isTrustedMarkerAuthor(c) || String(c?.body ?? '').split('\n').some(isLaterVerdictBody)) return true;
     // Keep head-labelled carry envelopes in the full thread: the shared guard
     // must prove their canonical shape, predecessor path and formal-review window.
-    if (parseVerdictCarriedMarker(c?.body) && /Head `[0-9a-f]{12}`/.test(c?.body ?? '')) return true;
+    if (needsChainProof(c)) return true;
     return !informationalProvenance(c?.body, sha, number);
   });
   const record = latestAcceptRecord(verdictComments, reviews);

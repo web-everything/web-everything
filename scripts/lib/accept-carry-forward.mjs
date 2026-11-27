@@ -342,7 +342,9 @@ function isProvenMultiHop(text, comment, context) {
     let acc = origin - 1;
     for (; acc >= 0; acc--) {
       const c = cs[acc], body = c?.body;
-      if (isTrustedMarkerAuthor(c) && typeof body === 'string' && body.startsWith('✅')
+      if (isTrustedMarkerAuthor(c) && typeof body === 'string'
+        && (/^✅ review — accepted(?:\r?\n|$)/.test(body)
+          || (/^✅ review — `review:human` cleared via the sanctioned path(?:\r?\n|$)/.test(body) && CLEARED_HUMAN_RE.test(body)))
         && !isLaterVerdictBody(body) && lastMatch(REVIEWED_SHA_RE, body) === h) break;
     }
     const at = Date.parse(cs[acc]?.createdAt ?? cs[acc]?.created_at ?? '');

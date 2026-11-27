@@ -4,6 +4,7 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, parseVerdictCarriedMarker, resolveCarryAcrossRebase } from '../rebase-verdict-carry.mjs';
+import { latestAcceptRecord } from '../accept-carry-forward.mjs';
 const a = 'a'.repeat(40), b = 'b'.repeat(40), p = 'c'.repeat(40);
 const comment = body => ({ author: { login: 'chalbert' }, body });
 
@@ -21,6 +22,24 @@ describe('multi-hop carry chain', () => {
     comment(`${buildVerdictCarriedMarker({ fromSha: b, toSha: c, patchId: p })}\nReview verdict carried across an identical contribution.\n${adv(c)}`),
   ];
   it('carries the plain chain with reviews []', () => expect(findCarriableVerdict({ comments: cs(), headSha: d, pr: 1, reviews: [] })?.sha).toBe(c));
+  it('refuses a non-verdict checkmark note that would reset the chain past a hold', () => {
+    const comments = cs();
+    comments.splice(1, 0, comment('Hold this review.'), {
+      ...comment(`✅ conveyor fix — complete\n<!-- reviewed-sha: ${a} -->`),
+      createdAt: '2026-11-01T01:00:00Z',
+    });
+    expect(findCarriableVerdict({ comments, headSha: d, pr: 1, reviews: [] })).toBeNull();
+    expect(latestAcceptRecord(comments, []).laterVerdict).toBe(true);
+  });
+  it('refuses conflicting destination provenance before the final restamp using the complete chain window', () => {
+    for (const body of [adv(c).replace('red team codex/test', 'red team codex/conflicting'),
+      `<!-- we:red-team-gate pr=1 rev=${c} outcome=card-queued -->`]) {
+      const comments = cs();
+      comments.splice(4, 0, comment(body));
+      expect(latestAcceptRecord(comments, []).laterVerdict, body).toBe(true);
+      expect(findCarriableVerdict({ comments, headSha: d, pr: 1, reviews: [] }), body).toBeNull();
+    }
+  });
   it.each([undefined, null, {}, [{ state: 'CHANGES_REQUESTED', submitted_at: '2026-11-02T00:00:00Z' }],
     [{ state: 'COMMENTED', submitted_at: '2026-11-02T00:00:00Z', user: { login: 'operator' } },
       { state: 'APPROVED', submitted_at: '2026-11-02T01:00:00Z', user: { login: 'operator' } }]].map(reviews => [reviews]))(
