@@ -25,11 +25,15 @@
 
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import * as debugFs from 'node:fs';
+import { execFileSync } from 'node:child_process';
 
 import { describe, it, expect, vi, onTestFinished } from 'vitest';
 
-import { createRegistry } from '../registry.mjs';
+import { createRegistry, op } from '../registry.mjs';
+import { compute, judge, effect } from '../step-kinds.mjs';
 import { NAME_RE, createMemoryRunStore } from '../run-store.mjs';
 import { judgeOutcome, parseOperationArgv } from '../cli-adapter.mjs';
 import { fileItemOperation } from '../file-item.mjs';
@@ -39,6 +43,7 @@ import {
   runReviewLoopCliOnce, createReviewPassPrReader, defaultFindResumableRun, RESUME_MAX_ATTEMPTS, applyUnattendedActorDefault, buildFileItemArgv, fileItemForPrevention, fileItemForPreventionViaLandingJob,
   findFiledPreventionCard, findFiledRoundCardsCard, findRetainedRoundCardsReceipt, QUEUED_RECEIPT_TTL_MS, retainedRoundCardsReceipt,
   runReviewLoopOnce as driveReviewLoopOnceRaw, UNATTENDED_REVIEW_ACTOR,
+  writeErrorDebugLog,
 } from '../review-loop-cli.mjs';
 import { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops, recordPostAcceptAdvisoryRating, createReviewPrSinks } from '../review-pr-io.mjs';
 import { planRedTeamOnSkip } from '../../lib/review-red-team-on-skip.mjs';
@@ -2422,5 +2427,215 @@ describe('runReviewLoopOnce — error-class output (REVIEW-CLI-ERROR-CLASS): a t
     // the token-bearing error WAS reached: the full text is only in the 0600 debug log
     expect(readFileSync(logPath, 'utf8')).toContain('test-xyz');
     expect(statSync(logPath).mode & 0o077).toBe(0);
+  });
+});
+
+describe('REVIEW-CLI-ERROR-CLASS-HARDEN', () => {
+  const SECRET = 'fixture-private-detail-7c109';
+  const CORRELATION_ID = 'c048f625-7810-45df-9852-742e35a81d6b';
+  const NOW = '2026-11-26T12:00:00.000Z';
+
+  function fixture({ kind = 'returned', error = new Error(`401 ${SECRET}`), json = false, io = {} } = {}) {
+    const root = mkdtempSync(join(tmpdir(), 'review-error-harden-'));
+    const cwd = join(root, 'lane-fixture');
+    mkdirSync(cwd);
+    const logPath = join(root, 'debug.log');
+    const env = { HOME: root, REVIEW_LOOP_CLI_DEBUG_LOG: logPath };
+    // These also isolate the old producer during the red run, before it consumes the injected ports.
+    vi.stubEnv('REVIEW_LOOP_CLI_DEBUG_LOG', logPath);
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date(NOW));
+    const uid = statSync(root).uid;
+    const getuid = vi.spyOn(process, 'getuid').mockReturnValue(uid);
+    onTestFinished(() => {
+      getuid.mockRestore();
+      vi.useRealTimers();
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    });
+    const never = vi.fn(() => { throw new Error('unexpected external IO'); });
+    const declaration = op('review-error-probe', {
+      input: { actor: { type: 'string', required: false } },
+      probe: kind === 'thrown' ? judge({ request: () => ({ mandate: 'fixture', input: 'fixture input', shape: { type: 'object' } }) })
+        : kind === 'effect' ? effect({ effects: () => [{ type: 'fixture.fail' }, { type: 'fixture.write' }] })
+          : compute({ fn: () => { throw error; } }),
+      after: effect({ effects: () => [{ type: 'fixture.write' }] }),
+      unusedJudge: judge({ request: () => ({ mandate: 'unreachable fixture' }) }),
+    });
+    const registry = createRegistry();
+    registry.register(declaration);
+    const store = createMemoryRunStore();
+    const descriptorIO = { ...debugFs, getuid: () => uid, now: () => NOW, ...io };
+    const log = vi.fn((site, failure) => writeErrorDebugLog(site, failure, env, descriptorIO));
+    const options = {
+      declaration, registry, argv: [`--cwd=${cwd}`, ...(json ? ['--json'] : [])], store,
+      sinks: { 'fixture.fail': async () => { throw error; }, 'fixture.write': never },
+      makeJudge: ({ cwd: requested }) => {
+        expect(requested).toBe(cwd);
+        return async () => { throw error; };
+      },
+      mintRunId: () => 'r-fixture-error', now: () => NOW, clock: () => Date.parse(NOW),
+      autoConfirm: never, appendLearning: never, fileItem: never,
+      findFiledPrevention: never, findFiledRoundCards: never, findResumableRun: never,
+      readResumePr: never, readAcceptancePr: never, cardReadable: never,
+      acceptPolicy: { value: { unattendedAcceptRequiresCleanReferrals: true } },
+      redTeamOnSkipSettings: () => ({ value: { ciHeldRecordRetryMax: 0 } }),
+      advisorySettings: never, advisoryLog: never, recordAdvisoryShadow: never,
+      recordAdvisoryLoops: never, recordAdvisoryRating: never,
+      diagnostics: { log, correlationId: () => CORRELATION_ID },
+    };
+    return { root, logPath, env, descriptorIO, log, options, never, store };
+  }
+
+  async function boundary(options) {
+    const stdout = [];
+    const stderr = [];
+    const outSpy = vi.spyOn(process.stdout, 'write').mockImplementation(chunk => { stdout.push(String(chunk)); return true; });
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(chunk => { stderr.push(String(chunk)); return true; });
+    try {
+      const out = await runReviewLoopCliOnce(options);
+      // Include the executable's final stdout write along with any mid-drive writes to either stream.
+      stdout.push(`${out.lines.join('\n')}\n`);
+      return { out, stdout: stdout.join(''), stderr: stderr.join('') };
+    } finally { outSpy.mockRestore(); errSpy.mockRestore(); }
+  }
+
+  it('symlink debug log and driveRun error cannot leak raw messages', async () => {
+    const f = fixture();
+    const target = join(f.root, 'target');
+    writeFileSync(target, 'untouched', { mode: 0o600 });
+    debugFs.symlinkSync(target, f.logPath);
+    const { out, stdout, stderr } = await boundary(f.options);
+    expect(out.code).toBe(1);
+    expect(stdout).toContain('drive-run:auth');
+    expect(stdout).toContain(CORRELATION_ID);
+    expect(stdout).toContain('debug-log-open-refused');
+    expect(stdout + stderr).not.toContain(SECRET);
+    expect(readFileSync(target, 'utf8')).toBe('untouched');
+    expect(f.never).not.toHaveBeenCalled();
+  });
+
+  it('debug descriptor is private and no-follow', () => {
+    const openSync = vi.fn(debugFs.openSync);
+    const fstatSync = vi.fn(debugFs.fstatSync);
+    const closeSync = vi.fn(debugFs.closeSync);
+    const f = fixture({ io: { openSync, fstatSync, closeSync } });
+    const result = f.log('fixture', new Error(SECRET));
+    expect(result).toEqual({ ok: true });
+    const [path, flags, mode] = openSync.mock.calls[0];
+    expect(path).toBe(f.logPath);
+    expect(flags & debugFs.constants.O_NOFOLLOW).toBe(debugFs.constants.O_NOFOLLOW);
+    expect(mode).toBe(0o600);
+    expect(fstatSync).toHaveBeenCalledWith(openSync.mock.results[0].value);
+    expect(closeSync).toHaveBeenCalledWith(openSync.mock.results[0].value);
+    expect(statSync(f.logPath).mode & 0o777).toBe(0o600);
+    expect(readFileSync(f.logPath, 'utf8')).toContain(SECRET);
+  });
+
+  it('creates a private debug descriptor under a permissive umask in a native process', () => {
+    const f = fixture();
+    const script = `
+      import * as fs from 'node:fs';
+      import { writeErrorDebugLog } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '..', 'review-loop-cli.mjs')).href)};
+      process.umask(0);
+      const result = writeErrorDebugLog('fixture', new Error('private fixture'), ${JSON.stringify(f.env)}, {
+        getuid: () => ${statSync(f.root).uid}, now: () => ${JSON.stringify(NOW)}
+      });
+      process.stdout.write(JSON.stringify({ result, mode: fs.statSync(${JSON.stringify(f.logPath)}).mode & 0o777 }));
+    `;
+    const output = execFileSync(process.execPath, ['--input-type=module', '-e', script], {
+      cwd: join(f.root, 'lane-fixture'), env: { HOME: f.root, TMPDIR: f.root, WE_TELEMETRY: '0' },
+      encoding: 'utf8', timeout: 15000, maxBuffer: 64 * 1024,
+    });
+    expect(JSON.parse(output)).toEqual({ result: { ok: true }, mode: 0o600 });
+  });
+
+  it.each(['unsafe-permissions', 'non-regular', 'wrong-owner', 'unreadable-metadata'])(
+    'refuses debug descriptor metadata: %s', kind => {
+      const f = fixture();
+      writeFileSync(f.logPath, 'untouched', { mode: 0o600 });
+      if (kind === 'unsafe-permissions') debugFs.chmodSync(f.logPath, 0o644);
+      const closeSync = vi.fn(debugFs.closeSync);
+      const fstatSync = vi.fn(fd => {
+        if (kind === 'unreadable-metadata') throw new Error(SECRET);
+        const metadata = debugFs.fstatSync(fd);
+        if (kind === 'wrong-owner') metadata.uid += 1;
+        if (kind === 'non-regular') metadata.isFile = () => false;
+        return metadata;
+      });
+      expect(writeErrorDebugLog('fixture', new Error(SECRET), f.env, { ...f.descriptorIO, fstatSync, closeSync }))
+        .toEqual({ ok: false, reason: 'debug-log-metadata-refused' });
+      expect(fstatSync).toHaveBeenCalledTimes(1);
+      expect(closeSync).toHaveBeenCalledTimes(1);
+      expect(readFileSync(f.logPath, 'utf8')).toBe('untouched');
+    });
+
+  it('refuses a symlink substituted at the atomic open', async () => {
+    const f = fixture();
+    const target = join(f.root, 'target');
+    writeFileSync(target, 'untouched', { mode: 0o600 });
+    writeFileSync(f.logPath, 'private', { mode: 0o600 });
+    f.descriptorIO.openSync = (path, flags, mode) => {
+      debugFs.renameSync(path, join(f.root, 'old-debug'));
+      debugFs.symlinkSync(target, path);
+      return debugFs.openSync(path, flags, mode);
+    };
+    const { out, stdout, stderr } = await boundary(f.options);
+    expect(out.code).toBe(1);
+    expect(stdout).toContain('debug-log-open-refused');
+    expect(stdout + stderr).not.toContain(SECRET);
+    expect(readFileSync(target, 'utf8')).toBe('untouched');
+    expect(readFileSync(join(f.root, 'old-debug'), 'utf8')).toBe('private');
+  });
+
+  describe.each(['returned', 'thrown', 'effect'])('every driveRun error is classified at the producer: %s', kind => {
+    it.each([
+      ['auth', '401 Unauthorized'], ['network', 'ETIMEDOUT'], ['rate-limit', '429 rate limit'],
+      ['not-found', 'ENOENT'], ['parse', 'JSON parse error'], ['unknown', 'unrecognized failure'],
+    ])('%s remains classified in text and JSON; both child streams stay private', async (errorClass, message) => {
+      const error = Object.assign(new Error(`${message}: ${SECRET}`), { stdout: `out ${SECRET}`, stderr: `err ${SECRET}` });
+      const f = fixture({ kind, error });
+      for (const json of [false, true]) {
+        const { out, stdout, stderr } = await boundary({ ...f.options,
+          store: createMemoryRunStore(), argv: [`--cwd=${join(f.root, 'lane-fixture')}`, ...(json ? ['--json'] : [])] });
+        expect(out.code).toBe(1);
+        expect(stdout).toContain(`${kind === 'thrown' ? 'error-class' : 'drive-run'}:${errorClass}`);
+        expect(stdout).toContain(CORRELATION_ID);
+        expect(stdout + stderr).not.toContain(SECRET);
+        expect(f.never).not.toHaveBeenCalled();
+      }
+      const detail = readFileSync(f.logPath, 'utf8');
+      expect(detail).toContain(CORRELATION_ID);
+      expect(detail).toContain(NOW);
+      expect(detail).toContain(`out ${SECRET}`);
+      expect(detail).toContain(`err ${SECRET}`);
+      expect(statSync(f.logPath).mode & 0o077).toBe(0);
+    });
+  });
+
+  it.each([
+    ['ENOSPC', 'writeSync', 'debug-log-write-refused'],
+    ['EWOULDBLOCK', 'openSync', 'debug-log-open-refused'],
+    ['EACCES', 'mkdirSync', 'debug-log-open-refused'],
+    ['EIO', 'closeSync', 'debug-log-close-refused'],
+  ])('debug failure preserves original classified failure: %s', async (code, method, reason) => {
+    const f = fixture({ kind: 'effect', io: { [method]: (...args) => {
+      if (method === 'closeSync') debugFs.closeSync(...args);
+      throw Object.assign(new Error(`${code} ${SECRET}`), { code });
+    } } });
+    const { out, stdout, stderr } = await boundary(f.options);
+    expect(out.code).toBe(1);
+    expect(stdout).toContain('drive-run:auth');
+    expect(stdout).toContain(CORRELATION_ID);
+    expect(stdout).toContain(reason);
+    expect(stdout).toContain('inspect private debug logging before retrying');
+    expect(stdout + stderr).not.toContain(SECRET);
+    expect(f.never).not.toHaveBeenCalled();
+    expect(f.store.read('r-fixture-error').effects.some(entry => entry.status === 'applied')).toBe(false);
+  });
+
+  it('an incomplete debug write refuses instead of reporting a saved diagnostic', () => {
+    const f = fixture({ io: { writeSync: () => 1 } });
+    expect(f.log('fixture', new Error(SECRET))).toEqual({ ok: false, reason: 'debug-log-write-refused' });
   });
 });
