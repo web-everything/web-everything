@@ -1,7 +1,6 @@
 ---
 kind: task
 status: open
-scope: ["handoff:daemon-clone-git-guard"]
 dateOpened: "2026-11-27"
 tags: []
 ---
