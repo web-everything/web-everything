@@ -1990,7 +1990,7 @@ export async function load(url, context, nextLoad) {
   });
 
   it('never inherits the parent scan scope into the vitest, guard or standards phases', () => {
-    const f = fixture({ guard: true });
+    const f = fixture({ guard: true, guardExcluded: true });
     const pollutedRoot = mkdtempSync(join(tmpdir(), 'verify-scan-root-'));
     const r = f.invoke([], { ...idleFallbackEnv(), VERIFY_SCAN_FILES: '[]', VERIFY_SCAN_ROOT: pollutedRoot });
     const calls = f.calls();

@@ -1469,8 +1469,9 @@ if (exitCode === 0 && !signal && !verificationInfrastructureFailure({ exitCode, 
   }
 }
 
+// Keep evaluated empty plans visible, including WE guards deliberately excluded by repository identity policy.
 const builtPhases = buildVerifyPhases({ admission: { mode: phaseAdmission ? 'phase' : 'gate', phases: admissionPhases }, admissionWaitMs: admission.waitedMs, ...phaseMs, gateMs, decision: resolvedGate?.decision, outcomes,
-  alwaysRun: alwaysRun.declared.length ? alwaysRun : null });
+  alwaysRun: guardGate ? alwaysRun : null });
 builtPhases.executedTests = sharedTestCounts.length && sharedTestCounts.every(Number.isSafeInteger)
   ? sharedTestCounts.reduce((sum, n) => sum + n, 0) : null;
 const phases = admissionFallback ? { ...builtPhases, admissionFallback } : builtPhases;
