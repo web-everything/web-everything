@@ -45,6 +45,13 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
   {
+    test: 'scripts/__tests__/pr-workflows-cancel-superseded.test.mjs',
+    scope: 'files',
+    why: 'retired runner labels are scoped to changed workflows; existing concurrency prefix invariants retain their whole-workflow check',
+    matches: (f) => /^\.github\/workflows\/[^/]+\.ya?ml$/.test(f),
+    inputs: ['scripts/__tests__/pr-workflows-cancel-superseded.test.mjs', 'scripts/lib/repo-scan-tests.mjs'],
+  },
+  {
     test: 'scripts/operations/__tests__/audit-nonconvergence.test.mjs',
     scope: 'files',
     why: 'keeps the explicitly invoked diagnostic free of production consumers and mutating adapters',
