@@ -1213,27 +1213,49 @@ export function buildPhaseOutcome({ kind, exitCode, signal, failureDetails, outp
 }
 
 /**
- * #99 — the always-run guard command: the declared `alwaysRunTests` files that exist in this checkout and are not
- * already run by a scan command, as ONE `vitest run` (one startup). Independent of the related selection, so a small
- * or truncated selection can never skip them. Null when nothing applies (empty set, sibling checkout, no test half).
+ * #99 — plan the required guard files independently of related selection. A missing, unreadable or invalid
+ * declaration REFUSES verification, including when command is null. Callers must check `refusal` before execution.
+ * `requiredFiles` includes scan-covered guards: naming a guard in scan argv is not execution evidence.
+ * `skipped` retains the legacy planner projection; `missingRequired` and `scanCovered` distinguish its causes.
+ * Marker telemetry must never report missingRequired as a successful skip. Declarations remain required until
+ * deliberately migrated; the 50-entry settings bound also applies here, with an explicit operator repair action.
  * Pure over the injected `fileExists`. With `reportFile` the run ALSO writes vitest's JSON report there (the default
  * reporter stays on, so failure output is unchanged): vitest treats file arguments as filters, so a guard its config
  * excludes is dropped silently while the others still pass — `alwaysRunInventory` reads the report to prove each ran.
- * @returns {{command: string|null, declared: string[], files: string[], skipped: string[]}}
+ * @returns {{command: string|null, declared: unknown[], files: string[], requiredFiles: string[], skipped: unknown[], scanCovered: string[], missingRequired: {file: unknown, reason: string}[], refusal: object|null}}
  */
 export function alwaysRunPlan({ declared = [], fileExists, scanCommands = [], testTimeoutFactor = 1, reportFile = null } = {}) {
+  if (!Array.isArray(declared) || declared.length > 50) {
+    return { command: null, declared: [], files: [], requiredFiles: [], skipped: [], scanCovered: [],
+      missingRequired: [{ file: null, reason: 'invalid-declarations' }], refusal: { reason: 'missing-required-guard',
+        detail: 'Required guard declarations are malformed or exceed 50 entries; repair the declaration list, restore every required guard, and retry verification.' } };
+  }
   const wanted = [...new Set(declared.map(f => typeof f === 'string' ? f.replace(/^\.\//, '') : f))];
-  const files = [], skipped = [];
+  const files = [], skipped = [], requiredFiles = [], missingRequired = [], scanCovered = [];
   for (const f of wanted) {
     // Defence in depth behind the settings validation: an entry is a file argument, never a vitest option.
-    if (typeof f !== 'string' || !f || f.startsWith('-')) skipped.push(f);
-    else if (typeof fileExists === 'function' && !fileExists(f)) skipped.push(f);
-    else if (scanCommands.some(c => c.includes(shellQuote(f)))) skipped.push(f);
-    else files.push(f);
+    let reason = null;
+    if (typeof f !== 'string' || f.length > 1024 || !/^[\w@][\w./@-]*\.test\.[cm]?[jt]sx?$/.test(f) || f.split('/').includes('..')) reason = 'invalid-entry';
+    else {
+      requiredFiles.push(f);
+      try {
+        const exists = typeof fileExists === 'function' ? fileExists(f) : undefined;
+        if (exists !== true) reason = exists === false ? 'file-missing' : 'file-unreadable';
+      } catch { reason = 'file-unreadable'; }
+    }
+    if (reason) {
+      skipped.push(f);
+      missingRequired.push({ file: f, reason });
+    } else if (Array.isArray(scanCommands) && scanCommands.some(c => typeof c === 'string' && c.includes(shellQuote(f)))) {
+      skipped.push(f);
+      scanCovered.push(f);
+    } else files.push(f);
   }
   const reporter = reportFile ? ` --reporter=default --reporter=json --outputFile.json=${shellQuote(reportFile)}` : '';
   const command = files.length ? `npx vitest run ${files.map(shellQuote).join(' ')}${reporter}${scaledTimeoutFlags(testTimeoutFactor)}` : null;
-  return { command, declared: wanted, files, skipped };
+  const refusal = missingRequired.length ? { reason: 'missing-required-guard',
+    detail: `Required guard evidence is missing: ${missingRequired.map(({ file, reason }) => `${typeof file === 'string' ? JSON.stringify(stripVTControlCharacters(file.slice(0, 120)).replace(/[\u007f-\u009f\u2028\u2029]/g, '?')) : '<invalid entry>'} (${reason})`).join(', ')}. Repair the declarations or restore readable guard files, then retry verification.` } : null;
+  return { command, declared: wanted, files, requiredFiles, skipped, scanCovered, missingRequired, refusal };
 }
 
 /**

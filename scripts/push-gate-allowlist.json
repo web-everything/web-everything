@@ -346,6 +346,6 @@
     "scripts/run-fresh.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
     "scripts/sync-commands-deploy.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
     "scripts/sync-skills-deploy.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":2},
-    "scripts/verify-lane.mjs": {"status":"pending-migration","reason":"S2: existing unresolved calls; sharedGit is a bounded hardened read port. The added HEAD:.gitattributes show uses an enumerated tracked path, never a transport or write.","sites":4}
+    "scripts/verify-lane.mjs": {"status":"pending-migration","reason":"S2: existing unresolved calls; sharedGit is a bounded hardened read port. The added HEAD:.gitattributes show uses an enumerated tracked path, never a transport or write. The guard-policy origin lookup uses hardened remote get-url origin arguments with a 5-second timeout and 64 KiB output cap to identify the checkout; it performs no transport or write.","sites":5}
   }
 }

@@ -609,6 +609,63 @@ if (!resolvedGate && typeof flags.gate === 'string') {
   }
 }
 
+// File policy belongs to the verifier's repository. Explicit declarations apply to every operated checkout;
+// unrelated/originless checkouts do not acquire WE's repository-specific guard list. A failed identity read
+// is not evidence of a sibling: only Git's explicit "no such remote" result establishes an originless checkout.
+function declaredGuardsForCheckout() {
+  const declared = verifySetting('alwaysRunTests', process.env);
+  const toolingRoot = resolve(fileURLToPath(new URL('../', import.meta.url)));
+  if (verifySettingSource('alwaysRunTests', process.env) !== 'file' || REPO === toolingRoot || !declared?.length) return declared;
+  const origin = root => {
+    try {
+      const value = execFileSync('git', hardenLaneGitArgs(['remote', 'get-url', 'origin']), { cwd: root,
+        env: GIT_ENV, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000, maxBuffer: 64 * 1024 }).trim();
+      const slug = repoSlugFromRemote(value);
+      if (!slug) throw new Error('unrecognized guard policy repository');
+      return slug;
+    } catch (error) {
+      if (error.status === 2 && /No such remote ['"]origin['"]/.test(String(error.stderr))) return null;
+      throw error;
+    }
+  };
+  const target = origin(REPO);
+  if (target !== null && target === origin(toolingRoot)) return declared;
+  process.stderr.write('verify-lane: guard-policy-other-repository — WE file declarations do not apply; declare this checkout\'s guards explicitly.\n');
+  return [];
+}
+function planRequiredGuards({ reportFile = null } = {}) {
+  let declared;
+  try { declared = declaredGuardsForCheckout(); }
+  catch {
+    return alwaysRunPlan({ declared: verifySetting('alwaysRunTests', process.env), fileExists: () => { throw new Error('guard policy repository unreadable'); } });
+  }
+  return alwaysRunPlan({ declared, reportFile, testTimeoutFactor: resolvedGate?.decision?.testTimeoutFactor ?? 1,
+    // Scan argv alone proves nothing. Run each declared guard with a guard-owned executed-file report, even when
+    // a scanner also named it. This keeps scan failure/outcome evidence independent and never credits a skipped scan.
+    fileExists: file => {
+      const root = realpathSync(REPO), path = realpathSync(join(REPO, file));
+      if (!path.startsWith(root + '/')) throw new Error('guard path escapes checkout');
+      const fd = nodeFs.openSync(path, nodeFs.constants.O_RDONLY | nodeFs.constants.O_NONBLOCK);
+      try {
+        if (!nodeFs.fstatSync(fd).isFile()) throw new Error('guard is not a regular file');
+        nodeFs.readSync(fd, Buffer.alloc(1), 0, 1, 0);
+        return true;
+      } finally { nodeFs.closeSync(fd); }
+    } });
+}
+const guardPolicyApplies = () => isSelectedTestCommand(resolvedGate?.testCommand ?? '')
+  || (resolvedGate?.decision?.mode === 'full' && resolvedGate.testCommand === 'npx vitest run');
+function refuseRequiredGuards(plan) {
+  if (!plan.refusal) return;
+  process.stderr.write(`FAIL ${plan.refusal.reason}: ${plan.refusal.detail}\n`);
+  const phases = buildVerifyPhases({ decision: resolvedGate?.decision, alwaysRun: { ...plan,
+    files: plan.declared, skipped: [], missing: plan.missingRequired.map(entry => entry.file), result: 'refused' } });
+  emit({ sha: headSha, status: 'gate-refused', reason: plan.refusal.reason, ok: false, exitCode: 1,
+    missingRequired: plan.missingRequired, phases, detail: plan.refusal.detail }, 3);
+}
+// Before cache hits, request markers or admission, including all-deleted declarations with command=null.
+if (guardPolicyApplies()) refuseRequiredGuards(planRequiredGuards());
+
 const priorAudit = readMarker();
 // A dispatched --gate transports the original request; preserve its explicit/default provenance.
 const gateExplicit = DISPATCHED_RUN ? priorAudit?.sha === headSha && priorAudit?.gateExplicit === true
@@ -1170,8 +1227,7 @@ let sharedFullPhaseComplete = false;
 const alwaysRunReportDir = guardGate && verifySetting('alwaysRunTests', process.env)?.length ? mkdtempSync(join(tmpdir(), 'verify-always-run-')) : null;
 const alwaysRunReport = alwaysRunReportDir ? join(alwaysRunReportDir, 'report.json') : null;
 const alwaysRun = guardGate
-  ? alwaysRunPlan({ declared: verifySetting('alwaysRunTests', process.env), fileExists: (p) => existsSync(join(REPO, p)),
-    scanCommands: resolvedGate.scanCommands ?? [], testTimeoutFactor: resolvedGate.decision?.testTimeoutFactor ?? 1, reportFile: alwaysRunReport })
+  ? planRequiredGuards({ reportFile: alwaysRunReport })
   : { command: null, declared: [], files: [], skipped: [] };
 // Only the full phase needs a new reporter for shared publication. Changing selected-test or legacy
 // retry argv also changes remote admission/routing; those commands retain their original arguments.
@@ -1265,6 +1321,8 @@ async function retryPhase(result, phase, previousOutcome, scanCommand) {
 }
 const continueAfter = (r) => r.exitCode === 0 || (runAllPhases && !r.signal && !verificationInfrastructureFailure(r));
 try {
+  // Re-check after admission, inside the held slot, before executing any partial plan.
+  if (alwaysRun.refusal) throw Object.assign(new Error(alwaysRun.refusal.detail), { status: 1 });
   let result = await runCountedTestGate(phasedTestGate ? 'vitestMs' : null,
     // Item 59 (b) — a recognized default gate with a non-`vitest related` test half (a skipped-vitest echo)
     // runs the plan resolved under THIS (the daemon's) standards policy, not the requester's stamped command.
@@ -1307,6 +1365,12 @@ try {
   // #99 — the always-run guard set, independent of how many tests the related selection picked. Same phase kind as
   // the scanners ('scan'): admission, timing and outcome telemetry are shared; a red here is a `scan` redCause.
   if (guardGate && alwaysRun.command && continueAfter(phaseResults.at(-1).result)) {
+    const liveGuards = planRequiredGuards({ reportFile: alwaysRunReport });
+    if (liveGuards.refusal) {
+      alwaysRun.missing = liveGuards.missingRequired.map(entry => entry.file);
+      alwaysRun.result = 'refused';
+      throw Object.assign(new Error(liveGuards.refusal.detail), { status: 1 });
+    }
     process.stderr.write(`⏱ always-run guard tests (#99): ${alwaysRun.files.length} file(s)\n`);
     const started = performance.now();
     let guard = await runCountedTestGate('scanMs', alwaysRun.command, undefined, { outcomeKey: 'guard', reportFile: alwaysRunReport });
@@ -1356,6 +1420,13 @@ try {
       runBase: (files) => withBaseRerunSlot(() => runVitestOnBase({ git, repo: REPO, baseSha, files, tmp: tmpdir(), spawnFn: spawn, collectorFactory: createFailureCollector, fs: nodeFs })) });
   }
 } catch (e) {
+  if (alwaysRun.refusal || alwaysRun.result === 'refused') {
+    failureDetails = { tests: (alwaysRun.missing ?? alwaysRun.missingRequired.map(entry => entry.file)).map(file => ({ file, name: null })),
+      summary: `missing-required-guard: ${e.message}`, truncated: false };
+    process.stderr.write(failureDetails.summary + '\n');
+    alwaysRun.result = 'refused';
+    alwaysRun.missing ??= alwaysRun.missingRequired.map(entry => entry.file);
+  }
   signal = e?.signal || null;
   exitCode = Number.isFinite(e && e.status) ? e.status : 2;
 } finally {

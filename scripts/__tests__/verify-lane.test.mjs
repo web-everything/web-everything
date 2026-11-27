@@ -1,3 +1,4 @@
+// @vitest-environment node
 /**
  * @file scripts/__tests__/verify-lane.test.mjs
  * @description Behavioral proof of the #2833 verification WRITER (`scripts/verify-lane.mjs`) — the IO half the
@@ -31,11 +32,119 @@ import { readLockEntry } from '../readiness/file-locks.mjs';
 import { verifyFinishBody } from '../lib/lane-verify.mjs';
 import { GATE_STARTED_MARKER, GATE_QUEUED_MARKER } from '../conveyor/verify-dispatch.mjs';
 import { CARD_ONLY_SKIP_GATE, shellQuote } from '../lib/verify-lane-gate.mjs';
+import * as guardCore from '../lib/verify-lane-gate.mjs';
 import { resolveOperation } from '../operations/run.mjs';
 import { runOperationCli } from '../operations/cli-adapter.mjs';
 import { createMemoryRunStore } from '../operations/run-store.mjs';
 
-const namedSuitesCommand = `npx vitest run ${JSON.parse(readFileSync(resolve(process.cwd(), 'scripts/verify-settings.json'), 'utf8')).alwaysRunTests.slice().sort().map(shellQuote).join(' ')} --passWithNoTests`;
+describe('declared guard refusal (hermetic producer)', () => {
+  let producerRun = 0;
+  const mockedModules = [
+    '../lib/tools-root-guard.mjs', '../lib/build-policy.mjs', '../lib/tests-first-policy.mjs',
+    '../lib/verify-lane-gate.mjs', '../lib/verify-revert-red.mjs', '../operations/coordination-root.mjs',
+    '../readiness/heavy-admission.mjs', '../lib/write-all-sync.mjs', 'node:child_process',
+    '../../skills-src/conveyor/runner-lock.mjs', '../../skills-src/conveyor/verify-daemon.mjs',
+    '../lib/fix-handoff.mjs', '../readiness/file-locks.mjs', '../lib/verify-base-rerun.mjs',
+    '../conveyor/await-verify.mjs', '../operations/mutation-check-io.mjs', '../lib/verify-shared-marker.mjs',
+    '../lib/verify-remote-routing.mjs', '../lib/verify-shard-run.mjs', '../lib/tree-watchdog.mjs',
+    '../lib/remote-fallback-log.mjs',
+  ];
+  async function deletedGuardProducer({ declared, mode = 'verify', unreadable = false, scanCommands = [] }) {
+    const root = join(dir, 'lane-4');
+    mkdirSync(join(root, '.git'), { recursive: true });
+    writeFileSync(join(root, 'package.json'), JSON.stringify({ scripts: { 'test:unit': 'true' } }));
+    // Persist the old declaration, then remove its file. No repository/host settings are consulted.
+    const settingsFile = join(root, 'verify-settings.json');
+    writeFileSync(settingsFile, JSON.stringify({ alwaysRunTests: declared }));
+    writeFileSync(join(root, 'deleted.test.mjs'), '// declared guard\n');
+    rmSync(join(root, 'deleted.test.mjs'));
+    if (declared.includes('kept.test.mjs')) writeFileSync(join(root, 'kept.test.mjs'), '// kept guard\n');
+    const settings = { ...guardCoreSettings(), ...JSON.parse(readFileSync(settingsFile, 'utf8')) };
+    const sha = 'a'.repeat(40);
+    const effects = [];
+    let stdout = '', stderr = '', exit;
+    const oldArgv = process.argv;
+    const stopped = new Error('fixture process exit');
+    const RealDate = Date;
+    vi.stubGlobal('Date', class extends RealDate {
+      constructor(...args) { super(...(args.length ? args : ['2026-11-26T12:00:00Z'])); }
+      static now() { return RealDate.parse('2026-11-26T12:00:00Z'); }
+    });
+    vi.spyOn(process, 'cwd').mockReturnValue(root);
+    vi.spyOn(process, 'exit').mockImplementation(code => { exit = code; throw stopped; });
+    vi.spyOn(process.stderr, 'write').mockImplementation(text => { stderr += text; return true; });
+    process.argv = [process.execPath, 'verify-lane.mjs', mode, `--repo=${root}`, '--json'];
+    vi.stubEnv('HOME', root);
+    vi.stubEnv('WE_COORDINATION_ROOT', join(root, 'coordination'));
+    vi.doMock('../lib/tools-root-guard.mjs', () => ({}));
+    vi.doMock('../lib/build-policy.mjs', () => ({ resolveBuildPolicy: () => ({ finalGate: 'related', finalGateStandards: 'selected', sources: { finalGate: 'tool', finalGateStandards: 'tool' } }) }));
+    vi.doMock('../lib/tests-first-policy.mjs', () => ({ redFirstWarning: () => null }));
+    vi.doMock('../operations/coordination-root.mjs', () => ({ resolveCoordinationRoot: () => join(root, 'coordination') }));
+    vi.doMock('../lib/verify-revert-red.mjs', () => ({ recoverRevertRed: () => ({ ok: true }) }));
+    for (const id of mockedModules.slice(9)) vi.doMock(id, () => ({}));
+    vi.doMock('../lib/write-all-sync.mjs', () => ({ writeAllSync: (fd, text) => { if (fd === 1) stdout += text; else stderr += text; } }));
+    vi.doMock('../lib/verify-lane-gate.mjs', () => ({ ...guardCore,
+      initializeVerifierIdentity: () => ({ sha, scriptsClean: true }),
+      describeGate: () => 'fixture selected gate',
+      verifySetting: key => settings[key], verifySettingSource: () => 'fixture',
+      resolveDefaultGate: () => ({ command: "npx vitest run 'selected.test.mjs'", testCommand: "npx vitest run 'selected.test.mjs'", scanCommands,
+        gateReasons: [], decision: { mode: 'shrink', reasons: [], changedFiles: ['source.mjs'], settingsSource: { standards: 'fixture' }, standards: { policy: 'always' } } }),
+      ...(unreadable ? { alwaysRunPlan: options => guardCore.alwaysRunPlan({ ...options, fileExists: () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); } }) } : {}),
+    }));
+    vi.doMock('../readiness/heavy-admission.mjs', () => ({ admissionLockRoot: () => join(root, 'admission'), resolveCap: () => 1, resolveTimeoutMs: () => 1,
+      acquireSlotBlocking: async () => { effects.push('admission'); throw new Error('refusal must precede admission'); } }));
+    vi.doMock('node:child_process', () => {
+      const unexpected = (...args) => { effects.push({ command: 'unexpected-subprocess', args }); throw new Error('unexpected fixture subprocess'); };
+      const fake = { spawn: unexpected, spawnSync: unexpected, execSync: unexpected, execFile: unexpected, exec: unexpected, fork: unexpected,
+        execFileSync: (command, args, options) => {
+      effects.push({ command, args, cwd: options?.cwd });
+      if (command !== 'git' || options?.cwd !== root) throw new Error('unexpected external call');
+      if (args.includes('--absolute-git-dir')) return join(root, '.git');
+      if (args.includes('rev-parse') && args.includes('HEAD')) return sha;
+      if (args.includes('symbolic-ref')) return 'lane/4';
+      throw new Error(`unexpected fixture git: ${args.join(' ')}`);
+      } };
+      return { ...fake, default: fake };
+    });
+    try {
+      const entry = `../verify-lane.mjs?guard-fixture=${++producerRun}`;
+      await import(/* @vite-ignore */ entry);
+    } catch (error) {
+      if (error !== stopped) throw error;
+    } finally {
+      process.argv = oldArgv;
+      for (const id of mockedModules) vi.doUnmock(id);
+      vi.restoreAllMocks();
+      vi.unstubAllGlobals();
+    }
+    return { exit, json: JSON.parse(stdout.trim()), stderr, effects, markerPath: join(root, '.git', '.lane-verify') };
+  }
+  function guardCoreSettings() {
+    return { alwaysRunTests: [], retryFailed: 0, revertRed: 'off', skipLocalForCardOnly: false };
+  }
+  it.each([
+    ['one deleted', ['deleted.test.mjs', 'kept.test.mjs'], 'verify', false, []],
+    ['all deleted, command null', ['deleted.test.mjs'], 'verify', false, []],
+    ['markerless run', ['deleted.test.mjs'], 'run', false, []],
+    ['unreadable path', ['deleted.test.mjs'], 'verify', true, []],
+    ['invalid option', ['--bail'], 'verify', false, []],
+    ['deleted scan-covered guard', ['deleted.test.mjs'], 'verify', false, ["npx vitest run 'deleted.test.mjs'"]],
+  ])('a declared guard whose file no longer exists fails verification instead of being skipped (%s)', async (_case, declared, mode, unreadable, scanCommands) => {
+    const result = await deletedGuardProducer({ declared, mode, unreadable, scanCommands });
+    expect(result.exit, result.stderr).toBe(3);
+    expect(result.json).toMatchObject({ status: 'gate-refused', reason: 'missing-required-guard', ok: false });
+    expect(result.json.detail).toContain('restore');
+    expect(result.stderr).toContain('missing-required-guard');
+    expect(result.json.phases.alwaysRun).toMatchObject({ ran: [], executed: false, result: 'refused' });
+    expect(result.json.phases.alwaysRun.missing).toContain(declared[0]);
+    expect(result.effects).not.toContain('admission');
+    expect(result.effects.every(call => call.command === 'git')).toBe(true);
+    expect(existsSync(result.markerPath)).toBe(false);
+  });
+});
+
+const TEST_REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
+let namedSuitesCommand;
 
 // Selection fixtures explicitly opt into the related-selection policy.
 beforeEach(() => {
@@ -44,7 +153,7 @@ beforeEach(() => {
 });
 afterEach(() => vi.unstubAllEnvs());
 
-const VERIFY_LANE = resolve(process.cwd(), 'scripts/verify-lane.mjs');
+const VERIFY_LANE = resolve(TEST_REPO_ROOT, 'scripts/verify-lane.mjs');
 const OTHER_SHA = 'b'.repeat(40); // "Y" — the sha the overlapping run's marker belongs to (never this HEAD)
 
 function seedVerifyServer(root, options = {}) {
@@ -55,9 +164,15 @@ function seedVerifyServer(root, options = {}) {
 let dir;
 let lockRoot;
 let previousLockRoot;
-beforeEach(() => {
+beforeEach(context => {
   previousLockRoot = process.env.CONVEYOR_RUNNER_LOCK_ROOT;
   lockRoot = mkdtempSync(join(tmpdir(), 'verify-server-'));
+  if (context.task.suite.name === 'declared guard refusal (hermetic producer)') {
+    dir = mkdtempSync(join(tmpdir(), 'verify-deleted-guard-'));
+    mkdirSync(join(dir, '.git'));
+    return;
+  }
+  namedSuitesCommand ??= `npx vitest run ${JSON.parse(readFileSync(resolve(TEST_REPO_ROOT, 'scripts/verify-settings.json'), 'utf8')).alwaysRunTests.slice().sort().map(shellQuote).join(' ')} --passWithNoTests`;
   seedVerifyServer(lockRoot);
   process.env.CONVEYOR_RUNNER_LOCK_ROOT = lockRoot;
   dir = mkdtempSync(join(tmpdir(), 'verify-lane-race-'));
@@ -2254,6 +2369,97 @@ export async function load(url, context, nextLoad) {
 
   // item 99 — the always-run guard set is wired into the runner independent of the related selection.
   describe('always-run guard tests', () => {
+    // Run the real producer and its guard/report path; only repository identity IO and setting provenance vary.
+    function repositoryIdentityEnv(identity, source = 'file') {
+      const coreUrl = pathToFileURL(resolve(TEST_REPO_ROOT, 'scripts/lib/verify-lane-gate.mjs')).href;
+      const admissionUrl = pathToFileURL(resolve(TEST_REPO_ROOT, 'scripts/readiness/heavy-admission.mjs')).href;
+      const loader = join(dir, 'identity-loader.mjs');
+      const preload = join(dir, 'identity-preload.mjs');
+      const calls = join(dir, 'identity-calls.jsonl');
+      const admitted = join(dir, 'identity-admitted');
+      writeFileSync(loader, `
+export async function load(url, context, nextLoad) {
+  const result = await nextLoad(url, context);
+  if (url === ${JSON.stringify(coreUrl)}) return { ...result,
+    source: String(result.source).replace('export function verifySettingSource(', 'function originalVerifySettingSource(')
+      + '\\nexport function verifySettingSource(key, ...args) { return key === "alwaysRunTests" ? ${JSON.stringify(source)} : originalVerifySettingSource(key, ...args); }' };
+  if (url === ${JSON.stringify(admissionUrl)}) return { ...result,
+    source: String(result.source).replace('export async function acquireSlotBlocking(', 'async function originalAcquireSlotBlocking(')
+      + '\\nexport async function acquireSlotBlocking(...args) { (await import("node:fs")).writeFileSync(${JSON.stringify(admitted)}, "admitted"); return originalAcquireSlotBlocking(...args); }' };
+  return result;
+}
+`);
+      writeFileSync(preload, `
+import cp from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
+import { appendFileSync } from 'node:fs';
+const original = cp.execFileSync;
+cp.execFileSync = function(command, args, options) {
+  if (command === 'git' && args.slice(-3).join(' ') === 'remote get-url origin') {
+    const target = options.cwd === ${JSON.stringify(dir)};
+    appendFileSync(${JSON.stringify(calls)}, JSON.stringify({ target, timeout: options.timeout, maxBuffer: options.maxBuffer }) + '\\n');
+    const identity = ${JSON.stringify(identity)};
+    if ((target && ['originless', 'read-failure', 'invalid', 'wrong-error'].includes(identity)) || (!target && identity === 'tooling-read-failure')) {
+      if (identity === 'invalid') return 'unrecognized-origin';
+      throw Object.assign(new Error('identity unavailable'), { status: identity === 'originless' || identity === 'wrong-error' ? 2 : 1,
+        stderr: identity === 'originless' ? "error: No such remote 'origin'" : 'identity read denied' });
+    }
+    return target && identity === 'unrelated' ? 'https://github.com/fixture/other.git' : 'git@github.com:fixture/standard.git';
+  }
+  return original.apply(this, arguments);
+};
+syncBuiltinESMExports();
+`);
+      return { env: { NODE_OPTIONS: `--import=${preload} --experimental-loader=${loader}` }, calls, admitted };
+    }
+    it.each(['unrelated', 'originless'])('repository identity: %s checkouts skip file-sourced guards', identity => {
+      const f = fixture();
+      const policy = repositoryIdentityEnv(identity);
+      // No guard file: an exemption must be explicit, rather than accidentally running an empty filter.
+      // Keep it out of the tracked diff too: deleted tests can independently enter related selection.
+      const result = f.invoke([], { ...policy.env, WE_VERIFY_ALWAYS_RUN_TESTS: 'guard.test.mjs' });
+      expect(result.code, result.stdout + result.stderr).toBe(0);
+      expect(result.stderr).toContain('guard-policy-other-repository');
+      // Selection's capped fallback can independently name guards; the exemption removes the required
+      // guard phase, whose own report is the execution evidence enforced by the producer.
+      expect(f.calls().some(call => call.args.some(arg => arg.startsWith('--outputFile.json=') && arg.includes('verify-always-run-')))).toBe(false);
+      expect(JSON.parse(readFileSync(marker(), 'utf8')).phases.alwaysRun.planned).toEqual([]);
+      expect(existsSync(policy.calls)).toBe(true);
+      expect(existsSync(policy.admitted)).toBe(true);
+    });
+    it.each([
+      ['same-repository file declarations', 'same', 'file', true],
+      ['explicit declarations in unrelated checkout', 'unrelated', 'env', false],
+      ['explicit declarations in originless checkout', 'originless', 'env', false],
+    ])('repository identity: %s execute every required guard', (_name, identity, source, readsIdentity) => {
+      const f = fixture({ guard: true });
+      const policy = repositoryIdentityEnv(identity, source);
+      const result = f.invoke([], policy.env);
+      expect(result.code, result.stdout + result.stderr).toBe(0);
+      expect(f.calls().some(call => call.args.includes('guard.test.mjs'))).toBe(true);
+      expect(JSON.parse(readFileSync(marker(), 'utf8')).phases.alwaysRun).toMatchObject({
+        planned: ['guard.test.mjs'], ran: ['guard.test.mjs'], executed: true, result: 'passed',
+      });
+      expect(result.stderr).not.toContain('guard-policy-other-repository');
+      expect(existsSync(policy.calls)).toBe(readsIdentity);
+    });
+    it.each(['read-failure', 'tooling-read-failure', 'invalid', 'wrong-error'])(
+      'repository identity: %s refuses before admission even with a readable guard', identity => {
+        const f = fixture({ guard: true });
+        const policy = repositoryIdentityEnv(identity);
+        const result = f.invoke([], policy.env);
+        expect(result.code, result.stdout + result.stderr).toBe(3);
+        expect(result.json).toMatchObject({ status: 'gate-refused', reason: 'missing-required-guard', ok: false });
+        expect(result.json.phases.alwaysRun).toMatchObject({ ran: [], executed: false, result: 'refused', missing: ['guard.test.mjs'] });
+        expect(result.stderr).not.toContain('guard-policy-other-repository');
+        expect(existsSync(policy.admitted)).toBe(false);
+        expect(existsSync(join(dir, 'calls.jsonl'))).toBe(false);
+        expect(existsSync(marker())).toBe(false);
+        const reads = readFileSync(policy.calls, 'utf8').trim().split('\n').map(JSON.parse);
+        expect(reads).toEqual(identity === 'tooling-read-failure'
+          ? [{ target: true, timeout: 5000, maxBuffer: 65536 }, { target: false, timeout: 5000, maxBuffer: 65536 }]
+          : [{ target: true, timeout: 5000, maxBuffer: 65536 }]);
+      });
     it('runs the declared guard though the related selection did not pick it, and a red guard turns the gate red as a `scan` cause', () => {
       const f = fixture({ guard: true, guardExit: 1 });
       const result = f.invoke();

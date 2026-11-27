@@ -1417,6 +1417,73 @@ describe('#5128 — bounded related-test selection', () => {
 });
 
 describe('alwaysRunPlan (item 99)', () => {
+  it('a declared guard whose file no longer exists fails verification instead of being skipped', () => {
+    const plan = alwaysRunPlan({ declared: ['kept.test.mjs', 'deleted.test.mjs'], fileExists: file => file === 'kept.test.mjs' });
+    expect(plan.missingRequired).toEqual([{ file: 'deleted.test.mjs', reason: 'file-missing' }]);
+    expect(plan.refusal).toMatchObject({ reason: 'missing-required-guard' });
+    expect(plan.refusal.detail).toContain('restore');
+  });
+  it('all deleted legacy declarations refuse even when there is no command', () => {
+    const persisted = JSON.parse('{"alwaysRunTests":["legacy.test.mjs"]}');
+    const plan = alwaysRunPlan({ declared: persisted.alwaysRunTests, fileExists: () => false });
+    expect(plan.command).toBeNull();
+    expect(plan.missingRequired).toEqual([{ file: 'legacy.test.mjs', reason: 'file-missing' }]);
+    expect(plan.refusal?.reason).toBe('missing-required-guard');
+  });
+  it.each([
+    ['read-throws', () => { throw Object.assign(new Error('unreadable'), { code: 'EACCES' }); }],
+    ['timed-out', () => { throw Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }); }],
+    ['ambiguous', () => undefined],
+    ['no reader', undefined],
+  ])('%s never supplies required guard evidence', (_name, fileExists) => {
+    const plan = alwaysRunPlan({ declared: ['guard.test.mjs'], fileExists });
+    expect(plan.refusal?.reason).toBe('missing-required-guard');
+    expect(plan.missingRequired).toEqual([{ file: 'guard.test.mjs', reason: 'file-unreadable' }]);
+  });
+  it.each(['--bail', './--bail.test.mjs', '../outside.test.mjs', '/absolute.test.mjs', '', null, 17])(
+    'invalid entry %j explicitly refuses instead of becoming an option or path escape', entry => {
+      let reads = 0;
+      const plan = alwaysRunPlan({ declared: [entry], fileExists: () => { reads++; return true; } });
+      expect(plan.refusal?.reason).toBe('missing-required-guard');
+      expect(plan.missingRequired).toEqual([{ file: entry === './--bail.test.mjs' ? '--bail.test.mjs' : entry, reason: 'invalid-entry' }]);
+      expect(reads).toBe(0);
+    });
+  it('malformed and oversized declaration sets refuse with a bounded repair action', () => {
+    for (const declared of [null, {}, 'guard.test.mjs', Array(51).fill('guard.test.mjs')]) {
+      const plan = alwaysRunPlan({ declared, fileExists: () => { throw new Error('must not inspect malformed input'); } });
+      expect(plan.refusal?.reason).toBe('missing-required-guard');
+      expect(plan.refusal.detail).toContain('repair');
+      expect(plan.command).toBeNull();
+    }
+  });
+  it('an oversized guard path refuses before IO and reports a bounded repair action', () => {
+    const file = 'a'.repeat(1024) + '.test.mjs';
+    const plan = alwaysRunPlan({ declared: [file], fileExists: () => { throw new Error('must not read oversized path'); } });
+    expect(plan.missingRequired).toEqual([{ file, reason: 'invalid-entry' }]);
+    expect(plan.refusal.detail).toContain('Repair');
+    expect(plan.refusal.detail.length).toBeLessThan(1000);
+  });
+  it('untrusted declaration text cannot inject terminal controls into the refusal detail', () => {
+    const plan = alwaysRunPlan({ declared: ['--bail\u001b[31m\u009b\u2028.test.mjs'], fileExists: () => { throw new Error('must not read an option'); } });
+    expect(plan.refusal.reason).toBe('missing-required-guard');
+    expect(plan.refusal.detail).not.toMatch(/[\u001b\u009b\u2028]/);
+  });
+  it('duplicate declarations have one required identity and one missing result', () => {
+    let reads = 0;
+    const plan = alwaysRunPlan({ declared: ['gone.test.mjs', './gone.test.mjs'], fileExists: () => { reads++; return false; } });
+    expect(reads).toBe(1);
+    expect(plan.missingRequired).toEqual([{ file: 'gone.test.mjs', reason: 'file-missing' }]);
+  });
+  it('a scan command alone is not execution evidence for a required guard', () => {
+    const plan = alwaysRunPlan({ declared: ['scan.test.mjs'], fileExists: () => true,
+      scanCommands: ["npx vitest run 'scan.test.mjs'"] });
+    expect(plan.requiredFiles).toEqual(['scan.test.mjs']);
+    expect(alwaysRunInventory({ reportText: null, files: plan.requiredFiles, cwd: '/fixture' }).missing).toEqual(['scan.test.mjs']);
+    expect(plan.refusal).toBeNull();
+  });
+  it('no declarations deliberately require no guard reader or command', () => {
+    expect(alwaysRunPlan({ declared: [] })).toMatchObject({ command: null, missingRequired: [], refusal: null });
+  });
   const declared = ['a/guard.test.mjs', 'b/contract.test.mjs', 'c/missing.test.mjs'];
   it('runs every declared file that exists in ONE vitest command, independent of any selection', () => {
     const plan = alwaysRunPlan({ declared, fileExists: (f) => !f.startsWith('c/'), testTimeoutFactor: 3 });
