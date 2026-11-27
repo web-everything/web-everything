@@ -81,7 +81,17 @@ it('malformed routing blocks refuse instead of silently selecting the default pr
 it('every routine session resolves an explicit model from one providerOrder policy', () => {
   for (const order of [['codex', 'claude'], ['claude', 'codex']]) {
     const resolved = routing.resolveAiRouting(sessionFixture({ routing: { providerOrder: order } }));
+    // Fix coordinators accept accounts only; their executor chain owns model selection.
+    // Check that refusal explicitly rather than treating a missing routine route as valid.
+    expect(resolved.sessionRoles).toEqual(routing.AI_ROUTING_ROLES.filter(role => role !== 'fix'));
+    expect(resolved.invalid).toEqual([
+      expect.stringMatching(/fix: missing route.*account-only.*restore routing\.providerOrder/),
+    ]);
     for (const role of routing.AI_ROUTING_ROLES) {
+      if (role === 'fix') {
+        expect(() => routing.aiRoutingInputs(role, resolved)).toThrow(/missing route for fix/);
+        continue;
+      }
       expect(routing.aiRoutingInputs(role, resolved).coordinator).toMatchObject({
         provider: order[0], model: expect.stringMatching(/^(gpt-|claude-)/),
       });

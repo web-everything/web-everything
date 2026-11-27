@@ -196,6 +196,10 @@ function resolveSessions(resolved, { env, routing, routingPlatform, available, r
         throw new TypeError(role === 'fix' ? 'resume violates fix coordinator account-only validator'
           : 'resume has invalid coordinator fields or lacks explicit effort');
       }
+      // Fix models belong to executor rungs, never to the account-only coordinator.
+      // Refuse before borrowing a routine model from providerOrder, even when that
+      // provider is unavailable; callers must use the fix executor-chain resolver.
+      if (role === 'fix') throw new TypeError('fix coordinator is account-only; use the fix executor chain for model selection');
       if (orderInvalid && !persisted) throw new TypeError('invalid providerOrder');
       const pinned = old.provider !== 'inherit';
       const provider = persisted?.provider ?? (pinned ? old.provider : policy.value.providerOrder.find(p => available.includes(p)));
@@ -211,8 +215,7 @@ function resolveSessions(resolved, { env, routing, routingPlatform, available, r
         effort: old.effort !== 'inherit' ? old.effort : security.has(role) ? 'high' : role === 'helper' ? 'low' : 'medium',
         account: old.account };
       if (!valid[`${role}.coordinator`](coordinator)) {
-        throw new TypeError(role === 'fix' ? 'fix coordinator account-only validator forbids session overrides'
-          : 'invalid coordinator fields');
+        throw new TypeError('invalid coordinator fields');
       }
       checkCoordinator(coordinator);
       resolved.value[role].coordinator = coordinator;
