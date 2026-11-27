@@ -2,7 +2,7 @@
  * @file scripts/lib/__tests__/test-result-cache.test.mjs
  * @description prepare-124 S1 — the test-result cache key: what changes it, what must not, and when it is off.
  */
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -183,6 +183,66 @@ describe('test-result cache retention', () => {
     return path;
   };
 
+  it('keeps an idle run past minAgeMs whose owner PID is alive', () => {
+    const dir = makeCache();
+    const middle = makeRun(dir, MIDDLE, DAY, 8);
+    makeRun(dir, OLD, 2 * DAY);
+    const result = testResultCache.pruneCache({ dir, env: { WE_TEST_CACHE_MAX_BYTES: '1' }, now: NOW, isOwnerAlive: pid => pid === 102 });
+    expect(result.removed).toEqual([OLD]);
+    expect(existsSync(middle)).toBe(true);
+  });
+
+  it('ownerAlive maps kill outcomes', () => {
+    expect(typeof testResultCache.ownerAlive).toBe('function');
+    const kill = vi.fn();
+    expect(testResultCache.ownerAlive(102, kill)).toBe(true);
+    expect(kill).toHaveBeenCalledTimes(1);
+    expect(kill).toHaveBeenCalledWith(102, 0);
+    for (const [code, expected] of [['EPERM', true], ['ESRCH', false], ['EINVAL', true]]) {
+      expect(testResultCache.ownerAlive(102, () => { throw Object.assign(new Error(code), { code }); })).toBe(expected);
+    }
+    kill.mockClear();
+    for (const pid of [0, 1, -5, NaN, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(testResultCache.ownerAlive(pid, kill)).toBe(true);
+    }
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it('reaps a live-owner run once older than maxAgeDays', () => {
+    const dir = makeCache();
+    makeRun(dir, OLD, 4 * DAY);
+    expect(testResultCache.pruneCache({ dir, env: {}, now: NOW, isOwnerAlive: () => true }).removed).toEqual([OLD]);
+  });
+
+  it('a dead owner is reaped as before', () => {
+    const dir = makeCache();
+    makeRun(dir, MIDDLE, DAY);
+    expect(testResultCache.pruneCache({ dir, env: { WE_TEST_CACHE_MAX_BYTES: '1' }, now: NOW, isOwnerAlive: () => false }).removed).toEqual([MIDDLE]);
+  });
+
+  it('rechecks owner liveness immediately before removal', () => {
+    const dir = makeCache();
+    const middle = makeRun(dir, MIDDLE, DAY);
+    const isOwnerAlive = vi.fn().mockReturnValueOnce(false).mockReturnValue(true);
+    expect(testResultCache.pruneCache({ dir, env: { WE_TEST_CACHE_MAX_BYTES: '1' }, now: NOW, isOwnerAlive }).removed).toEqual([]);
+    expect(isOwnerAlive.mock.calls).toEqual([[102], [102]]);
+    expect(existsSync(middle)).toBe(true);
+  });
+
+  it('keeps a live owner exactly at maxAgeDays under byte pressure', () => {
+    const dir = makeCache();
+    makeRun(dir, MIDDLE, 3 * DAY);
+    expect(testResultCache.pruneCache({ dir, env: { WE_TEST_CACHE_MAX_BYTES: '1' }, now: NOW, isOwnerAlive: () => true }).removed).toEqual([]);
+  });
+
+  it('never probes the caller own runId', () => {
+    const dir = makeCache();
+    makeRun(dir, ACTIVE, DAY);
+    const isOwnerAlive = vi.fn(() => false);
+    expect(testResultCache.pruneCache({ dir, env: { WE_TEST_CACHE_MAX_BYTES: '1' }, now: NOW, runId: ACTIVE, isOwnerAlive }).removed).toEqual([]);
+    expect(isOwnerAlive).not.toHaveBeenCalled();
+  });
+
   it('exports retention defaults and reports default setting provenance', () => {
     expect(testResultCache.TEST_CACHE_RETENTION_DEFAULTS).toEqual(DEFAULTS);
     const settings = testResultCache.retentionSettings({});
@@ -209,7 +269,7 @@ describe('test-result cache retention', () => {
     const middle = makeRun(dir, OLD, 24 * HOUR, 8);
     const oldest = makeRun(dir, MIDDLE, 48 * HOUR, 8);
     const fresh = makeRun(dir, FRESH, HOUR, 8);
-    const result = testResultCache.pruneCache({ dir, env: { WE_TEST_CACHE_MAX_BYTES: '17' }, now: NOW });
+    const result = testResultCache.pruneCache({ dir, env: { WE_TEST_CACHE_MAX_BYTES: '17' }, now: NOW, isOwnerAlive: () => false });
     expect(result.removed).toEqual([MIDDLE]);
     expect(result.freedBytes).toBe(8);
     expect(result.remainingBytes).toBe(16);
@@ -224,7 +284,7 @@ describe('test-result cache retention', () => {
     const oldest = makeRun(dir, OLD, 48 * HOUR, 8);
     const middle = makeRun(dir, MIDDLE, 24 * HOUR, 8);
     const fresh = makeRun(dir, FRESH, HOUR, 20);
-    const result = testResultCache.pruneCache({ dir, env: { WE_TEST_CACHE_MAX_BYTES: '10' }, now: NOW });
+    const result = testResultCache.pruneCache({ dir, env: { WE_TEST_CACHE_MAX_BYTES: '10' }, now: NOW, isOwnerAlive: () => false });
     expect(result.removed).toEqual([OLD, MIDDLE]);
     expect(result.freedBytes).toBe(16);
     expect(result.remainingBytes).toBe(20);

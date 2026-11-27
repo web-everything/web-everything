@@ -11,10 +11,10 @@
  * an unresolvable relative import, a missing FUI checkout, a deny entry in the policy file.
  *
  * The closure reuses `related-test-selection.mjs#resolveSpecifier`, so "what a test imports" has one definition.
- * Trace retention: runs older than 3 days are removed, then oldest eligible runs until below 2 GiB.
- * WE_TEST_CACHE_MAX_AGE_DAYS and WE_TEST_CACHE_MAX_BYTES override those limits. Active runs and runs
- * younger than 6 hours are protected. A different run that is alive but idle over 6 hours is NOT yet protected
- * (owner-PID liveness is a follow-up card).
+ * Trace retention removes runs older than maxAgeDays, then the oldest eligible runs until under maxBytes.
+ * A run is never removed while it is the caller's own run, younger than 6 hours, or owned by a process
+ * that is still alive (or whose liveness cannot be determined) and not older than maxAgeDays.
+ * WE_TEST_CACHE_MAX_AGE_DAYS and WE_TEST_CACHE_MAX_BYTES override the 3-day and 2 GiB defaults.
  * Key contexts prune at most hourly, only for enabled cache runs (so createKeyContext is no longer read-only
  * in that case: it may delete old trace run dirs and write .prune-stamp).
  */
@@ -82,8 +82,15 @@ function traceBytes(path) {
   return readdirSync(path).reduce((bytes, name) => bytes + traceBytes(join(path, name)), 0);
 }
 
+/** Unknown liveness keeps traces; only ESRCH establishes a dead owner. */
+export function ownerAlive(pid, kill = process.kill) {
+  if (!Number.isSafeInteger(pid) || pid <= 1) return true;
+  try { kill(pid, 0); return true; }
+  catch (error) { return error?.code !== 'ESRCH'; }
+}
+
 /** Best-effort retention of real, directly contained trace run directories. */
-export function pruneCache({ dir = cacheDir(), env = process.env, now = Date.now(), runId = env.WE_TEST_CACHE_RUN_ID } = {}) {
+export function pruneCache({ dir = cacheDir(), env = process.env, now = Date.now(), runId = env.WE_TEST_CACHE_RUN_ID, isOwnerAlive = ownerAlive } = {}) {
   const settings = retentionSettings(env);
   const result = { removed: [], freedBytes: 0, remainingBytes: 0, settings };
   const runs = [];
@@ -91,13 +98,14 @@ export function pruneCache({ dir = cacheDir(), env = process.env, now = Date.now
   try {
     if (!lstatSync(traces).isDirectory()) return result;
     for (const name of readdirSync(traces)) {
-      if (!/^\d{8}T\d{6}-\d+-[0-9a-f]+$/.test(name)) continue;
+      const match = /^\d{8}T\d{6}-(\d+)-[0-9a-f]+$/.exec(name);
+      if (!match) continue;
       try {
         const path = join(traces, name);
         const stat = lstatSync(path);
         if (!stat.isDirectory()) continue;
         const bytes = traceBytes(path);
-        runs.push({ name, path, mtimeMs: stat.mtimeMs, bytes });
+        runs.push({ name, path, pid: Number(match[1]), mtimeMs: stat.mtimeMs, bytes });
         result.remainingBytes += bytes;
       } catch { /* An unreadable or disappearing run is never a reason to fail a test run. */ }
     }
@@ -106,12 +114,12 @@ export function pruneCache({ dir = cacheDir(), env = process.env, now = Date.now
   for (const run of runs) {
     const age = now - run.mtimeMs;
     if (run.name === runId || age < settings.minAgeMs) continue;
-    if (age <= settings.maxAgeDays * 86400 * 1000 && result.remainingBytes <= settings.maxBytes) continue;
+    if (age <= settings.maxAgeDays * 86400 * 1000 && (isOwnerAlive(run.pid) || result.remainingBytes <= settings.maxBytes)) continue;
     try {
       // Recheck eligibility immediately before removal; never follow a replacement symlink.
       const stat = lstatSync(run.path);
       if (!stat.isDirectory() || now - stat.mtimeMs < settings.minAgeMs) continue;
-      if (now - stat.mtimeMs <= settings.maxAgeDays * 86400 * 1000 && result.remainingBytes <= settings.maxBytes) continue;
+      if (now - stat.mtimeMs <= settings.maxAgeDays * 86400 * 1000 && (isOwnerAlive(run.pid) || result.remainingBytes <= settings.maxBytes)) continue;
       rmSync(run.path, { recursive: true });
       result.removed.push(run.name);
       result.freedBytes += run.bytes;
