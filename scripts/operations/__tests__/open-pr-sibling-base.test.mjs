@@ -82,9 +82,9 @@ describe('open-pr sibling base', () => {
 
   it('allows a branch cut on main, and a branch whose sibling commits already landed via their PRs', () => {
     const f = fixture();
-    f.git(['checkout', '-qb', 'lane/clean', 'main']);
+    // lane/own itself is cut on main; a second lane at the same tip would be a duplicate sibling (refused above).
+    f.git(['reset', '--hard', 'main']);
     f.commit('clean', 'clean change');
-    f.git(['branch', '-f', 'lane/own', 'HEAD']);
     expect(f.run()).toMatchObject({ outcome: 'opened' });
     f.git(['checkout', 'main']);
     f.git(['merge', '--squash', 'lane/7357']);
@@ -359,6 +359,27 @@ describe('open-pr sibling base: landed-sibling evidence', () => {
       squash('lane/7358');
       f.git(['checkout', 'lane/own']);
       expect(f.run('lane/7357')).toMatchObject({ outcome: 'opened' });
+    });
+
+    it('fails closed when parent ancestry comparison exits with status 128', () => {
+      const { f } = stack();
+      const parentTip = f.git(['rev-parse', 'lane/7357']).trim();
+      const childTip = f.git(['rev-parse', 'lane/7358']).trim();
+      let compared = 0;
+      const git = (args, opts) => {
+        // Only the parent-classification call (sibling tip vs sibling tip); creation-evidence checks still succeed.
+        if (args[0] === 'merge-base' && args[1] === '--is-ancestor' && args[2] === parentTip && args[3] === childTip) {
+          compared++;
+          throw Object.assign(new Error('fatal: bad object'), { status: 128 });
+        }
+        return f.git(args, opts);
+      };
+      const result = f.run('main', { git });
+      expect(compared).toBe(1);
+      expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base-unknown' });
+      expect(result.detail).toContain('Cannot establish sibling history');
+      expect(f.calls).toHaveLength(1);
+      expect(f.calls[0]).toContain('--check');
     });
 
     it('still names the child when only the parent landed', () => {

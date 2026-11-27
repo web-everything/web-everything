@@ -70,6 +70,23 @@ describe('sibling-base admission with injected publishing IO', () => {
     }
   });
 
+  it('fails closed in the runner when siblingBase throws or returns no decision (outside --dry-run)', () => {
+    for (const siblingBase of [
+      vi.fn(() => { throw new Error('history unreadable'); }),
+      vi.fn(() => undefined),
+      vi.fn(() => ({})),
+      vi.fn(() => ({ ok: 'yes' })),
+    ]) {
+      const f = fixture({ siblingBase });
+      const result = f.run({ argv: ['--ref=lane/own'] });
+      expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base-unknown' });
+      expect(result.blockers).toContainEqual(expect.objectContaining({ gate: 'sibling-base', reason: 'sibling-base-unknown' }));
+      expect(siblingBase).toHaveBeenCalledOnce();
+      expect(f.spawn).toHaveBeenCalledOnce();
+      expect(f.spawn.mock.calls[0][1]).toContain('--check');
+    }
+  });
+
   it('does not read Git for the default history checker on --dry-run', () => {
     const git = vi.fn(() => { throw new Error('dry-run must not read Git'); });
     const f = fixture({ git });
