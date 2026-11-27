@@ -5,6 +5,7 @@ import { spawnSync as realSpawn } from 'node:child_process';
 import { hostname, homedir, tmpdir } from 'node:os';
 import { join, dirname, resolve, delimiter } from 'node:path';
 import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
+import { safeRegistrationRef } from './prototype-load.mjs';
 import { ciUnitPlan, ciGatePlan, urgentLedger, urgentKeyPath, urgentSignature, normalizeUrgentRepo, urgentFuiRepo, canonicalFuiRepo } from './urgent-verify-marker.mjs';
 
 const worktreePrefix = '.urgent-verify-';
@@ -66,7 +67,7 @@ function supervisedSpawnSync(cmd, args, options) {
 
 // `decorate(deps, dir)` is a test seam: it may replace step functions of the scoped (worktree) deps.
 // `isolated: true` (the CLI default via urgentVerify) adds `isolate`; scoped deps are created with false so they never nest.
-export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = realFs, spawnSync = supervisedSpawnSync, env = process.env, decorate, isolated = false, stepHome, wrapperRoot, maxMinutes, deadline } = {}) {
+export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = realFs, spawnSync = supervisedSpawnSync, env = process.env, decorate, isolated = false, stepHome, wrapperRoot, maxMinutes, deadline, host = hostname(), tempRoot = tmpdir() } = {}) {
   // Wall-clock limit for the whole run (setting urgentVerify.maxMinutes via WE_URGENT_VERIFY_MAX_MINUTES, default 180).
   // Full 17-step greens: 85.6 min (8e5fde5d1, 2026-11-19), 78.0 min (c673c976e, 2026-11-24).
   // Keep at least 2x the measured baseline; the wall-clock regression test guards this headroom.
@@ -100,7 +101,7 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
   childEnv.PATH = [childEnv.PATH, ...binDirs].filter(Boolean).join(delimiter);
   // Resolve before changing HOME or cwd; ~/ overrides and relative paths belong to the caller.
   const admissionPool = resolve(cwd, defaultPoolRoot(cwd, env));
-  const run = (cmd, args, dir = cwd) => {
+  const run = (cmd, args, dir = cwd, timeoutMs = Infinity) => {
     // The checkout under test may predate the child-env strip, so its wrapper is the runner's own copy.
     if (wrapperRoot && String(args[0]).endsWith('heavy-admission.mjs')) args = [join(wrapperRoot, 'scripts/readiness/heavy-admission.mjs'), ...args.slice(1)];
     // Checkout-local bins only for the admission wrapper that runs vitest/npm; git, gh and plain node calls
@@ -108,6 +109,8 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
     // Checkout code (the wrapper's children) gets the throwaway HOME, never the real one that holds the signing key.
     const wrapper = String(args[0]).endsWith('heavy-admission.mjs');
     const env = wrapper ? { ...childEnv, LANE_POOL_ROOT: admissionPool, WE_STRIP_POOL_ROOT_FROM_CHILD: '1', ...(stepHome ? { HOME: stepHome, npm_config_cache: join(home, '.npm') } : {}) } : { ...childEnv, PATH: systemPath };
+    if (isolated && cmd === 'git') Object.assign(env, { GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_SYSTEM: '/dev/null',
+      GIT_CONFIG_GLOBAL: '/dev/null', GIT_NO_REPLACE_OBJECTS: '1', GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' });
     // Own process group (detached) so an expired child's whole tree dies, and only that tree: -pid is our spawn's group.
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
@@ -116,7 +119,7 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
       throw late;
     }
     // SIGKILL (not the SIGTERM default) so a child that traps TERM cannot delay the expiry.
-    const r = spawnSync(cmd, args, { cwd: dir, env, encoding: 'utf8', timeout: remaining, killSignal: 'SIGKILL', maxBuffer: 16 * 1024 * 1024, detached: true });
+    const r = spawnSync(cmd, args, { cwd: dir, env, encoding: 'utf8', timeout: Math.min(remaining, timeoutMs), killSignal: 'SIGKILL', maxBuffer: 16 * 1024 * 1024, detached: true });
     const timedOut = r.error?.code === 'ETIMEDOUT';
     // Any spawn error (timeout, buffer overflow) may leave descendants: kill the group we created, nothing else.
     if (r.error && Number.isInteger(r.pid) && r.pid > 1) { try { process.kill(-r.pid, 'SIGKILL'); } catch { /* already gone */ } }
@@ -140,6 +143,7 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
   // alternates), NOT a linked worktree: a linked worktree's gitdir lives inside the caller's .git, which
   // repo tests (and the hermetic guard) treat as live lane access. Sibling of the caller so ../frontierui resolves.
   const isolate = isolated ? sha => {
+    if (typeof sha !== 'string' || !/^[a-f0-9]{40}$/.test(sha)) throw new Error('invalid-urgent-sha');
     // No fallback to checkout bins: the admission wrapper's PATH ends with them, so a missing system tool
     // or non-executable system tool would silently resolve to a checkout-supplied replacement. Refuse up front instead.
     for (const tool of ['git', 'node', 'npm', 'sh']) {
@@ -159,7 +163,7 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
       if (m && !pidAlive(Number(m[1]))) fs.rmSync(join(parent, name), { recursive: true, force: true });
     }
     const dir = join(parent, `${worktreePrefix}${sha.slice(0, 12)}-${process.pid}`);
-    const stepHome = fs.mkdtempSync(join(tmpdir(), 'urgent-step-home-'));
+    const stepHome = fs.mkdtempSync(join(tempRoot, 'urgent-step-home-'));
     const resetCheckout = () => fs.rmSync(dir, { recursive: true, force: true });
     const cleanup = () => {
       for (const path of [stepHome, dir]) {
@@ -173,11 +177,52 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
       if (String(run('git', ['status', '--porcelain', '--', 'scripts/readiness', 'scripts/lib'])).trim() !== '') throw new Error('runner admission wrapper has uncommitted changes; refusing to run it');
       const objects = join(run('git', ['rev-parse', '--path-format=absolute', '--git-common-dir']).trim(), 'objects');
       resetCheckout();
-      run('git', ['init', '-q', dir]);
+      run('git', ['init', '-q', '--template=', dir]);
       run('git', ['remote', 'add', 'origin', origin], dir);
       fs.writeFileSync(join(dir, '.git/objects/info/alternates'), `${objects}\n`);
+      let available = false;
+      try { run('git', ['cat-file', '-e', `${sha}^{commit}`], dir); available = true; }
+      catch (e) { if (e.failure?.error) throw e; }
+      if (!available) {
+        const source = normalizeUrgentRepo(origin);
+        // This verifier runs WE's CI mirror. Never send a SHA to a substituted repository or helper.
+        if (source !== 'https://github.com/web-everything/web-everything') throw new Error('origin-not-allowed');
+        const fetch = ref => run('git', ['-c', 'credential.helper=', '-c', 'core.hooksPath=/dev/null',
+          '-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always', 'fetch', '--no-tags',
+          '--no-recurse-submodules', '--no-auto-maintenance', '--refmap=', '--', source, ref], dir, 60_000);
+        try { fetch(sha); }
+        catch (e) {
+          if (e.failure?.timedOut) throw new Error('fetch-timeout: retry urgent-verify or wait for CI');
+          if (e.failure?.error) throw new Error('fetch-failed: repair Git transport and retry urgent-verify');
+          // The configured fix-ready ledger is the only source of a fallback branch, never caller input.
+          let ref;
+          try {
+            const config = JSON.parse(fs.readFileSync(join(cwd, 'scripts/settings/prototype-load.json'), 'utf8'));
+            const path = config.readyRecordPath;
+            if (typeof path !== 'string' || !path) throw new Error('fix-ready-path-missing');
+            const fd = fs.openSync(path.startsWith('~/') ? join(home, path.slice(2)) : resolve(cwd, path), 'r');
+            let text;
+            try {
+              const bytes = Buffer.alloc(1024 * 1024 + 1);
+              let size = 0, n;
+              while (size < bytes.length && (n = fs.readSync(fd, bytes, size, bytes.length - size, null)) > 0) size += n;
+              if (size === bytes.length) throw new Error('fix-ready-ledger-too-large: repair the ledger and retry or wait for CI');
+              text = bytes.subarray(0, size).toString('utf8');
+            } finally { fs.closeSync(fd); }
+            const records = text.split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
+            const record = records.filter(r => r?.sha === sha).at(-1);
+            if (!record) throw new Error('fix-ready-record-missing');
+            if (!safeRegistrationRef(record.ref) || record.ref.startsWith('refs/')) throw new Error('fix-ready-ref-invalid');
+            ref = record.ref;
+          } catch (readError) { throw new Error(`fetch-failed: ${readError.message}; repair fix-ready evidence and retry or wait for CI`); }
+          try { fetch(`refs/heads/${ref}`); }
+          catch (branchError) { throw new Error(`${branchError.failure?.timedOut ? 'fetch-timeout' : 'fetch-failed'}: repair the recorded branch and retry or wait for CI`); }
+        }
+        if (run('git', ['rev-parse', '--verify', 'FETCH_HEAD^{commit}'], dir).trim() !== sha)
+          throw new Error('fetched-sha-mismatch: refresh fix-ready evidence and retry or wait for CI');
+      }
       run('git', ['checkout', '-q', '--detach', sha], dir);
-      const scoped = createUrgentDeps({ cwd: dir, home, fs, spawnSync, env: { ...env, LANE_POOL_ROOT: admissionPool }, isolated: false, stepHome, wrapperRoot: cwd, maxMinutes: limitMin, deadline });
+      const scoped = createUrgentDeps({ cwd: dir, home, fs, spawnSync, env: { ...env, LANE_POOL_ROOT: admissionPool }, isolated: false, stepHome, wrapperRoot: cwd, maxMinutes: limitMin, deadline, host, tempRoot });
       if (scoped.head() !== sha) throw new Error('isolated checkout not at requested sha');
       return { deps: decorate ? decorate(scoped, dir) : scoped, cleanup };
     } catch (e) { cleanup(); throw e; }
@@ -189,7 +234,7 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
       try { fs.writeFileSync(path, randomBytes(32), { flag: 'wx', mode: 0o600 }); }
       catch (e) { if (e.code !== 'EEXIST') throw e; }
       return fs.readFileSync(path);
-    }, host: hostname(), now: () => new Date().toISOString(),
+    }, host, now: () => new Date().toISOString(),
     // Also refuse hidden changes: assume-unchanged (lowercase tag) and skip-worktree (S) entries make
     // `git status` lie, so a checkout could edit tracked files and still look clean.
     clean: () => run('git', ['status', '--porcelain']) === ''
