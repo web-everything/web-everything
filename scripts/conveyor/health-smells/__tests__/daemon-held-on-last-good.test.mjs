@@ -106,14 +106,16 @@ describe('last-good hold alarm contract', () => {
   });
 
   it.each([
-    [],
-    [{ cloneKey: 'one', rebuild: null }],
-    [{ cloneKey: 'one', rebuild: { held: null } }],
-    [{ cloneKey: 'one', rebuild: { held: null, adopted: { at: NOW - HOUR, head: 'def456' } } }],
-    [{ cloneKey: 'one', rebuild: { held: null, adopted: { at: NOW + MINUTE, head: 'abc123' } } }],
-  ])('missing or stale adoption evidence does not close an owed hold (%j)', (rows) => {
+    { rows: [] },
+    { rows: [{ cloneKey: 'one', rebuild: null }] },
+    { rows: [{ cloneKey: 'one', rebuild: { held: null } }] },
+    { rows: [{ cloneKey: 'one', rebuild: { held: null, adopted: { at: NOW - HOUR, head: 'def456' } } }] },
+    // Same-head recovery is valid when fresh (tested above); this adoption predates the hold.
+    { rows: [{ cloneKey: 'one', rebuild: { held: null, adopted: { at: NOW - HOUR, head: 'abc123' } } }] },
+  ])('missing or stale adoption evidence does not close an owed hold (%j)', ({ rows }) => {
     const first = tick([clone('one', held(31))]);
     const result = tick(rows, first.state, NOW + MINUTE);
+    expect(result.evaluations[0].error).toBeUndefined();
     expect(result.transitions.some(t => t.type === 'closed')).toBe(false);
     expect(result.state.episodes['daemon-held-on-last-good::clone:one'].measure.uncertainty.length).toBeGreaterThan(0);
   });
