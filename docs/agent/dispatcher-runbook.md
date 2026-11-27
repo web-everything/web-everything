@@ -208,3 +208,55 @@ Linked from `we:skills-src/conveyor/SKILL.md` §2 ("Start the runner") — that'
 dispatcher will naturally land first.
 
 Manual intervention without a worker: `run.mjs why --pr=N|--item=X` then the op it suggests (see [operator-ops.md](operator-ops.md)).
+
+
+## Managed-clone staleness guard
+
+A daemon-managed clone dispatches only when its HEAD is the adopted build recorded in `rebuild.json` and its code tree is clean, and then only if it is not behind on a file this dispatch loads, unless a named exception applies (last-good holding or a running rebuild).
+
+The identity is `adopted.head`, not a smoke certification: force-adopted and
+skip-unrelated heads count. A clone with no readable adopted head passes when it
+is not behind (nothing to compare), including an offline or null checker result;
+it refuses when the checker reports behind. A readable adoption requires a
+readable, matching HEAD for every checker result. A mismatch may be the brief
+mid-adoption window or a foreign checkout; it always refuses with
+`off-adopted-build`. Only the gated rebuild may move a managed clone.
+
+After identity, an independent code-tree probe checks every tracked edit and
+untracked code file. Untracked backlog Markdown is harmless; unreadable status
+refuses. A fresh/offline/null checker cannot bypass this gate. The two named
+exceptions override only the behind-on-path check, never identity or cleanliness.
+
+“Loads” means the declared review-path boundary: the explicit entry-file list and
+review/judge/jury pattern, the static closure of `REVIEW_SANDBOX_ROOTS`, package
+manifests and named JSON inputs of that closure, and `skills-src/review/**`.
+The named JSON boundary explicitly retains `push-gate-allowlist.json` after the
+scorecard store's import cut removes its former path through the rebuild graph.
+Static imports do not follow spawned scripts. The runtime-read audit pins the two
+review prompts; the `ownedBy` skill pointer is metadata, not a runtime read. The
+fix brief `skills-src/conveyor/fix-agent-brief.md` remains a deferred fix-path gap;
+this boundary does not claim to cover it.
+
+Fresh local `main` is insufficient: a detached adopted HEAD can still lag the
+origin ref. The guard lists missing commits from `HEAD..origin/<base>` locally,
+once, without fetching again. A known empty list passes; an unreadable list
+requires a bounded ref probe. Only an ordinary exit 1 without a signal or spawn
+error establishes an absent ref. Every other failure holds dispatch unless the
+explicit last-good exception applies. The existing
+`WE_STALE_GUARD_MISSING_COMMITS=0` opt-out keeps merge-base diff semantics.
+
+With a declared dispatch path, a known list passes only if no file matches that
+predicate (including Markdown and test files). Without a predicate, the existing
+non-code-only tolerance still requires a nonempty list. Relevant lag can pass via
+last-good holding, or via bounded running-rebuild grace with a known list.
+Refusals and grace diagnostics name up to five relevant paths. Comparison failures
+name the configured origin ref. Commit counts and file counts are separate;
+unreadable evidence is logged as `unknown`, never zero.
+
+Each review caller emits `review-guard: job=<slug> path=<branch>
+checker=<original classification> behind-commits=<count> behind-files=<count>`.
+Branches are `unmanaged`, `fresh`, `off-path`, `last-good`, and `grace` for review;
+`non-code` is available to callers without a dispatch predicate. A refusal emits
+no successful observation. For a persistent refusal, inspect the managed clone's
+`clone-held-stale` alert and rebuild state; retry after the gated rebuild restores
+matching, clean adoption evidence. Do not reset or detach a live daemon clone.

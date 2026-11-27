@@ -1,3 +1,4 @@
+import { cloneKeyOf } from '../../lib/daemon-last-good.mjs';
 import { completeCheckRows } from '../../lib/__tests__/helpers/complete-check-rows.mjs';
 import { readReviewCiGate } from '../../lib/review-ci-gate-io.mjs';
 /**
@@ -10,12 +11,20 @@ import { readReviewCiGate } from '../../lib/review-ci-gate-io.mjs';
  */
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, posix } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import * as fixtureFs from 'node:fs';
+import ts from 'typescript';
+import * as staleness from '../../lib/main-staleness.mjs';
+import { collectImportClosure } from '../../lib/import-closure.mjs';
+import { scopedScanFiles } from '../../lib/repo-scan-tests.mjs';
+import { isPromoteCodePath } from '../promote-draft-pr-dispatch.mjs';
+import { isFixCodePath } from '../../conveyor/reconcile-fix-dispatch.mjs';
 
 import { afterEach, describe, it, expect, vi } from 'vitest';
+vi.mock('node:fs', async (original) => ({ ...await original() }));
 import { dispatchReviewJob, runReviewJob, runReviewJobCli, createReviewJobIo } from '../review-job.mjs';
 it('job CLI forwards its high-care model and the loop spawns with that model', () => {
   const runJob = vi.fn(() => ({ refused: true }));
@@ -74,7 +83,7 @@ import {
   assertMainNotStale, canonicalReviewPlaceholder, dispatchReview as realDispatchReview, fillReviewBrief, formatSessionDispatchResult, isReviewCodePath, planReviewDispatch,
   reviewDispatchDisallowedToolsArgs, reviewSessionSlug, REVIEW_BRIEF_PLACEHOLDERS,
   REVIEW_DISPATCH_DISALLOWED_TOOLS, REVIEW_DISPATCH_SYSTEM_PROMPT_FILE,
-  REVIEW_SANDBOX_ROOTS, TOOL_FREE_ONLY_JUDGE_PROVIDERS,
+  REVIEW_SANDBOX_ROOTS, reviewSandboxClosure, TOOL_FREE_ONLY_JUDGE_PROVIDERS,
 } from '../review-dispatch.mjs';
 import { buildReviewJudgeRequest, DEFAULT_LENS } from '../review-pr.mjs';
 import { dispatchSessionCwd } from '../dispatch-lane-io.mjs';
@@ -778,8 +787,17 @@ describe('dispatchReview — managed clone behind origin/main (#4387)', () => {
     if (prevEnv === undefined) delete process.env.WE_DAEMON_MANAGED_CLONE; else process.env.WE_DAEMON_MANAGED_CLONE = prevEnv;
     if (dir) rmSync(dir, { recursive: true, force: true });
     dir = undefined;
+    vi.unstubAllEnvs();
   });
-  const managed = () => { prevEnv = process.env.WE_DAEMON_MANAGED_CLONE; process.env.WE_DAEMON_MANAGED_CLONE = '1'; };
+  const managed = () => {
+    prevEnv = process.env.WE_DAEMON_MANAGED_CLONE; process.env.WE_DAEMON_MANAGED_CLONE = '1';
+    const root = join(dir, 'clone'), stateDir = join(dir, 'state');
+    vi.stubEnv('WE_DAEMON_STATE_DIR', stateDir);
+    mkdirSync(stateDir);
+    writeFileSync(join(stateDir, `${cloneKeyOf(root)}.rebuild.json`), JSON.stringify({ adopted: {
+      head: git(root, 'rev-parse', 'HEAD').trim(), at: '2020-01-01T00:00:00Z',
+    } }));
+  };
 
   it('behind only in code OFF the review path: the review dispatches (before #4387: refused)', () => {
     const root = behindClone('scripts/backlog/capacity.mjs', 'scripts/lane-pool.mjs', 'backlog/1-card.md');
@@ -980,5 +998,203 @@ describe('session expectedHead binding immediately before spawn', () => {
       readBrief: () => REAL_TEMPLATE_STUB, checkStaleness: FRESH, expectedHead: 'a'.repeat(40), readExpectedHead: () => 'a'.repeat(40),
       wrapReview: false, spawnAgent: vi.fn() });
     expect(out.prompt).toContain(`PINNED HEAD: ${'a'.repeat(40)}`);
+  });
+});
+
+
+// @repo-scanning-test scope=files
+// Capture source inputs before execution; closure checks run against a temp snapshot.
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+const guardSources = {};
+function walk(directory) {
+  for (const entry of readdirSync(join(repoRoot, directory), { withFileTypes: true })) {
+    const file = `${directory}/${entry.name}`;
+    if (entry.isDirectory()) {
+      if (!['__tests__', '__fixtures__', 'node_modules'].includes(entry.name)
+        && file !== 'scripts/workflows') walk(file);
+    } else if (entry.isFile() && (directory.startsWith('scripts') ? /\.(mjs|cjs|js|json)$/ : /\.mjs$/).test(file)) {
+      guardSources[file] = readFileSync(join(repoRoot, file), 'utf8');
+    }
+  }
+}
+walk('scripts');
+walk('skills-src');
+const guardEntries = ['review-dispatch', 'review-job', 'review-pr', 'cli-adapter', 'review-loop-cli']
+  .map(n => `scripts/operations/${n}.mjs`);
+
+// Parse string/template tokens, not comments. Walk out to the expression that owns
+// each literal so join/resolve/URL fragments are reported together and metadata is separate.
+function auditRuntimeReads(sources) {
+  const mentions = [];
+  for (const [file, source] of Object.entries(sources)) {
+    const ast = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+    function visit(node) {
+      if ((ts.isStringLiteralLike(node) || ts.isTemplateHead(node) || ts.isTemplateMiddle(node) || ts.isTemplateTail(node))
+        && node.text.includes('skills-src')) {
+        let owner = node, metadata = false, read = false;
+        while (owner.parent && !ts.isStatement(owner)) {
+          if (ts.isPropertyAssignment(owner) && owner.name.getText(ast) === 'ownedBy') { metadata = true; break; }
+          if ((ts.isCallExpression(owner) || ts.isNewExpression(owner)) && ts.isIdentifier(owner.expression)
+            && ['join', 'resolve', 'URL', 'readFileSync'].includes(owner.expression.text)) { read = true; break; }
+          owner = owner.parent;
+        }
+        const strings = [];
+        function literals(n) {
+          if (ts.isStringLiteralLike(n)) strings.push(n.text);
+          ts.forEachChild(n, literals);
+        }
+        literals(owner);
+        const fragment = strings.findIndex(s => s.includes('skills-src'));
+        const raw = read ? strings.slice(fragment).join('/') : node.text;
+        const path = raw.match(/skills-src\/[\w./-]+\.md/)?.[0] ?? raw.match(/skills-src[^\s'"`) ]*/)?.[0] ?? raw;
+        const kind = metadata ? 'metadata' : read
+          ? (file === 'scripts/conveyor/reconcile-fix-dispatch.mjs' ? 'fix-path-read' : 'runtime-read')
+          : 'non-read-string';
+        mentions.push({ file, path, kind });
+      }
+      ts.forEachChild(node, visit);
+    }
+    visit(ast);
+  }
+  return mentions;
+}
+
+describe('REVIEW-GUARD-RELEVANT-BEHIND review boundary', () => {
+  let root;
+  const complete = { complete: true, files: new Set(), bareDeps: true, jsonNames: new Set() };
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); if (root) rmSync(root, { recursive: true, force: true }); root = undefined; });
+  function snapshot() {
+    root = mkdtempSync(join(tmpdir(), 'review-source-snapshot-'));
+    for (const [file, text] of Object.entries(guardSources)) {
+      mkdirSync(dirname(join(root, file)), { recursive: true }); writeFileSync(join(root, file), text);
+    }
+    return collectImportClosure({ root, entries: [...REVIEW_SANDBOX_ROOTS] });
+  }
+  it('12 runtime-read prompts refuse; absolute review/promote/fix predicate table and dispatch behaviour', () => {
+    root = mkdtempSync(join(tmpdir(), 'review-path-'));
+    vi.stubEnv('WE_DAEMON_MANAGED_CLONE', '1');
+    const review = p => isReviewCodePath(p, { closure: complete });
+    const promote = p => isPromoteCodePath(p, { closure: complete });
+    const fix = p => isFixCodePath(p, { closure: complete });
+    const prompts = ['skills-src/review/review-agent-brief.md', 'skills-src/review/review-agent-system-prompt.md'];
+    const other = ['backlog/x.md', 'docs/agent/x.md', 'scripts/lib/README.md', 'skills-src/other/SKILL.md'];
+    for (const p of [...other, ...prompts]) {
+      expect(review(p), p).toBe(prompts.includes(p)); expect(promote(p), p).toBe(false); expect(fix(p), p).toBe(false);
+    }
+    expect(review('package.json')).toBe(true); expect(review('package-lock.json')).toBe(true);
+    const opts = { adoptedHead: () => 'fixture-head', readHeadSha: () => 'fixture-head', treeDirtyForCode: () => false,
+      env: { WE_DAEMON_MANAGED_CLONE: '1' }, lastGood: () => null, rebuildGrace: () => null, write: () => {} };
+    const run = (dispatchPath, files) => assertMainNotStale(root, () => ({ action: 'warn', behind: 1 }),
+      { ...opts, dispatchPath, listBehindFiles: () => files });
+    for (const dispatchPath of [review, promote, fix]) {
+      expect(() => run(dispatchPath, ['backlog/x.md'])).not.toThrow();
+      if (dispatchPath === review) expect(() => run(dispatchPath, [prompts[0]])).toThrow(/STALE/);
+      else expect(() => run(dispatchPath, [prompts[0]])).not.toThrow();
+    }
+    for (const files of [[prompts[0]], [prompts[1]], [prompts[0], 'off-path.mjs']]) expect(() => run(review, files)).toThrow(/STALE/);
+    for (const p of other) expect(() => run(review, [p])).not.toThrow();
+  });
+  it('13 runtime-read audit reports negative fixtures, comments, metadata and the exact review inventory', () => {
+    const closure = snapshot();
+    expect(closure?.complete).toBe(true);
+    const all = [...new Set([...closure.files].filter(p => /^scripts\/.*\.mjs$/.test(p)).concat(guardEntries))];
+    const files = scopedScanFiles(all);
+    const sources = Object.fromEntries(files.map(file => [file, readFileSync(join(root, file), 'utf8')]));
+    const nonReads = [
+      ['scripts/lib/gate-config.mjs', 'skills-src/', 'explanation of a trust-chain pattern'],
+      ['scripts/lib/gate-config.mjs', 'skills-src/conveyor/runner.mjs', 'trust-chain home metadata'],
+      ['scripts/lib/gate-config.mjs', 'skills-src/conveyor/supervisor.mjs', 'trust-chain home metadata'],
+      ['scripts/lib/standards-sections.mjs', 'skills-src/**', 'checker selection glob'],
+      ['scripts/lib/standards-sections.mjs', 'skills-src/**/*.mjs', 'checker selection glob'],
+      ['scripts/lib/standards-sections.mjs', 'skills-src/**/*.js', 'checker selection glob'],
+      ['scripts/lib/standards-sections.mjs', 'skills-src/**/*.mjs', 'second checker selection glob'],
+      ['scripts/operations/registry.mjs', 'skills-src/review/SKILL.md', 'metadata validation error example'],
+      ['scripts/operations/registry.mjs', 'skills-src/review/SKILL.md', 'second metadata validation error example'],
+      ['scripts/lib/codex-transcript-check.mjs', 'skills-src/inspect-codex-transcript/codex-transcript.mjs', 'static JS import, already in the closure'],
+      ['scripts/lib/merge-queue-affected.mjs', 'skills-src', 'settings-reader directory classification'],
+      ['scripts/operations/review-dispatch.mjs', 'skills-src/review/', 'declared dispatch-path prefix'],
+    ];
+    const expected = [
+      { file: guardEntries[0], path: 'skills-src/review/review-agent-system-prompt.md', kind: 'runtime-read' },
+      { file: guardEntries[0], path: 'skills-src/review/review-agent-brief.md', kind: 'runtime-read' },
+      // names the owning skill, not loaded at dispatch
+      { file: 'scripts/operations/review-pr.mjs', path: 'skills-src/review/SKILL.md', kind: 'metadata' },
+      ...nonReads.map(([file, path, reason]) => {
+        expect(reason.length).toBeGreaterThan(10);
+        return { file, path, kind: 'non-read-string' };
+      }),
+    ].filter(row => files.includes(row.file));
+    const sorted = rows => rows.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+    expect(sorted(auditRuntimeReads(sources))).toEqual(sorted(expected));
+    expect(auditRuntimeReads({ 'fixture.mjs': `// readFileSync('skills-src/comment.md')
+      /* join(dir, 'skills-src', 'ignored.md') */
+      const path = join(dir, 'skills-src', 'review', 'x.md');
+      const metadata = { ownedBy: 'we:skills-src/x/SKILL.md' };
+      const template = \`skills-src/review/unknown.md\`;
+      const url = new URL('skills-src/review/url.md', import.meta.url);
+    ` })).toEqual([
+      { file: 'fixture.mjs', path: 'skills-src/review/x.md', kind: 'runtime-read' },
+      { file: 'fixture.mjs', path: 'skills-src/x/SKILL.md', kind: 'metadata' },
+      { file: 'fixture.mjs', path: 'skills-src/review/unknown.md', kind: 'non-read-string' },
+      { file: 'fixture.mjs', path: 'skills-src/review/url.md', kind: 'runtime-read' },
+    ]);
+    // The only separately audited, deferred source. It is never part of the review set.
+    const fixFile = 'scripts/conveyor/reconcile-fix-dispatch.mjs';
+    expect(all).not.toContain(fixFile);
+    expect(auditRuntimeReads({ [fixFile]: readFileSync(join(root, fixFile), 'utf8') })).toEqual([
+      { file: fixFile, path: 'skills-src/conveyor/fix-agent-brief.md', kind: 'fix-path-read' },
+      { file: fixFile, path: 'skills-src/conveyor/fix-agent-brief.md', kind: 'non-read-string' },
+    ]);
+  });
+  it('14 closure no longer reaches the rebuild graph, remains complete and below 300 files', () => {
+    const expected = snapshot();
+    // Redirect the production closure's file adapters to the captured fixture too.
+    const liveRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+    const read = fixtureFs.readFileSync, stat = fixtureFs.statSync;
+    const fixturePath = p => {
+      const relative = posix.relative(posix.normalize(liveRoot), String(p));
+      if (relative.startsWith('..')) throw Error(`unexpected closure path: ${relative}`);
+      return join(root, relative);
+    };
+    vi.spyOn(fixtureFs, 'readFileSync').mockImplementation((p, ...args) => read(fixturePath(p), ...args));
+    vi.spyOn(fixtureFs, 'statSync').mockImplementation((p, ...args) => stat(fixturePath(p), ...args));
+    const closure = reviewSandboxClosure();
+    expect(closure.files).toEqual(expected.files);
+    expect(closure.complete).toBe(true);
+    console.info(`REVIEW-GUARD-RELEVANT-BEHIND closure files=${closure.files.size}`);
+    expect([...closure.files].filter(p => p === 'scripts/lib/daemon-rebuild.mjs' || p.startsWith('scripts/lib/daemon-rebuild/'))).toEqual([]);
+    expect(closure.files.size).toBeLessThan(300);
+    expect(closure.files.has('scripts/lib/daemon-last-good.mjs')).toBe(true);
+    expect(closure.jsonNames.has('push-gate-allowlist.json')).toBe(true);
+    expect(closure.bareDeps).toBe(true);
+    for (const p of ['package.json', 'package-lock.json']) expect(isReviewCodePath(p, { closure })).toBe(true);
+  });
+  it('18 null and incomplete closure keep both prompts on the path', () => {
+    for (const closure of [null, { complete: false }]) {
+      for (const p of ['skills-src/review/review-agent-brief.md', 'skills-src/review/review-agent-system-prompt.md']) {
+        expect(isReviewCodePath(p, { closure })).toBe(true);
+      }
+      expect(isReviewCodePath('backlog/x.md', { closure })).toBe(false);
+    }
+  });
+  it.each(['unmanaged', 'fresh', 'off-path', 'last-good', 'grace'])('21 session logs one job-correlated observation for %s', guardPath => {
+    root = mkdtempSync(join(tmpdir(), 'review-log-'));
+    const note = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    vi.spyOn(staleness, 'assertMainNotStale').mockReturnValue({ guardPath, checker: 'offline', behindCommits: null, behindFileCount: null });
+    expect(() => realDispatchReview({ expectedHead: 'a'.repeat(40), io: { liveHead: () => 'a'.repeat(40) },
+      pr: 10, repo: 'web-everything/web-everything', root, env: {}, home: root, checkoutExists: () => true, wrapReview: false,
+      // Stop after the observation, before provider/lane/session effects.
+      judgeProvider: 'invalid-fixture' })).toThrow(/judgeProvider/);
+    expect(note.mock.calls.map(c => c[0]).filter(s => s.startsWith('review-guard:'))).toEqual([
+      `review-guard: job=review-10 path=${guardPath} checker=offline behind-commits=unknown behind-files=unknown\n`,
+    ]);
+  });
+  it('21 session refusal emits no successful observation', () => {
+    root = mkdtempSync(join(tmpdir(), 'review-refusal-'));
+    const note = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    vi.spyOn(staleness, 'assertMainNotStale').mockImplementation(() => { throw Error('fixture refusal'); });
+    expect(() => realDispatchReview({ pr: 10, repo: 'web-everything/web-everything', root, home: root,
+      checkoutExists: () => true, wrapReview: false, expectedHead: 'a'.repeat(40), io: { liveHead: () => 'a'.repeat(40) } })).toThrow('fixture refusal');
+    expect(note.mock.calls.filter(c => String(c[0]).startsWith('review-guard:'))).toEqual([]);
   });
 });

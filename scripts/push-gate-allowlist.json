@@ -228,7 +228,7 @@
     "scripts/lib/lane-repair.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":30},
     "scripts/lib/lane-salvage.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":30},
     "scripts/lib/launchd-code-restart.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
-    "scripts/lib/main-staleness.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":4},
+    "scripts/lib/main-staleness.mjs": {"status":"pending-migration","reason":"S2: dynamic Git runner and checkout helper plus the new bounded read-only rev-parse --verify --quiet origin commit probe; injected runners replace prior direct calls. No new push path.","sites":3},
     "scripts/lib/merge-queue-affected.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":9},
     "scripts/lib/merge-queue-enqueue.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":6},
     "scripts/lib/mirror-sync.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},

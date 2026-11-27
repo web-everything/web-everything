@@ -464,3 +464,13 @@ describe('strict scorecard reads for red-team admission', () => {
     expect(readStore({ path: '/fixture/store', strict: true, read: () => JSON.stringify({ records }) }).records).toEqual(records);
   });
 });
+
+
+it('REVIEW-GUARD-RELEVANT-BEHIND 14 scorecard path preserves default and CONVEYOR_STATE_ROOT resolution', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'scorecard-path-'));
+  vi.stubEnv('HOME', root);
+  try {
+    expect(resolveScorecardStorePath({})).toBe(join(root, '.claude', 'daemon-self-sync-state', 'conveyor-state', '.conveyor', 'run-scorecards.json'));
+    expect(resolveScorecardStorePath({ CONVEYOR_STATE_ROOT: join(root, 'pinned') })).toBe(join(root, 'pinned', '.conveyor', 'run-scorecards.json'));
+  } finally { vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); }
+});

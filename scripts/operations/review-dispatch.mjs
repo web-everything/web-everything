@@ -442,8 +442,7 @@ export function fillReviewBrief(template, values = {}) {
 /** #4387 — the declared REVIEW CODE PATH: the review operation (review-pr, this dispatcher, the loop CLI), its
  *  provider adapter, the lib judge/jury/review modules, and the staleness guard itself. A managed clone behind
  *  `origin/main` only in files outside this set still dispatches a review (see `assertMainNotStale`'s
- *  `dispatchPath`). A declared list, not the full import closure: that closure reaches ~330 files (the backlog,
- *  lane-pool and conveyor libraries), so nearly every landed PR would touch it and the guard would keep refusing.
+ *  `dispatchPath`). The declared boundary includes the review prompts under skills-src/review/;
  *  It does include EVERY direct import of the four review entry files (this dispatcher, review-pr, cli-adapter,
  *  review-loop-cli) — the sandbox (dispatch-lane-io's gh shim and argv, dispatch-bg-isolation), seat/model routing
  *  and the operation engine. A clone behind in one of those must refuse (PR #2916 review). The
@@ -472,6 +471,10 @@ const REVIEW_CODE_PATH_FILES = new Set([
   'scripts/lib/operator-send-backs.mjs',
   'scripts/conveyor/advisory-round-count.mjs', 'scripts/conveyor/learnings-drop.mjs',
   'scripts/conveyor/run-scorecard-store.mjs',
+  // Keep entry-file dependencies explicit after the scorecard's rebuild-graph
+  // cut: collision healing and the boundary's own import scanner still run.
+  'scripts/backlog/frontmatter.mjs', 'scripts/lib/card-number-allocator.mjs',
+  'scripts/lib/import-closure.mjs',
   // #4493 — review-loop-cli's own mechanized prevention filing now spawns the shared detached landing job
   // (the same one review-set-label.mjs's approval-time filing already used) instead of driving `file-item`
   // in-process; a new direct import of the review-loop-cli entry file.
@@ -503,10 +506,8 @@ const REVIEW_CODE_PATH_FILES = new Set([
  *  deeper (dispatch-lane-io → gh-app-shim's `sanitizeSpawnEnv`/`buildGhShimSettingsEnv`, github-app-auth-env,
  *  session-role, spawn-to-completion; review-core → mandate-fence). The FULL static import closure of these
  *  sandbox, spawn and verdict modules is on the review code path, computed from the running tree, so a new
- *  import under them is covered with no list to update. That closure is ~75 files (it also reaches daemon-sync,
- *  telemetry and queue helpers); about 1 in 6 recent landed PRs touch the path with it. The closure of the entry
- *  files themselves is not used: it reaches ~330 files (the conveyor, via review-job and dispatch-lane-io), and
- *  about a quarter of recent landed PRs touch it, so the guard would refuse most of the time again. */
+ *  import under them is covered with no list to update. The entry files' full closure is intentionally not
+ *  used: it also reaches the conveyor and lane machinery outside this declared review boundary. */
 export const REVIEW_SANDBOX_ROOTS = Object.freeze([
   'scripts/lib/gh-app-shim.mjs', 'scripts/lib/github-app-auth-env.mjs', 'scripts/operations/session-role.mjs',
   'scripts/lib/spawn-to-completion.mjs', 'scripts/lib/dispatch-bg-isolation.mjs', 'scripts/lib/gh-throttle.mjs',
@@ -522,6 +523,10 @@ let sandboxClosureMemo;
 export function reviewSandboxClosure() {
   if (sandboxClosureMemo === undefined) {
     sandboxClosureMemo = collectImportClosure({ root: THIS_CODE_ROOT, entries: [...REVIEW_SANDBOX_ROOTS] });
+    // Preserve the declared push-gate policy input when the scorecard store stops
+    // importing the rebuild graph. This is an explicit relevance boundary, not
+    // a claim that a spawned CLI's runtime inputs are all static imports.
+    sandboxClosureMemo?.jsonNames.add('push-gate-allowlist.json');
   }
   return sandboxClosureMemo;
 }
@@ -531,7 +536,7 @@ export function reviewSandboxClosure() {
 export function isReviewCodePath(path, { closure = reviewSandboxClosure() } = {}) {
   const p = String(path || '');
   if (!p) return false;
-  if (REVIEW_CODE_PATH_FILES.has(p) || REVIEW_CODE_PATH_RE.test(p)) return true;
+  if (REVIEW_CODE_PATH_FILES.has(p) || REVIEW_CODE_PATH_RE.test(p) || p.startsWith('skills-src/review/')) return true;
   if (!closure || !closure.complete) return isCodePath(p);
   return closureHits({ closure, changedFiles: [p] }).length > 0;
 }
@@ -649,7 +654,9 @@ export function dispatchReview({
   // #3439 — refuse (not silently spawn) when this checkout is behind origin/main: see `assertMainNotStale`.
   // `checkStaleness` undefined here falls straight through to that function's own default — no need to
   // duplicate it. #4387 — a managed clone refuses only when a behind file is on the review code path.
-  assertMainNotStale(root, checkStaleness, { dispatchPath: isReviewCodePath });
+  const guard = assertMainNotStale(root, checkStaleness, { dispatchPath: isReviewCodePath });
+  process.stderr.write(`review-guard: job=${planned.sessionSlug} path=${guard.guardPath} checker=${guard.checker} `
+    + `behind-commits=${guard.behindCommits ?? 'unknown'} behind-files=${guard.behindFileCount ?? 'unknown'}\n`);
   // #xqa9ttq — validated HERE, before the brief is ever filled: an unrecognised name would otherwise reach
   // `review-loop-cli.mjs`'s own `--provider` parse INSIDE the dispatched session, where the refusal happens
   // minutes into a real dispatch instead of at the command line that requested it.

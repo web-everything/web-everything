@@ -42,7 +42,7 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { scrubReasons } from '../lib/secret-scrub.mjs';
-import { daemonConveyorStateRoot } from '../lib/daemon-rebuild.mjs';
+import { daemonConveyorStateRoot } from '../lib/daemon-last-good.mjs';
 import { withInfraLock } from './infra-blocked.mjs';
 import { appendRotationShadow } from '../lib/provider-rotation-shadow.mjs';
 
@@ -59,7 +59,7 @@ export const LEGACY_IN_TREE_STORE = 'scripts/conveyor/run-scorecards.json';
 /**
  * Where the store file lives — ONE shared file outside every git tree (#4155):
  * `<conveyor state root>/.conveyor/run-scorecards.json`, where the root is
- * `daemon-rebuild.mjs#daemonConveyorStateRoot` — the operator's `CONVEYOR_STATE_ROOT` pin when set (#4052),
+ * `daemon-last-good.mjs#daemonConveyorStateRoot` — the operator's `CONVEYOR_STATE_ROOT` pin when set (#4052),
  * else `~/.claude/daemon-self-sync-state/conveyor-state` (`WE_DAEMON_STATE_DIR` moves the parent).
  *
  * WHY NOT THE OLD IN-TREE DEFAULT: the store used to default to the tracked `scripts/conveyor/run-scorecards.json`

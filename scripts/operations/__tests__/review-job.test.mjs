@@ -1,3 +1,4 @@
+import { cloneKeyOf } from '../../lib/daemon-last-good.mjs';
 import * as reviewDispatch from '../review-dispatch.mjs';
 import * as ghShim from '../../lib/gh-app-shim.mjs';
 import { runReviewTick } from '../../../skills-src/conveyor/review-daemon.mjs';
@@ -470,8 +471,14 @@ describe('dispatchReviewJob — a managed clone behind origin/main (the default 
     git(up, 'push', '-q', 'origin', 'main');
     root = join(dir, 'clone');
     prevEnv = process.env.WE_DAEMON_MANAGED_CLONE; process.env.WE_DAEMON_MANAGED_CLONE = '1';
+    const stateDir = join(dir, 'state');
+    vi.stubEnv('WE_DAEMON_STATE_DIR', stateDir);
+    mkdirSync(stateDir);
+    writeFileSync(join(stateDir, `${cloneKeyOf(root)}.rebuild.json`), JSON.stringify({ adopted: {
+      head: git(root, 'rev-parse', 'HEAD').trim(), at: '2020-01-01T00:00:00Z',
+    } }));
   }
-  afterEach(() => { if (prevEnv === undefined) delete process.env.WE_DAEMON_MANAGED_CLONE; else process.env.WE_DAEMON_MANAGED_CLONE = prevEnv; prevEnv = undefined; });
+  afterEach(() => { if (prevEnv === undefined) delete process.env.WE_DAEMON_MANAGED_CLONE; else process.env.WE_DAEMON_MANAGED_CLONE = prevEnv; prevEnv = undefined; vi.unstubAllEnvs(); });
   const go = () => dispatchReviewJob({ ...headFixture(),
     ciGate: () => ({ allowed: true, headSha: 'a'.repeat(40) }), pr: 10, repo: REPO, root, dir: join(dir, 'jobs'),
     readCompletion: () => null, resolveSettingsEnv: () => null, spawnJob: () => 77,
@@ -768,4 +775,31 @@ it('classifies juror-timeout and writes the named seat to the ended record', () 
   const { io } = fakeIo({ writeEnded, runLoop: () => ({ status: 1, stdout: JSON.stringify(payload), stderr: '' }) });
   expect(runReviewJob({ pr: 10, repo: REPO, pid: 99 }, io)).toMatchObject({ outcome: BLOCKED_ON_INFRA, reason: 'juror-timeout', lens: payload.lens, provider: payload.provider, model: payload.model, head: HEAD, timeoutMs: 5, wallMs: 6, runId: payload.runId });
   expect(writeEnded).toHaveBeenCalledWith({ slug: 'review-10', pid: 99 }, expect.objectContaining({ outcome: BLOCKED_ON_INFRA, reason: 'juror-timeout', lens: payload.lens, provider: payload.provider, model: payload.model, head: HEAD, timeoutMs: 5, wallMs: 6, runId: payload.runId }));
+});
+
+
+describe('REVIEW-GUARD-RELEVANT-BEHIND job observation', () => {
+  afterEach(() => vi.restoreAllMocks());
+  it.each(['unmanaged', 'fresh', 'off-path', 'last-good', 'grace'])('21 job logs its original checker and job id for %s', guardPath => {
+    vi.spyOn(reviewDispatch, 'assertMainNotStale').mockReturnValue({
+      guardPath, checker: 'warn', behindCommits: 3, behindFileCount: 2,
+    });
+    const log = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    expect(() => dispatchReviewJob({ pr: 10, repo: REPO, root: dir, home: dir, env: {},
+      now: 1_000, dir: join(dir, 'jobs'), checkoutExists: () => true, ...headFixture(),
+      readCompletion: () => null, ciGate: () => { throw Error('fixture stop after observation'); },
+    })).toThrow('fixture stop after observation');
+    expect(log.mock.calls.map(c => c[0]).filter(s => s.startsWith('review-guard:'))).toEqual([
+      `review-guard: job=review-10 path=${guardPath} checker=warn behind-commits=3 behind-files=2\n`,
+    ]);
+  });
+  it('21 refusal emits no successful observation or dispatch', () => {
+    vi.spyOn(reviewDispatch, 'assertMainNotStale').mockImplementation(() => { throw Error('fixture refusal'); });
+    const log = vi.spyOn(process.stderr, 'write').mockReturnValue(true), spawnJob = vi.fn();
+    expect(() => dispatchReviewJob({ pr: 10, repo: REPO, root: dir, home: dir, env: {}, now: 1_000,
+      dir: join(dir, 'jobs'), checkoutExists: () => true, ...headFixture(), spawnJob,
+    })).toThrow('fixture refusal');
+    expect(spawnJob).not.toHaveBeenCalled();
+    expect(log.mock.calls.filter(c => String(c[0]).startsWith('review-guard:'))).toEqual([]);
+  });
 });
