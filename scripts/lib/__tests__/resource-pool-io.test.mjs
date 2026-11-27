@@ -536,6 +536,34 @@ it('unknown settings hold every pool decision even with complete sources', () =>
   expectPoolClosed(collectPool({ settings: { value: structuredClone(POOL_DEFAULTS), unknown: true } }));
 });
 
+it('duplicate job evidence with unknown or failed-source flags still holds every grant', () => {
+  for (const patch of [{ unknown: true }, { sourceOk: false }]) {
+    for (const taintedSource of ['workers', 'fix']) {
+      const report = collectPool({ readSource: source => ({ ...validPoolSource(source),
+        holders: ['fix', 'workers'].includes(source) ? [{
+          resource: 'studio.units', source, kind: 'fix', class: 3, size: 2, jobId: 'same-job',
+          ...(source === taintedSource ? patch : {}),
+        }] : [] }) });
+      expect(report.rows.every(row => row.unknown && row.poolDecision === 'hold')).toBe(true);
+      expect(report.rows.every(row => row.reason.includes('inspect named sources and rerun'))).toBe(true);
+      expectPoolClosed(report);
+    }
+  }
+});
+
+it('retained evidence rejected by grant validation makes the report and digest unknown', () => {
+  for (const patch of [{ unknown: true }, { sourceOk: false }]) {
+    const report = collectPool({ readSource: source => ({ ...validPoolSource(source),
+      holders: source === 'workers' ? [{
+        resource: 'studio.units', source, kind: 'fix', class: 3, size: 2, ...patch,
+      }] : [] }) });
+    expect(report.holders).toHaveLength(1);
+    expect(report.rows.every(row => row.unknown && row.poolDecision === 'hold')).toBe(true);
+    expectPoolClosed(report);
+    expect(report.digest).toBe('pool studio ?/?u · C2 ? C3 ? (floor 4)');
+  }
+});
+
 it('duplicate fix jobId across claim and workers counts once while unrelated and unidentified jobs remain', () => {
   const report = collectPool({ readSource: source => ({ ...validPoolSource(source),
     holders: ['fix', 'workers'].includes(source) ? [

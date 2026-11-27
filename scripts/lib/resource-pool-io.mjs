@@ -327,6 +327,8 @@ export function collectResourcePool({ env = process.env, nowMs = Date.now(), coo
   // An explicit repo scopes a jobId; identical IDs from different repos are distinct jobs.
   const jobs = new Set();
   const holders = sources.flatMap(s => s.ok ? s.holders : []).filter(holder => {
+    // Preserve refusal flags for grantDecision, even behind a healthy duplicate.
+    if (holder.unknown || holder.sourceOk === false) return true;
     if (holder.kind !== 'fix' || typeof holder.jobId !== 'string' || !holder.jobId) return true;
     const jobKey = JSON.stringify([holder.repo ?? null, holder.jobId]);
     if (jobs.has(jobKey)) return false;
@@ -346,7 +348,8 @@ export function collectResourcePool({ env = process.env, nowMs = Date.now(), coo
       legacySource: 'resource-admission.admit (resource check only; dispatch caps excluded)',
       unknown: unknown || pool.unknown, reason: pool.reason };
   });
-  const report = { mode: settings.value.mode, configuredMode: settings.configuredMode, unknown, holders, sources, settings,
+  const report = { mode: settings.value.mode, configuredMode: settings.configuredMode,
+    unknown: unknown || rows.some(row => row.unknown), holders, sources, settings,
     budgets, summary: summarize(holders), rows, builderFloor: settings.value.builderFloor,
     scope: 'S1a partial inventory: C2 review rounds/red-team, C3 fix/ci-heal claims and live workers', shrink: null };
   report.digest = digestLine(report);
