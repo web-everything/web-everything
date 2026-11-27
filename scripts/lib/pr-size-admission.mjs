@@ -85,7 +85,7 @@ function boundedGit(git, { deadline, now = () => performance.now(), timedOut, pr
 }
 
 /** Read-only ancestry admission. Lane refs are local evidence, never proof of forge PR status.
- * A declared lane base excludes its ancestry; squash landings require patch evidence, not a PR title alone.
+ * A declared lane base excludes its published ancestry; squash landings require patch evidence, not a PR title alone.
  * `now` is injectable so the 15s inspection deadline can be tested with a fake clock.
  */
 export function checkSiblingBase({ git, ref, sha, base = 'main', now = () => performance.now() }) {
@@ -102,9 +102,11 @@ export function checkSiblingBase({ git, ref, sha, base = 'main', now = () => per
     const headRef = qualifiedRef(ref?.startsWith('refs/') ? ref : `refs/heads/${ref}`);
     const head = resolveCommit(sha || headRef);
     const main = resolveCommit('refs/remotes/origin/main');
-    const parentRef = base.startsWith('lane/') ? qualifiedRef(`refs/heads/${base}`)
+    // The forge opens against the published parent, never an advanced local shadow.
+    const parentRef = base.startsWith('lane/') ? qualifiedRef(`refs/remotes/origin/${base}`)
       : base.startsWith('origin/lane/') ? qualifiedRef(`refs/remotes/${base}`)
-        : base.startsWith('refs/heads/lane/') || base.startsWith('refs/remotes/origin/lane/') ? qualifiedRef(base) : null;
+        : base.startsWith('refs/heads/lane/') ? qualifiedRef(base.replace('refs/heads/', 'refs/remotes/origin/'))
+          : base.startsWith('refs/remotes/origin/lane/') ? qualifiedRef(base) : null;
     if (!parentRef && !['main', 'origin/main', 'refs/remotes/origin/main'].includes(base)) {
       throw new Error('unknown declared base; use main or an explicit lane parent');
     }
@@ -120,6 +122,12 @@ export function checkSiblingBase({ git, ref, sha, base = 'main', now = () => per
     for (const commit of ownCommits) {
       for (const row of laneRefs([`--contains=${commit}`])) rows.add(row);
     }
+    const tipsByRef = new Map([...rows].map(row => row.split(' ')));
+    // Exit status 1 is the answer "no"; any other failure (bad object, timeout) is unreadable evidence.
+    const isAncestor = (ancestor, descendant) => {
+      try { read(['merge-base', '--is-ancestor', ancestor, descendant]); return true; }
+      catch (error) { if (error?.status === 1) return false; throw error; }
+    };
     const laneName = name => name.replace(/^refs\/(?:heads|remotes\/origin)\//, '');
     const ownLane = laneName(headRef).replace(/-v\d+$/, '');
     const candidates = [];
@@ -149,14 +157,25 @@ export function checkSiblingBase({ git, ref, sha, base = 'main', now = () => per
       }
       const history = list(read(['reflog', 'show', '--max-count=2049', '--format=%H%x00%gs', creationRef, '--']));
       if (history.length > 2048) throw new Error('lane creation evidence exceeds 2048 reflog entries');
-      const creation = /^([a-f0-9]{40})\0branch: Created from .+$/.exec(history.at(-1) || '');
+      const creation = /^([a-f0-9]{40})\0branch: Created from (.+)$/.exec(history.at(-1) || '');
       if (!creation) throw new Error(`missing lane creation evidence for ${lane}`);
       // A recreated or diverged lane (or a local lane unrelated to this fetched tip) has a record that
       // does not belong to this tip's history; using it would draw the ownership boundary in the wrong place.
       try { read(['merge-base', '--is-ancestor', creation[1], tip]); }
       catch { throw new Error(`lane creation record for ${lane} is not in the history of ${name}`); }
       const ownHistory = new Set(commits('--first-parent', tip, `^${creation[1]}`, `^${main}`, `^${parent}`));
-      if (![...ownHistory].some(commit => carried.has(commit))) continue;
+      if (![...ownHistory].some(commit => carried.has(commit))) {
+        // Checking out a fetched lane records its already-authored tip as local creation.
+        // That snapshot cannot prove its carried ancestry belongs to somebody else.
+        // Check the published history too: creation via a SHA has no remote name in its reflog.
+        const publishedTip = tipsByRef.get(`refs/remotes/origin/${lane}`);
+        const fetchedCreation = /^(?:refs\/remotes\/)?origin\/lane\//.test(creation[2]);
+        if ((fetchedCreation || (publishedTip && isAncestor(creation[1], commitSha(publishedTip))))
+          && shared.some(inherited => inheritedByUs(inherited) && isAncestor(inherited, creation[1]))) {
+          throw new Error(`published lane creation does not establish ownership for ${lane}`);
+        }
+        continue;
+      }
       for (const inherited of shared) {
         if (inheritedByUs(inherited)) candidates.push({ lane, tip: inherited });
       }
@@ -181,11 +200,6 @@ export function checkSiblingBase({ git, ref, sha, base = 'main', now = () => per
         const id = patch(`${commit}^`, commit);
         return id && landedPatches.has(id);
       });
-    };
-    // Exit status 1 is the answer "no"; any other failure (bad object, timeout) is unreadable evidence.
-    const isAncestor = (ancestor, descendant) => {
-      try { read(['merge-base', '--is-ancestor', ancestor, descendant]); return true; }
-      catch (error) { if (error?.status === 1) return false; throw error; }
     };
     const siblings = [];
     const unique = [...new Map(candidates.map(candidate => [`${candidate.lane}\0${candidate.tip}`, candidate])).values()];

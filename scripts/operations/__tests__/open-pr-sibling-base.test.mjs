@@ -25,6 +25,7 @@ function fixture() {
   git(['checkout', '-qb', 'lane/7357']);
   commit('one', 'first sibling change');
   commit('two', 'second sibling change');
+  git(['update-ref', 'refs/remotes/origin/lane/7357', 'HEAD']);
   git(['checkout', '-qb', 'lane/own']);
   commit('own', 'own change');
   const calls = [];
@@ -113,6 +114,78 @@ describe('open-pr sibling base', () => {
 
   it('allows a legitimate stack with a declared parent', () => {
     expect(fixture().run('lane/7357')).toMatchObject({ outcome: 'opened' });
+  });
+
+  it.each(['origin/lane/7357', 'refs/remotes/origin/lane/7357', 'sha'])(
+    'refuses fetched sibling creation ancestry as ownership evidence (%s)', source => {
+      const f = fixture();
+      const start = source === 'sha' ? f.git(['rev-parse', 'origin/lane/7357']).trim() : source;
+      f.git(['branch', '-D', 'lane/7357']);
+      f.git(['branch', 'lane/7357', start]);
+      const result = f.run();
+      expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base-unknown' });
+      expect(result.detail).toContain('published lane creation');
+      expect(f.calls).toHaveLength(1);
+      expect(f.calls[0]).toContain('--check');
+    });
+
+  it('refuses a fetched sibling even after its local and published tips advance', () => {
+    const f = fixture();
+    f.git(['branch', '-D', 'lane/7357']);
+    f.git(['checkout', '-b', 'lane/7357', 'origin/lane/7357']);
+    f.commit('later', 'later sibling change');
+    f.git(['update-ref', 'refs/remotes/origin/lane/7357', 'HEAD']);
+    f.git(['checkout', 'lane/own']);
+    expect(f.run()).toMatchObject({ outcome: 'refused', reason: 'sibling-base-unknown' });
+    expect(f.calls).toHaveLength(1);
+  });
+
+  it('refuses an earlier carried tip when the sibling is first checked out after advancing', () => {
+    const f = fixture();
+    f.git(['checkout', 'lane/7357']);
+    f.commit('later', 'published after own forked');
+    f.git(['update-ref', 'refs/remotes/origin/lane/7357', 'HEAD']);
+    f.git(['checkout', 'lane/own']);
+    f.git(['branch', '-D', 'lane/7357']);
+    f.git(['branch', 'lane/7357', 'origin/lane/7357']);
+    expect(f.run()).toMatchObject({ outcome: 'refused', reason: 'sibling-base-unknown' });
+    expect(f.calls).toHaveLength(1);
+  });
+
+  it.each(['lane/7357', 'refs/heads/lane/7357', 'origin/lane/7357', 'refs/remotes/origin/lane/7357'])(
+    'uses the published declared parent instead of unpublished local commits (%s)', base => {
+      const f = fixture();
+      f.git(['update-ref', 'refs/remotes/origin/lane/7357', 'main']);
+      const result = f.run(base);
+      expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base' });
+      expect(result.detail).toContain('lane/7357');
+      expect(f.calls).toHaveLength(1);
+      expect(f.calls[0]).toContain('--check');
+    });
+
+  it('fails closed when a declared local parent has never been published', () => {
+    const f = fixture();
+    f.git(['update-ref', '-d', 'refs/remotes/origin/lane/7357']);
+    expect(f.run('lane/7357')).toMatchObject({ outcome: 'refused', reason: 'sibling-base-unknown' });
+    expect(f.calls).toHaveLength(1);
+  });
+
+  it('admits a published declared parent without a local branch', () => {
+    const f = fixture();
+    f.git(['branch', '-D', 'lane/7357']);
+    expect(f.run('lane/7357')).toMatchObject({ outcome: 'opened' });
+  });
+
+  it('refuses an advanced published parent even when its local shadow is contained', () => {
+    const f = fixture();
+    f.git(['checkout', '-b', 'lane/advanced', 'lane/7357']);
+    f.commit('advanced', 'published parent advanced');
+    f.git(['update-ref', 'refs/remotes/origin/lane/7357', 'HEAD']);
+    f.git(['checkout', 'lane/own']);
+    const result = f.run('lane/7357');
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base-unknown' });
+    expect(result.detail).toContain('declared parent is not contained in this head');
+    expect(f.calls).toHaveLength(1);
   });
 
   it('allows an advanced parent with an unmerged child sharing its earlier history', () => {
@@ -263,6 +336,7 @@ describe('open-pr sibling base: evidence bounds', () => {
     const f = fixture();
     f.git(['checkout', '-qb', 'lane/elsewhere', 'main']);
     f.commit('elsewhere', 'unrelated parent work');
+    f.git(['update-ref', 'refs/remotes/origin/lane/elsewhere', 'HEAD']);
     f.git(['checkout', 'lane/own']);
     const result = f.run('lane/elsewhere');
     expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base-unknown' });
