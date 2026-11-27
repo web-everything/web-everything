@@ -287,6 +287,16 @@ it('expires red-team leases strictly after 24h but never excuses unreadable evid
     .toMatchObject({ ok: true, holders: [], expiredRedTeamRows: 1 });
   fs.writeFileSync(file, '{'); expect(read('redTeam', { nowMs: clock + 1 }).ok).toBe(false);
 });
+it('counts an expired red-team lease before consulting slot liveness', () => {
+  const clock = 200000000, file = join(paths.redTeam, filename);
+  fs.writeFileSync(file, JSON.stringify(status()));
+  const statusAt = clock - RED_TEAM_HARD_LEASE_CEILING_MS - 1;
+  fs.utimesSync(file, new Date(statusAt), new Date(statusAt));
+  const slotAlive = vi.fn(() => { throw Error('expired lease must not probe'); });
+  expect(read('redTeam', { nowMs: clock, slotAlive }))
+    .toMatchObject({ ok: true, holders: [], expiredRedTeamRows: 1 });
+  expect(slotAlive).not.toHaveBeenCalled();
+});
 it('foreign hosts and unknown local probes stay unknown; only ESRCH proves death', () => {
   const file = join(paths.redTeam, filename);
   fs.writeFileSync(file, JSON.stringify({ ...status(), host: 'foreign' }));
