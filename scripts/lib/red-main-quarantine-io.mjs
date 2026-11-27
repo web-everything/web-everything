@@ -662,12 +662,14 @@ export function rerunRedMainFailedJobs({ brokenSha: rawSha, exec = execFileSyncT
       marker = null;
       return taken ? { rerun: false, reason: 'already-rerun' } : { rerun: false, error: `rerun claim unwritable: ${String(e?.message || e).split('\n')[0]}` };
     }
+    // Call the REST endpoint directly: `gh run rerun` performs a workflow lookup that can fail under App tokens.
+    const rerunEndpoint = `repos/${repoSlug}/actions/runs/${latest.databaseId}/rerun-failed-jobs`;
     try {
-      exec('gh', ['run', 'rerun', String(latest.databaseId), '--repo', repoSlug, '--failed'], opts);
+      exec('gh', ['api', '-X', 'POST', rerunEndpoint], opts);
     } catch (e) {
       // The claim STAYS: at most one request per sha, so a failing gh can never turn into a storm (a lost response may
       // even have been accepted). The operator-visible fallback is the manual command named in the error.
-      return { rerun: false, runId: latest.databaseId, error: `${String(e?.message || e).split('\n')[0]} (claim kept; rerun by hand: gh run rerun ${latest.databaseId} --failed)` };
+      return { rerun: false, runId: latest.databaseId, error: `${String(e?.message || e).split('\n')[0]} (claim kept; rerun by hand: gh api -X POST ${rerunEndpoint})` };
     }
     return { rerun: true, runId: latest.databaseId };
   } catch (e) {
