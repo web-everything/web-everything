@@ -120,7 +120,7 @@ describe('awaitGroupDeath', () => {
 });
 
 describe('decidePromotion', () => {
-  const good = { exitCode: 77, groupDeath: 'dead', escapeEvidence: 'confirmed', recordWritten: true, inFlight: 0, nowMs: 1000, expectedDigest: 'd1', candidate: { pid: 9, alive: true, ready: true, codeDigest: 'd1' } };
+  const good = { exitCode: 77, groupDeath: 'dead', escapeEvidence: 'confirmed', recordWritten: true, inFlight: 0, nowMs: 1000, ghRequestTimeoutMs: 5000, settleMs: 0, expectedDigest: 'd1', candidate: { pid: 9, alive: true, ready: true, codeDigest: 'd1' } };
   const clean = { ...good, nowMs: 0, expectedDigest: 'd', candidate: { pid: 4242, alive: true, ready: true, codeDigest: 'd' } };
   it('promotes a clean handover with no wait', () => {
     expect(decidePromotion(good)).toMatchObject({ promote: true, waitMs: 0, reconcileFirst: false });
@@ -133,6 +133,22 @@ describe('decidePromotion', () => {
   });
   it('checks group death before escape evidence', () => {
     expect(decidePromotion({ ...good, groupDeath: 'alive', escapeEvidence: undefined })).toEqual({ promote: false, reason: 'group-alive' });
+  });
+  it.each([
+    ['ghRequestTimeoutMs', [undefined, null, 0, -1, NaN, Infinity, -Infinity, '5000', {}, true], 'request-timeout-invalid'],
+    ['settleMs', [undefined, null, -1, NaN, Infinity, -Infinity, '0', {}, false], 'settle-bound-invalid'],
+  ])('refuses promotion with missing or invalid %s, even after the fallback would expire', (field, values, reason) => {
+    for (const value of values) for (const exitCode of [77, 1]) {
+      const input = { ...good, exitCode, lastSendAt: 0, nowMs: 150000, [field]: value };
+      expect(decidePromotion(input)).toEqual({ promote: false, reason });
+    }
+    const input = { ...good, exitCode: 1, lastSendAt: 0, nowMs: 150000 };
+    delete input[field];
+    expect(decidePromotion(input)).toEqual({ promote: false, reason });
+  });
+  it('accepts explicit finite bounds and an explicit zero settle bound', () => {
+    expect(decidePromotion({ ...good, exitCode: 1, lastSendAt: 0, nowMs: 150000 }))
+      .toMatchObject({ promote: true, reconcileFirst: true, waitMs: 0 });
   });
   it.each([
     ['group alive', { groupDeath: 'alive' }, 'group-alive'],

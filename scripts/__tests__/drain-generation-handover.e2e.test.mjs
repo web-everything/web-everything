@@ -26,7 +26,13 @@ async function startBlue(sink) {
 }
 
 const candidate = { pid: 4321, alive: true, ready: true, codeDigest: 'd1' };
-const decide = (groupDeath, escapeEvidence) => decidePromotion({ exitCode: 77, groupDeath, escapeEvidence, recordWritten: true, inFlight: 0, nowMs: 0, expectedDigest: 'd1', candidate });
+const decide = (groupDeath, escapeEvidence) => decidePromotion({ exitCode: 77, groupDeath, escapeEvidence, recordWritten: true, inFlight: 0, nowMs: 0, ghRequestTimeoutMs: 5000, settleMs: 0, expectedDigest: 'd1', candidate });
+
+function assertMutationOrdering(all) {
+  const greenIndex = all.indexOf('green-merge');
+  expect(greenIndex, 'mutation proof requires an actual green merge').toBeGreaterThanOrEqual(0);
+  expect(all.lastIndexOf('blue-merge')).toBeGreaterThan(greenIndex);
+}
 
 /** Green acts only after `go`, which exists only if the barrier said so. `awaitDeath` is injectable for the mutation proof. */
 async function runHandover(sink, awaitDeath) {
@@ -114,6 +120,10 @@ describe('generation handover (ordered exit)', () => {
     expect(lines.lastIndexOf('blue-merge')).toBeLessThan(lines.indexOf('green-merge'));
   }, 30_000);
 
+  it('rejects a mutation proof whose blue effects have no green merge', () => {
+    expect(() => assertMutationOrdering(['blue-merge', 'blue-merge'])).toThrow();
+  });
+
   it('mutation proof: with awaitGroupDeath stubbed to "dead" the ordering is violated', async () => {
     const sink = join(mkdtempSync(join(tmpdir(), 'gen-handover-mut-')), 'sink.log');
     writeFileSync(sink, '');
@@ -121,8 +131,10 @@ describe('generation handover (ordered exit)', () => {
     await sleep(1200); // let the straggler finish so the interleave is visible
     const all = readFileSync(sink, 'utf8').trim().split('\n');
     expect(lines.length).toBeGreaterThan(0);
-    expect(all.lastIndexOf('blue-merge')).toBeGreaterThan(all.indexOf('green-merge')); // the invariant test would FAIL here
+    assertMutationOrdering(all); // the invariant test would FAIL here
   }, 30_000);
+
+  it.todo('D7 / S3: an already-running --under-lease stale child must stop gh calls after ownership transfers; scripts/merge-ai-prs.mjs checks ownership only at startup and needs a per-call ownership gate (outside S1 scope)');
 
   it('an --under-lease child of the old owner makes zero gh calls after the lease changes owner', () => {
     const home = mkdtempSync(join(tmpdir(), 'gen-home-'));

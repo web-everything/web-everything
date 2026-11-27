@@ -47,7 +47,7 @@ export async function awaitGroupDeath({ pgid, identity = null, probeIdentity = n
  * Settle decision for the first act of a new generation. A clean blue (exit 77 AND nothing in flight) needs no
  * wait. Otherwise a request blue sent may still land at the store: green waits until `lastSendAt + bound`
  * (bound >= blue's gh request timeout) and its first act is a reconcile read. Unknown send time waits the full
- * bound from now. Pure.
+ * bound from now. Pure arithmetic helper; promotion validates explicit bounds before calling it.
  * @returns {{waitMs:number, reconcileFirst:boolean, clean:boolean}}
  */
 export function settleDecision({ exitCode, inFlight, lastSendAt = null, nowMs, ghRequestTimeoutMs = DEFAULT_GH_REQUEST_TIMEOUT_MS, settleMs = 0 } = {}) {
@@ -63,6 +63,7 @@ export function settleDecision({ exitCode, inFlight, lastSendAt = null, nowMs, g
 /**
  * Promote the candidate only when every condition holds; anything absent or unknown refuses.
  * Required escapeEvidence must be 'confirmed' by an approved producer; S1 supplies none.
+ * Both bounds must be explicit and finite, even for a clean blue; invalid bounds refuse, never default.
  * A promotion after an unclean blue still carries the settle decision (wait + reconcile read first).
  */
 export function decidePromotion({ exitCode, groupDeath, escapeEvidence, recordWritten, candidate, expectedDigest, inFlight, lastSendAt = null, nowMs, ghRequestTimeoutMs, settleMs } = {}) {
@@ -74,6 +75,8 @@ export function decidePromotion({ exitCode, groupDeath, escapeEvidence, recordWr
   if (!expectedDigest || candidate.codeDigest !== expectedDigest) return { promote: false, reason: 'digest-mismatch' };
   if (!Number.isInteger(inFlight) || inFlight < 0) return { promote: false, reason: 'in-flight-unknown' };
   if (!Number.isInteger(exitCode)) return { promote: false, reason: 'exit-code-unknown' };
+  if (!Number.isFinite(ghRequestTimeoutMs) || ghRequestTimeoutMs <= 0) return { promote: false, reason: 'request-timeout-invalid' };
+  if (!Number.isFinite(settleMs) || settleMs < 0) return { promote: false, reason: 'settle-bound-invalid' };
   const settle = settleDecision({ exitCode, inFlight, lastSendAt, nowMs, ghRequestTimeoutMs, settleMs });
   if (settle.clean) return { promote: true, to: candidate, waitMs: 0, reconcileFirst: false };
   // Not a clean handover (killed, crashed, not 77, or work in flight): the group is dead, but green settles first.

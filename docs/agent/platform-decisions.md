@@ -6771,6 +6771,12 @@ and a source denylist cannot establish it.
 its process group. Existing conditions also apply. Escape evidence comes only from a producer approved by
 its own ruling. Until one exists, ordered-exit handover cannot promote through this module.
 
+**Bounds:** Every promotion requires an explicit finite positive `ghRequestTimeoutMs` and an explicit
+finite nonnegative `settleMs`, including clean handovers. Missing or invalid values refuse with
+`request-timeout-invalid` or `settle-bound-invalid`; no arithmetic-helper default authorizes promotion.
+The operator must supply the real request timeout and a valid settle bound before retrying. Green still
+waits for at least the greater bound after an unclean exit and reconciles first.
+
 **Ordering:** The caller appends the handover record before deciding; `recordWritten` reflects the real
 append result. S1 adds no call site. The G2 source-scan condition becomes “promotion requires approved
 escape evidence”; the producer and gate wiring require their own S2/S3 rulings. Detached-job idleness and
