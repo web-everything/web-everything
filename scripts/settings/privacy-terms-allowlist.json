@@ -2354,6 +2354,14 @@
       "matchSha256": "22423ebcf8167430ec454d9be455cc0646979c63aa0bfc2ca34b5783d4eb3926",
       "lineSha256": "8d29d03b2375859a29714ae601d7942eee76ada2796371204bfc7d65f420c452",
       "reason": "R972 synthetic GitHub App ID exercises inventory decisions; exemption requires the exact fixture path, match and source line."
+    },
+    {
+      "path": "scripts/settings/privacy-terms-allowlist.json",
+      "pattern": "account-id",
+      "matchText": "app_id: 2",
+      "matchSha256": "22423ebcf8167430ec454d9be455cc0646979c63aa0bfc2ca34b5783d4eb3926",
+      "lineSha256": "48909e367acae369601c04a654ef4ca17aab7d2e8af4c96c2b9bc1e209c8f4be",
+      "reason": "R972 policy excerpt quotes the synthetic inventory App ID; exemption requires the exact policy path, match and source line."
     }
   ]
 }
