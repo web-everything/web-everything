@@ -13,7 +13,7 @@
 import { describe, it, expect } from 'vitest';
 import { execSync, spawnSync } from 'node:child_process';
 import { LANE_RELEASE_LITTER_ALLOWLIST } from '../lane-litter.mjs';
-import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -53,6 +53,45 @@ function fakeGit(changedFiles, { deleted = [], untracked = [], grepHits = {}, or
 
 /** Factor 1 = vitest's own timeouts, i.e. the exact pre-WE_VERIFY_TEST_TIMEOUT_FACTOR command. */
 const TODAY = Object.freeze({ WE_VERIFY_TEST_TIMEOUT_FACTOR: '1' });
+
+it('untrusted standards script and missing sibling validator both refuse fallback', () => {
+  const root = mkdtempSync(join(tmpdir(), 'verify-fallback-harden-'));
+  try {
+    for (const scripts of [{ test: 'vitest run', 'check:standards': 'node hostile.mjs' }, { test: 'vitest run' }]) {
+      writeFileSync(join(root, 'package.json'), JSON.stringify({ scripts }));
+      const gate = resolveDefaultGate({
+        fileConfig: null, env: TODAY,
+        runGit: fakeGit(['package.json'], { origin: 'git@github.com:plateauapp/plateau-app.git' }),
+        saturation: () => ({ saturated: false, known: true, reason: 'fixture idle host' }),
+        scripts: Object.keys(scripts),
+        fileExists: p => existsSync(join(root, p)),
+        readRepoFile: p => readFileSync(join(root, p), 'utf8'),
+      });
+      expect.soft(gate.command).toBeNull();
+      expect.soft(gate.decision.mode).toBe('blocked');
+      expect.soft(gate.decision.reasons.join(' ')).toMatch(/validator.*(missing|unreadable)/i);
+      expect(existsSync(join(root, '.git', '.lane-verify'))).toBe(false);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+it.each([
+  ['empty validator', () => ''],
+  ['whitespace-only validator', () => ' \t\r\n'],
+  ['unreadable validator (reader error)', () => { throw new Error('fixture: validator permission denied'); }],
+])('%s refuses broad fallback', (_name, readRepoFile) => {
+  const gate = resolveDefaultGate({
+    fileConfig: null, env: TODAY,
+    runGit: fakeGit(['package.json'], { origin: 'git@github.com:plateauapp/plateau-app.git' }),
+    saturation: () => ({ saturated: false, known: true, reason: 'fixture idle host' }),
+    scripts: ['test', 'check:standards'],
+    fileExists: () => true,
+    readRepoFile,
+  });
+  expect(gate.command).toBeNull();
+  expect(gate.decision.mode).toBe('blocked');
+  expect(gate.decision.reasons.join(' ')).toMatch(/validator.*(missing|unreadable)/i);
+});
 
 describe('broad selection host policy', () => {
   const FALLBACK_GATE = 'npx vitest run && node scripts/check-standards.mjs';
