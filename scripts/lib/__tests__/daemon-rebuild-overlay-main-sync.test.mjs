@@ -4,7 +4,7 @@ import * as fs from 'node:fs';
 import { join, dirname } from 'node:path';
 import ts from 'typescript';
 import { tmpdir } from 'node:os';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { retryGit, kickOverlayMainSync, runOverlayMainSync, selectSyncTargets, resolveOverlayMainSyncMode, VITEST_INVENTORY_MARK } from '../daemon-rebuild/overlay-main-sync.mjs';
 import { addOverlay, readOverlayState, overlayFilePath, appendOverlayEvent } from '../daemon-overlays.mjs';
@@ -21,6 +21,8 @@ vi.mock('node:fs', async importOriginal => ({ ...await importOriginal() }));
 
 const remoteUnconfirmed = 'heavy-admission: remote failed (transport lost) - remote termination unconfirmed; refusing local rerun (exit 124). Confirm remote termination before retrying; remote slot-0 retained until its .unconfirmed marker is cleared.\n';
 
+// Resolve repository assets from this module so fixtures work from any caller cwd.
+const repoRoot = fileURLToPath(new URL('../../../', import.meta.url));
 const temps = [], ref = 'lane/fix';
 const temp = () => { const p = fs.mkdtempSync(join(tmpdir(), 'we-main-sync-test-')); temps.push(p); return p; };
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); temps.splice(0).forEach(p => fs.rmSync(p, { recursive: true, force: true })); });
@@ -265,7 +267,7 @@ describe('overlay main sync', () => {
   it('Vitest 1.x listing loads the scratch vitest.config.ts include and exclude without running tests', async () => {
     const f = fixture({ unrunnable: true });
     fs.rmSync(join(f.root, 'node_modules'), { recursive: true });
-    fs.symlinkSync(join(process.cwd(), 'node_modules'), join(f.root, 'node_modules'), 'dir');
+    fs.symlinkSync(join(repoRoot, 'node_modules'), join(f.root, 'node_modules'), 'dir');
     delete f.deps.testListRunner;
     expect(await job(f)).toMatchObject({ pushed: true, tests: ['overlay.test.mjs', 'worker0.test.mjs'] });
   }, 90_000);
@@ -273,7 +275,7 @@ describe('overlay main sync', () => {
   it('Vitest listing establishes the CLI environment, so a config gated on VITEST/TEST/NODE_ENV still discovers tests', async () => {
     const f = fixture({ envGated: true });
     fs.rmSync(join(f.root, 'node_modules'), { recursive: true });
-    fs.symlinkSync(join(process.cwd(), 'node_modules'), join(f.root, 'node_modules'), 'dir');
+    fs.symlinkSync(join(repoRoot, 'node_modules'), join(f.root, 'node_modules'), 'dir');
     // The daemon is started outside Vitest: none of the CLI's flags are present.
     for (const key of ['TEST', 'VITEST', 'NODE_ENV']) delete f.env[key];
     delete f.deps.testListRunner;
@@ -283,7 +285,7 @@ describe('overlay main sync', () => {
   it('Vitest listing ignores config or plugin stdout around the inventory (banner, JSON-like lines, unterminated and late writes)', async () => {
     const f = fixture({ noisy: true });
     fs.rmSync(join(f.root, 'node_modules'), { recursive: true });
-    fs.symlinkSync(join(process.cwd(), 'node_modules'), join(f.root, 'node_modules'), 'dir');
+    fs.symlinkSync(join(repoRoot, 'node_modules'), join(f.root, 'node_modules'), 'dir');
     delete f.deps.testListRunner;
     expect(await job(f)).toMatchObject({ pushed: true, tests: ['overlay.test.mjs', 'worker0.test.mjs'] });
   }, 90_000);
@@ -291,7 +293,7 @@ describe('overlay main sync', () => {
   it('Vitest listing runs in the test run\'s environment, so a config that reacts to the daemon\'s LANE_POOL_ROOT cannot drop tests', async () => {
     const f = fixture({ laneGated: true });
     fs.rmSync(join(f.root, 'node_modules'), { recursive: true });
-    fs.symlinkSync(join(process.cwd(), 'node_modules'), join(f.root, 'node_modules'), 'dir');
+    fs.symlinkSync(join(repoRoot, 'node_modules'), join(f.root, 'node_modules'), 'dir');
     f.env.LANE_POOL_ROOT = join(f.base, 'lanes'); // set for the daemon, deleted for the test run
     delete f.deps.testListRunner;
     expect(await job(f)).toMatchObject({ pushed: true, tests: ['overlay.test.mjs', 'worker0.test.mjs'] });
@@ -309,7 +311,7 @@ describe('overlay main sync', () => {
   it('Vitest listing keeps an operator-chosen NODE_ENV, as the CLI only defaults it', async () => {
     const f = fixture({ envGated: true });
     fs.rmSync(join(f.root, 'node_modules'), { recursive: true });
-    fs.symlinkSync(join(process.cwd(), 'node_modules'), join(f.root, 'node_modules'), 'dir');
+    fs.symlinkSync(join(repoRoot, 'node_modules'), join(f.root, 'node_modules'), 'dir');
     for (const key of ['TEST', 'VITEST']) delete f.env[key];
     f.env.NODE_ENV = 'production'; // the gated config requires 'test', so nothing is discoverable: skip, never run
     delete f.deps.testListRunner;
@@ -1755,7 +1757,7 @@ describe('overlay main sync', () => {
     vi.spyOn(Date, 'now').mockReturnValue(started);
     fs.writeFileSync(sidecar(f), '{broken');
     tick(f, { spawnFn: spawner() });
-    const moduleUrl = pathToFileURL(join(process.cwd(), 'scripts/lib/daemon-rebuild/overlay-main-sync.mjs')).href;
+    const moduleUrl = pathToFileURL(join(repoRoot, 'scripts/lib/daemon-rebuild/overlay-main-sync.mjs')).href;
     const code = `
       import { readFileSync, existsSync } from 'node:fs';
       import { kickOverlayMainSync } from ${JSON.stringify(moduleUrl)};
@@ -1810,7 +1812,7 @@ describe('overlay main sync', () => {
 
 describe('health-watch overlay main sync wiring', () => {
   it('tick registers overlayMainSync and forwards the actual flags through its error boundary', () => {
-    const source = fs.readFileSync(join(process.cwd(), 'scripts/conveyor/health-watch.mjs'), 'utf8');
+    const source = fs.readFileSync(join(repoRoot, 'scripts/conveyor/health-watch.mjs'), 'utf8');
     const ast = ts.createSourceFile('health-watch.mjs', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
     const tickNode = ast.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === 'tick');
     const assignments = [];
