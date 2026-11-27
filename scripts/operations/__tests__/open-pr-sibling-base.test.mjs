@@ -300,6 +300,19 @@ describe('open-pr sibling base: landed-sibling evidence', () => {
     expect(result.detail).toContain('lane/7357');
   });
 
+  it('fails closed when the local lane was recreated elsewhere and its record is not in the fetched tip history', () => {
+    const f = fixture();
+    f.git(['checkout', '-qb', 'lane/side', 'main']);
+    f.commit('side', 'unrelated side work');
+    f.git(['checkout', 'lane/own']);
+    f.git(['update-ref', 'refs/remotes/origin/lane/7357', 'refs/heads/lane/7357']);
+    f.git(['branch', '-D', 'lane/7357']);
+    f.git(['branch', 'lane/7357', 'lane/side']);
+    const result = f.run();
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base-unknown' });
+    expect(result.detail).toContain('lane creation record for lane/7357 is not in the history of refs/remotes/origin/lane/7357');
+  });
+
   it('fails closed for a remote-only sibling: a fetched ref has no local creation record', () => {
     const f = fixture();
     f.git(['update-ref', 'refs/remotes/origin/lane/7357', 'refs/heads/lane/7357']);

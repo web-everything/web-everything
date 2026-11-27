@@ -144,6 +144,10 @@ export function checkSiblingBase({ git, ref, sha, base = 'main', now = () => per
       if (history.length > 2048) throw new Error('lane creation evidence exceeds 2048 reflog entries');
       const creation = /^([a-f0-9]{40})\0branch: Created from .+$/.exec(history.at(-1) || '');
       if (!creation) throw new Error(`missing lane creation evidence for ${lane}`);
+      // A recreated or diverged lane (or a local lane unrelated to this fetched tip) has a record that
+      // does not belong to this tip's history; using it would draw the ownership boundary in the wrong place.
+      try { read(['merge-base', '--is-ancestor', creation[1], tip]); }
+      catch { throw new Error(`lane creation record for ${lane} is not in the history of ${name}`); }
       const ownHistory = new Set(commits('--first-parent', tip, `^${creation[1]}`, `^${main}`, `^${parent}`));
       if (![...ownHistory].some(commit => carried.has(commit))) continue;
       for (const inherited of shared) {
