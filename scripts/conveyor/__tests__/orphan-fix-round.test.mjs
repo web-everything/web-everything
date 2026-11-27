@@ -112,6 +112,26 @@ describe('ORPHAN-LIST-INCOMPLETE listing boundary', () => {
     });
   });
 
+  it.each([
+    { complete: false, reason: 'complete' },
+    { complete: true, reason: 'page-cap' },
+  ])('fails closed when listing complete=$complete disagrees with reason=$reason', async status => {
+    const f = fixture();
+    const isOwned = vi.fn(async () => false);
+    const result = await runOrphanFixRoundPass({ ...f.options, isOwned,
+      listBounced: () => ({ items: [pr4715([])], ...status, continuation: null }),
+      cursor: { [slug]: 4715 } });
+    expect(result).toMatchObject({ complete: false, reason: 'required-evidence-missing', handled: 0,
+      listings: { [slug]: { complete: false, reason: 'required-evidence-missing' } },
+      repoCursors: { [slug]: 4715 } });
+    expect(result.rows).toContainEqual(expect.objectContaining({ repo: slug, decision: 'error',
+      reason: expect.stringMatching(/required-evidence-missing.*retry.*operator/i) }));
+    expect(f.exec).not.toHaveBeenCalled();
+    expect(isOwned).not.toHaveBeenCalled();
+    expect(f.readComments).not.toHaveBeenCalled();
+    expect(f.write).not.toHaveBeenCalled();
+  });
+
   it('deadline before listing makes no external call and retains retry evidence', () => {
     const f = fixture();
     const result = orphanListing.readBouncedListing(slug, { exec: f.exec, now: f.now, timeoutMs: 1000, deadlineAt: 0 });

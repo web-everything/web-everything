@@ -71,6 +71,23 @@ describe('ORPHAN-LIST-INCOMPLETE dispatch consumer', () => {
   it.each([null, {}, { rows: [] }, { complete: 'true', rows: [] }])('required-evidence-missing: legacy guard result holds before any writer (%j)', scan =>
     held(scan, result => expect(result.refusals[0].why).toMatch(/required-evidence-missing.*retry.*operator/i)));
 
+  it('holds reconciliation and dispatch when the real producer receives complete:false with reason:complete', async () => {
+    const unexpected = vi.fn(() => { throw new Error('contradictory listing reached PR processing'); });
+    const scan = await orphanListing.runOrphanFixRoundPass({ env: {}, nowMs: 0, now: () => 0,
+      repos: [{ key: 'we', slug }],
+      listBounced: () => ({ items: [{ number: 1, labels: [{ name: 'review:changes' }],
+        headRefOid: 'a'.repeat(40), isDraft: false }], complete: false, reason: 'complete', continuation: null }),
+      readComments: unexpected, isOwned: unexpected, cardReadable: unexpected,
+      rearm: unexpected, redispatch: unexpected, escalate: unexpected, postComment: unexpected,
+      resolveProfile: unexpected });
+    expect(scan).toMatchObject({ complete: false, reason: 'required-evidence-missing', handled: 0 });
+    expect(unexpected).not.toHaveBeenCalled();
+    await held(scan, result => {
+      expect(result.refusals[0].why).toMatch(/required-evidence-missing.*retry.*operator/i);
+      expect(result.orphanScan).toBe(scan);
+    });
+  });
+
   it.each(['page-cap', 'page-failure', 'listing-deadline'])('real producer %s reaches the dispatch consumer as incomplete and preserves continuation', async reason => {
     let time = 0;
     const exec = vi.fn((_cmd, args) => {

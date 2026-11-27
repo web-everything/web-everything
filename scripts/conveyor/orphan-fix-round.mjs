@@ -395,7 +395,8 @@ export async function runOrphanFixRoundPass({
       // Existing array callbacks explicitly supply a full list. Envelopes require affirmative evidence.
       if (Array.isArray(listing)) listing = { items: listing, complete: true, reason: 'complete', continuation: null };
       if (!listing || !Array.isArray(listing.items) || typeof listing.complete !== 'boolean'
-        || typeof listing.reason !== 'string' || (listing.complete && (listing.reason !== 'complete' || listing.continuation !== null))) {
+        || typeof listing.reason !== 'string' || listing.complete !== (listing.reason === 'complete')
+        || (listing.complete && listing.continuation !== null)) {
         listing = { items: [], complete: false, reason: 'required-evidence-missing', continuation: null, action: listingAction };
       }
       listings[slug] = listing;
