@@ -1367,6 +1367,9 @@ describe('audit history repair digest (BLD-8039)', () => {
       notify: () => ({ ok: true }), enqueue: () => {}, drain: () => {} });
     const held = out => {
       expect(out.incomplete).toBe(true); expect(out.act).toEqual([]);
+      expect(out.items).toEqual([expect.objectContaining({
+        lane: 'operator', action: 'repair-audit-history', state: 'audit-history-incomplete',
+      })]);
       expect(dispatchRestart).not.toHaveBeenCalled();
       expect(out.records.some(r => ['intent', 'did', 'would-do'].includes(r.phase))).toBe(false);
       const emitted = digest(out);

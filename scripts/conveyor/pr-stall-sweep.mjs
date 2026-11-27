@@ -421,7 +421,8 @@ export async function runStallSweep({ now = Date.now(), env = process.env, state
         evidence: historyIssues.slice(0, 3) });
     }
   }
-  for (const { context, metadata, status, ownerAlive } of pending) {
+  // Partial history cannot establish restart counts; preserve the audit repair item in the per-head digest.
+  if (historyOk) for (const { context, metadata, status, ownerAlive } of pending) {
     const restarts = spending(afterRestartResets(history)).filter(h => h.prHead === metadata.prHead && h.action === 'restart-red-team');
     const latest = restarts.length ? restarts.reduce((latest, h) => Math.max(latest, Date.parse(h.ts)), -Infinity) : null;
     const c = classifyStall({ ...context, redTeam: { now, ageMinutes: context.row.ageMinutes, status, ownerAlive,

@@ -21,7 +21,7 @@ export default {
     try {
       const { readAuditHistory, runStallSweep, planStallActions, STALL_SWEEP_DEFAULTS } = await import(pathToFileURL(join(sourceRoot, SOURCE)).href);
       const now = Date.parse('2026-11-26T18:00:00Z'), ts = new Date(now - 3 * 3600_000).toISOString();
-      const repo = 'web-everything/web-everything', pr = 11, head = 'a'.repeat(40), prHead = `${repo}#${pr}@${head}`;
+      const repo = 'example/project', pr = 11, head = 'a'.repeat(40), prHead = `${repo}#${pr}@${head}`;
       const receipt = { ts, phase: 'intent', action: 'tooling-card', prHead, key: `${prHead}:original` };
       const pass = JSON.stringify({ ts, phase: 'pass', settings: { padding: 'x'.repeat(2048) } }) + '\n';
       writeFileSync(join(dir, '2026-10.jsonl'), JSON.stringify(receipt) + '\n' + pass.repeat(4096));
