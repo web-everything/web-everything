@@ -189,6 +189,9 @@ export function publishSharedPass(o) {
     atomic(fs, join(dir, `${i.key}.pass.json`), r, true); notice(o, 'smoke-shared-published', { key: i.key });
     try { const names = fs.readdirSync(dir); if (names.length > 10000) notice(o, 'smoke-shared-prune-deferred', { reason: 'entry-limit; operator should prune aged records' });
       for (const name of names.slice(0, 10000)) { const p = join(dir, name), st = maybe(() => fs.lstatSync(p)); if (!st) continue; const age = now() - st.mtimeMs;
+        // Only empty abandoned lock directories are disposable. Never recursively
+        // remove quarantined ownership evidence, even when its mtime is old.
+        if (/^[a-f0-9]{64}\.lock\.stale-[a-f0-9]{8}$/.test(name) && st.isDirectory() && age >= 86400000) maybe(() => fs.rmdirSync(p));
         if ((/^[a-f0-9]{64}\.pass\.json$/.test(name) && age >= 86400000) || (name.endsWith('.tmp') && age >= 3600000)) maybe(() => fs.rmSync(p, { recursive: true })); }
     } catch { notice(o, 'smoke-shared-prune-deferred', { reason: 'prune-unreadable; operator should inspect store' }); }
     return true;

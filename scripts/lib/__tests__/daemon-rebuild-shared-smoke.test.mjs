@@ -581,6 +581,14 @@ describe('audit: shared evidence never bypasses current inputs or ownership', ()
     expect(fs.readFileSync(owner, 'utf8')).toBe('{"token":"replacement"}');
     expect(fs.existsSync(`${lock}.guard`)).toBe(true);
   });
+  it('preserves aged quarantined ownership evidence without a guard', () => {
+    const options = { ...f.store(), result: pass(), canPublish };
+    const moved = join(f.stateDir, 'smoke-shared', `${options.identity.key}.lock.stale-12345678`);
+    const owner = write(join(moved, 'owner.json'), '{"token":"replacement"}');
+    fs.utimesSync(moved, 0, new Date(f.now() - 86400001));
+    expect(publishSharedPass(options)).toBe(true);
+    expect(fs.readFileSync(owner, 'utf8')).toBe('{"token":"replacement"}');
+  });
   it('rechecks the environment on an hour-old hit and preserves refusals and missing-runner fallback', async () => {
     expect(publishSharedPass({ ...f.store(), result: pass(), canPublish })).toBe(true);
     f.advance(3600000);
