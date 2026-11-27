@@ -138,6 +138,33 @@ describe('open-pr sibling base', () => {
     expect(f.calls[0]).toContain('--check');
   });
 
+  it('refuses a different sibling lane sharing the submitted head', () => {
+    const f = fixture();
+    // lane/own is created from the unmerged sibling and submitted before adding a commit: same tip, different lane.
+    f.git(['checkout', 'lane/7357']);
+    f.git(['branch', '-f', 'lane/own', 'lane/7357']);
+    f.git(['checkout', 'lane/own']);
+    const result = f.run();
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base' });
+    expect(result.detail).toContain('lane/7357');
+    expect(f.calls).toHaveLength(1);
+    expect(f.calls[0]).toContain('--check');
+  });
+
+  it('admits a same-tip lane once the sibling work landed, and a same-tip lane with no own commits', () => {
+    const f = fixture();
+    f.git(['checkout', 'lane/7357']);
+    f.git(['branch', '-f', 'lane/own', 'lane/7357']);
+    f.git(['checkout', 'lane/own']);
+    f.git(['branch', 'lane/empty-copy']);
+    f.git(['checkout', 'main']);
+    f.git(['merge', '--squash', 'lane/7357']);
+    f.git(['commit', '-qm', 'land sibling (#7357)']);
+    f.git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
+    f.git(['checkout', 'lane/own']);
+    expect(f.run()).toMatchObject({ outcome: 'opened' });
+  });
+
   it('fails closed when shared history has no surviving lane creation evidence', () => {
     const f = fixture();
     f.git(['reflog', 'expire', '--expire=all', 'refs/heads/lane/7357']);
@@ -322,6 +349,16 @@ describe('open-pr sibling base: landed-sibling evidence', () => {
       for (const lane of ['lane/7357', 'lane/7358', 'lane/7359']) squash(lane);
       f.git(['checkout', 'lane/own']);
       expect(f.run()).toMatchObject({ outcome: 'opened' });
+    });
+
+    it('admits a separately squash-landed stack with a declared parent', () => {
+      const { f, squash } = stack();
+      // Control: while the child is unmerged, the declared parent never clears it.
+      expect(f.run('lane/7357')).toMatchObject({ outcome: 'refused', reason: 'sibling-base' });
+      squash('lane/7357');
+      squash('lane/7358');
+      f.git(['checkout', 'lane/own']);
+      expect(f.run('lane/7357')).toMatchObject({ outcome: 'opened' });
     });
 
     it('still names the child when only the parent landed', () => {

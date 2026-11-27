@@ -128,12 +128,16 @@ export function checkSiblingBase({ git, ref, sha, base = 'main', now = () => per
       if (!match) throw new Error('unreadable lane ref');
       const [, name, tip] = match;
       const lane = laneName(name);
-      if (lane.replace(/-v\d+$/, '') === ownLane || tip === head) continue;
+      if (lane.replace(/-v\d+$/, '') === ownLane) continue;
+      // A different lane at the very tip we submit shares our whole history: its ownership evidence is
+      // judged like any other lane's. Only a lane that is strictly AHEAD of this head built on it, so
+      // the head itself is the sibling's inheritance only when the two tips coincide.
+      const inheritedByUs = inherited => carried.has(inherited) && (inherited !== head || tip === head);
       // A lane may have advanced since this branch forked. Inspect the shared ancestry,
       // and judge only the inherited portion for squash equivalence below.
       const shared = list(read(['merge-base', '--all', head, tip])).map(commitSha);
       if (!shared.length) throw new Error('missing sibling ancestry');
-      if (!shared.some(inherited => inherited !== head && carried.has(inherited))) continue;
+      if (!shared.some(inheritedByUs)) continue;
       // Shared ancestry alone has no ownership direction. A local creation record
       // bounds this lane's own first-parent work, excluding the history it inherited.
       // Missing/expired records cannot safely establish that direction.
@@ -154,7 +158,7 @@ export function checkSiblingBase({ git, ref, sha, base = 'main', now = () => per
       const ownHistory = new Set(commits('--first-parent', tip, `^${creation[1]}`, `^${main}`, `^${parent}`));
       if (![...ownHistory].some(commit => carried.has(commit))) continue;
       for (const inherited of shared) {
-        if (inherited !== head && carried.has(inherited)) candidates.push({ lane, tip: inherited });
+        if (inheritedByUs(inherited)) candidates.push({ lane, tip: inherited });
       }
     }
     if (!candidates.length) return { ok: true };
@@ -193,7 +197,8 @@ export function checkSiblingBase({ git, ref, sha, base = 'main', now = () => per
       // The parents are judged in their own turn, so excluding them here never clears them. Only ancestors
       // are set aside: a descendant or an unrelated sibling contains commits this lane owns.
       const parents = unique.filter(other => other.tip !== tip && isAncestor(other.tip, tip));
-      const own = commits('--topo-order', tip, `^${main}`, ...parents.map(other => `^${other.tip}`));
+      // An explicitly declared parent is set aside the same way: its commits never belong to this sibling's own range.
+      const own = commits('--topo-order', tip, `^${main}`, ...(parentRef ? [`^${parent}`] : []), ...parents.map(other => `^${other.tip}`));
       if (rangeLanded(own, `${own.at(-1)}^`, tip)) continue;
       siblings.push(lane);
     }
