@@ -1,17 +1,278 @@
-import { describe, it, expect } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import { describe, it, expect, afterEach } from 'vitest';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { planWrongBranchHeal, healWrongBranch, parseTrackedChanges, resolveWrongBranchHealSettings } from '../daemon-rebuild/wrong-branch-heal.mjs';
+import { planWrongBranchHeal, healWrongBranch, parseTrackedChanges, resolveWrongBranchHealSettings, IN_PROGRESS_MARKERS } from '../daemon-rebuild/wrong-branch-heal.mjs';
 
 const settings = { branches: ['ops/review-requests'], pathPrefixes: ['verdict-ledger/'] };
+
+// DAEMON-CLONE-DETACHED-HEAL fixtures never inherit Git configuration, hooks, cwd or daemon state.
+const detachedTemps = [];
+afterEach(() => { for (const dir of detachedTemps.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+function detachedFixture() {
+  const dir = mkdtempSync(join(tmpdir(), 'detached-heal-'));
+  detachedTemps.push(dir);
+  const root = join(dir, 'clone');
+  const origin = join(dir, 'origin.git');
+  mkdirSync(root);
+  const env = {
+    PATH: process.env.PATH, HOME: dir, TMPDIR: dir, LC_ALL: 'C',
+    GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(dir, 'no-global-config'),
+    GIT_AUTHOR_NAME: 'fixture', GIT_AUTHOR_EMAIL: 'fixture@example.invalid',
+    GIT_COMMITTER_NAME: 'fixture', GIT_COMMITTER_EMAIL: 'fixture@example.invalid',
+    GIT_AUTHOR_DATE: '2026-11-27T12:00:00Z', GIT_COMMITTER_DATE: '2026-11-27T12:00:00Z',
+  };
+  const calls = [];
+  const git = args => {
+    calls.push(args);
+    return spawnSync('git', args, { cwd: root, env, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024 });
+  };
+  const ok = args => { const r = git(args); expect(r.status, r.stderr).toBe(0); return r.stdout.trim(); };
+  ok(['init', '--bare', '--quiet', '-b', 'main', origin]);
+  ok(['init', '--quiet', '-b', 'main']);
+  ok(['remote', 'add', 'origin', origin]);
+  writeFileSync(join(root, 'tracked.txt'), 'A\n');
+  writeFileSync(join(root, 'collision.txt'), 'adopted bytes\n');
+  writeFileSync(join(root, '.gitignore'), 'collision.txt\n');
+  ok(['add', '-f', 'tracked.txt', 'collision.txt', '.gitignore']);
+  ok(['commit', '--quiet', '-m', 'A: adopted']);
+  const adoptedHead = ok(['rev-parse', 'HEAD']);
+  ok(['checkout', '--quiet', '--detach']);
+  ok(['rm', '--quiet', 'collision.txt']);
+  writeFileSync(join(root, 'tracked.txt'), 'B\n');
+  ok(['add', 'tracked.txt']);
+  ok(['commit', '--quiet', '-m', 'B: detached']);
+  const oldHead = ok(['rev-parse', 'HEAD']);
+  writeFileSync(join(root, 'tracked.txt'), 'C\n');
+  ok(['add', 'tracked.txt']);
+  ok(['commit', '--quiet', '-m', 'C: remote tip']);
+  const tip = ok(['rev-parse', 'HEAD']);
+  // Remote IO is deliberately replaced with an explicit local tracking ref.
+  ok(['update-ref', 'refs/remotes/origin/main', tip]);
+  ok(['checkout', '--quiet', '--detach', oldHead]);
+  const refs = () => ok(['for-each-ref', '--format=%(refname)', 'refs/we/wrong-branch-heal/']).split('\n').filter(Boolean);
+  const heal = (extra = {}) => healWrongBranch({ git, settings, adoptedHead, now: () => 1234, ...extra });
+  const unchanged = (head = oldHead, main = adoptedHead) => {
+    expect(ok(['rev-parse', 'HEAD'])).toBe(head);
+    expect(ok(['rev-parse', 'refs/heads/main'])).toBe(main);
+    expect(git(['symbolic-ref', '--quiet', 'HEAD']).status).toBe(1);
+    expect(refs()).toEqual([]);
+  };
+  return { dir, root, git, ok, calls, adoptedHead, oldHead, tip, refs, heal, unchanged };
+}
+
+describe('DAEMON-CLONE-DETACHED-HEAL', () => {
+  const pure = overrides => planWrongBranchHeal({ branch: null, headSha: 'b'.repeat(40), mainSha: 'a'.repeat(40),
+    adoptedHead: 'a'.repeat(40), headReachability: 'reachable', changedPaths: [], hasMain: true, settings, inProgress: [], ...overrides });
+
+  it.each(['origin/main', 'ancestor'])('heals-detached-ahead-of-main: %s, preserving old HEAD under a named ref', where => {
+    const f = detachedFixture();
+    const head = where === 'origin/main' ? f.tip : f.oldHead;
+    f.ok(['checkout', '--quiet', '--detach', head]);
+    expect(f.git(['merge-base', '--is-ancestor', f.adoptedHead, head]).status).toBe(0);
+    expect(head).not.toBe(f.adoptedHead);
+    const result = f.heal();
+    expect(result.healed).toBe(true);
+    expect(f.ok(['symbolic-ref', 'HEAD'])).toBe('refs/heads/main');
+    expect(f.ok(['rev-parse', 'HEAD'])).toBe(f.adoptedHead);
+    expect(result.savedRef).toBe(`refs/we/wrong-branch-heal/1234-${head.slice(0, 9)}`);
+    expect(f.ok(['rev-parse', result.savedRef])).toBe(head);
+    expect(f.calls).toContainEqual(['merge-base', '--is-ancestor', head, 'refs/remotes/origin/main']);
+    expect(f.calls).toContainEqual(['checkout', '--quiet', '--no-overwrite-ignore', 'main']);
+    const save = f.calls.find(args => args[0] === 'update-ref' && args.includes(result.savedRef));
+    expect(save.slice(-2)).toEqual([head, '0'.repeat(40)]);
+  });
+
+  it('refuses dirty tracked tree before saving', () => {
+    const f = detachedFixture();
+    writeFileSync(join(f.root, 'tracked.txt'), 'dirty\n');
+    expect(f.heal().reason).toBe('detached-with-changes');
+    f.unchanged();
+    expect(readFileSync(join(f.root, 'tracked.txt'), 'utf8')).toBe('dirty\n');
+  });
+  it('refuses foreign detached commits before saving', () => {
+    const f = detachedFixture();
+    f.ok(['update-ref', 'refs/remotes/origin/main', f.adoptedHead]);
+    expect(f.heal().reason).toBe('detached-foreign-commit');
+    f.unchanged();
+  });
+  it('refuses local main different from the adopted head', () => {
+    const f = detachedFixture();
+    expect(f.heal({ adoptedHead: f.tip }).reason).toBe('detached-not-adopted');
+    f.unchanged();
+  });
+  it.each([
+    ['adoptedHead', null], ['adoptedHead', 'bad'], ['mainSha', 'bad'], ['headSha', 'bad'],
+  ])('refuses invalid %s=%s before saving', (field, value) => {
+    expect(pure({ [field]: value }).reason).toBe('detached-not-adopted');
+    const f = detachedFixture();
+    const git = args => {
+      if (args.join(' ') === `rev-parse --verify --quiet ${field === 'mainSha' ? 'refs/heads/main' : 'HEAD'}` && field !== 'adoptedHead') {
+        return { status: 0, stdout: value };
+      }
+      return f.git(args);
+    };
+    expect(f.heal({ git, ...(field === 'adoptedHead' ? { adoptedHead: value } : {}) }).reason).toBe('detached-not-adopted');
+    f.unchanged();
+  });
+  it.each(IN_PROGRESS_MARKERS)('refuses operation marker %s at the helper', marker => {
+    const f = detachedFixture();
+    writeFileSync(join(f.root, '.git', marker), 'paused\n');
+    expect(f.heal().reason).toBe('operation-in-progress');
+    f.unchanged();
+    expect(readFileSync(join(f.root, '.git', marker), 'utf8')).toBe('paused\n');
+  });
+  it.each(['missing-origin-main', 'exit-128', 'timeout', 'throw'])('refuses unreadable reachability: %s', fault => {
+    const f = detachedFixture();
+    if (fault === 'missing-origin-main') f.ok(['update-ref', '-d', 'refs/remotes/origin/main']);
+    const git = args => {
+      if (args[0] === 'merge-base' && fault !== 'missing-origin-main') {
+        if (fault === 'throw') throw new Error('injected unreadable reachability');
+        return { status: fault === 'timeout' ? null : 128, stdout: '', error: new Error(fault) };
+      }
+      return f.git(args);
+    };
+    expect(f.heal({ git }).reason).toBe('detached-reachability-unreadable');
+    f.unchanged();
+  });
+  it.each([undefined, 'unexpected', 'unreadable'])('pure reachability %s fails closed', headReachability => {
+    expect(pure({ headReachability }).reason).toBe('detached-reachability-unreadable');
+  });
+  it('save-failed stops without attempting checkout', () => {
+    const f = detachedFixture();
+    const calls = [];
+    const git = args => { calls.push(args); return args[0] === 'update-ref' ? { status: 128, stderr: 'injected save refusal' } : f.git(args); };
+    expect(f.heal({ git }).reason).toBe('save-failed');
+    expect(calls.some(args => args[0] === 'checkout')).toBe(false);
+    f.unchanged();
+  });
+  it.each(['untracked', 'ignored'])('switch-failed preserves %s collision bytes and saved ref', collision => {
+    const f = detachedFixture();
+    // The untracked variant removes the ignore rule in its own detached commit.
+    let head = f.oldHead;
+    if (collision === 'untracked') {
+      writeFileSync(join(f.root, '.gitignore'), '');
+      f.ok(['add', '.gitignore']); f.ok(['commit', '--quiet', '-m', 'remove ignore rule']);
+      head = f.ok(['rev-parse', 'HEAD']);
+      f.ok(['update-ref', 'refs/remotes/origin/main', head]);
+    }
+    const bytes = Buffer.from([0, 1, 255, 10, 13]);
+    writeFileSync(join(f.root, 'collision.txt'), bytes);
+    const result = f.heal();
+    expect(result.reason).toBe('switch-failed');
+    expect(f.git(['symbolic-ref', '--quiet', 'HEAD']).status).toBe(1);
+    expect(f.ok(['rev-parse', 'HEAD'])).toBe(head);
+    expect(f.ok(['rev-parse', result.detail.savedRef])).toBe(head);
+    expect(f.refs()).toEqual([result.detail.savedRef]);
+    expect(readFileSync(join(f.root, 'collision.txt'))).toEqual(bytes);
+  });
+  it.each(['head', 'main', 'head-unreadable', 'main-missing', 'dirty', 'status-unreadable', 'marker', 'git-dir-unreadable'])(
+    're-verifies before mutation: %s changed since planning', change => {
+      const f = detachedFixture();
+      let statusRead = false;
+      let mutated = false;
+      const git = args => {
+        const key = args.join(' ');
+        if (statusRead && !mutated) {
+          mutated = true;
+          if (change === 'head') f.ok(['checkout', '--quiet', '--detach', f.tip]);
+          if (change === 'main') f.ok(['update-ref', 'refs/heads/main', f.tip]);
+          if (change === 'main-missing') f.ok(['update-ref', '-d', 'refs/heads/main']);
+          if (change === 'dirty') writeFileSync(join(f.root, 'tracked.txt'), 'raced\n');
+          if (change === 'marker') writeFileSync(join(f.root, '.git', 'REBASE_HEAD'), f.oldHead);
+        }
+        if (statusRead && ((change === 'head-unreadable' && key === 'rev-parse --verify --quiet HEAD')
+          || (change === 'status-unreadable' && args[0] === 'status')
+          || (change === 'git-dir-unreadable' && key === 'rev-parse --absolute-git-dir'))) return { status: 128, stdout: '' };
+        const result = f.git(args);
+        if (args[0] === 'status') statusRead = true;
+        return result;
+      };
+      const reason = { dirty: 'detached-with-changes', 'status-unreadable': 'status-unreadable', marker: 'operation-in-progress',
+        'git-dir-unreadable': 'git-dir-unreadable' }[change] ?? 'detached-state-changed';
+      const result = f.heal({ git });
+      expect(result.reason).toBe(reason);
+      if (reason === 'detached-state-changed') expect(result.detail.field).toBe(change.startsWith('head') ? 'headSha' : 'mainSha');
+      expect(mutated).toBe(true);
+      expect(f.ok(['rev-parse', 'HEAD'])).toBe(change === 'head' ? f.tip : f.oldHead);
+      if (change !== 'main-missing') expect(f.ok(['rev-parse', 'refs/heads/main'])).toBe(change === 'main' ? f.tip : f.adoptedHead);
+      else expect(f.git(['rev-parse', '--verify', 'refs/heads/main']).status).not.toBe(0);
+      expect(f.refs()).toEqual([]);
+    });
+  it('re-verifies before checkout: HEAD moved after saving refuses checkout and retains the original HEAD', () => {
+    const f = detachedFixture();
+    const calls = [];
+    let savedRef = null;
+    let interveningHead = null;
+    const git = args => {
+      calls.push(args);
+      const result = f.git(args);
+      if (args[0] === 'update-ref' && args[1].startsWith('refs/we/wrong-branch-heal/') && result.status === 0) {
+        savedRef = args[1];
+        expect(f.ok(['rev-parse', savedRef])).toBe(f.oldHead);
+        writeFileSync(join(f.root, 'tracked.txt'), 'intervening committed work\n');
+        f.ok(['add', 'tracked.txt']);
+        f.ok(['commit', '--quiet', '-m', 'intervening work after audit save']);
+        interveningHead = f.ok(['rev-parse', 'HEAD']);
+      }
+      return result;
+    };
+    const result = f.heal({ git });
+    expect(interveningHead).toMatch(/^[a-f0-9]{40}$/);
+    expect(interveningHead).not.toBe(f.oldHead);
+    expect(result).toEqual({ healed: false, reason: 'detached-state-changed', detail: { field: 'headSha', savedRef } });
+    expect(calls.filter(args => args[0] === 'checkout')).toEqual([]);
+    expect(f.ok(['rev-parse', 'HEAD'])).toBe(interveningHead);
+    expect(f.git(['symbolic-ref', '--quiet', 'HEAD']).status).toBe(1);
+    expect(f.ok(['rev-parse', 'refs/heads/main'])).toBe(f.adoptedHead);
+    expect(readFileSync(join(f.root, 'tracked.txt'), 'utf8')).toBe('intervening committed work\n');
+    expect(f.refs()).toEqual([savedRef]);
+    expect(f.ok(['rev-parse', result.detail.savedRef])).toBe(f.oldHead);
+  });
+  it('saved-ref collision never replaces an existing audit ref', () => {
+    const f = detachedFixture();
+    const ref = `refs/we/wrong-branch-heal/1234-${f.oldHead.slice(0, 9)}`;
+    f.ok(['update-ref', ref, f.adoptedHead]);
+    const result = f.heal();
+    expect(result).toMatchObject({ healed: false, reason: 'save-failed' });
+    expect(f.ok(['rev-parse', ref])).toBe(f.adoptedHead);
+    expect(f.ok(['rev-parse', 'HEAD'])).toBe(f.oldHead);
+    expect(f.git(['symbolic-ref', '--quiet', 'HEAD']).status).toBe(1);
+  });
+  it('unreadable HEAD wins over malformed adoptedHead', () => {
+    const f = detachedFixture();
+    const git = args => args.join(' ') === 'rev-parse --verify --quiet HEAD' ? { status: 128, stdout: '' } : f.git(args);
+    expect(f.heal({ git, adoptedHead: 'bad' }).reason).toBe('detached-or-unreadable-head');
+    f.unchanged();
+  });
+  it('detached at main needs no adoption evidence, reachability or saved ref', () => {
+    const f = detachedFixture();
+    f.ok(['checkout', '--quiet', '--detach', f.adoptedHead]);
+    const calls = [];
+    const git = args => { calls.push(args); return f.git(args); };
+    expect(f.heal({ git, adoptedHead: null })).toMatchObject({ healed: true, savedRef: null });
+    expect(calls.some(args => ['merge-base', 'update-ref'].includes(args[0]))).toBe(false);
+    expect(f.refs()).toEqual([]);
+  });
+  it.each([
+    ['operation-in-progress', { inProgress: ['REBASE_HEAD'], headSha: null }],
+    ['git-dir-unreadable', { inProgress: null, headSha: null }],
+    ['detached-or-unreadable-head', { headSha: null, hasMain: false }],
+    ['no-local-main', { hasMain: false, changedPaths: null }],
+    ['status-unreadable', { changedPaths: null, adoptedHead: null }],
+    ['detached-with-changes', { changedPaths: ['tracked.txt'], adoptedHead: null }],
+    ['detached-not-adopted', { adoptedHead: null, headReachability: 'unreadable' }],
+    ['detached-reachability-unreadable', { headReachability: 'unreadable' }],
+    ['detached-foreign-commit', { headReachability: 'unreachable' }],
+  ])('precedence: %s wins over later refusals', (reason, overrides) => expect(pure(overrides).reason).toBe(reason));
+});
 const mainSha = '536356170' + '0'.repeat(31);
 const detachedCases = [
-  { name: 'clean HEAD at main', headSha: mainSha, changedPaths: [], expected: { heal: true } },
+  { name: 'clean HEAD at main', headSha: mainSha, changedPaths: [], expected: { heal: true, savedRefNeeded: false } },
   { name: 'tracked store change at main', headSha: mainSha, changedPaths: ['verdict-ledger/x'], expected: { heal: false, reason: 'detached-with-changes' } },
   { name: 'tracked non-store change at main', headSha: mainSha, changedPaths: ['scripts/x'], expected: { heal: false, reason: 'detached-with-changes' } },
-  { name: 'HEAD off main', headSha: '1'.repeat(40), changedPaths: [], expected: { heal: false, reason: 'detached-off-main' } },
+  { name: 'HEAD off main without adoption evidence', headSha: '1'.repeat(40), changedPaths: [], expected: { heal: false, reason: 'detached-not-adopted' } },
   { name: 'unreadable HEAD', headSha: null, changedPaths: [], expected: { heal: false, reason: 'detached-or-unreadable-head' } },
   { name: 'missing main', headSha: mainSha, hasMain: false, changedPaths: [], expected: { heal: false, reason: 'no-local-main' } },
   { name: 'unreadable status', headSha: mainSha, changedPaths: null, expected: { heal: false, reason: 'status-unreadable' } },
@@ -53,7 +314,7 @@ describe('planWrongBranchHeal (pure rule)', () => {
     expect(planWrongBranchHeal({ branch: null, headSha, mainSha: hasMain ? mainSha : null, changedPaths, hasMain, settings })).toEqual(expected);
   });
   it('heals an allowlisted branch with only store changes', () => {
-    expect(planWrongBranchHeal({ branch: 'ops/review-requests', changedPaths: ['verdict-ledger/x.jsonl'], hasMain: true, settings })).toEqual({ heal: true });
+    expect(planWrongBranchHeal({ branch: 'ops/review-requests', changedPaths: ['verdict-ledger/x.jsonl'], hasMain: true, settings })).toEqual({ heal: true, savedRefNeeded: false });
   });
   it('refuses an unknown branch, a detached HEAD, a foreign change, no main, unreadable status', () => {
     expect(planWrongBranchHeal({ branch: 'feature/x', changedPaths: [], hasMain: true, settings }).reason).toBe('branch-not-allowlisted');
@@ -123,7 +384,7 @@ describe('in-progress git operations block the heal (red-team: paused interactiv
       .toBe('operation-in-progress');
     expect(planWrongBranchHeal({ branch: null, headSha: mainSha, mainSha, changedPaths: [], hasMain: true, settings, inProgress: null }).reason)
       .toBe('git-dir-unreadable');
-    expect(planWrongBranchHeal({ branch: null, headSha: mainSha, mainSha, changedPaths: [], hasMain: true, settings, inProgress: [] })).toEqual({ heal: true });
+    expect(planWrongBranchHeal({ branch: null, headSha: mainSha, mainSha, changedPaths: [], hasMain: true, settings, inProgress: [] })).toEqual({ heal: true, savedRefNeeded: false });
   });
 
   // Each state is created by real git, then healWrongBranch must leave HEAD detached and the operation intact.

@@ -187,7 +187,7 @@
     "scripts/lib/daemon-rebuild/shared.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":2},
     "scripts/lib/daemon-rebuild/smoke.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":7},
     "scripts/lib/daemon-rebuild/state.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":3},
-    "scripts/lib/daemon-rebuild/wrong-branch-heal.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":2},
+    "scripts/lib/daemon-rebuild/wrong-branch-heal.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push. Detached recovery adds a read-only merge-base --is-ancestor check against origin/main and a create-only update-ref preserving the detached HEAD before checkout; both are flagged for dynamic SHA/ref arguments.","sites":4},
     "scripts/lib/daemon-self-sync.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":7},
     "scripts/lib/daemon-version-migrate.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":10},
     "scripts/lib/daemon-version-state.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":3},
