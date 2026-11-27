@@ -13,8 +13,8 @@
  * The closure reuses `related-test-selection.mjs#resolveSpecifier`, so "what a test imports" has one definition.
  * Trace retention: runs older than 3 days are removed, then oldest eligible runs until below 2 GiB.
  * WE_TEST_CACHE_MAX_AGE_DAYS and WE_TEST_CACHE_MAX_BYTES override those limits. Active runs and runs
- * younger than 6 hours are protected. A different run that is alive but idle over 6 hours is NOT yet protected
- * (owner-PID liveness is a follow-up card).
+ * younger than 6 hours are protected. Under byte pressure an in-window run whose owner PID answers kill(pid, 0) is
+ * removed only after every other eligible run; liveness reorders removal and adds no exemption (failures skip a run).
  * Key contexts prune at most hourly, only for enabled cache runs (so createKeyContext is no longer read-only
  * in that case: it may delete old trace run dirs and write .prune-stamp).
  */
@@ -82,8 +82,14 @@ function traceBytes(path) {
   return readdirSync(path).reduce((bytes, name) => bytes + traceBytes(join(path, name)), 0);
 }
 
+/** Positive evidence only: kill(pid, 0) returned. Invalid pids and every error are false (no deferral). */
+export function ownerAlive(pid, kill = process.kill) {
+  if (!Number.isSafeInteger(pid) || pid <= 1) return false;
+  try { kill(pid, 0); return true; } catch { return false; }
+}
+
 /** Best-effort retention of real, directly contained trace run directories. */
-export function pruneCache({ dir = cacheDir(), env = process.env, now = Date.now(), runId = env.WE_TEST_CACHE_RUN_ID } = {}) {
+export function pruneCache({ dir = cacheDir(), env = process.env, now = Date.now(), runId = env.WE_TEST_CACHE_RUN_ID, isOwnerAlive = ownerAlive } = {}) {
   const settings = retentionSettings(env);
   const result = { removed: [], freedBytes: 0, remainingBytes: 0, settings };
   const runs = [];
@@ -97,7 +103,7 @@ export function pruneCache({ dir = cacheDir(), env = process.env, now = Date.now
         const stat = lstatSync(path);
         if (!stat.isDirectory()) continue;
         const bytes = traceBytes(path);
-        runs.push({ name, path, mtimeMs: stat.mtimeMs, bytes });
+        runs.push({ name, path, pid: Number(name.split('-')[1]), mtimeMs: stat.mtimeMs, bytes });
         result.remainingBytes += bytes;
       } catch { /* An unreadable or disappearing run is never a reason to fail a test run. */ }
     }
@@ -108,6 +114,8 @@ export function pruneCache({ dir = cacheDir(), env = process.env, now = Date.now
     if (run.name === runId || age < settings.minAgeMs) continue;
     if (age <= settings.maxAgeDays * 86400 * 1000 && result.remainingBytes <= settings.maxBytes) continue;
     try {
+      // Proven-live in-window owner: revisit once at the end (oldest-first among deferred); the cap still applies.
+      if (!run.deferred && age <= settings.maxAgeDays * 86400 * 1000 && isOwnerAlive(run.pid)) { runs.push({ ...run, deferred: true }); continue; }
       // Recheck eligibility immediately before removal; never follow a replacement symlink.
       const stat = lstatSync(run.path);
       if (!stat.isDirectory() || now - stat.mtimeMs < settings.minAgeMs) continue;

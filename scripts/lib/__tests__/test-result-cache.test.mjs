@@ -183,6 +183,202 @@ describe('test-result cache retention', () => {
     return path;
   };
 
+  it('defers a live-owner run so a younger dead-owner run goes first', () => {
+    const dir = makeCache();
+    const middle = makeRun(dir, MIDDLE, 48 * HOUR);
+    makeRun(dir, OLD, 24 * HOUR);
+    const calls = [];
+    const probe = (pid) => (calls.push(pid), pid === 102);
+    const result = testResultCache.pruneCache({ dir, env: { WE_TEST_CACHE_MAX_BYTES: '9' }, now: NOW, isOwnerAlive: probe });
+    expect(result.removed).toEqual([OLD]);
+    expect(calls).toEqual([102, 101]);
+    expect(result.freedBytes).toBe(8);
+    expect(result.remainingBytes).toBe(8);
+    expect(existsSync(middle)).toBe(true);
+  });
+
+  it('the byte cap still removes a deferred live-owner run', () => {
+    const dir = makeCache();
+    makeRun(dir, MIDDLE, 48 * HOUR);
+    makeRun(dir, OLD, 24 * HOUR);
+    const calls = [];
+    const probe = (pid) => (calls.push(pid), pid === 102);
+    const result = testResultCache.pruneCache({ dir, env: { WE_TEST_CACHE_MAX_BYTES: '1' }, now: NOW, isOwnerAlive: probe });
+    expect(result.removed).toEqual([OLD, MIDDLE]);
+    expect(calls).toEqual([102, 101]);
+    expect(result.freedBytes).toBe(16);
+    expect(result.remainingBytes).toBe(0);
+  });
+
+  it('may keep more bytes than main, never above the cap', () => {
+    const dir = makeCache();
+    makeRun(dir, MIDDLE, 48 * HOUR, 8);
+    makeRun(dir, OLD, 24 * HOUR, 2);
+    const calls = [];
+    const probe = (pid) => (calls.push(pid), pid === 102);
+    const result = testResultCache.pruneCache({ dir, env: { WE_TEST_CACHE_MAX_BYTES: '8' }, now: NOW, isOwnerAlive: probe });
+    expect(result.removed).toEqual([OLD]);
+    expect(calls).toEqual([102, 101]);
+    expect(result.freedBytes).toBe(2);
+    expect(result.remainingBytes).toBe(8);
+  });
+
+  it('two deferred live owners are removed oldest-first after the dead one', () => {
+    const dir = makeCache();
+    makeRun(dir, OLD, 60 * HOUR);
+    makeRun(dir, MIDDLE, 48 * HOUR);
+    makeRun(dir, FRESH, 30 * HOUR);
+    const calls = [];
+    const probe = (pid) => (calls.push(pid), pid !== 103);
+    const result = testResultCache.pruneCache({ dir, env: { WE_TEST_CACHE_MAX_BYTES: '1' }, now: NOW, isOwnerAlive: probe });
+    expect(result.removed).toEqual([FRESH, OLD, MIDDLE]);
+    expect(calls).toEqual([101, 102, 103]);
+    expect(result.freedBytes).toBe(24);
+    expect(result.remainingBytes).toBe(0);
+  });
+
+  it('equal-mtime deferred runs keep name order', () => {
+    const dir = makeCache();
+    makeRun(dir, MIDDLE, 48 * HOUR);
+    makeRun(dir, OLD, 48 * HOUR);
+    const calls = [];
+    const probe = (pid) => (calls.push(pid), true);
+    const result = testResultCache.pruneCache({ dir, env: { WE_TEST_CACHE_MAX_BYTES: '9' }, now: NOW, isOwnerAlive: probe });
+    expect(result.removed).toEqual([OLD]);
+    expect(calls).toEqual([101, 102]);
+    expect(result.freedBytes).toBe(8);
+    expect(result.remainingBytes).toBe(8);
+  });
+
+  it.each([0, -1])('exactly 6h is eligible and probed; just under is not (offset %i ms)', (offset) => {
+    const dir = makeCache();
+    const path = makeRun(dir, MIDDLE, 6 * HOUR);
+    const m = lstatSync(path).mtimeMs;
+    const calls = [];
+    const probe = (pid) => (calls.push(pid), true);
+    const result = testResultCache.pruneCache({ dir, env: { WE_TEST_CACHE_MAX_BYTES: '1' }, now: m + 6 * HOUR + offset, isOwnerAlive: probe });
+    expect(result.removed).toEqual(offset === 0 ? [MIDDLE] : []);
+    expect(calls).toEqual(offset === 0 ? [102] : []);
+    expect(result.freedBytes).toBe(offset === 0 ? 8 : 0);
+    expect(result.remainingBytes).toBe(offset === 0 ? 0 : 8);
+  });
+
+  it.each([undefined, '1'])('exactly maxAgeDays is in-window; past it is removed unprobed (cap %s)', (cap) => {
+    const dir = makeCache();
+    const path = makeRun(dir, MIDDLE, 3 * DAY);
+    const m = lstatSync(path).mtimeMs;
+    const now = m + 3 * DAY;
+    makeRun(dir, OLD, 3 * DAY + 1000, 8, now);
+    const calls = [];
+    const probe = (pid) => (calls.push(pid), true);
+    const env = cap === undefined ? {} : { WE_TEST_CACHE_MAX_BYTES: cap };
+    const result = testResultCache.pruneCache({ dir, env, now, isOwnerAlive: probe });
+    expect(result.removed).toEqual(cap === undefined ? [OLD] : [OLD, MIDDLE]);
+    expect(calls).toEqual(cap === undefined ? [] : [102]);
+    expect(result.freedBytes).toBe(cap === undefined ? 8 : 16);
+    expect(result.remainingBytes).toBe(cap === undefined ? 8 : 0);
+  });
+
+  it('runId and runs under 6h are never probed under byte pressure', () => {
+    const dir = makeCache();
+    makeRun(dir, ACTIVE, 24 * HOUR);
+    makeRun(dir, FRESH, HOUR);
+    const calls = [];
+    const probe = (pid) => (calls.push(pid), true);
+    const result = testResultCache.pruneCache({ dir, env: { WE_TEST_CACHE_MAX_BYTES: '1' }, now: NOW, runId: ACTIVE, isOwnerAlive: probe });
+    expect(result.removed).toEqual([]);
+    expect(calls).toEqual([]);
+    expect(result.freedBytes).toBe(0);
+    expect(result.remainingBytes).toBe(16);
+  });
+
+  it('ownerAlive is true only when kill(pid, 0) returns', () => {
+    expect(typeof testResultCache.ownerAlive).toBe('function');
+    const calls = [];
+    expect(testResultCache.ownerAlive(102, (...args) => { calls.push(args); })).toBe(true);
+    expect(calls).toEqual([[102, 0]]);
+    for (const code of ['EPERM', 'ESRCH', 'EINVAL']) {
+      const errors = [];
+      expect(testResultCache.ownerAlive(102, (...args) => {
+        errors.push(args);
+        throw Object.assign(new Error(code), { code });
+      })).toBe(false);
+      expect(errors).toEqual([[102, 0]]);
+    }
+    const invalidCalls = [];
+    for (const pid of [0, 1, -5, NaN, 1.5, Number.MAX_SAFE_INTEGER + 1, Infinity]) {
+      expect(testResultCache.ownerAlive(pid, (...args) => { invalidCalls.push(args); })).toBe(false);
+    }
+    expect(invalidCalls).toEqual([]);
+  });
+
+  it('an in-window run whose owner is not alive is removed as before', () => {
+    const dir = makeCache();
+    makeRun(dir, MIDDLE, 24 * HOUR);
+    const calls = [];
+    const probe = (pid) => (calls.push(pid), false);
+    const result = testResultCache.pruneCache({ dir, env: { WE_TEST_CACHE_MAX_BYTES: '1' }, now: NOW, isOwnerAlive: probe });
+    expect(result.removed).toEqual([MIDDLE]);
+    expect(result.freedBytes).toBe(8);
+    expect(result.remainingBytes).toBe(0);
+    expect(calls).toEqual([102]);
+  });
+
+  it('a throwing injected probe skips that run and pruneCache does not throw', () => {
+    const dir = makeCache();
+    makeRun(dir, MIDDLE, 24 * HOUR);
+    const calls = [];
+    const probe = (pid) => { calls.push(pid); throw new Error('probe unavailable'); };
+    let result;
+    expect(() => { result = testResultCache.pruneCache({ dir, env: { WE_TEST_CACHE_MAX_BYTES: '1' }, now: NOW, isOwnerAlive: probe }); }).not.toThrow();
+    expect(result.removed).toEqual([]);
+    expect(calls).toEqual([102]);
+    expect(result.freedBytes).toBe(0);
+    expect(result.remainingBytes).toBe(8);
+  });
+
+  it('a deferred run refreshed during another owner\'s probe is kept and not re-probed', () => {
+    const dir = makeCache();
+    const middle = makeRun(dir, MIDDLE, 48 * HOUR);
+    makeRun(dir, OLD, 24 * HOUR);
+    const calls = [];
+    const probe = (pid) => {
+      calls.push(pid);
+      if (pid === 101) utimesSync(middle, new Date(NOW - HOUR), new Date(NOW - HOUR));
+      return pid === 102;
+    };
+    const result = testResultCache.pruneCache({ dir, env: { WE_TEST_CACHE_MAX_BYTES: '1' }, now: NOW, isOwnerAlive: probe });
+    expect(result.removed).toEqual([OLD]);
+    expect(calls).toEqual([102, 101]);
+    expect(result.freedBytes).toBe(8);
+    expect(result.remainingBytes).toBe(8);
+    expect(existsSync(middle)).toBe(true);
+  });
+
+  it('a deferred run replaced by a symlink during another owner\'s probe is not followed', () => {
+    const dir = makeCache();
+    const target = makeCache();
+    writeFileSync(join(target, 'keep.txt'), 'keep');
+    const middle = makeRun(dir, MIDDLE, 48 * HOUR);
+    makeRun(dir, OLD, 24 * HOUR);
+    const calls = [];
+    const probe = (pid) => {
+      calls.push(pid);
+      if (pid === 101) {
+        rmSync(middle, { recursive: true });
+        symlinkSync(target, middle, 'dir');
+      }
+      return pid === 102;
+    };
+    const result = testResultCache.pruneCache({ dir, env: { WE_TEST_CACHE_MAX_BYTES: '1' }, now: NOW, isOwnerAlive: probe });
+    expect(result.removed).toEqual([OLD]);
+    expect(calls).toEqual([102, 101]);
+    expect(result.freedBytes).toBe(8);
+    expect(result.remainingBytes).toBe(8);
+    expect(lstatSync(middle).isSymbolicLink()).toBe(true);
+    expect(readFileSync(join(target, 'keep.txt'), 'utf8')).toBe('keep');
+  });
+
   it('exports retention defaults and reports default setting provenance', () => {
     expect(testResultCache.TEST_CACHE_RETENTION_DEFAULTS).toEqual(DEFAULTS);
     const settings = testResultCache.retentionSettings({});
@@ -209,7 +405,7 @@ describe('test-result cache retention', () => {
     const middle = makeRun(dir, OLD, 24 * HOUR, 8);
     const oldest = makeRun(dir, MIDDLE, 48 * HOUR, 8);
     const fresh = makeRun(dir, FRESH, HOUR, 8);
-    const result = testResultCache.pruneCache({ dir, env: { WE_TEST_CACHE_MAX_BYTES: '17' }, now: NOW });
+    const result = testResultCache.pruneCache({ dir, env: { WE_TEST_CACHE_MAX_BYTES: '17' }, now: NOW, isOwnerAlive: () => false });
     expect(result.removed).toEqual([MIDDLE]);
     expect(result.freedBytes).toBe(8);
     expect(result.remainingBytes).toBe(16);
@@ -224,7 +420,7 @@ describe('test-result cache retention', () => {
     const oldest = makeRun(dir, OLD, 48 * HOUR, 8);
     const middle = makeRun(dir, MIDDLE, 24 * HOUR, 8);
     const fresh = makeRun(dir, FRESH, HOUR, 20);
-    const result = testResultCache.pruneCache({ dir, env: { WE_TEST_CACHE_MAX_BYTES: '10' }, now: NOW });
+    const result = testResultCache.pruneCache({ dir, env: { WE_TEST_CACHE_MAX_BYTES: '10' }, now: NOW, isOwnerAlive: () => false });
     expect(result.removed).toEqual([OLD, MIDDLE]);
     expect(result.freedBytes).toBe(16);
     expect(result.remainingBytes).toBe(20);
