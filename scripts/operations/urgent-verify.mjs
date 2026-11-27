@@ -8,6 +8,7 @@ import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
 import { ciUnitPlan, ciGatePlan, urgentLedger, urgentKeyPath, urgentSignature, normalizeUrgentRepo, urgentFuiRepo, canonicalFuiRepo } from './urgent-verify-marker.mjs';
 
 const worktreePrefix = '.urgent-verify-';
+export const ADMISSION_DEFERRED_EXIT = 75;
 const pidAlive = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
 
 // spawnSync blocks JS signal handlers. Keep a responsive supervisor in the caller's
@@ -129,6 +130,7 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
       const err = new Error(`urgent-verify subprocess failed or admission unavailable (exit ${r.status ?? r.error?.code ?? 'unknown'}): ${cmd} ${args.join(' ')}`);
       err.failure = { cmd: [cmd, ...args].join(' ').slice(0, 300), exit: r.status ?? null, error: r.error ? String(r.error.message ?? r.error) : undefined, stderrTail: tail, ...(timedOut ? { timedOut: true, limitMinutes: limitMin } : {}) };
       err.stdout = String(r.stdout ?? '');
+      err.deferred = wrapper && r.status === ADMISSION_DEFERRED_EXIT && tail.includes('admission-deferred');
       throw err;
     }
     return r.stdout;
@@ -320,8 +322,10 @@ export async function urgentVerify({ sha }, deps = createUrgentDeps({ isolated: 
       const finalFui = await deps.verifyFui({ sha: fuiSha, repo: fuiRepo });
       if (finalFui.sha !== fuiSha || finalFui.repo !== fuiRepo) throw new Error('FUI sibling changed');
     } catch (e) {
-      result = 'red';
       failure = { step: currentStep, message: String(e?.message ?? e), ...(e?.failure ?? {}) };
+      if (e?.deferred === true) return { ok: false, deferred: true, detail: 'admission-deferred', failure,
+        fallback: 'No heavy slot was free; nothing ran. Retry urgent-verify when `heavy-admission.mjs queue-status` shows a free slot, or wait for passing CI.' };
+      result = 'red';
       console.error(`urgent-verify RED at step ${failure.step}: ${failure.message}${failure.stderrTail ? `\n${failure.stderrTail}` : ''}`);
     }
     guard?.release(); // the parent alone reads the key and appends, after every step has finished
