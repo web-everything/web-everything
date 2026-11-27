@@ -17,7 +17,7 @@ export function mainRedAlertSettings(config = {}) {
 }
 
 export function planMainRedAlert(input = {}) {
-  const { runs, tip, readOk = true, now, prev = {},
+  const { runs, tip, readOk = true, stateUnreadable = false, now, prev = {},
     settings = mainRedAlertSettings(), details } = input;
   const next = { ...prev, seq: Number.isSafeInteger(prev.seq) && prev.seq >= 0 ? prev.seq : 0 };
   const items = [];
@@ -55,7 +55,10 @@ export function planMainRedAlert(input = {}) {
   if (state.status === 'green' && !provenGreen && !prev.fingerprint) return { items, next };
   if (!['red', 'green'].includes(state.status) || (state.status === 'green' && !provenGreen)) {
     if (!prev.unknownEmitted) emit({ ...base, kind: 'main-status-unknown',
-      head: 'main-status-unknown', reason: 'Main CI status is unavailable' });
+      head: stateUnreadable ? 'main-state-unreadable' : 'main-status-unknown',
+      reason: stateUnreadable
+        ? 'Main-red state unreadable; repair main-red-alert.json and retry'
+        : 'Main CI status is unavailable' });
     next.unknownEmitted = true;
     return { items, next };
   }
@@ -212,8 +215,7 @@ export async function runMainRedAlert({ probe, dir, now = Date.now(), config = {
     prev = await readState(dir);
     if (!validAlertState(prev)) throw new Error('Invalid main-red alert state');
   } catch {
-    const result = planMainRedAlert({ readOk: false, now });
-    result.items[0].reason = 'Main-red state unreadable; repair main-red-alert.json and retry';
+    const result = planMainRedAlert({ readOk: false, stateUnreadable: true, now });
     for (const item of result.items) await send(item);
     // Never replace unreadable evidence or interpret its missing fingerprint as healthy.
     return { ...result, stateUnreadable: true };

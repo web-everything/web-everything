@@ -778,6 +778,29 @@ const expectPersisted = (writeState, next) => {
 };
 
 describe('WATCH-DAEMON-WE — durable MAIN-RED contract', () => {
+  it('state corruption publishes repair instructions even when ordinary unknown is already open, and deduplicates retries', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'watch-main-red-corruption-'));
+    try {
+      const now = START + 30 * MINUTE;
+      const ordinary = plan({ readOk: false });
+      let open = diffFeed([], ordinary.items, now).openKeys;
+      const lines = [];
+      const args = wrapperInput({ dir, now, publish: async item => {
+        const diff = diffFeed(open, [item], now, { incomplete: true });
+        open = diff.openKeys;
+        lines.push(...diff.lines);
+      }, readState: () => { throw new Error('unreadable fixture state'); } });
+      await runMainRedAlert(args);
+      expect(lines).toHaveLength(1);
+      expect(parseFeedLine(lines[0])).toMatchObject({ kind: 'main-status-unknown',
+        reason: expect.stringMatching(/state.*unreadable.*repair.*retry/i) });
+      await runMainRedAlert(args);
+      expect(lines).toHaveLength(1);
+      expect(args.writeState).not.toHaveBeenCalled();
+      expect(args.readDetails).not.toHaveBeenCalled();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it.each([
     ['state', 'main-red-alert.json', 64 * 1024],
     ['history', 'alerts.jsonl', 8 * 1024 * 1024],
