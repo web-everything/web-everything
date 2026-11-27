@@ -393,7 +393,7 @@ describe('runReconcileCiHealDispatch — repo capability gate (#3967 multi-repo 
         flushTimeouts: async () => { calls.push('timeouts'); return []; },
         pollAttempts: () => [],
         reconcile: () => ({ dispatch: [
-          ...(!timeoutOnly ? [{ kind: 'ci-heal', prNumber: 50, headRefName: 'lane/x' }] : []),
+          ...(!timeoutOnly ? [{ kind: 'ci-heal', admission: { admitted: true }, prNumber: 50, headRefName: 'lane/x' }] : []),
           { kind: 'ci-timeout-rerun', prNumber: 52, timeoutRetry: { eligible: true, jobs: [{ run: 10, job: 20 }] } },
           { kind: 'fix', prNumber: 51 },
         ], refusals: [] }),
@@ -425,7 +425,7 @@ describe('runReconcileCiHealDispatch — repo capability gate (#3967 multi-repo 
       recordUnsupported({ repo: 'plateau-app', rows: [{ action: 'fix', prNumber: 9 }], path: unsupportedPath });
       await runReconcileCiHealDispatch({
         root: '/repo', repo: 'plateauapp/plateau-app', unsupportedPath,
-        reconcile: () => ({ dispatch: [{ kind: 'ci-heal', prNumber: 50, headRefName: 'lane/x' }], refusals: [] }),
+        reconcile: () => ({ dispatch: [{ kind: 'ci-heal', admission: { admitted: true }, prNumber: 50, headRefName: 'lane/x' }], refusals: [] }),
         resolveProfile: () => ({ capabilities: { fix: true, ciHeal: false }, lanePoolRepo: '/nonexistent' }),
         checkStaleness: FRESH,
       });
@@ -457,7 +457,7 @@ describe('runReconcileCiHealDispatch — repo capability gate (#3967 multi-repo 
       const result = await runReconcileCiHealDispatch({
         root: '/repo', repo: slug,
         reconcile: () => ({
-          dispatch: [{ kind: 'ci-heal', prNumber: 202, headRefName: 'lane/some-branch', attempts: 0 }],
+          dispatch: [{ kind: 'ci-heal', admission: { admitted: true }, prNumber: 202, headRefName: 'lane/some-branch', attempts: 0 }],
           refusals: [],
         }),
         resolveWorkUnit: () => ({ itemNum: null, scope: [`${tag === 'pa' ? 'plateau' : 'fui'}:src/x.ts`] }),
@@ -484,7 +484,7 @@ describe('runReconcileCiHealDispatch — repo capability gate (#3967 multi-repo 
   it('a `held` dispatch answer is reported as a `held` refusal, not thrown or silently dropped', async () => {
     const result = await runReconcileCiHealDispatch({
       root: '/repo', repo: 'plateauapp/plateau-app',
-      reconcile: () => ({ dispatch: [{ kind: 'ci-heal', prNumber: 50, headRefName: 'lane/x' }], refusals: [] }),
+      reconcile: () => ({ dispatch: [{ kind: 'ci-heal', admission: { admitted: true }, prNumber: 50, headRefName: 'lane/x' }], refusals: [] }),
       resolveWorkUnit: () => ({ itemNum: null, scope: [] }),
       pickFreeLanes: () => [3],
       dispatch: async () => ({ held: true, reason: 'pr 50 already has a ci-heal in flight' }),
@@ -499,8 +499,8 @@ describe('runReconcileCiHealDispatch — repo capability gate (#3967 multi-repo 
       root: '/repo', repo: 'plateauapp/plateau-app',
       reconcile: () => ({
         dispatch: [
-          { kind: 'ci-heal', prNumber: 50, headRefName: 'lane/x' },
-          { kind: 'ci-heal', prNumber: 51, headRefName: 'lane/y' },
+          { kind: 'ci-heal', admission: { admitted: true }, prNumber: 50, headRefName: 'lane/x' },
+          { kind: 'ci-heal', admission: { admitted: true }, prNumber: 51, headRefName: 'lane/y' },
         ],
         refusals: [],
       }),
@@ -521,7 +521,7 @@ describe('runReconcileCiHealDispatch — repo capability gate (#3967 multi-repo 
     const result = await runReconcileCiHealDispatch({
       root: '/repo', repo: 'plateauapp/plateau-app',
       reconcile: () => ({
-        dispatch: [{ kind: 'ci-heal', prNumber: 50, headRefName: 'lane/x' }],
+        dispatch: [{ kind: 'ci-heal', admission: { admitted: true }, prNumber: 50, headRefName: 'lane/x' }],
         refusals: [],
       }),
       resolveWorkUnit: () => ({ itemNum: null, scope: [] }),
@@ -752,7 +752,7 @@ describe('xng7q1p retry reservation and restart soak', () => {
   }
   const healPass = (dir, e, options = {}) => runReconcileCiHealDispatch({
     root: dir, repo: e.repo, checkStaleness: FRESH, now: () => t0 + 40 * 60_000,
-    reconcile: () => ({ dispatch: [{ kind: 'ci-heal', prNumber: e.pr, headRefOid: e.head, headRefName: 'lane/retry' }], refusals: [] }),
+    reconcile: () => ({ dispatch: [{ kind: 'ci-heal', admission: { admitted: true }, prNumber: e.pr, headRefOid: e.head, headRefName: 'lane/retry' }], refusals: [] }),
     flushOwed: () => ({}), flushTimeouts: async () => [], pollAttempts: () => [],
     unsupportedPath: join(dir, 'unsupported'), resolveWorkUnit: () => ({ itemNum: null, scope: [] }),
     pickFreeLanes: () => [3], salvage: async () => null, currentBuild: () => null,
@@ -1269,7 +1269,7 @@ describe('CI-heal salvage before agent dispatch', () => {
     expect(scenario.judge(await scenario.run())).toEqual([]);
   });
 
-  const entry = { kind: 'ci-heal', prNumber: 3895, headRefName: 'lane/session-watchdog', headRefOid: 'a'.repeat(40) };
+  const entry = { kind: 'ci-heal', admission: { admitted: true }, prNumber: 3895, headRefName: 'lane/session-watchdog', headRefOid: 'a'.repeat(40) };
   async function exercise(salvage, overrides = {}) {
     const dir = mkdtempSync(join(tmpdir(), 'ci-heal-salvage-dispatch-'));
     const dispatch = vi.fn(() => ({ agentId: 'test' }));
@@ -1572,7 +1572,7 @@ it('preserves oldest-owed order with a deadline and resumes at the exact PR curs
   const touched = [];
   const now = vi.fn(() => time); // launches run concurrently now, so the old serial inEffect interleave no longer applies
   const options = { root: '/repo', checkStaleness: FRESH, now, deadlineAt: 10,
-    reconcile: () => ({ dispatch: [3, 1, 2].map(prNumber => ({ kind: 'ci-heal', prNumber, headRefOid: 'a',
+    reconcile: () => ({ dispatch: [3, 1, 2].map(prNumber => ({ kind: 'ci-heal', admission: { admitted: true }, prNumber, headRefOid: 'a',
       waitingSince: { 3: '2026-10-13T01:00:00Z', 1: '2026-10-13T02:00:00Z', 2: '2026-10-13T03:00:00Z' }[prNumber],
     })), refusals: [] }),
     dispatch: async p => { inEffect = true; time = 11; touched.push(p.pr); await Promise.resolve(); return { pr: p.pr }; },
@@ -1622,7 +1622,7 @@ it('past deadline with a cursor skips every blocking prelude, keeps deferred=[cu
 
 it('past deadline without a cursor skips every blocking prelude (including reconcile), flags deadlineSkipped and starts from the top next pass', async () => {
   const pollAttempts = vi.fn(() => []), flushOwed = vi.fn(() => ({})), flushTimeouts = vi.fn(async () => []);
-  const reconcile = vi.fn(() => ({ dispatch: [42, 43].map(prNumber => ({ kind: 'ci-heal', prNumber })), refusals: [] }));
+  const reconcile = vi.fn(() => ({ dispatch: [42, 43].map(prNumber => ({ kind: 'ci-heal', admission: { admitted: true }, prNumber })), refusals: [] }));
   const dispatch = vi.fn();
   const result = await runReconcileCiHealDispatch({ root: '/repo', checkStaleness: FRESH,
     now: () => 11, deadlineAt: 10, pollAttempts, flushOwed, flushTimeouts, reconcile, dispatch,
@@ -1636,7 +1636,7 @@ it('past deadline without a cursor skips every blocking prelude (including recon
 it('a flush skipped at the deadline runs on the next pass even if still past deadline, with a fresh gate slice for all PRs', async () => {
   resetCiHealFlushDeadlineState();
   const flushOwed = vi.fn(() => ({})), flushTimeouts = vi.fn(async () => []);
-  const reconcile = vi.fn(() => ({ dispatch: [{ kind: 'ci-heal', prNumber: 7, headRefOid: 'a' }, { kind: 'ci-heal', prNumber: 8, headRefOid: 'a' }], refusals: [] }));
+  const reconcile = vi.fn(() => ({ dispatch: [{ kind: 'ci-heal', admission: { admitted: true }, prNumber: 7, headRefOid: 'a' }, { kind: 'ci-heal', admission: { admitted: true }, prNumber: 8, headRefOid: 'a' }], refusals: [] }));
   const dispatch = vi.fn(async p => ({ pr: p.pr }));
   const options = { root: '/repo', checkStaleness: FRESH, now: () => 11, deadlineAt: 10, cursor: 7,
     pollAttempts: () => [], flushOwed, flushTimeouts, reconcile, dispatch, pickFreeLanes: () => [1, 2],
@@ -1658,7 +1658,7 @@ it('ci-heal: a prelude that always overruns the budget still handles all PRs eve
   const handledPrs = [];
   const options = { root: '/repo', checkStaleness: FRESH, now: () => time,
     pollAttempts: () => { time += 1000; return []; }, flushOwed: () => ({}), flushTimeouts: async () => [],
-    reconcile: () => ({ dispatch: [5, 6].map(prNumber => ({ kind: 'ci-heal', prNumber, headRefOid: 'a' })), refusals: [] }),
+    reconcile: () => ({ dispatch: [5, 6].map(prNumber => ({ kind: 'ci-heal', admission: { admitted: true }, prNumber, headRefOid: 'a' })), refusals: [] }),
     dispatch: async p => { handledPrs.push(p.pr); return { pr: p.pr }; }, pickFreeLanes: () => [1, 2],
     resolveWorkUnit: () => ({ itemNum: null, scope: [] }), resolveProfile: () => ({ capabilities: { ciHeal: true } }),
     timeoutHold: () => null, salvage: async () => null, currentBuild: () => null,
@@ -1677,7 +1677,7 @@ it('heals all PRs oldest first when the deadline passes before the loop', async 
   const touched = [];
   let time = 0;
   const options = { root: '/repo', checkStaleness: FRESH, now: () => time, deadlineAt: 10,
-    reconcile: () => ({ dispatch: [1, 2].map(prNumber => ({ kind: 'ci-heal', prNumber, headRefOid: 'a',
+    reconcile: () => ({ dispatch: [1, 2].map(prNumber => ({ kind: 'ci-heal', admission: { admitted: true }, prNumber, headRefOid: 'a',
       waitingSince: `2026-10-13T0${prNumber}:00:00Z` })), refusals: [] }),
     dispatch: async p => { touched.push(p.pr); return { pr: p.pr }; },
     pickFreeLanes: () => [1, 2], resolveWorkUnit: () => ({ itemNum: null, scope: [] }),
@@ -1691,4 +1691,46 @@ it('heals all PRs oldest first when the deadline passes before the loop', async 
     expect(touched).toEqual([1, 2]);
     expect(result).toMatchObject({ handled: 2, deferred: [], nextCursor: null });
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+
+describe('CI-heal dispatcher requires planner admission', () => {
+  async function exercise(entries, overrides = {}) {
+    const dir = mkdtempSync(join(tmpdir(), 'ci-heal-admission-'));
+    const dispatch = vi.fn(async planned => ({ pr: planned.pr, lane: planned.lane }));
+    const killed = vi.fn(() => false), salvage = vi.fn(async () => null);
+    const timeoutHold = vi.fn(() => null), expireLost = vi.fn();
+    const tryAdmit = vi.fn(() => ({ admit: true })), queueTryAdmit = vi.fn(() => ({ admit: true }));
+    const resolveWorkUnit = vi.fn(() => ({ itemNum: null, scope: [] }));
+    try {
+      const result = await runReconcileCiHealDispatch({ root: '/repo', checkStaleness: FRESH,
+        reconcile: () => ({ dispatch: entries, refusals: [] }), dispatch,
+        unsupportedPath: join(dir, 'unsupported.json'),
+        resolveProfile: () => ({ capabilities: { ciHeal: true } }), pickFreeLanes: () => [2],
+        resolveWorkUnit, flushOwed: () => ({}), pollAttempts: () => [], flushTimeouts: async () => [],
+        timeoutHold, expireLost, salvage, currentBuild: () => null, queueAdmission: { tryAdmit: queueTryAdmit },
+        dispatchThrottle: { tryAdmit, recheckHost: () => ({ admit: true }) }, ciHealReserve: null,
+        fixLoop: { killed, readRows: () => [], append: vi.fn() }, ...overrides,
+      });
+      return { result, dispatch, killed, salvage, timeoutHold, expireLost, tryAdmit, queueTryAdmit, resolveWorkUnit };
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+  const entry = (prNumber, admission) => ({ kind: 'ci-heal', prNumber,
+    headRefOid: 'a'.repeat(40), headRefName: `lane/${prNumber}`, ...(admission === undefined ? {} : { admission }) });
+  it('an absent, false or malformed admission record is held x-no-admission before salvage, budget and lane', async () => {
+    const invalid = [undefined, { admitted: false }, null, {}, true, 'true', { admitted: 'true' }, { admitted: 1 }];
+    const out = await exercise(invalid.map((admission, i) => entry(8000 + i, admission)));
+    expect(out.result.dispatched).toEqual([]);
+    expect(out.result.refusals).toEqual(invalid.map((_, i) => expect.objectContaining({ pr: 8000 + i, kind: 'x-no-admission' })));
+    // killed() is the first pre-existing per-entry effect, before expiry, salvage, budgets and lane assignment.
+    for (const spy of [out.killed, out.timeoutHold, out.expireLost, out.salvage, out.tryAdmit, out.queueTryAdmit,
+      out.resolveWorkUnit, out.dispatch]) expect(spy).not.toHaveBeenCalled();
+  });
+  it('an admitted record reaches the injected dispatch', async () => {
+    const out = await exercise([entry(8000), entry(8001, { admitted: true })]);
+    expect(out.result.refusals).toContainEqual(expect.objectContaining({ pr: 8000, kind: 'x-no-admission' }));
+    expect(out.dispatch).toHaveBeenCalledTimes(1);
+    expect(out.dispatch).toHaveBeenCalledWith(expect.objectContaining({ pr: 8001, lane: 2 }), expect.any(Object));
+    expect(out.result.dispatched).toContainEqual(expect.objectContaining({ pr: 8001 }));
+  });
 });

@@ -1,5 +1,6 @@
 import { parseMqFailureRoute } from '../lib/mq-failure-route.mjs';
 import { admitMqFailureRoute } from './mq-failure-intake.mjs';
+import { admitCiHeal } from './ci-heal-admission.mjs';
 import { ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { reviewStartGate, earlyStartShadow, fastChecksFor, REVIEW_TIMING_DEFAULTS, joinedFixDecision, fixReadiness, FIX_TIMING_DEFAULTS } from '../lib/review-timing.mjs';
 import { runEligibilityShadow, eligibilityShadowDeps, reportShadowError } from './dispatch-eligibility-shadow.mjs';
@@ -304,6 +305,7 @@ export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-tim
  *   `scope-bloat` / `ruling-dispute` — see the comments on the list below.
  */
 export const REFUSAL_KINDS = Object.freeze([
+  'review-hold', 'main-red', 'no-failing-check', 'x-merge-gate-unreadable',
   'no-code-rearm-held', 'no-code-rearm-spent',
   'fix-join-wait',
   'review-ci', 'review-referrals-pending', 'advisory-unreadable',
@@ -3261,8 +3263,14 @@ export function planReconcile({
           text: `PR #${prNumber}: ci-heal attempts exhausted (${healAttempts}/${ciHealCap}) — auto-heal cannot clear the CodeQL alert the drain is holding this PR for; a person must take it over. Last failure: CodeQL (drain gate)`,
         });
       } else {
+        const admission = admitCiHeal({ reason: 'codeql', codeqlFailure: pr.codeqlFailure });
+        if (!admission.admitted) {
+          refuse(admission.reason, { ...withPhase, why: admission.why });
+          return;
+        }
+        console.error(`ci-heal admission admitted classes=[${admission.classes.join(',')}] basis=${admission.basis}`);
         dispatch.push({
-          ...base, ...withPhase, ...hold, kind: 'ci-heal', reason: 'codeql', attempts: healAttempts, codeql: pr.codeqlFailure, ciHealBudget: healBudget.log,
+          ...base, ...withPhase, ...hold, admission, kind: 'ci-heal', reason: 'codeql', attempts: healAttempts, codeql: pr.codeqlFailure, ciHealBudget: healBudget.log,
           why: `the drain refuses to land this PR because its CodeQL check failed (${(pr.codeqlFailure.alerts ?? []).length} alert(s)), nothing live is working it, and ${healAttempts} of ${ciHealCap} CI-heal attempts are spent`
             + (hold.owedMainRule ? `; test's hand-picked-NNN errors are drain-assigned (${hold.owedMainRule.nums.map(n => `#${n}`).join(', ')}) and must be left alone` : ''),
         });
@@ -3658,8 +3666,20 @@ export function planReconcile({
             + ` repair this required-check failure any further; a person must take it over. Last failure: ${lastFailureReason}${reported}`,
         });
       } else {
+        const mainState = mainRedWindows.some(window => window.end == null) ? 'red'
+          : pr.mainGreenNow?.red === false ? 'green' : 'unknown';
+        const admission = admitCiHeal({ reason: 'required', failingRequired: failing.required,
+          rollup: pr.statusCheckRollup, mainState });
+        if (!admission.admitted) {
+          refuse(admission.reason, { ...withPhase, why: admission.why });
+          if (admission.reason === 'x-merge-gate-unreadable') notes.push({
+            kind: admission.reason, prNumber, text: `PR #${prNumber}: ${admission.why}`,
+          });
+          continue;
+        }
+        console.error(`ci-heal admission admitted classes=[${admission.classes.join(',')}] basis=${admission.basis}`);
         dispatch.push({
-          ...base, ...withPhase, ...refund, ...healFacts, ...owedMainRuleFact, kind: 'ci-heal', attempts: ciHealAttempts,
+          ...base, ...withPhase, ...refund, ...healFacts, ...owedMainRuleFact, admission, kind: 'ci-heal', attempts: ciHealAttempts,
           ...(timeoutRetryFallback ? { timeoutRetryFallback: pr.timeoutRetry.reason } : {}),
           ...(partialFailureInventory ? { partialFailureInventory: true } : {}),
           ...(fixTiming.joinCiAndReview && readiness.reviewFindings ? { reviewFixAttempts: roundAttempts() } : {}),
