@@ -337,11 +337,11 @@ export function assertMainNotStale(root, checkStaleness, {
     }
   }
   // A2. A declared boundary decides relevance itself, including prompts and tests.
-  // Without it the #4044 non-code-only tolerance retains its nonempty-list rule.
+  // Both off-path and non-code tolerances require a nonempty list for known lag.
   if (st?.action === 'warn' && managedClone && !dirty) {
     const files = behindList();
     if (typeof dispatchPath === 'function') {
-      if (Array.isArray(files) && !files.some(dispatchPath)) {
+      if (Array.isArray(files) && files.length > 0 && !files.some(dispatchPath)) {
         const codeFiles = files.filter(isCodePath);
         const named = codeFiles.slice(0, 5).join(', ') + (codeFiles.length > 5 ? `, +${codeFiles.length - 5} more` : '');
         write(`${label}: the managed clone is ${st.behind ?? 'unknown'} commit(s) behind origin/${base} (${codeFiles.length} code file(s), none on `

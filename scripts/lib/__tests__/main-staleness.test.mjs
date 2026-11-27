@@ -271,12 +271,12 @@ describe('assertMainNotStale — managed clone never auto-ffs (#4044 Module E)',
       label: 'test', dispatchPath: (p) => p === 'review.mjs', write: () => {},
     }))).toThrow(/STALE code from this checkout/);
   });
-  it('dispatchPath fails closed: unknown behind-file list refuses; known empty dispatches; unset keeps the #4044 rule (#4387)', () => {
+  it('dispatchPath fails closed: unknown or empty behind-file list refuses; unset keeps the #4044 rule (#4387)', () => {
     const warn = () => ({ action: 'warn', reason: 'not-auto-syncing', behind: 3, ahead: 0, dirty: false });
     const opts = { adoptedHead: () => 'fixture-head', readHeadSha: () => 'fixture-head', treeDirtyForCode: () => false, label: 'test', dispatchPath: () => false, write: () => {}, lastGood: () => null };
     withManagedCloneEnv('1', () => {
       expect(() => assertMainNotStale('/repo', warn, { ...opts, listBehindFiles: () => null })).toThrow(/STALE/);
-      expect(assertMainNotStale('/repo', warn, { ...opts, listBehindFiles: () => [] })).toMatchObject({ fresh: true, behindOffDispatchPath: true });
+      expect(() => assertMainNotStale('/repo', warn, { ...opts, listBehindFiles: () => [] })).toThrow(/STALE/);
       expect(() => assertMainNotStale('/repo', warn, { ...opts, dispatchPath: null, listBehindFiles: () => ['x.mjs'] }))
         .toThrow(/STALE/);
       // A declared path includes its own test files; no non-code shortcut applies.
@@ -574,7 +574,8 @@ describe('REVIEW-GUARD-RELEVANT-BEHIND', () => {
     writeFileSync(join(root, 'state', `${cloneKeyOf(root)}.rebuild.json`), JSON.stringify(state));
     expect(head).not.toBe(adopted);
     expect(behindFiles(root, 'main', realOptions.run, {})).toEqual([]);
-    expect(guard(warn, realOptions).guardPath).toBe('off-path');
+    refused(() => guard(warn, realOptions));
+    expect(assertMainNotStale(root, undefined, realOptions).guardPath).toBe('fresh');
   });
   it('8 forceUnverified tree hashes and skipped-unrelated adoptions pass identity', () => {
     const { realOptions } = realFixture();
@@ -603,16 +604,29 @@ describe('REVIEW-GUARD-RELEVANT-BEHIND', () => {
     }
     expect(guard(fresh, { listBehindFiles: () => [] }).guardPath).toBe('fresh');
   });
-  it('11 tolerance precedence refuses relevant or unknown files; empty known list is off-path only', () => {
+  it('11 tolerance precedence refuses relevant, unknown or empty files', () => {
     for (const files of [null, ['scripts/lib/review-core.mjs'], ['backlog/x.md', 'scripts/lane-pool.mjs', 'scripts/lib/jury-core.mjs']]) {
       refused(() => guard(warn, { listBehindFiles: () => files,
         dispatchPath: p => /review-core|jury-core/.test(p) }));
     }
     expect(guard(warn, { listBehindFiles: () => ['backlog/x.md'], dispatchPath: null }).guardPath).toBe('non-code');
-    expect(guard(warn, { listBehindFiles: () => [] }).guardPath).toBe('off-path');
+    refused(() => guard(warn, { listBehindFiles: () => [] }));
     refused(() => guard(warn, { listBehindFiles: () => [], dispatchPath: null }));
     refused(() => guard(warn, { listBehindFiles: () => ['a/__tests__/r.mjs'], dispatchPath: p => p.startsWith('a/') }));
     refused(() => guard(warn, { listBehindFiles: () => ['a/__tests__/r.json'], dispatchPath: p => p.startsWith('a/') }));
+  });
+  it('behind managed clone with empty evidence refuses without last-good and cannot use rebuild grace', () => {
+    const lastGood = vi.fn(() => null);
+    const rebuildGrace = vi.fn(() => ({ grace: true }));
+    const opts = { listBehindFiles: () => [], lastGood, rebuildGrace };
+    const error = refused(() => guard(warn, opts));
+    expect(error.message).toContain('6 commit(s) behind origin/main');
+    expect(error.message).toContain('0 file(s) behind');
+    expect(error.message).toContain('clone-held-stale');
+    expect(lastGood).toHaveBeenCalledOnce();
+    expect(rebuildGrace).not.toHaveBeenCalled();
+    expect(guard(warn, { ...opts, lastGood: () => ({ onLastGood: true, lastGood: H }) }).guardPath).toBe('last-good');
+    expect(guard(fresh, opts).guardPath).toBe('fresh');
   });
   it('15 overrides are explicit and ordered after identity and cleanliness; unknown diff may use last-good', () => {
     const lastGood = () => ({ onLastGood: true, lastGood: H });

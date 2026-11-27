@@ -515,6 +515,9 @@ export const REVIEW_SANDBOX_ROOTS = Object.freeze([
   'scripts/operations/dispatch-lane.mjs', 'scripts/lib/mandate-fence.mjs', 'scripts/lib/review-core.mjs',
   'scripts/lib/jury-core.mjs', 'scripts/lib/judge-spawn.mjs', 'scripts/lib/codex-judge-spawn.mjs',
   'scripts/lib/antigravity-judge-spawn.mjs', 'scripts/lib/main-staleness.mjs', 'scripts/lib/atomic-json-file.mjs',
+  // Review still validates completion records and red-team verdicts after the
+  // scorecard import cut. Retain their transitive validators independently of rebuild.
+  'scripts/operations/completion-store.mjs', 'scripts/lib/red-team-gate.mjs',
 ]);
 const THIS_CODE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 let sandboxClosureMemo;

@@ -232,6 +232,8 @@ review/judge/jury pattern, the static closure of `REVIEW_SANDBOX_ROOTS`, package
 manifests and named JSON inputs of that closure, and `skills-src/review/**`.
 The named JSON boundary explicitly retains `push-gate-allowlist.json` after the
 scorecard store's import cut removes its former path through the rebuild graph.
+Completion-store and red-team-gate remain closure roots so their transitive
+validators stay on the review path independently of that import cut.
 Static imports do not follow spawned scripts. The runtime-read audit pins the two
 review prompts; the `ownedBy` skill pointer is metadata, not a runtime read. The
 fix brief `skills-src/conveyor/fix-agent-brief.md` remains a deferred fix-path gap;
@@ -245,10 +247,13 @@ error establishes an absent ref. Every other failure holds dispatch unless the
 explicit last-good exception applies. The existing
 `WE_STALE_GUARD_MISSING_COMMITS=0` opt-out keeps merge-base diff semantics.
 
-With a declared dispatch path, a known list passes only if no file matches that
-predicate (including Markdown and test files). Without a predicate, the existing
+When the checker reports lag, a declared dispatch path requires a known nonempty
+list and passes only if no file matches that predicate (including Markdown and
+test files). Without a predicate, the existing
 non-code-only tolerance still requires a nonempty list. Relevant lag can pass via
-last-good holding, or via bounded running-rebuild grace with a known list.
+last-good holding, or via bounded running-rebuild grace with a known nonempty list.
+An empty list cannot clear reported lag through either off-path tolerance or grace;
+the explicit last-good exception still applies.
 Refusals and grace diagnostics name up to five relevant paths. Comparison failures
 name the configured origin ref. Commit counts and file counts are separate;
 unreadable evidence is logged as `unknown`, never zero.

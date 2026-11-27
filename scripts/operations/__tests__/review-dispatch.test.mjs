@@ -1146,6 +1146,25 @@ describe('REVIEW-GUARD-RELEVANT-BEHIND review boundary', () => {
       { file: fixFile, path: 'skills-src/conveyor/fix-agent-brief.md', kind: 'non-read-string' },
     ]);
   });
+  it('review validation dependencies remain on-path after the scorecard rebuild import cut', () => {
+    const closure = snapshot();
+    expect(closure?.complete).toBe(true);
+    const validation = collectImportClosure({ root, entries: [
+      'scripts/operations/completion-store.mjs', 'scripts/lib/red-team-gate.mjs',
+    ] });
+    expect(validation?.complete).toBe(true);
+    for (const path of validation.files) expect(closure.files.has(path), path).toBe(true);
+    vi.stubEnv('WE_DAEMON_MANAGED_CLONE', '1');
+    for (const path of ['scripts/operations/completion-record.mjs',
+      'scripts/lib/red-team-disposition.mjs', 'scripts/lib/red-team-sealed-status.mjs']) {
+      expect(isReviewCodePath(path, { closure }), path).toBe(true);
+      expect(() => assertMainNotStale(root, () => ({ action: 'warn', behind: 1 }), {
+        adoptedHead: () => 'fixture-head', readHeadSha: () => 'fixture-head', treeDirtyForCode: () => false,
+        dispatchPath: p => isReviewCodePath(p, { closure }), listBehindFiles: () => [path],
+        lastGood: () => null, rebuildGrace: () => null, write: () => {},
+      }), path).toThrow(/STALE/);
+    }
+  });
   it('14 closure no longer reaches the rebuild graph, remains complete and below 300 files', () => {
     const expected = snapshot();
     // Redirect the production closure's file adapters to the captured fixture too.
