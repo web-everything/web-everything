@@ -12,7 +12,7 @@
  * `health-watch.mjs#probeSelfSync` (see `daemon-rebuild.mjs`'s own doc for the exact shape:
  * `{since, reason: 'smoke-rejected'|'smoke-harness-broken'|'smoke-transient'|'smoke-threw'|'github-auth-broken'|'smoke-env-timeout'|'smoke-env-unavailable', failed, details,
  * lastGood, target, mainSha, updatedAt}`). A cleared hold closes an existing episode only with a newer
- * adoption of a different build. Missing or invalid evidence retains the alert with uncertainty.
+ * adoption, including same-head recovery. Missing or invalid evidence retains the alert with uncertainty.
  *
  * Notify scope: still notifies even in shadow mode — a PREVIOUSLY approved sign, carried forward unchanged by
  * the Sun 2026-09-27 ~7:40 AM ET operator decision (`we:scripts/conveyor/health-smells-notify-list.mjs`),
@@ -38,6 +38,9 @@ export default {
   heldForMs: 15 * MINUTE,
   recommendationHint: 'A daemon clone is held on its last-good build after a failed live smoke — its alerts file names the failing check(s); fix the tree (or, if the harness itself is broken, the tool the check exercises) — never the clone by hand.',
   evaluate({ selfSync }, { now, episodes = {} }) {
+    if (selfSync != null && !Array.isArray(selfSync)) {
+      throw new TypeError('selfSync must be an array');
+    }
     const previous = Object.values(episodes).filter(ep => ep.smell === this.id);
     const rows = Array.isArray(selfSync) ? [...selfSync] : [];
     const seen = new Set(rows.map(c => `clone:${c.cloneKey}`));
@@ -55,14 +58,13 @@ export default {
         const after = Number.isFinite(recordedSince) ? recordedSince : prior.firstBreachAt;
         const resolved = c.rebuild?.held === null && Number.isFinite(adopted?.at)
           && adopted.at > after && adopted.at <= now && typeof adopted.head === 'string'
-          && adopted.head.length > 0 && typeof prior.measure?.lastGood === 'string'
-          && adopted.head !== prior.measure.lastGood;
+          && adopted.head.length > 0 && typeof prior.measure?.lastGood === 'string';
         return { subject, breach: !resolved,
           measure: { ...prior.measure, daemon: c.cloneKey,
             episodeId: prior.measure?.episodeId ?? prior.id,
             uncertainty: resolved ? [] : ['unconfirmed-adoption'] },
-          summary: resolved ? `clone ${c.cloneKey}: newer build adopted.` : prior.summary,
-          recommendation: resolved ? `clone ${c.cloneKey} adopted a newer build.`
+          summary: resolved ? `clone ${c.cloneKey}: adoption confirmed.` : prior.summary,
+          recommendation: resolved ? `clone ${c.cloneKey} confirmed adoption and cleared its hold.`
             : 'Inspect the daemon rebuild state and adoption history; rebuild through the normal smoke gate. The hold cannot yet be confirmed cleared.',
         };
       }

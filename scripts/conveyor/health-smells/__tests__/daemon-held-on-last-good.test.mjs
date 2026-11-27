@@ -79,6 +79,32 @@ describe('last-good hold alarm contract', () => {
     expect(sink(next)[0].episodeId).not.toBe(firstId);
   });
 
+  it('malformed non-array selfSync advances the evaluator-error streak and exposes the failure', () => {
+    const first = tick([clone('fixture-daemon', held(31))]);
+    const errorKey = `smell:${daemonHeldOnLastGood.id}`;
+    const state = { ...first.state, probeErrors: { [errorKey]: { count: 2, last: 'previous failure' } } };
+    const result = tick({ malformed: true }, state, NOW + MINUTE);
+    expect(result.state.probeErrors[errorKey]).toEqual({ count: 3, last: expect.stringMatching(/selfSync.*array/i) });
+    expect(result.evaluations[0]).toMatchObject({ results: null, error: expect.stringMatching(/selfSync.*array/i) });
+    expect(result.state.episodes).toEqual(first.state.episodes);
+    expect(result.transitions).toEqual([]);
+  });
+
+  it('same-head recovery closes the episode so a later hold notifies again', () => {
+    const first = tick([clone('fixture-daemon', held(31))]);
+    const [firstRecord] = sink(first);
+    const recovered = tick([{ cloneKey: 'fixture-daemon', rebuild: { held: null,
+      adopted: { at: NOW + MINUTE, head: firstRecord.lastGood } } }], first.state, NOW + MINUTE);
+    expect(recovered.transitions.filter(t => t.type === 'closed').map(t => t.episode.subject))
+      .toEqual(['clone:fixture-daemon']);
+    expect(recovered.state.episodes['daemon-held-on-last-good::clone:fixture-daemon']).toBeUndefined();
+    const next = tick([clone('fixture-daemon', held(31, { since: NOW + 2 * MINUTE }))],
+      recovered.state, NOW + 33 * MINUTE);
+    expect(sink(next)).toHaveLength(1);
+    expect(sink(next)[0].daemon).toBe('fixture-daemon');
+    expect(sink(next)[0].episodeId).not.toBe(firstRecord.episodeId);
+  });
+
   it.each([
     [],
     [{ cloneKey: 'one', rebuild: null }],
