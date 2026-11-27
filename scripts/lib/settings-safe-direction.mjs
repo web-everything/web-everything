@@ -18,6 +18,7 @@ export const SAFE_DIRECTION = Object.freeze({
   'ciUnitRerun.maxFiles': { kind: 'safety', safe: 'min' },
   'review.unattendedAcceptRequiresCleanReferrals': { kind: 'safety', safe: 'true' },
   'review.careExemptPaths': { kind: 'safety', safe: 'subset' },
+  'drain.mqEjectAfterFailures': { kind: 'safety', safe: 'min' },
   'redTeam.recheckReadsRepo': { kind: 'safety', safe: 'true' },
   'redTeam.skipCardOnly': { kind: 'safety', safe: 'false' },
 });

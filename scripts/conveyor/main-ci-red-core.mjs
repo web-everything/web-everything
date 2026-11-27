@@ -19,6 +19,7 @@
  * last-N-runs-across-all-workflows window (card xfrjlsi: busy other workflows push main's CI runs out of that window).
  */
 
+import { createHash } from 'node:crypto';
 import { isTrustedMarkerAuthor, AUTOMATION_LOGINS } from '../lib/marker-authorship.mjs';
 import { isNonCodeFile } from '../lib/merge-queue-affected.mjs';
 import { parsePushBeforeGate } from '../lib/fix-push-policy.mjs';
@@ -845,4 +846,160 @@ export function planStalledRecovery({ stall, failingRun, reruns = {}, settings =
     return { kind: 'rerun', runId: failingRun.databaseId, sha: failingRun.headSha, reason: 'owner-stalled' };
   }
   return { kind: 'revert-proposal', sha: stall.firstRedSha, reason: 'owner-stalled' };
+}
+
+
+/** RED-METRICS v1: constants are safety bounds, not policy settings.
+ * Archive the journal and replay smaller ranges on refusal; never tune policy from incomplete evidence.
+ * UTC calendar days, a rolling 30-day report horizon, at most 10,000 events and 8 KiB/event.
+ * Retention is read-only: older journal entries remain available for operator archival/replay.
+ */
+export const MAIN_RED_METRIC_LIMITS = Object.freeze({ events: 10_000, bytes: 8192, days: 30 });
+const numericMetricTime = v => typeof v === 'number' && Number.isFinite(v) && v >= 0
+  && v <= 8640000000000000 ? v : null;
+const metricTime = v => numericMetricTime(typeof v === 'string' && v.trim() ? ts(v) : v);
+
+/** Enqueue→start wait and start→completion service are independent.
+ * A queued job or missing/reversed timestamp is unknown, never a zero-duration success.
+ */
+export function measureMainQueue({ enqueuedAt, startedAt, completedAt } = {}) {
+  const delta = (a, b) => {
+    const start = metricTime(a); const end = metricTime(b);
+    return start !== null && end !== null && end >= start ? end - start : null;
+  };
+  return { waitMs: delta(enqueuedAt, startedAt), serviceMs: delta(startedAt, completedAt) };
+}
+
+/** Only structured job/file/test identifiers; never hash log/error/annotation text.
+ * Reject controls, credential-shaped identifiers and oversize input before hashing. No raw identifiers persist.
+ * v1 fixes field order, slash direction and whitespace; a future normalization change needs a new version.
+ */
+export function mainFailureSignature(ids) {
+  const parts = ['job', 'file', 'test'].map(k => ids?.[k] ?? '');
+  if (parts.some(v => typeof v !== 'string' || v.length > 1024
+    || /[\x00-\x1f\x7f-\x9f]|(?:token|password|secret|authorization)\s*[:=]|gh[pousr]_|github_pat_|sk-[a-z0-9]/i.test(v))) return null;
+  const normalized = parts.map(v => v.trim().replaceAll('\\', '/').replace(/\s+/g, ' '));
+  return normalized.some(Boolean) ? `v1:${createHash('sha256').update(JSON.stringify(normalized)).digest('hex')}` : null;
+}
+
+const exactMetricKeys = (value, keys) => value !== null && typeof value === 'object'
+  && !Array.isArray(value) && Object.keys(value).length === keys.length
+  && keys.every(key => Object.hasOwn(value, key));
+
+export function validMainRedMetric(e) {
+  return exactMetricKeys(e, ['v', 'key', 'repo', 'head', 'seq', 'runId', 'kind', 'at', 'since', 'queue', 'signature', 'truncated'])
+    && typeof e.truncated === 'boolean' && e.v === 1 && ['red', 'green', 'unknown', 'queue'].includes(e.kind)
+    && typeof e.key === 'string' && e.key.length <= 256 && /^[a-zA-Z0-9:_-]+$/.test(e.key)
+    && typeof e.repo === 'string' && /^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(e.repo)
+    && typeof e.head === 'string' && (e.head === 'unknown' || /^[a-f0-9]{7,64}$/i.test(e.head))
+    && Number.isSafeInteger(e.seq) && e.seq >= 0 && numericMetricTime(e.at) !== null
+    && (e.since === null || numericMetricTime(e.since) !== null && e.since <= e.at)
+    && (e.runId === null || Number.isSafeInteger(e.runId) && e.runId > 0)
+    && (e.kind !== 'red' || numericMetricTime(e.since) !== null && e.since <= e.at)
+    && (e.signature === null || typeof e.signature === 'string' && /^v1:[a-f0-9]{64}$/.test(e.signature))
+    && exactMetricKeys(e.queue, ['waitMs', 'serviceMs']) && ['waitMs', 'serviceMs'].every(k => e.queue[k] === null
+      || typeof e.queue[k] === 'number' && Number.isFinite(e.queue[k]) && e.queue[k] >= 0);
+}
+
+/** Read-only baseline. Red intervals are [since, recovery observation), open until query time.
+ * Union within each repo BEFORE summing UTC days, so overlapping runs/retries never multiply minutes.
+ * Unknown observations preserve the open interval but mark it uncertain; gaps never prove recovery.
+ * Report bounds refuse rather than truncate silently. `warnings` require archival/smaller replay or evidence recovery.
+ */
+export function reportMainRedMetrics(events, { from, to, now, warnings = [] } = {}) {
+  const result = { timezone: 'UTC', days: {}, openEpisodes: 0,
+    queue: { waitMs: [], serviceMs: [], unknown: 0 }, signatures: [], warnings: [...warnings] };
+  const warn = text => { if (!result.warnings.includes(text)) result.warnings.push(text); };
+  if (![from, to, now].every(v => typeof v === 'number' && metricTime(v) !== null)
+    || from >= to || to > now || to - from > MAIN_RED_METRIC_LIMITS.days * 86400000) {
+    warn('Incomplete range: invalid range or retention limit; archive and replay at most 30 days through query time.'); return result;
+  }
+  if (!Array.isArray(events) || events.length > MAIN_RED_METRIC_LIMITS.events) {
+    warn('Incomplete event scan limit; archive journal and replay smaller ranges.'); return result;
+  }
+  const unique = new Map();
+  for (const e of events) {
+    if (!validMainRedMetric(e) || Buffer.byteLength(JSON.stringify(e)) > MAIN_RED_METRIC_LIMITS.bytes) {
+      warn('Incomplete malformed/oversized event; archive and recover source evidence.'); continue;
+    }
+    if (unique.has(e.key) && JSON.stringify(unique.get(e.key)) !== JSON.stringify(e)) warn('Incomplete conflicting duplicate event; recover source evidence.');
+    else if (!unique.has(e.key)) unique.set(e.key, e);
+  }
+  const rows = [...unique.values()].filter(e => e.at < to).sort((a, b) => a.at - b.at || a.seq - b.seq);
+  if (!rows.length)
+    warn('Incomplete range: history does not cover the requested start; recover archived evidence.');
+  const historyStarts = new Map();
+  for (const e of rows) {
+    const start = e.kind === 'red' ? e.since : e.at;
+    historyStarts.set(e.repo, Math.min(historyStarts.get(e.repo) ?? Infinity, start));
+  }
+  for (const [repo, start] of historyStarts) {
+    if (start > from)
+      warn(`Incomplete range: history does not cover the requested start for ${repo}; recover archived evidence.`);
+  }
+  const episodes = new Map(); const intervals = new Map(); const signatures = new Map(); const queues = new Map();
+  for (const e of rows) {
+    const episode = `${e.repo}:${e.seq}`;
+    if (e.kind === 'unknown') warn('Unknown observation: red duration may include unobserved recovery; recover source evidence.');
+    if (e.kind === 'queue' && !episodes.has(episode))
+      warn('Incomplete range: queue observation has no episode start; recover archived evidence.');
+    if (e.kind === 'red') {
+      if (episodes.has(episode) && episodes.get(episode).end !== null) {
+        warn('Incomplete episode identity: an episode start repeats a closed episode; recover archived evidence.');
+        continue;
+      }
+      if (!episodes.has(episode)) episodes.set(episode, { repo: e.repo, start: e.since, end: null });
+      else if (episodes.get(episode).start !== e.since)
+        warn('Incomplete episode origin: conflicting starts for an open episode; recover source evidence.');
+    }
+    if (e.kind === 'green') {
+      const open = episodes.get(episode);
+      if (open) {
+        // Recovery is the first green for this episode; later tips retain its sequence.
+        if (open.end === null) open.end = e.at;
+      }
+      else if (e.seq > 0) warn('Incomplete range: recovery has no episode start; recover archived evidence.');
+    }
+    const queueSample = e.kind === 'red' || e.kind === 'queue';
+    if (queueSample) queues.set(`${e.repo}:${e.head}:${e.runId}`, e);
+    if (e.truncated) warn('Incomplete episode origin: source run window is truncated; recover archived evidence.');
+    if (queueSample && e.at >= from && e.signature) signatures.set(e.signature, (signatures.get(e.signature) ?? 0) + 1);
+  }
+  for (const e of queues.values()) {
+    const episode = episodes.get(`${e.repo}:${e.seq}`);
+    if (e.at < from && (!episode || episode.end !== null && episode.end <= from)) continue;
+    if (e.queue.waitMs === null) result.queue.unknown++;
+    for (const field of ['waitMs', 'serviceMs']) if (e.queue[field] !== null) result.queue[field].push(e.queue[field]);
+  }
+  if (result.queue.unknown) warn('Unknown queue wait: enqueue/start evidence missing or reversed; recover timestamps.');
+  for (const e of episodes.values()) {
+    if (e.end === null) result.openEpisodes++;
+    const start = Math.max(from, e.start); const end = Math.min(to, e.end ?? now);
+    if (end > start) {
+      if (!intervals.has(e.repo)) intervals.set(e.repo, []);
+      intervals.get(e.repo).push([start, end]);
+    }
+  }
+  for (const ranges of intervals.values()) {
+    ranges.sort((a, b) => a[0] - b[0]);
+    const union = [];
+    for (const [start, end] of ranges) {
+      const last = union.at(-1);
+      if (last && start <= last[1]) last[1] = Math.max(last[1], end);
+      else union.push([start, end]);
+    }
+    for (const [start, end] of union) {
+      let cursor = start;
+      while (cursor < end) {
+        // utc-day-slice-ok: UTC-anchored interval arithmetic is the documented metric timezone, independent of operator wall time.
+        const day = new Date(cursor).toISOString().slice(0, 10);
+        const boundary = Math.min(end, (Math.floor(cursor / 86400000) + 1) * 86400000);
+        result.days[day] = (result.days[day] ?? 0) + (boundary - cursor) / MINUTE;
+        cursor = boundary;
+      }
+    }
+  }
+  result.signatures = [...signatures].map(([signature, observations]) => ({ signature, observations }))
+    .sort((a, b) => b.observations - a.observations || a.signature.localeCompare(b.signature));
+  return result;
 }

@@ -10,11 +10,12 @@
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import { sharedRepos, withGhStub } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
-import { readFileSync, mkdtempSync, rmSync, existsSync } from 'node:fs';
-import { resolve, join } from 'node:path';
+import { readFileSync, mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync, symlinkSync } from 'node:fs';
+import { resolve, join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 
-const SCRIPT = resolve(process.cwd(), 'scripts/lane-pool.mjs');
+const SCRIPT = resolve(dirname(fileURLToPath(import.meta.url)), '../lane-pool.mjs');
 const LEASE_FILE = (lane) => join(lane, '.git', '.lane-lease');
 
 function git(args, cwd) {
@@ -212,6 +213,33 @@ describe('lane-pool #2748 — release --all-pools --item sweeps every pool BY IT
 });
 
 describe('lane-pool #2667 — --pool=<name> selects a pool by dir-name (no checkout path)', () => {
+  it('acquire --pool=<name> without a matching primary refuses (no caller-origin fallback)', () => {
+    // This refusal must occur during resolution, before any host/process/remote probe.
+    const bin = join(base, 'bin'), home = join(base, 'home'), scratch = join(base, 'tmp');
+    for (const dir of [bin, home, scratch]) mkdirSync(dir);
+    const realGit = execFileSync('/usr/bin/which', ['git'], { encoding: 'utf8' }).trim();
+    symlinkSync(realGit, join(bin, 'git'));
+    for (const name of ['gh', 'pgrep', 'ps', 'launchctl']) {
+      writeFileSync(join(bin, name), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    }
+    const clock = join(base, 'clock.cjs');
+    writeFileSync(clock, `const RealDate = Date; global.Date = class extends RealDate { constructor(...a) { super(...(a.length ? a : [1795780800000])); } static now() { return 1795780800000; } };
+      const os = require('node:os'); os.hostname = () => 'fixture-host'; os.homedir = () => process.env.HOME;
+      os.userInfo = () => ({ homedir: process.env.HOME, username: 'fixture' }); require('node:module').syncBuiltinESMExports();`);
+    const child = spawnSync(process.execPath, [SCRIPT, 'acquire', '--pool=missing-primary', '--session=fixture', '--wait-ms=0', '--no-reap', '--no-install'], {
+      cwd: referenceDir, encoding: 'utf8', timeout: 20_000, maxBuffer: 1024 * 1024,
+      env: { PATH: bin, HOME: home, TMPDIR: scratch, DEVELOPER_DIR: process.env.DEVELOPER_DIR,
+        GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_ALLOW_PROTOCOL: 'file',
+        LANE_POOL_ROOT: poolRoot, NODE_OPTIONS: `--require=${clock}`, WE_TELEMETRY: '0', WE_UNDER_TEST: '1' },
+    });
+    expect(child.error).toBeUndefined();
+    const r = { code: child.status, err: child.stderr };
+    expect(r.code).toBe(1);
+    expect(r.err).toContain('acquire --pool=missing-primary: no primary checkout for pool missing-primary whose origin names missing-primary');
+    expect(r.err).toContain('pass --reference=<missing-primary checkout> or --origin=<url>');
+    expect(existsSync(join(poolRoot, 'missing-primary'))).toBe(false);
+  });
+
   it('release --pool=<name> --lane=N targets that pool, not the cwd\'s', () => {
     const b1 = acquire('poolB', 1, 'sess-x');
     // Release it by pool NAME + session, with NO --origin/--reference/--repo — just --pool.
