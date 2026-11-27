@@ -3,6 +3,9 @@ import { describe, it, expect } from 'vitest';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import nunjucks from 'nunjucks';
 import { Window } from 'happy-dom';
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
+const { build: buildTiles } = require('../../src/_data/backlogTileChunks.js');
 
 const root = `${process.cwd()}/`;
 const read = (path) => readFileSync(`${root}${path}`, 'utf8');
@@ -18,7 +21,7 @@ function renderTracked(resolvedView, items = fixture) {
   let tiles;
   // Exercise the real template producer without invoking the FUI build subprocess.
   env.addFilter('weBacklogGrid', (rows) => { tiles = rows; return '<div class="project-grid"></div>'; });
-  const html = env.render('backlog-tracked.njk', { backlog: items, resolvedView, backlogMeta: {} });
+  const html = env.render('backlog-tracked.njk', { backlogTileChunks: buildTiles(items), resolvedView, backlogMeta: {} });
   return { html, tiles };
 }
 
@@ -41,7 +44,8 @@ describe('resolved backlog static split', () => {
   it('does not grow the main tile payload when resolved history grows', () => {
     const history = Array.from({ length: 1000 }, (_, i) => ({ ...fixture.at(-1), id: `history-${i}` }));
     expect(renderTracked(false, fixture.concat(history)).tiles).toEqual(renderTracked(false).tiles);
-    expect(renderTracked(true, fixture.concat(history)).tiles).toHaveLength(1001);
+    expect(renderTracked(true, fixture.concat(history)).tiles).toHaveLength(100);
+    expect(buildTiles(fixture.concat(history)).resolved.items).toHaveLength(1001);
   });
 
   it('uses the same tile bodies and facets, with resolved selected by default under a separate saved-state key', () => {
@@ -108,7 +112,7 @@ describe('resolved backlog static split', () => {
     const env = new nunjucks.Environment();
     env.addFilter('where', (list, key, value) => list.filter((item) => item[key] === value));
     const items = fixture.map((item) => ({ ...item, activeBatchable: ['active', 'resolved'].includes(item.status) }));
-    const rows = JSON.parse(env.renderString(source.slice(start, end) + '{{ tableRows | dump | safe }}', { backlog: items }));
+    const rows = JSON.parse(env.renderString(source.slice(start, end) + '{{ tableRows | dump | safe }}', { backlog: items, backlogPrioChunks: require('../../src/_data/backlogPrioChunks.js').build(items) }));
     expect(rows.some((item) => item.status === 'resolved')).toBe(false);
     expect(rows.some((item) => item.status === 'open')).toBe(true);
     expect(rows.some((item) => item.status === 'active')).toBe(true);
