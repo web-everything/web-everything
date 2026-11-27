@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { URL as NodeURL, fileURLToPath } from 'node:url';
 import { main, renderWorkerBrief, renderScopeFlags, readForgeAllowlist } from '../worker-brief.mjs';
 import { resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { renderBriefHeader } from '../lib/brief-header.mjs';
@@ -124,7 +125,9 @@ describe('BRIEF-TEMPLATE-HARDEN', () => {
  * yet ships without it) may omit the runner definition — and never on GitHub Actions, where the
  * checkout always has it. A present-but-renamed runner still throws.
  */
-function readRunnerDefinition({ root = process.cwd(), env = process.env } = {}) {
+const repoRoot = fileURLToPath(new NodeURL('../../', import.meta.url));
+
+function readRunnerDefinition({ root = repoRoot, env = process.env } = {}) {
   const file = path.resolve(root, '.claude/agents/codex-runner.md');
   try { return fs.readFileSync(file, 'utf8'); }
   catch (error) {
@@ -278,7 +281,7 @@ describe('renderWorkerBrief', () => {
     const brief = renderWorkerBrief({ ...params, repo });
     const command = /`(node [^`]*verify-lane\.mjs[^`]* check [^`]+)`/.exec(brief)?.[1];
     expect(command).toBeDefined();
-    expect(command).toContain(path.resolve('scripts/verify-lane.mjs'));
+    expect(command).toContain(path.join(repoRoot, 'scripts/verify-lane.mjs'));
     expect(command).toContain('check --wait=150000 --json --repo=<lane>');
   });
 
@@ -596,7 +599,7 @@ describe('per-dispatch owner token', () => {
       expect(brief).toContain('Resume only after the exact register command above succeeds');
       const prePush = brief.slice(brief.indexOf('7. **Pre-push recheck.**'));
       expect(prePush).toContain("Apply step 2's lost-reservation warning and renewal rules before proceeding");
-      expect(fs.readFileSync('skills-src/worker-brief/SKILL.md', 'utf8')).toContain('same-owner TTL renewal');
+      expect(fs.readFileSync(path.join(repoRoot, 'skills-src/worker-brief/SKILL.md'), 'utf8')).toContain('same-owner TTL renewal');
       expect(run(register, 240)).toMatchObject({ code: 0, err: '' });
       expect(run(['check', `--files=${files}`], 240).code).toBe(1);
     });
@@ -746,7 +749,7 @@ describe('worker-brief hardening (items 90, 92)', () => {
     const brief = renderWorkerBrief(params);
     const step2 = brief.slice(brief.indexOf('2. **Register'), brief.indexOf('3. **Lane'));
     expect(step2).toMatch(/register exits non-zero[\s\S]*stop and report/);
-    const skill = fs.readFileSync('skills-src/worker-brief/SKILL.md', 'utf8');
+    const skill = fs.readFileSync(path.join(repoRoot, 'skills-src/worker-brief/SKILL.md'), 'utf8');
     expect(skill).toMatch(/register` exits non-zero[\s\S]*stop and report/);
   });
 });
@@ -868,7 +871,7 @@ describe('brief red-team prep reading is gated and bounded (blocking-read hang)'
 });
 
 describe('brief header lines (BRIEF-GUARD-TEMPLATE)', () => {
-  const routes = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), 'scripts/settings/delivery-routes.json'), 'utf8'));
+  const routes = JSON.parse(fs.readFileSync(path.join(repoRoot, 'scripts/settings/delivery-routes.json'), 'utf8'));
   const base = { purpose: 'hdr-test', files: 'scripts/x.mjs', owner: 'abc123' };
   const prepDir = fs.mkdtempSync(path.join(os.tmpdir(), 'brief-hdr-'));
   const prepFile = path.join(prepDir, 'prt-pin-probe-prep.md');
