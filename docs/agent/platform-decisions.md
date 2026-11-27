@@ -6759,3 +6759,25 @@ plus its tested guards. It composes with [#deterministic-core-thin-judgment](#de
 writers to `main` keep no unlocked fallback.
 
 **Lineage:** `#4219`.
+
+## Generation handover: no source scan
+
+**Rule:** A source denylist is never a handover control (PD1 s3b precedent). Repo code is trusted through
+PR review; a same-user adversary is out of scope. Process-group membership is a property of what runs,
+and a source denylist cannot establish it.
+
+**Contract:** `decidePromotion` refuses unless the caller passes group death `'dead'` and escape evidence
+`'confirmed'`. S1 supplies no escape-evidence producer and makes no claim that blue's descendants stay in
+its process group. Existing conditions also apply. Escape evidence comes only from a producer approved by
+its own ruling. Until one exists, ordered-exit handover cannot promote through this module.
+
+**Bounds:** Every promotion requires an explicit finite positive `ghRequestTimeoutMs` and an explicit
+finite nonnegative `settleMs`, including clean handovers. Missing or invalid values refuse with
+`request-timeout-invalid` or `settle-bound-invalid`; no arithmetic-helper default authorizes promotion.
+The operator must supply the real request timeout and a valid settle bound before retrying. Green still
+waits for at least the greater bound after an unclean exit and reconciles first.
+
+**Ordering:** The caller appends the handover record before deciding; `recordWritten` reflects the real
+append result. S1 adds no call site. The G2 source-scan condition becomes “promotion requires approved
+escape evidence”; the producer and gate wiring require their own S2/S3 rulings. Detached-job idleness and
+the follow-up-job gate remain deferred to S1.4; exit handover must stay disabled until its prerequisites land.
