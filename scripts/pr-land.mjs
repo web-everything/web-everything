@@ -932,6 +932,17 @@ async function runCli() {
   function submissionWriteFailed() {
     if (SKIP_PUSH) refuseSubmission('gh-error', 'submission-write-unconfirmed');
   }
+  function labelCreationFailed(error, label) {
+    // An existing label definition needs no update. Match the duplicate-name response
+    // independently of gh's optional semicolon-separated advice about updating metadata.
+    // Only its explicit duplicate-name response confirms success; unknown failures still refuse.
+    const detail = (typeof error?.stderr === 'string' || Buffer.isBuffer(error?.stderr))
+      ? error.stderr.toString().trim() : '';
+    const duplicate = `label with name "${label}" already exists`;
+    if (error?.status === 1 && !error.signal && !/[\r\n]/.test(detail)
+      && detail.split(';', 1)[0] === duplicate) return;
+    submissionWriteFailed();
+  }
 
   // #2290 — the single-couple FAST DRAIN pr-land shells after labelling green so /pr still feels instant. The
   // drain is the sole writer to main; scoping it to this ONE PR (+ --this-repo) lands the couple immediately
@@ -956,9 +967,9 @@ async function runCli() {
     // NO label of any kind; once the fix daemon healed the red the PR sat green and label-less forever.
     let handOff = null;
     try { handOff = unlabelledHandOffLabel({ mode: PLAN.mode, reason: result?.reason, labelApplied, prNum }); } catch { /* emitted before the PR/plan existed (TDZ) — nothing to hand off */ }
-    if (handOff && (!SKIP_PUSH || exitCode === 0)) {
+    if (handOff) {
       beforeSubmissionWrite();
-      try { forge.ensureLabel(handOff, { color: 'FBCA04', description: 'Review pending — an independent review is owed once required checks are green' }); } catch { submissionWriteFailed(); }
+      try { forge.ensureLabel(handOff, { color: 'FBCA04', description: 'Review pending — an independent review is owed once required checks are green' }); } catch (e) { labelCreationFailed(e, handOff); }
       beforeSubmissionWrite();
       try { forge.addLabel(prNum, handOff); result = { ...result, handOffLabel: handOff }; }
       catch (e) { submissionWriteFailed(); if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · could not hand #${prNum} off with "${handOff}" (${String(e.message || e).split('\n')[0]})\n`); }
@@ -1393,7 +1404,7 @@ async function runCli() {
   const applyLabel = () => {
     if (!LABEL || prNum == null) return; // same guard buildAddLabelArgs applies internally — don't run it twice
     beforeSubmissionWrite();
-    try { forge.ensureLabel(LABEL, { color: '0E8A16', description: 'Producer-certified: required checks green, safe for the label lander (/drain) to merge' }); } catch { submissionWriteFailed(); }
+    try { forge.ensureLabel(LABEL, { color: '0E8A16', description: 'Producer-certified: required checks green, safe for the label lander (/drain) to merge' }); } catch (e) { labelCreationFailed(e, LABEL); }
     beforeSubmissionWrite();
     try { forge.addLabel(prNum, LABEL); labelApplied = true; }
     catch (e) { submissionWriteFailed(); if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · could not apply label "${LABEL}" to #${prNum} (${String(e.message || e).split('\n')[0]}) — land continues\n`); }
@@ -1502,7 +1513,7 @@ async function runCli() {
     if (verdict.label && verdict.apply) {
       const meta = REVIEW_LABEL_META[verdict.label];
       beforeSubmissionWrite();
-      try { forge.ensureLabel(verdict.label, { color: meta.color, description: meta.description }); } catch { submissionWriteFailed(); }
+      try { forge.ensureLabel(verdict.label, { color: meta.color, description: meta.description }); } catch (e) { labelCreationFailed(e, verdict.label); }
       ledgerProducerHold(verdict.label, verdict.reasons.join('; ') || 'producer review escalation', prNum);
       beforeSubmissionWrite();
       try { forge.addLabel(prNum, verdict.label); }
@@ -1514,7 +1525,7 @@ async function runCli() {
       if (verdict.label === REVIEW_LABELS.human && shouldApplyReviewLabel(REVIEW_LABELS.awaitingAdvisory, currentLabels)) {
         const awaitMeta = REVIEW_LABEL_META[REVIEW_LABELS.awaitingAdvisory];
         beforeSubmissionWrite();
-        try { forge.ensureLabel(REVIEW_LABELS.awaitingAdvisory, { color: awaitMeta.color, description: awaitMeta.description }); } catch { submissionWriteFailed(); }
+        try { forge.ensureLabel(REVIEW_LABELS.awaitingAdvisory, { color: awaitMeta.color, description: awaitMeta.description }); } catch (e) { labelCreationFailed(e, REVIEW_LABELS.awaitingAdvisory); }
         beforeSubmissionWrite();
         try { forge.addLabel(prNum, REVIEW_LABELS.awaitingAdvisory); }
         catch (e) { submissionWriteFailed(); if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · could not apply "${REVIEW_LABELS.awaitingAdvisory}" to #${prNum} (${String(e.message || e).split('\n')[0]}) — land continues\n`); }
@@ -1600,7 +1611,7 @@ async function runCli() {
     const meta = REVIEW_LABEL_META[parkLabel];
     let parkApplied = false;
     beforeSubmissionWrite();
-    try { forge.ensureLabel(parkLabel, { color: meta.color, description: meta.description }); } catch { submissionWriteFailed(); }
+    try { forge.ensureLabel(parkLabel, { color: meta.color, description: meta.description }); } catch (e) { labelCreationFailed(e, parkLabel); }
     ledgerProducerHold(parkLabel, `producer --park ${parkLabel}`, prNum);
     const parkTry = applyLabelWithRetry(() => { beforeSubmissionWrite(); return forge.addLabel(prNum, parkLabel); }, { attempts: 3 });
     if (!parkTry.applied) submissionWriteFailed();
