@@ -7,7 +7,7 @@
  *   `<primary>/agent-memory-src/`), must be denied and routed to a lane.
  */
 import { describe, it, expect, afterAll } from 'vitest';
-import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, existsSync, rmSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, existsSync, rmSync, realpathSync, statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -25,6 +25,7 @@ describe('laneGuardDecision — Standards-owned paths', () => {
   const target = path.join(standards, 'drafts/core/authority/x.md');
   mkdirSync(weRoot, { recursive: true });
   mkdirSync(path.dirname(target), { recursive: true });
+  writeFileSync(target, '{}');
 
   it('a worker-marked session is refused an edit under .operations/handoff/standards/drafts', () => {
     expect(laneGuardDecision(target, weRoot, { sessionRole: 'worker' })).toMatch(/Standards-owned/);
@@ -62,14 +63,33 @@ describe('laneGuardDecision — Standards-owned paths', () => {
       { sessionRole: 'worker' })).toMatch(/Standards-owned/);
   });
 
-  const runHook = (marker) => spawnSync(process.execPath, [path.join(here, '../guard-lane.mjs')], {
+  it.each(['worker', 'unknown'])('refuses case-variant Standards paths for %s sessions', (sessionRole) => {
+    const variants = [
+      path.join(ws, '.operations/handoff/STANDARDS'),
+      path.join(ws, '.operations/handoff/StAnDaRdS/new/schema.json'),
+      path.join(ws, '.OPERATIONS/HANDOFF/standards/new/schema.json'),
+      target.toUpperCase(),
+    ];
+    for (const file of variants) {
+      expect(laneGuardDecision(file, weRoot, { sessionRole }), file).toMatch(/Standards-owned/);
+    }
+  });
+
+  it('allows case-variant sibling names and the Standards orchestrator', () => {
+    expect(laneGuardDecision(path.join(ws, '.operations/handoff/STANDARDS-other/x.md'), weRoot,
+      { sessionRole: 'worker' })).toBeNull();
+    expect(laneGuardDecision(target.toUpperCase(), weRoot,
+      { sessionRole: 'orchestrator' })).toBeNull();
+  });
+
+  const runHook = (marker, file = target) => spawnSync(process.execPath, [path.join(here, '../guard-lane.mjs')], {
     cwd: ws,
     env: {
       HOME: ws, TMPDIR: ws, WE_HOOK_ROOT: weRoot,
       WE_DAEMON_OVERLAY_DIR: path.join(ws, 'overlay-state'),
       ...(marker === undefined ? {} : { WE_CONVEYOR_WORKER: marker }),
     },
-    input: JSON.stringify({ tool_input: { file_path: target } }),
+    input: JSON.stringify({ tool_input: { file_path: file } }),
     encoding: 'utf8', timeout: 10_000, maxBuffer: 64 * 1024,
   });
 
@@ -78,6 +98,31 @@ describe('laneGuardDecision — Standards-owned paths', () => {
     expect(result.error).toBeUndefined();
     expect(result.status, result.stderr).toBe(2);
     expect(result.stderr).toMatch(/Standards-owned/);
+  });
+
+  it.each(['1', '0'])('CLI refuses case variants and new descendants for marker %s', (marker) => {
+    for (const file of [
+      path.join(ws, '.operations/handoff/STANDARDS'),
+      path.join(ws, '.OPERATIONS/HANDOFF/StAnDaRdS/drafts/core/authority/schema.json'),
+    ]) {
+      const result = runHook(marker, file);
+      expect(result.error).toBeUndefined();
+      expect(result.status, `${file}: ${result.stderr}`).toBe(2);
+      expect(result.stderr).toMatch(/Standards-owned/);
+    }
+  });
+
+  const caseAlias = path.join(ws, '.operations/handoff/STANDARDS/drafts/core/authority/x.md');
+  it.skipIf(!existsSync(caseAlias))('CLI denies both spellings of the same live file on a case-insensitive filesystem', () => {
+    const canonicalStat = statSync(target);
+    const aliasStat = statSync(caseAlias);
+    expect([aliasStat.dev, aliasStat.ino]).toEqual([canonicalStat.dev, canonicalStat.ino]);
+    for (const file of [target, caseAlias]) {
+      const result = runHook('1', file);
+      expect(result.error).toBeUndefined();
+      expect(result.status, `${file}: ${result.stderr}`).toBe(2);
+      expect(result.stderr).toMatch(/Standards-owned/);
+    }
   });
 
   it('CLI allows the unmarked orchestrator/Standards session', () => {

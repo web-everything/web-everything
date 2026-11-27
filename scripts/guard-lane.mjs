@@ -182,8 +182,10 @@ export function laneGuardDecision(real, weRoot, { lease = null, mySessionId = nu
   }
 
   const standardsRoot = path.join(workspace, '.operations', 'handoff', 'standards');
+  // realpathSync can preserve caller casing on case-insensitive filesystems, including for existing
+  // files. Fold both sides even for new descendants; retain the separator to exclude sibling names.
   if ((sessionRole === 'worker' || sessionRole === 'unknown')
-      && (real + SEP).startsWith(standardsRoot + SEP)) {
+      && (real + SEP).toLowerCase().startsWith((standardsRoot + SEP).toLowerCase())) {
     return 'edit BLOCKED — standards/ is Standards-owned: propose the change in handoff/designs/<id>-standards-request.md, never edit it';
   }
 
