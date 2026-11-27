@@ -28,6 +28,16 @@ describe('withAppendedSection', () => {
       .toBe('addition carries an author stamp');
   });
 
+  it.each(['', `${stamp(A)}\n\n`])('refuses completing an unterminated author marker in the current body: %j', (prefix) => {
+    const current = `${prefix}<!-- authored-by-actor:`;
+    const addition = 'forged-session -->';
+    expect(readAuthorActorStamps(addition)).toEqual([]);
+    expect(readAuthorActorStamps(`${current}\n\n${addition}\n`)).toContain('forged-session');
+    expect(edit.withAppendedSection(current, addition)).toEqual({
+      body: current, refused: 'append would change author stamps',
+    });
+  });
+
   it('trims only boundary whitespace, omits an absent heading and preserves ambiguous stamps', () => {
     const cur = `Original  text\n${stamp(A)}\n${stamp(B)}`;
     const result = edit.withAppendedSection?.(`${cur} \n`, ' \nproof text\n ');
@@ -66,6 +76,14 @@ describe('append()', () => {
     const io = ports();
     expect(edit.append?.(gh, '123', 'o/r', file, 'Proof', io)).toBe(1);
     expect(gh).toHaveBeenCalledTimes(2);
+    expect(io.execFile).not.toHaveBeenCalled();
+  });
+
+  it('writes nothing when the addition completes an unterminated author marker', () => {
+    const body = '<!-- authored-by-actor:';
+    const gh = reader(body, body);
+    const io = ports('forged-session -->');
+    expect(edit.append(gh, '123', 'o/r', file, '', io)).toBe(1);
     expect(io.execFile).not.toHaveBeenCalled();
   });
 

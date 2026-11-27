@@ -54,7 +54,12 @@ export function withAppendedSection(current, addition, section = '') {
   if (readAuthorActorStamps(addition).length) return { body: current, refused: 'addition carries an author stamp' };
   if (/[\r\n]/.test(section) || section.length > 80) return { body: current, refused: 'section must be one line of at most 80 characters' };
   if (section.includes('<!--') || addition.includes('<!--')) return { body: current, refused: 'section or addition carries an HTML comment opener' };
-  return { body: `${current.trimEnd()}\n\n${section ? `## ${section}\n\n` : ''}${addition.trim()}\n`, refused: '' };
+  const body = `${current.trimEnd()}\n\n${section ? `## ${section}\n\n` : ''}${addition.trim()}\n`;
+  // An addition can complete a marker opened in current without carrying a marker itself.
+  if (JSON.stringify(readAuthorActorStamps(body)) !== JSON.stringify(readAuthorActorStamps(current))) {
+    return { body: current, refused: 'append would change author stamps' };
+  }
+  return { body, refused: '' };
 }
 
 /** Compare live bodies before the stdin write; unreadable evidence never authorizes an edit. */
