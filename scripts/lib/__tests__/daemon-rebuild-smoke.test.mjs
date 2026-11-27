@@ -628,6 +628,50 @@ describe('BLD-5539 — rate-limited overlay recovery', () => {
     expect(f.adopt).not.toHaveBeenCalled();
   });
 
+  it.each([300, 2400])('smoke producer cannot authorize throttle-only recovery after truncating TypeError at %i characters', async cap => {
+    const prefix = 'HTTP 403: API rate limit exceeded for ';
+    const line = size => prefix + 'x'.repeat(size - prefix.length);
+    const stderr = cap === 300 ? `${line(300)} TypeError: invalid dispatch`
+      : ['TypeError: invalid dispatch', ...Array(9).fill(line(264))].join('\n');
+    let produced;
+    f.smoke.mockImplementation(async ({ root, env }) => {
+      const smoke = await runLiveSmoke({ root, env, repos: [], clock: f.now, now: f.now(), load: () => 0, cores: () => 1,
+        shadow: () => null, admit: () => null, hostBusy: () => false,
+        makeReadMemoDir: () => mkdtempSync(join(f.env.TMPDIR, 'memo-')),
+        runChild: async (cmd, args, options) => {
+          if (cmd === 'gh') throw Object.assign(new Error(`exited 1: ${throttle}`), {
+            status: 1, signal: null, stdout: throttle, stderr,
+          });
+          if (args[1] === 'list') return '[]';
+          if (args[1] === 'acquire') return JSON.stringify({ lane: 39 });
+          if (options.env.GH_CALLER === 'rebuild-smoke:dispatch-dry-run') {
+            return JSON.stringify([{ kind: options.env.WE_SMOKE_DRYRUN_ONLY, ok: true, ms: 1 }]);
+          }
+          return cmd === 'node' ? JSON.stringify({ ok: true }) : '';
+        } });
+      produced = { verdict: classifySmokeFailure(smoke.results), smoke };
+      return produced;
+    });
+
+    const result = await f.rebuild();
+    const failed = produced.smoke.results.filter(row => row.ok === false);
+    expect(failed.map(row => row.name)).toEqual(['gh-api-repo', 'gh-pr-list']);
+    for (const row of failed) {
+      expect(row.detail).toContain(throttle);
+      expect(row.stderrTail).toHaveLength(cap);
+      expect(row.stderrTail).not.toContain('TypeError');
+      expect(row.stderrTail.split(' | ')).toHaveLength(cap === 300 ? 1 : 9);
+    }
+    expect(rateLimitOnly(produced)).toBe(false);
+    expect(result.adopted).toBeFalsy();
+    expect(result.alerts.some(a => a.kind === 'smoke-rate-limited')).toBe(false);
+    expect(f.state().held.reason).toBe('smoke-harness-broken');
+    expect(f.state().held.cause).not.toBe('github-rate-limit');
+    expect(f.git(['rev-parse', 'HEAD'])).toBe(f.lastGood);
+    expect(f.refs()).toEqual(['lane/rate-limit']);
+    expect(f.adopt).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['oversized', 'dispatch-dry-run', 'detail'],
     ['oversized', 'dispatch-dry-run', 'stderrTail'],
@@ -712,6 +756,23 @@ describe('BLD-5539 — rate-limit proof boundaries', () => {
     const stderrTail = cap === 10 ? Array(cap).fill('HTTP 403: API rate limit exceeded').join(' | ')
       : prefix + 'x'.repeat(cap - prefix.length);
     expect(rateLimitOnly(result({ stderrTail }))).toBe(false);
+  });
+  const rateLine = size => {
+    const prefix = 'HTTP 403: API rate limit exceeded for ';
+    return prefix + 'x'.repeat(size - prefix.length);
+  };
+  const boundaries = [
+    ['10-line', 10, size => ({ stderrTail: Array(size).fill(rateLine(50)).join(' | ') })],
+    ['300-character line', 300, size => ({ stderrTail: rateLine(size) })],
+    ['2400-character tail', 2400, size => ({ stderrTail: [...Array(8).fill(rateLine(264)), rateLine(size - 8 * 264 - 8 * 3)].join(' | ') })],
+    ['4000-character diagnostic', 4000, size => ({ detail: rateLine(size) })],
+  ];
+  it.each(boundaries)('rejects evidence at and beyond the %s limit', (_name, cap, patch) => {
+    expect(rateLimitOnly(result(patch(cap)))).toBe(false);
+    expect(rateLimitOnly(result(patch(cap + 1)))).toBe(false);
+  });
+  it.each(boundaries)('accepts complete rate-limit evidence just below the %s limit', (_name, cap, patch) => {
+    expect(rateLimitOnly(result(patch(cap - 1)))).toBe(true);
   });
   it.each([
     { detail: 'gh api failed: rate limit exceeded; TypeError: invalid code' },

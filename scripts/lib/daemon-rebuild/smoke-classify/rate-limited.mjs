@@ -7,6 +7,12 @@ const EXTERNAL = new Set(SMOKE_CHECKS.filter(row => row.mayBeTransient === true)
 const THROTTLE = /^gh-throttle: throttled — no gh slot within \d+(?:\.\d+)?s \(class=[\w-]+\)(?:; retry next tick)?$(?![\s\S])/;
 const RATE_LIMIT = /^(?:HTTP (?:403|429): )?(?:API rate limit exceeded(?: for [\w.:]+)?|You have exceeded a secondary rate limit\. Please wait a few minutes before you try again\.)(?: \(https:\/\/api\.github\.com\/[^\s()]*\))?$(?![\s\S])/i;
 const MAX_DIAGNOSTIC_CHARS = 4000;
+// Match childFailureDiagnostics' producer bounds. Reaching a bound cannot prove
+// completeness: discarded text may contain a code failure. Keep last-good and
+// use the normal smoke recovery/diagnostics path for operator inspection instead.
+const MAX_STDERR_LINES = 10;
+const MAX_STDERR_LINE_CHARS = 300;
+const MAX_STDERR_CHARS = 2400;
 
 function provenDiagnostic(text) {
   const line = text.replace(/^gh (?:api|pr list) [^\r\n]*? failed: /, '').replace(/^exited 1: /, '').trim();
@@ -22,7 +28,12 @@ export function rateLimitOnly(result) {
     // Check both producer channels, including negative evidence. A stderr code failure cannot be
     // hidden by a rate-limit summary, and a truncated/oversized diagnostic asks for operator inspection.
     const parts = [row.detail, row.stderrTail].filter(text => text !== undefined && text !== '');
-    if (!parts.length || parts.some(text => typeof text !== 'string' || text.length > MAX_DIAGNOSTIC_CHARS)) return false;
+    if (!parts.length || parts.some(text => typeof text !== 'string' || text.length >= MAX_DIAGNOSTIC_CHARS)) return false;
+    if (row.stderrTail) {
+      const lines = row.stderrTail.split(' | ');
+      if (row.stderrTail.length >= MAX_STDERR_CHARS || lines.length >= MAX_STDERR_LINES
+        || lines.some(line => line.length >= MAX_STDERR_LINE_CHARS)) return false;
+    }
     let proven = false;
     for (const text of parts) {
       for (const line of text.split(' | ')) {
