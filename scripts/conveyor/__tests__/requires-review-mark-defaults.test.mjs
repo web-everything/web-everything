@@ -6,6 +6,8 @@ import { join } from 'node:path';
 const { post } = vi.hoisted(() => ({ post: vi.fn() }));
 vi.mock('../../lib/under-test.mjs', () => ({ isUnderTest: () => false }));
 vi.mock('../../lib/fix-review-floor.mjs', () => ({ postRequiresReviewMark: post }));
+// fix-slot-borrow posts through the leaf (fix-review-mark.mjs), reconcile-fix-dispatch through the floor re-export.
+vi.mock('../../lib/fix-review-mark.mjs', () => ({ postRequiresReviewMark: post }));
 vi.mock('../../lib/settings-files.mjs', async original => ({ ...await original(),
   readSettings: () => ({}), readDeclaredSettings: () => ({ settings: {}, sources: {} }),
 }));
