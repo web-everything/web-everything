@@ -31,6 +31,56 @@ const freeze = value => { if (value && typeof value === 'object') {
 const realPolicy = () => JSON.parse(readFileSync('scripts/settings/provider-rotation.json', 'utf8')).providerRotation;
 
 describe('pure provider rotation', () => {
+  it.each(['review-security', 'review-correctness', 'red-team'])(
+    '%s cannot lose vendor independence through lensOverride', kind => {
+      const p = clone(policy); p.mode = 'on'; p.kinds[kind].arms = [arms[0]];
+      for (const lensOverride of ['style', 'simplicity', 'performance']) {
+        for (const counting of [true, false]) {
+          const args = { kind, lens: kind === 'red-team' ? kind : kind.slice(7),
+            lensOverride, counting, subject: 'fixture#override', policy: p, capacity, builder };
+          expect(drawArm(args)).toMatchObject({ arm: null, refusal: 'kind-lens-mismatch' });
+          expect(routeFor(args)).toEqual({ route: null, shadow: null, refusal: 'kind-lens-mismatch' });
+        }
+      }
+    });
+  it('on mode enforces cross-vendor key lens after explicit lens override', () => {
+    const p = clone(policy); p.mode = 'on';
+    p.kinds['review-lens'].arms = [arms[0]];
+    expect(routeFor({ kind: 'review-lens', lens: 'style', lensOverride: 'security',
+      subject: 'fixture#1', policy: p, capacity, builder }))
+      .toEqual({ route: null, shadow: null, refusal: 'no-cross-vendor-seat' });
+    p.kinds['review-lens'].arms = [arms[2]];
+    expect(routeFor({ kind: 'review-lens', lens: 'style', lensOverride: 'security',
+      subject: 'fixture#1', policy: p, capacity, builder }).route).toEqual(arms[2].arm);
+    expect(draw({ kind: 'review-lens', lens: 'style', lensOverride: '', policy: p, builder }))
+      .toMatchObject({ arm: null, refusal: 'unknown-lens' });
+  });
+  it('crossVendor-only lenses require independent vendors without imposing a key-lens small floor', () => {
+    const p = clone(policy);
+    p.review = { crossVendorKeySeats: [...policy.keyLenses, 'style'] };
+    p.kinds['review-lens'].arms = [arms[0]];
+    expect(draw({ kind: 'review-lens', lens: 'style', builder, policy: p }))
+      .toMatchObject({ arm: null, refusal: 'no-cross-vendor-seat' });
+    p.kinds['review-lens'].arms = [entry('claude', 'haiku', 'anthropic', 'small', 1)];
+    expect(draw({ kind: 'review-lens', lens: 'style', builder, policy: p }).arm.model).toBe('haiku');
+  });
+  it('Hydrogen is limited to prepare, summary and doc-fix and refuses larger or security work', () => {
+    const p = clone(policy);
+    for (const kind of ['prepare', 'summary', 'doc-fix', 'build', 'fix', 'judge', 'review-security']) {
+      p.kinds[kind] = { arms: [entry('agy-gemini', 'hydrogen', 'google', 'small', 1)] };
+    }
+    for (const kind of ['prepare', 'summary', 'doc-fix']) expect(draw({ kind, policy: p }).arm.model).toBe('hydrogen');
+    for (const kind of ['build', 'fix', 'judge', 'review-security'])
+      expect(draw({ kind, policy: p, builder }).arm).toBeNull();
+  });
+  it('unhealthy and probation-held arms cannot receive a live route', () => {
+    const p = clone(policy); p.mode = 'on'; p.kinds.build.arms = [arms[0]];
+    for (const patch of [{ health: 0 }, { health: 'unknown' }, { probation: true }, { probation: 'unknown' }]) {
+      expect(routeFor({ kind: 'build', subject: 'fixture#1', policy: p,
+        capacity: { codex: { ...capacity.codex, ...patch } } }))
+        .toEqual({ route: null, shadow: null, refusal: 'no-eligible-arm' });
+    }
+  });
   it('refuses malformed on policies instead of returning the legacy route (audit 1)', () => {
     for (const broken of [{ mode: 'on' }, { ...policy, mode: 'on', kinds: null }]) {
       expect(routeFor({ policy: broken, legacyRoute: { provider: 'legacy' } }))

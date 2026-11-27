@@ -5,6 +5,10 @@ const families = ['openai', 'google', 'anthropic'];
 const keyLenses = ['correctness', 'security', 'red-team'];
 export const isKeyLens = (lens, policy) => keyLenses.includes(lens) ||
   (Array.isArray(policy?.keyLenses) && policy.keyLenses.includes(lens));
+// Vendor independence and model strength are separate floors. Extra independent seats
+// need not be key lenses, while every key lens always requires independence.
+const requiresCrossVendor = (lens, policy) => isKeyLens(lens, policy) ||
+  policy.review?.crossVendorKeySeats.includes(lens);
 const requiredStrongShapes = ['security', 'merge-path'];
 const allowedLenses = ['correctness', 'security', 'red-team', 'style', 'simplicity', 'performance',
   'accessibility', 'architecture', 'testing', 'maintainability', 'standards'];
@@ -68,6 +72,8 @@ const validPolicy = policy => object(policy) && ['off', 'shadow', 'on'].includes
 // Unknown, incomplete, unavailable or exhausted capacity contributes zero, never full quota.
 const spare = (cap, policy) => {
   if (!object(cap) || cap.available !== true || !Number.isFinite(cap.usedPct) ||
+    (cap.health !== undefined && (!Number.isFinite(cap.health) || cap.health <= 0)) ||
+    (cap.probation !== undefined && cap.probation !== false) ||
     cap.usedPct < 0 || cap.usedPct >= policy.exhaustedPercent ||
     ['reserve', 'reserved', 'reserveOnly', 'held'].some(k => cap[k] !== undefined && cap[k] !== false) ||
     (cap.label !== undefined && !['normal', 'ahead', 'behind'].includes(cap.label)) ||
@@ -96,7 +102,7 @@ const pick = (arms, bucket) => {
   return arms.find(a => (edge += a.share / total) > bucket) ?? arms.at(-1);
 };
 export function drawArm({ kind, subject, policy, capacity, exclude = [], builder, builderFamily,
-  lens, counting = true, shape = 'normal' } = {}) {
+  lens, lensOverride, counting = true, shape = 'normal' } = {}) {
   const result = { arm: null, bucket: null, redrawn: [], mode: typeof policy?.mode === 'string' ? policy.mode : null, ineligible: [] };
   const refuse = refusal => frozen({ ...result, refusal });
   if (!validPolicy(policy)) return refuse('invalid-policy');
@@ -104,6 +110,7 @@ export function drawArm({ kind, subject, policy, capacity, exclude = [], builder
   if (typeof subject !== 'string' || !subject.length || !strings(exclude)) return refuse('invalid-input');
   if (!object(capacity)) return refuse('missing-capacity');
   const kindLens = kind === 'red-team' ? kind : kind?.startsWith('review-') && kind !== 'review-lens' ? kind.slice(7) : undefined;
+  if (lensOverride !== undefined) lens = lensOverride;
   if (kindLens && lens !== undefined && lens !== kindLens) return refuse('kind-lens-mismatch');
   lens ??= kindLens;
   if ((kind === 'review-lens' || lens !== undefined) && !allowedLenses.includes(lens)) return refuse('unknown-lens');
@@ -111,7 +118,9 @@ export function drawArm({ kind, subject, policy, capacity, exclude = [], builder
   if (typeof counting !== 'boolean') return refuse('invalid-input');
   result.bucket = bucketFor(kind, subject);
   const allChoices = effectiveShares(policy.kinds[kind], capacity, policy);
-  let choices = allChoices;
+  // Hydrogen's probation is restricted to the three absorbed small work kinds.
+  let choices = allChoices.filter(a => !/hydrogen/i.test(a.arm.model) ||
+    ['prepare', 'summary', 'doc-fix'].includes(kind));
   const guarded = seatCandidates(choices, { lens, counting, builder, builderFamily, policy, capacity, shape });
   if (guarded.refusal) return refuse(guarded.refusal);
   choices = guarded.choices;
@@ -142,7 +151,7 @@ const seatKind = lens => lens === 'red-team' ? 'red-team' :
 
 function seatCandidates(choices, { lens, counting, builder, builderFamily, policy, capacity, shape }) {
   let eligible = choices.filter(a => a.share > 0);
-  if (isKeyLens(lens, policy)) {
+  if (requiresCrossVendor(lens, policy)) {
     // A family assertion alone is not evidence: use the same catalog boundary as composePanel.
     if (!validArm(builder, policy)) return { refusal: 'unknown-builder-family' };
     const derived = familyFor(builder);
