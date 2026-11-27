@@ -31,6 +31,7 @@ import { buildNoCodeOwedStandDown, parseNoCodeOwedStandDown } from '../../convey
 import { buildStandDownComment } from '../../conveyor/stand-down.mjs';
 import { buildOperatorAnswer, NO_CODE_REARM_RECEIPT } from '../../conveyor/stand-down-answer-core.mjs';
 import { decideEmptyFixRound, REARM_COMMENT_MARKER } from '../../conveyor/rearm-review.mjs';
+import rearmReplay from '../../conveyor/soak/breaks/no-code-resume-spent-rearm.mjs';
 
 const HEAD = 'a'.repeat(40);
 const binding = { repo: 'fixture/example', pr: 7, head: HEAD, runId: 'fixture-run', claimId: 'fixture-holder' };
@@ -92,6 +93,10 @@ function launcher({ comments = [verdict], message = 'Unable to repair the reques
 }
 
 describe('FIXER-NOCODE-TRAILER audit regressions', () => {
+  it('production rearm enforces no-code authorization, consumption and live holds', async () => {
+    expect(rearmReplay.judge(await rearmReplay.run())).toEqual([]);
+  });
+
   it('finding 1255: unchanged clean repair failure cannot emit no-code authorization', async () => {
     const run = launcher();
     expect((await run.execute()).code).toBe(0);

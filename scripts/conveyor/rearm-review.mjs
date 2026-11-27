@@ -410,8 +410,8 @@ if (IS_CLI) {
   // we:scripts/conveyor/rearm-review.mjs — the fix-agent re-arm CLI: the shared harness with the three deltas
   // this caller supplies (the comment body, the default --actor, the optional --repo fallback). The re-arm
   // swap + its refusal are the shared pure `decideSetLabel({ to: 'rearm' })` — this file adds no invariant.
-  // #6713 — refuse an EMPTY ordinary fix round before any label write. Fail-open on every READ problem; once an
-  // empty round is PROVEN the refusal is unconditional (a failed note never lets the re-arm through).
+  // #6713 — refuse an EMPTY ordinary fix round before any label write. Real pushes fail open on read problems;
+  // proven empty rounds and unverified no-code candidates refuse even when the best-effort note fails.
   const argOf = (n) => (process.argv.find((a) => a.startsWith(`--${n}=`)) || '').slice(n.length + 3);
   // A stray/extra positional would let the shared CLI act on a PR this guard never inspected: refuse before any write.
   if (hasUnexpectedPositionals(process.argv.slice(2)) || hasInvalidArgs(process.argv.slice(2))) {
@@ -431,8 +431,21 @@ if (IS_CLI) {
       // The FULL paginated thread (a latest fix-begin beyond the first page must not be missed).
       const apiRepo = repoVal || ':owner/:repo';
       const pages = JSON.parse(readGh(['api', `repos/${apiRepo}/issues/${prArg}/comments`, '--paginate', '--slurp'], opts));
-      verdict = decideEmptyFixRound({ comments: pages.flat(), liveHead });
-    } catch { /* fail open: never block a real push on a read error */ }
+      const comments = pages.flat();
+      verdict = decideEmptyFixRound({ comments, liveHead });
+      if (verdict.noCodeResume) {
+        // The CLI has no run/claim binding. A legacy decision is only a candidate: enforce the same
+        // one-use operator authorization as the structured path before handing off to the label writer.
+        // Set the refusal BEFORE the read so an unavailable snapshot cannot resurrect the exemption.
+        verdict = { empty: true, since: liveHead, reason: 'no-code authorization unreadable; operator inspection required' };
+        const snapshot = JSON.parse(readGh(['pr', 'view', prArg, ...repoFlag, '--json', 'headRefOid,labels,reviews'], opts));
+        const authorization = noCodeOwedAuthorization({ comments, liveHead,
+          labels: snapshot?.labels?.map(l => l?.name), reviews: snapshot?.reviews });
+        if (snapshot?.headRefOid !== liveHead) verdict.reason = 'no-code head moved; operator inspection required';
+        else if (!authorization.allowed) verdict.reason = authorization.reason;
+        else verdict = { empty: false, noCodeResume: true };
+      }
+    } catch { /* real pushes fail open on read errors; a proven no-code candidate stays refused */ }
     // Outside the read-error catch: a conflicting pin must refuse before even the no-change note.
     if (liveHead !== undefined || verdict.noCodeResume) {
       try { labelArgv = rearmLabelArgv(labelArgv, verdict, liveHead); }
@@ -446,7 +459,7 @@ if (IS_CLI) {
         readGh(['pr', 'comment', prArg, ...(repoVal ? [`--repo=${repoVal}`] : []), '--body-file', '-'],
           { input: buildNoChangeComment({ actor: argOf('actor') || 'conveyor fix agent', since: verdict.since }), stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
       } catch { /* the note is best-effort; the refusal below is not */ }
-      writeLineSync(1, JSON.stringify({ ok: false, pr: Number(prArg), reason: 'no change made — fix still owed (head unchanged since fix-begin)', head: verdict.since }));
+      writeLineSync(1, JSON.stringify({ ok: false, pr: Number(prArg), reason: verdict.reason ?? 'no change made — fix still owed (head unchanged since fix-begin)', head: verdict.since }));
       process.exit(1);
     }
   }
