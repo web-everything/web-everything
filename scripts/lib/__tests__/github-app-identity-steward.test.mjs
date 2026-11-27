@@ -25,16 +25,35 @@ describe('HANDLING-COMBO-A-WE steward identity', () => {
       const fakeGh = join(root, 'gh');
       writeFileSync(fakeGh, `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(effect)}, 'called');\n`, { mode: 0o755 });
       const id = resolveDeliveryIdentity({ tool: { steward: app, worker: { ...app, appId: fixtureIds.worker } }, env: {}, pinned: false });
-      const roleTable = shimRoleTable({ identity: id, cachePath });
+      const roleTable = shimRoleTable({ identity: id, cachePath, env: {} });
       if (fallback !== 'personal') writeFileSync(installationCachePath(fallback === 'worker' ? roleTable.worker.cachePath : cachePath, '101'),
         JSON.stringify({ v: 2, token: 'other-app', expiresAt: '2026-11-26T16:00:00Z' }));
       const shim = join(root, 'shim.cjs');
       writeFileSync(shim, renderGhShimScript({ realGhPath: fakeGh, cachePath, roleTable,
-        ghThrottleCliPath: join(root, 'no-throttle'), refreshCliPath: join(root, 'no-refresh') })
-        .replace('\n', `\nDate.now = () => ${now()};\n`));
-      const result = spawnSync(process.execPath, [shim, 'api', 'repos/fixture/repo'], { cwd: root, timeout: 10000,
+        ghThrottleCliPath: join(root, 'no-throttle'), refreshCliPath: join(root, 'no-refresh'),
+        personalFallbackPolicy: { personalFallback: 'allow', source: { personalFallback: 'fixture' } } }));
+      const entry = join(root, 'entry.cjs');
+      writeFileSync(entry, `const fs = require('node:fs');
+const cp = require('node:child_process');
+Date.now = () => ${now()};
+for (const method of ['readFileSync', 'existsSync', 'realpathSync']) {
+  const original = fs[method];
+  fs[method] = (path, ...args) => {
+    if (!String(path).startsWith(${JSON.stringify(root + '/')})) throw new Error('unexpected filesystem read: ' + path);
+    return original(path, ...args);
+  };
+}
+cp.spawnSync = (file, argv, options) => {
+  if (file === '/usr/bin/git') return { status: 0, stdout: '', stderr: '' };
+  if (file !== ${JSON.stringify(fakeGh)}) throw new Error('unexpected subprocess: ' + file);
+  fs.writeFileSync(${JSON.stringify(effect)}, 'called');
+  return { status: 0, stdout: Buffer.from(''), stderr: Buffer.from('') };
+};
+require(${JSON.stringify(shim)});
+`);
+      const result = spawnSync(process.execPath, [entry, 'api', 'repos/fixture/repo'], { cwd: root, timeout: 10000,
         maxBuffer: 1024 * 1024, encoding: 'utf8', env: { HOME: root, PATH: root, GH_TOKEN: 'personal',
-          GH_CONFIG_DIR: root, GH_REPO: 'fixture/repo', WE_GITHUB_APP_INSTALLATIONS: '{"fixture":"101"}',
+          GH_CONFIG_DIR: root, GH_CALLER: 'fixture', GH_REPO: 'fixture/repo', WE_GITHUB_APP_INSTALLATIONS: '{"fixture":"101"}',
           WE_GITHUB_APP_ROLE: 'steward' } });
       expect(result.error).toBeUndefined();
       expect(result.status).toBe(1);
@@ -50,7 +69,7 @@ describe('HANDLING-COMBO-A-WE steward identity', () => {
         const cachePath = join(root, 'cache.json'), calls = join(root, 'calls.jsonl');
         const fakeGh = join(root, 'gh'), shim = join(root, 'shim.cjs'), entry = join(root, 'entry.cjs');
         const id = resolveDeliveryIdentity({ tool: { steward: app, worker: { ...app, appId: fixtureIds.worker } }, env: {}, pinned: false });
-        const roleTable = shimRoleTable({ identity: id, cachePath });
+        const roleTable = shimRoleTable({ identity: id, cachePath, env: {} });
         const stewardCache = installationCachePath(roleTable.steward.cachePath, fixtureIds.installation);
         const fresh = { v: 2, expiresAt: receipt().expiresAt, installationId: fixtureIds.installation };
         if (fallback === 'worker' || fallback === 'legacy') {

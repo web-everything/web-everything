@@ -1374,7 +1374,7 @@ export function buildGhShimSettingsEnv({
   let id = identity;
   if (!id) { try { id = readDeliveryIdentity({ env }); } catch { id = null; } }
   if (!resolveGithubAppEnvConfig(env) && !id?.anyConfigured && !isDaemonCaller(env)) return null;
-  const roleTable = shimRoleTable({ identity: id, cachePath });
+  const roleTable = shimRoleTable({ identity: id, cachePath, env });
   // #4044: THIS checkout's own shim dir by default — never the one machine-wide file every dispatcher rewrote.
   const dir = dirOpt ?? checkoutShimDir({ ghThrottleCliPath });
   const realGhPath = resolveRealGhBinary({ pathEnv, shimDir: dir, exists });

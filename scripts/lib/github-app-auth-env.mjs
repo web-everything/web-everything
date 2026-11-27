@@ -447,20 +447,30 @@ async function ensureFreshGithubAppEnvUnguarded({
   let identity;
   let requested;
   let chain;
+  const refuseSteward = () => {
+    delete env.GH_TOKEN;
+    delete env.GITHUB_TOKEN;
+    throw new Error('steward identity refused; operator must provision or refresh the scoped App token');
+  };
   try {
-    // `github.auth: personal` is an explicit, host-wide choice — honoured, recorded, never a silent fallback.
+    // Personal policy is explicit, but cannot authorize the isolated steward identity.
     authPolicy = policy ?? readGithubAuthPolicy({ env });
     personal = authPolicy.auth === 'personal';
+    identity = identityOpt ?? (personal ? undefined : readDeliveryIdentity({ env }));
+    requested = roleOpt === LEGACY_ROLE ? { role: LEGACY_ROLE, source: 'arg' }
+      : resolveRequestedRole({ role: roleOpt, env, caller, callerRoles: identity?.callerRoles });
+    if (requested.role === 'steward') {
+      delete env.GH_TOKEN;
+      delete env.GITHUB_TOKEN;
+      if (personal) refuseSteward();
+    }
     if (!personal) {
       // PER-ROLE IDENTITY (we:scripts/lib/github-app-identity.mjs). With no role configured the chain is only today's
       // App and everything below behaves exactly as before. Once ANY role is configured, this process's role App is
       // tried first, then the worker App, then today's App, and every step down is logged and recorded loudly (the
       // github-app-config smell reads the caller file) — never a silent fallback.
-      identity = identityOpt ?? readDeliveryIdentity({ env });
       // An explicit `legacy` (the shim's on-demand refresh for a call that must author as today's App, #6535)
       // refreshes today's App only; it is never a process role, so env and the caller map cannot select it.
-      requested = roleOpt === LEGACY_ROLE ? { role: LEGACY_ROLE, source: 'arg' }
-        : resolveRequestedRole({ role: roleOpt, env, caller, callerRoles: identity.callerRoles });
       chain = buildIdentityChain({ requestedRole: requested.role, identity, env, cachePath });
       if (chain.loud) env[ROLE_ENV] = requested.role; // the gh shim and every child process pick the App by it
     }
@@ -480,7 +490,7 @@ async function ensureFreshGithubAppEnvUnguarded({
   // Install the refusal boundary BEFORE any cache/key/mint/access-check failure can return.
   // Without it a first tick can reach the real gh with inherited personal credentials.
   let daemonShim;
-  if (daemon) {
+  if (daemon || requested.role === 'steward') {
     try { daemonShim = await installShim(env, { cachePath, identity }); } catch { /* fail closed below */ }
     if (!daemonShim?.ok) {
       try { record({ applied: false, reason: 'shim-failed' }); } catch { /* the refusal must still throw */ }
@@ -637,6 +647,8 @@ async function ensureFreshGithubAppEnvUnguarded({
     }
     fallbackFrom.push({ role: cand.role, reason: r.reason, ...(r.missingPermissions?.length ? { missingPermissions: r.missingPermissions } : {}) });
   }
+
+  if (requested.role === 'steward') refuseSteward();
 
   // A HALF-configured App (some of the three vars set, or the key unreadable) is a misconfiguration, not an
   // opt-out: warn loudly and record it, so the health smell names the daemon. Still falls back (fail-safe).
