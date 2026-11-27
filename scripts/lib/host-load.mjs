@@ -17,6 +17,7 @@ import { loadHostOverloadSettings, hostStateRoot, boundedText, DEFAULT_MIN_MEMOR
 import { collectHostCapacity } from '../readiness/host-capacity.mjs';
 import { LEASE_FILENAME } from './lane-lease.mjs';
 import { decideSnapshotMemoryFloor } from './memory-warn-corroboration.mjs';
+import { parseVmStatPages } from './memory-available.mjs';
 import { readSnapshot } from './resource-admission.mjs';
 import { loadMemoryPressureSettings } from '../readiness/heavy-admission.mjs';
 
@@ -40,11 +41,16 @@ export function readHostLoad({ env = process.env, load = os.loadavg } = {}) {
  *  inactive file cache) plus free swap. Pure. Throws on unparseable input. */
 export function parseDarwinMemoryHeadroomMb(vmStat, swapUsage) {
   const page = Number(/page size of (\d+) bytes/.exec(vmStat)?.[1]);
-  const pages = (name) => Number(new RegExp(`Pages ${name}:\\s+(\\d+)`).exec(vmStat)?.[1] ?? NaN);
-  const free = pages('free'); const spec = pages('speculative'); const purge = pages('purgeable');
-  const swapFree = /free = ([\d.]+)M/.exec(swapUsage)?.[1];
-  if (![page, free, spec].every(Number.isFinite) || swapFree === undefined) throw Error('unparseable vm_stat/swapusage');
-  return ((free + spec + (Number.isFinite(purge) ? purge : 0)) * page) / 1048576 + Number(swapFree);
+  const free = parseVmStatPages(vmStat, 'free'); const spec = parseVmStatPages(vmStat, 'speculative');
+  const purge = parseVmStatPages(vmStat, 'purgeable');
+  const swap = /(?:^|\s)free\s*=\s*(\d+(?:\.\d+)?)([KMGT])(?=\s|$)/.exec(String(swapUsage));
+  const swapMb = swap ? Number(swap[1]) * ({ K: 1 / 1024, M: 1, G: 1024, T: 1048576 }[swap[2]]) : NaN;
+  if (!Number.isSafeInteger(page) || page <= 0 || ![free, spec].every(Number.isSafeInteger)
+    || (purge !== undefined && !Number.isSafeInteger(purge)) || !Number.isFinite(swapMb) || swapMb > Number.MAX_SAFE_INTEGER)
+    throw Error('unparseable vm_stat/swapusage');
+  const mb = ((free + spec + (purge ?? 0)) * page) / 1048576 + swapMb;
+  if (!Number.isFinite(mb) || mb > Number.MAX_SAFE_INTEGER) throw Error('unparseable vm_stat/swapusage');
+  return mb;
 }
 /** Measured reclaimable MB under normal pressure: legacy headroom plus inactive pages.
  * Pure; incomplete or invalid evidence throws rather than implying unlimited memory. */
@@ -129,7 +135,7 @@ export function readHostMemoryHeadroomMb(options = {}) {
 export function hostLoadAdmission({ policy, load = readHostLoad, cores = () => os.cpus().length, memory,
   capacity = collectHostCapacity,
   memoryReading = memory ? (options) => ({ mb: memory(options), source: 'injected' }) : readHostMemoryReading,
-  interactive = !!process.stdin.isTTY, env = process.env, log, readSnap = () => readSnapshot(), now = () => Date.now() } = {}) {
+  interactive = !!process.stdin.isTTY, env = process.env, log, memoryPressureSettings = loadMemoryPressureSettings, readSnap = () => readSnapshot(), now = () => Date.now() } = {}) {
   if (interactive) return { admitted: true, reason: 'operator interactive command' };
   let loadVerdict;
   try {
@@ -163,8 +169,11 @@ export function hostLoadAdmission({ policy, load = readHostLoad, cores = () => o
       if (!Number.isFinite(snap?.memory?.swapGrowthMb)) {
         return { admitted: false, reason: 'host memory pressure warn: warn corroboration unavailable; source=memory-pressure' };
       }
+      const sampled = Date.parse(snap?.sampledAt); const until = Date.parse(snap?.freshUntil);
+      if (!(sampled <= now() && now() < until && until > sampled))
+        return { admitted: false, reason: 'host memory pressure warn: snapshot chronology invalid; request a fresh collector sample' };
       const cap = policy.settings.host.capacity ?? {};
-      const d = decideSnapshotMemoryFloor({ snap, nowMs: now(), pressureLevel: 2, ...loadMemoryPressureSettings({ env }),
+      const d = decideSnapshotMemoryFloor({ snap, nowMs: now(), pressureLevel: 2, ...memoryPressureSettings({ env }),
         floor: { floorMb: Math.max(cap.memAvailableFloorMb, min), metric: cap.memoryMetric,
           snapshotMaxFreshMs: cap.snapshotMaxFreshMs, snapshotClockSkewMs: cap.snapshotClockSkewMs } });
       const m = snap.memory;

@@ -155,3 +155,12 @@ describe('R553 hard memory floor (fail closed)', () => {
     } finally { spy.mockRestore(); }
   });
 });
+
+describe('MEM-ADMIT-HARDEN strict pages', () => {
+  it.each(['free', 'inactive', 'speculative', 'purgeable'])('rejects garbage in the entire %s field', name => {
+    const vm = VM.replace(new RegExp(`(Pages ${name}:\\s+)\\d+\\.`), '$199999garbage.');
+    expect(parseVmStatAvailableBytes(vm)).toBeNull();
+    expect(() => memoryAvailableMb({ platform: 'darwin', exec: () => vm,
+      freemem: () => { throw Error('must not substitute'); } })).toThrow('vm_stat unreadable');
+  });
+});

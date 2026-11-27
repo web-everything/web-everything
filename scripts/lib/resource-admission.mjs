@@ -5,6 +5,7 @@
  * Cascade: standard → Platform Forever preference → tool override, per field.
  * This library returns observations only; callers retain their existing gates.
  */
+import * as snapshotIo from 'node:fs';
 import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
@@ -45,8 +46,33 @@ export function writeSnapshot(snapshot, { root } = {}) {
   writeJsonAtomic(paths.snapshot, snapshot);
   try { appendResourceLog(paths.history, snapshot); } catch { /* history is evidence only */ }
 }
-export function readSnapshot({ root } = {}) {
-  try { return JSON.parse(readFileSync(resourcePaths(root).snapshot, 'utf8')); } catch { return null; }
+export const SNAPSHOT_MAX_BYTES = 256 * 1024;
+/** Bounded, nonblocking descriptor read. Never follow a link or allocate the whole input. */
+export function readSnapshot({ root, io = snapshotIo, log = line => process.stderr.write(line + '\n'), onError } = {}) {
+  let fd;
+  try {
+    const path = resourcePaths(root).snapshot;
+    if (!io.lstatSync(path).isFile()) throw Error('snapshot must be a regular file');
+    fd = io.openSync(path, snapshotIo.constants.O_RDONLY | snapshotIo.constants.O_NOFOLLOW | snapshotIo.constants.O_NONBLOCK);
+    if (!io.fstatSync(fd).isFile()) throw Error('snapshot must be a regular file');
+    const buffer = Buffer.alloc(SNAPSHOT_MAX_BYTES + 1);
+    let length = 0; let budget = buffer.length; let eof = false;
+    while (budget > 0) {
+      const requested = Math.min(4096, budget);
+      const n = io.readSync(fd, buffer, length, requested, length);
+      budget -= requested;
+      if (!Number.isInteger(n) || n < 0 || n > requested) throw Error('snapshot read incomplete');
+      length += n;
+      if (length > SNAPSHOT_MAX_BYTES) throw Error('snapshot oversized');
+      if (!n) { eof = true; break; }
+    }
+    if (!eof) throw Error('snapshot read incomplete');
+    return JSON.parse(buffer.subarray(0, length).toString('utf8'));
+  } catch (error) {
+    const reason = `${error.message}; request a fresh collector sample`;
+    try { onError?.(reason); log(reason); } catch { /* observation cannot authorize work */ }
+    return null;
+  } finally { if (fd !== undefined) io.closeSync(fd); }
 }
 
 // Resolved lazily: some test harnesses load modules from a non-file URL, where a top-level fileURLToPath throws.
@@ -88,14 +114,22 @@ export function loadResourcePolicy({ env = process.env, repoRoot, home = homedir
   }
   return { policy: resolveResourcePolicy({ platform, tool }), sources };
 }
-export function admit({ kind, env = process.env, nowMs = Date.now(), root, policy } = {}) {
+export function admit({ kind, env = process.env, nowMs = Date.now(), root, policy, memoryPressureSettings = loadMemoryPressureSettings, log } = {}) {
   let decision;
   try {
     root ??= resolveCoordinationRoot({ env });
-    decision = decideAdmission({ kind, snapshot: readSnapshot({ root }), policy: policy ?? loadResourcePolicy({ env }).policy, nowMs,
-      ...loadMemoryPressureSettings({ env }) });
-  } catch {
-    decision = decideAdmission({ kind, snapshot: null, nowMs });
+    let readError;
+    const snapshot = readSnapshot({ root, log, onError: reason => { readError = reason; } });
+    if (readError) return { verdict: 'hold', unknown: true, reason: readError, snapshotAge: null };
+    const sampled = Date.parse(snapshot?.sampledAt); const until = Date.parse(snapshot?.freshUntil);
+    if (!(sampled <= nowMs && nowMs < until && until > sampled))
+      return { verdict: 'hold', unknown: true, reason: 'snapshot chronology invalid; request a fresh collector sample', snapshotAge: null };
+    if (snapshot?.memory?.availableMb != null && !Number.isFinite(snapshot.memory.availableMb))
+      return { verdict: 'hold', unknown: true, reason: 'available memory unreadable; request a fresh collector sample', snapshotAge: null };
+    decision = decideAdmission({ kind, snapshot, policy: policy ?? loadResourcePolicy({ env }).policy, nowMs,
+      ...memoryPressureSettings({ env }) });
+  } catch (error) {
+    decision = { verdict: 'hold', unknown: true, reason: error.message, snapshotAge: null };
   }
   return decision;
 }

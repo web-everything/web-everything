@@ -4,7 +4,7 @@ import { afterEach, expect, it } from 'vitest';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { RESOURCE_POLICY_STANDARD, resolveResourcePolicy, loadResourcePolicy, decideAdmission, admit, shadowAdmission, resourcePaths } from '../resource-admission.mjs';
+import { readSnapshot, RESOURCE_POLICY_STANDARD, resolveResourcePolicy, loadResourcePolicy, decideAdmission, admit, shadowAdmission, resourcePaths } from '../resource-admission.mjs';
 import { buildSnapshot, writeSnapshot } from '../resource-sampler.mjs';
 const roots = [];
 const temp = () => { const r = mkdtempSync(join(tmpdir(), 'admission-')); roots.push(r); return r; };
@@ -109,4 +109,65 @@ it('resource admission writes no legacy comparison row', () => {
   expect(admit({ root, kind: 'build', nowMs: 100000, env: { WE_RESOURCE_SHADOW: 'off' } }).unknown).toBe(true);
   expect(shadowAdmission({ gate: 'g', kind: 'build', oldVerdict: 'admit', oldReason: 'x', root, nowMs: 100000, log: () => {} }).unknown).toBe(true);
   expect(existsSync(join(root, 'resource', 'shadow.jsonl'))).toBe(false);
+});
+
+// MEM-ADMIT-HARDEN: the reader's IO port forbids whole-file allocation.
+it('snapshot reader reads at most limit plus one bytes', () => {
+  const limit = 256 * 1024;
+  for (const size of [limit, limit + 1, limit * 4]) {
+    for (const chunk of [limit + 1, 4096, 7]) {
+      const bytes = Buffer.from('{}' + ' '.repeat(size - 2));
+      let requested = 0; let returned = 0; let closed = false;
+      const messages = [];
+      const io = {
+        lstatSync: () => ({ isFile: () => true }),
+        openSync: () => 7,
+        fstatSync: () => ({ isFile: () => true }),
+        readFileSync: () => { throw Error('whole-file read forbidden'); },
+        readSync: (fd, buffer, offset, length, position) => {
+          expect(fd).toBe(7);
+          expect(position).toBe(returned);
+          expect(position + length).toBeLessThanOrEqual(limit + 1);
+          requested += length;
+          expect(requested).toBeLessThanOrEqual(limit + 1);
+          const n = Math.min(length, chunk, size - position);
+          bytes.copy(buffer, offset, position, position + n); returned += n;
+          expect(returned).toBeLessThanOrEqual(limit + 1);
+          return n;
+        },
+        closeSync: () => { closed = true; },
+      };
+      const result = readSnapshot({ root: temp(), io, log: message => messages.push(message) });
+      expect(closed).toBe(true);
+      if (size <= limit && chunk !== 7) expect(result).toEqual({});
+      else {
+        expect(result).toBeNull();
+        expect(messages.join(' ')).toMatch(/(?:oversized|incomplete).*fresh collector sample/);
+      }
+    }
+  }
+});
+it.each(['symlink', 'FIFO', 'device'])('snapshot reader refuses %s before opening and requests a fresh sample', () => {
+  const messages = [];
+  const result = readSnapshot({ root: temp(), io: {
+    lstatSync: () => ({ isFile: () => false }),
+    openSync: () => { throw Error('must not open'); },
+  }, log: m => messages.push(m) });
+  expect(result).toBeNull();
+  expect(messages.join(' ')).toMatch(/regular file.*fresh collector sample/);
+});
+
+it('snapshot reader closes the descriptor on malformed JSON and a raced nonregular file', () => {
+  for (const regular of [true, false]) {
+    let closed = 0; let reads = 0; const messages = [];
+    const result = readSnapshot({ root: temp(), io: {
+      lstatSync: () => ({ isFile: () => true }), openSync: () => 9,
+      fstatSync: () => ({ isFile: () => regular }),
+      readSync: (_fd, buffer) => { if (reads++) return 0; buffer.write('garbage'); return 7; },
+      closeSync: () => { closed++; },
+    }, log: message => messages.push(message) });
+    expect(result).toBeNull(); expect(closed).toBe(1);
+    expect(messages.join(' ')).toContain('fresh collector sample');
+    if (!regular) expect(reads).toBe(0);
+  }
 });

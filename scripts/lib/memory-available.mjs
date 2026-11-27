@@ -11,15 +11,24 @@ import { execFileSync } from 'node:child_process';
 export const MEMORY_METRICS = ['available', 'free'];
 export const DEFAULT_MEMORY_METRIC = 'available';
 
+/** Parse an entire vm_stat page field; absent optional fields stay absent, malformed ones fail. */
+export function parseVmStatPages(text, name) {
+  const lines = String(text ?? '').split(/\r?\n/).filter(line => line.startsWith(`Pages ${name}:`));
+  if (!lines.length) return undefined;
+  if (lines.length !== 1) return NaN;
+  const match = new RegExp(`^Pages ${name}:\\s+(\\d+)\\.?\\s*$`).exec(lines[0]);
+  const value = match ? Number(match[1]) : NaN;
+  return Number.isSafeInteger(value) && value >= 0 ? value : NaN;
+}
+
 /** Available bytes from `vm_stat` text; null when unparseable. Pure. */
 export function parseVmStatAvailableBytes(text) {
-  const t = String(text ?? '');
-  const page = Number(/page size of (\d+) bytes/.exec(t)?.[1]);
-  const pages = (name) => Number(new RegExp(`^Pages ${name}:\\s+(\\d+)`, 'm').exec(t)?.[1] ?? NaN);
-  const free = pages('free'); const inactive = pages('inactive'); const spec = pages('speculative');
-  const purge = pages('purgeable');
-  if (![page, free, inactive].every(Number.isFinite) || page <= 0) return null;
-  return (free + inactive + (Number.isFinite(spec) ? spec : 0) + (Number.isFinite(purge) ? purge : 0)) * page;
+  const page = Number(/page size of (\d+) bytes/.exec(String(text ?? ''))?.[1]);
+  const counts = ['free', 'inactive', 'speculative', 'purgeable'].map(name => parseVmStatPages(text, name));
+  if (!Number.isSafeInteger(page) || page <= 0 || !counts.slice(0, 2).every(Number.isSafeInteger)
+    || counts.some(value => value !== undefined && !Number.isSafeInteger(value))) return null;
+  const bytes = counts.reduce((sum, value) => sum + (value ?? 0), 0) * page;
+  return Number.isSafeInteger(bytes) ? bytes : null;
 }
 
 /** Memory-available bytes under `metric`. Throws on unreadable evidence. */

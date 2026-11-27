@@ -392,3 +392,38 @@ describe('hostLoadAdmission memory pressure warn corroboration (MEM-ADMIT-CORROB
     }
   });
 });
+
+describe('MEM-ADMIT-HARDEN', () => {
+  const time = Date.parse('2026-11-26T12:00:00Z');
+  const cap = { memAvailableFloorMb: 2048, memoryMetric: 'available', snapshotMaxFreshMs: 60000, snapshotClockSkewMs: 5000 };
+  const policyWithCapacity = { ...policy, settings: { host: { ...policy.settings.host, capacity: cap } } };
+  const settings = () => ({ warnMinFreePct: 20, warnSwapGrowthMb: 256 });
+  it('warn admission refuses a fresh reversed-lifetime snapshot in both gates', async () => {
+    const { admit } = await import('../resource-admission.mjs');
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const root = mkdtempSync(join(tmpdir(), 'mem-admit-'));
+    try {
+      mkdirSync(join(root, 'resource'));
+      const snap = { sampledAt: new Date(time + 4000).toISOString(), freshUntil: new Date(time + 2000).toISOString(),
+        cpu: { idlePct: 80 }, memory: { pressureLevel: 2, metric: 'available', availableMb: 8192, freePct: 45, swapGrowthMb: 0 } };
+      writeFileSync(join(root, 'resource/snapshot.json'), JSON.stringify(snap));
+      const host = hostLoad.hostLoadAdmission({ policy: policyWithCapacity, interactive: false, env: {},
+        load: () => [0], cores: () => 8, memoryReading: () => ({ source: 'memory-pressure', level: 'warn', mb: 0 }),
+        readSnap: () => snap, now: () => time, memoryPressureSettings: settings });
+      const heavy = admit({ root, kind: 'build', nowMs: time, env: {}, policy: {}, memoryPressureSettings: settings, log: () => {} });
+      expect(host.admitted).toBe(false);
+      expect(heavy.verdict).toBe('hold');
+      expect(host.reason).toContain('snapshot chronology invalid');
+      expect(heavy.reason).toContain('snapshot chronology invalid');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it.each(['Pages free', 'Pages speculative', 'Pages purgeable'])('rejects prefix parsing of %s', name => {
+    const vm = vmStat.replace(new RegExp(`(${name}: )\\d+\\.`), '$199999garbage.');
+    expect(() => hostLoad.parseDarwinMemoryHeadroomMb(vm, swapUsage)).toThrow();
+  });
+  it.each(['free = 10MB', 'free = 10Mgarbage', 'free = 1.2.3M', 'free = InfinityM', 'free = -1M'])('refuses malformed swap %s', swap => {
+    expect(() => hostLoad.parseDarwinMemoryHeadroomMb(vmStat, swap)).toThrow();
+  });
+});

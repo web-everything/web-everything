@@ -3280,3 +3280,45 @@ describe('canonical host manifest policy', () => {
     expect(formatAdmissionPolicy(policy)).toContain('invalid remote.manifest; local execution required');
   });
 });
+
+describe('MEM-ADMIT-HARDEN policy evidence', () => {
+  it('environment warn overrides only tighten platform policy with provenance', () => {
+    const p = resolveAdmissionPolicy({ platform: { warnMinFreePct: 30, warnSwapGrowthMb: 128 }, tool: {},
+      env: { WE_LOAD_ADMISSION_WARN_MIN_FREE_PCT: '5', WE_LOAD_ADMISSION_WARN_SWAP_GROWTH_MB: '1024' },
+      checkoutRoot: lockRoot });
+    expect(p.settings).toMatchObject({ warnMinFreePct: 30, warnSwapGrowthMb: 128 });
+    expect(p.sources).toMatchObject({ warnMinFreePct: 'platform', warnSwapGrowthMb: 'platform' });
+    expect(formatAdmissionPolicy(p)).toContain('may only tighten shared setting');
+  });
+  it.each(['NaN', 'Infinity', '-1', '', '9007199254740992'])('invalid swap policy %j refuses visibly with its source', async raw => {
+    const { loadMemoryPressureSettings } = await import('../heavy-admission.mjs');
+    const p = resolveAdmissionPolicy({ platform: {}, tool: {},
+      env: { WE_LOAD_ADMISSION_WARN_SWAP_GROWTH_MB: raw }, checkoutRoot: lockRoot });
+    expect(() => loadMemoryPressureSettings({ policy: p })).toThrow(/env WE_LOAD_ADMISSION_WARN_SWAP_GROWTH_MB/);
+  });
+});
+
+describe('MEM-ADMIT-HARDEN window evidence', () => {
+  const now = new Date('2026-11-26T12:00:00Z');
+  const row = (name, value, ago = 1000) => ({ event: 'metric', name: `host.mem.${name}`, value,
+    timestamp: new Date(now.getTime() - ago).toISOString() });
+  it('stale free-memory evidence cannot corroborate warn', () => {
+    const records = [row('pressure_level', 2), row('available_bytes', 45, 120000), row('total_bytes', 100)];
+    const sample = readLatestLoad({ root: lockRoot, now, readRecords: () => ({ records }) });
+    expect(sample.freePct).toBeNull();
+    expect(loadAdmissionDecision(sample).held).toBe(true);
+  });
+  it('configured sample count includes malformed middle swap evidence rather than hiding it', () => {
+    const records = [row('swap_used_bytes', 0, 3000), row('swap_used_bytes', 'garbage', 2000), row('swap_used_bytes', 0)];
+    const sample = readLatestLoad({ root: lockRoot, now, window: 3, readRecords: () => ({ records }) });
+    expect(sample.swapGrowthMb).toBeNull();
+  });
+  it('uses the requested window instead of a single swap interval', () => {
+    const records = [row('swap_used_bytes', 0, 3000), row('swap_used_bytes', 512 * 1048576, 2000), row('swap_used_bytes', 512 * 1048576)];
+    expect(readLatestLoad({ root: lockRoot, now, window: 3, readRecords: () => ({ records }) }).swapGrowthMb).toBe(512);
+    expect(readLatestLoad({ root: lockRoot, now, window: 2, readRecords: () => ({ records }) }).swapGrowthMb).toBe(0);
+  });
+  it('a throwing reader refuses instead of synthesizing one interval', () => {
+    expect(() => readLatestLoad({ root: lockRoot, now, readRecords: () => { throw Error('window unavailable'); } })).toThrow('window unavailable');
+  });
+});

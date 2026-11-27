@@ -289,7 +289,7 @@ const ADMISSION_VALID = {
   'fastScale.minCpuIdlePct': (v) => Number.isFinite(v) && v >= 0 && v <= 100,
   'fastScale.maxMemPressureLevel': (v) => admissionInt(1)(v) && v <= 4,
   warnMinFreePct: (v) => Number.isFinite(v) && v >= 0 && v <= 100,
-  warnSwapGrowthMb: (v) => Number.isFinite(v) && v >= 0,
+  warnSwapGrowthMb: (v) => Number.isFinite(v) && v >= 0 && v <= Number.MAX_SAFE_INTEGER,
   'priority.mode': (v) => ADMISSION_PRIORITY_MODES.includes(v),
   'priority.repairPatterns': validRepairPatterns,
   'remote.hosts': validRemoteHosts,
@@ -434,7 +434,9 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
         ignored.push(`env ${name}=${oneLine(raw)} (a per-process value would diverge from the shared host pool; set heavyAdmission.${leaf} in platform-preferences)`);
       } else {
         const v = parseAdmissionEnv(leaf, raw);
-        if (valid(v)) { value = v; sources[leaf] = `env ${name}`; }
+        if (valid(v) && !tightensWarn(leaf, v, value)) {
+          ignored.push(`env ${name}=${v} (may only tighten shared setting ${value})`);
+        } else if (valid(v)) { value = v; sources[leaf] = `env ${name}`; }
         else invalid.push(`env ${name}=${oneLine(JSON.stringify(raw))}`);
       }
     }
@@ -563,7 +565,9 @@ export function formatAdmissionPolicy({ settings, sources, ignored = [], invalid
 
 /** All memory gates consume these same admission-policy leaves (not a second settings cascade). */
 export function loadMemoryPressureSettings(options = {}) {
-  const { settings } = loadAdmissionPolicy(options);
+  const { settings, invalid = [] } = options.policy ?? loadAdmissionPolicy(options);
+  const errors = invalid.filter(message => /warnMinFreePct|warnSwapGrowthMb|WE_LOAD_ADMISSION_WARN_/.test(message));
+  if (errors.length) throw Error(`invalid memory policy: ${errors.join('; ')}`);
   return { warnMinFreePct: settings.warnMinFreePct, warnSwapGrowthMb: settings.warnSwapGrowthMb };
 }
 
