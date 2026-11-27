@@ -33,7 +33,7 @@ function sentBackPr(number = 6001, overrides = {}) {
 }
 const gateFor = (p, kind, local = locals()) => eligibility(p, buildEligibilityFacts({ pr: p, comments: p.comments,
   commentsComplete: p.commentsComplete === true, population: kind, locals: local }));
-const run = options => runEligibilityShadow({ mode: 'shadow', now, readLocals: locals, ...options });
+const run = options => runEligibilityShadow({ mode: 'shadow', now, readLocals: locals, appendLine: vi.fn(), ...options });
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -345,6 +345,41 @@ describe('shadow mode line never pollutes machine-readable stdout', () => {
 
 
 describe('explicit shadow evaluation coverage', () => {
+  it('keeps reader-only getters lazy on a separate local-reader snapshot', () => {
+    const p = sentBackPr();
+    const getter = vi.fn(() => 'reader evidence');
+    Object.defineProperty(p, 'readerEvidence', { enumerable: true, get: getter });
+    const readLocals = vi.fn((_entry, snapshot) => {
+      expect(snapshot).not.toBe(p);
+      expect(getter).not.toHaveBeenCalled();
+      expect(snapshot.readerEvidence).toBe('reader evidence');
+      snapshot.isDraft = true;
+      return locals();
+    });
+    const coverage = {};
+    const onError = vi.fn();
+    run({ dispatch: [entry()], prs: [p], readLocals, coverage, onError });
+    expect(onError).not.toHaveBeenCalled();
+    expect(getter).toHaveBeenCalledTimes(1);
+    expect(p.isDraft).toBe(false);
+    expect(coverage).toEqual({ attempted: 1, evaluated: 1, failed: 0, disagreements: 0, complete: true });
+  });
+
+  it('requires a ledger writer when omitted and completes only after a recorded replay', () => {
+    const coverage = {};
+    const diagnostics = [];
+    const input = { dispatch: [entry()], prs: [sentBackPr(6001, { isDraft: true })], now,
+      readLocals: locals, coverage, onError: vi.fn(), appendDiagnostic: line => diagnostics.push(JSON.parse(line)) };
+    runEligibilityShadow(input);
+    expect(coverage).toEqual({ attempted: 1, evaluated: 0, failed: 1, disagreements: 1, complete: false });
+    expect(diagnostics).toEqual([expect.objectContaining({ action: expect.stringMatching(/repair.*replay/i) })]);
+    const appendLine = vi.fn();
+    runEligibilityShadow({ ...input, appendLine });
+    expect(appendLine).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(appendLine.mock.calls[0][0])).toMatchObject({ pr: 6001, gate: 'hold', reasons: ['draft'] });
+    expect(coverage).toEqual({ attempted: 1, evaluated: 1, failed: 0, disagreements: 1, complete: true });
+  });
+
   const replay = options => {
     const coverage = {};
     const diagnostics = [];
