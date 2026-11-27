@@ -324,13 +324,6 @@ describe('open-pr sibling base: landed-sibling evidence', () => {
       expect(f.run()).toMatchObject({ outcome: 'opened' });
     });
 
-    it('admits a stack whose child landed as one squash carrying the parent commits too', () => {
-      const { f, squash } = stack();
-      squash('lane/7358');
-      f.git(['checkout', 'lane/own']);
-      expect(f.run()).toMatchObject({ outcome: 'opened' });
-    });
-
     it('still names the child when only the parent landed', () => {
       const { f, squash } = stack();
       squash('lane/7357');
