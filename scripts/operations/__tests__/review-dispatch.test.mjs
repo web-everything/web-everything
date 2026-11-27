@@ -16,6 +16,58 @@ import { dirname, join, posix } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { afterEach, describe, it, expect, vi } from 'vitest';
+import { dispatchReviewJob, runReviewJob, runReviewJobCli, createReviewJobIo } from '../review-job.mjs';
+it('job CLI forwards its high-care model and the loop spawns with that model', () => {
+  const runJob = vi.fn(() => ({ refused: true }));
+  const previousExit = process.exitCode;
+  const stdout = vi.spyOn(process.stdout, 'write').mockReturnValue(true);
+  try {
+    runReviewJobCli(['run', '--pr=1', '--repo=web-everything/web-everything', `--expected-head=${'a'.repeat(40)}`, '--review-model=opus'], { runJob });
+    expect(runJob).toHaveBeenCalledWith(expect.objectContaining({ reviewModel: 'opus' }));
+    const spawnNode = vi.fn(() => ({ status: 0, stdout: '', stderr: '' }));
+    createReviewJobIo({ root: '/fixture', env: {}, spawnNode }).runLoop({ pr: 1, repo: 'fixture/repo', lanePath: '/lane', reviewModel: 'opus' });
+    expect(spawnNode).toHaveBeenCalledTimes(1);
+    expect(spawnNode).toHaveBeenCalledWith(process.execPath,
+      expect.arrayContaining(['scripts/operations/review-loop-cli.mjs', '--model=opus']),
+      expect.objectContaining({ cwd: '/fixture' }));
+  } finally { process.exitCode = previousExit; stdout.mockRestore(); vi.restoreAllMocks(); }
+});
+
+it.each([{ careLevel: 'high' }, { escalationReason: ['statute'] }, { scopePaths: ['docs/agent/platform-decisions.md'] }])('job dispatch carries high-care model to the child: %j', signals => {
+  const dir = mkdtempSync(join(tmpdir(), 'review-routing-'));
+  try {
+    const spawnJob = vi.fn(() => 123);
+    dispatchReviewJob({ pr: 1, repo: 'web-everything/web-everything', root: '/daemon', dir,
+      expectedHead: 'a'.repeat(40), io: { liveHead: () => 'a'.repeat(40) },
+      ciGate: () => ({ allowed: true }), checkStaleness: () => ({ fresh: true }),
+      readCompletion: () => null, resolveSettingsEnv: () => null, spawnJob, ...signals });
+    expect(spawnJob.mock.calls[0][0].argv).toContain('--review-model=opus');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+it('job dispatch rejects unsupported options before effects', () => {
+  expect(() => dispatchReviewJob({ unsupportedRouting: 'high' })).toThrow('unsupported review job option');
+});
+it('job arc preserves the high-care model through lane acquisition', () => {
+  const runLoop = vi.fn(() => ({ status: 1, stdout: '', stderr: 'fixture stop' }));
+  const io = { root: '/daemon', now: () => 1000, newActorId: () => 'fixture', readPrevCompletion: () => null,
+    report: () => {}, claim: () => ({ ok: true }), updateRecord: () => {}, unclaim: () => {},
+    prepareLane: () => ({ head: 'a'.repeat(40) }), acquireLane: () => ({ lanePath: '/fixture-lane' }),
+    liveHead: () => 'a'.repeat(40), runLoop, releaseLane: () => {}, log: () => {} };
+  runReviewJob({ pr: 1, repo: 'web-everything/web-everything', expectedHead: 'a'.repeat(40), reviewModel: 'opus' }, io);
+  expect(runLoop).toHaveBeenCalledWith(expect.objectContaining({ reviewModel: 'opus' }));
+});
+it('job rechecks dispatch ownership after slow CI evidence, immediately before spawn', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'job-fence-'));
+  let held = true;
+  const spawnJob = vi.fn();
+  try {
+    expect(() => dispatchReviewJob({ pr: 1, repo: 'web-everything/web-everything', root: '/daemon', dir,
+      expectedHead: 'a'.repeat(40), io: { liveHead: () => 'a'.repeat(40) }, leaseHeld: () => held,
+      ciGate: () => { held = false; return { allowed: true }; }, checkStaleness: () => ({ fresh: true }),
+      readCompletion: () => null, resolveSettingsEnv: () => null, spawnJob })).toThrow('dispatch lease lost');
+    expect(spawnJob).not.toHaveBeenCalled();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 import { runReconcileFixDispatch } from '../../conveyor/reconcile-fix-dispatch.mjs';
 import {
@@ -46,6 +98,7 @@ const GREEN_CI = () => ({ allowed: true, headSha: 'a'.repeat(40) });
 const dispatchReview = options => realDispatchReview({ expectedHead: 'a'.repeat(40),
   io: { liveHead: () => 'a'.repeat(40) }, ...options });
 const FRESH = () => ({ fresh: true, behind: 0 });
+const SESSION_PIN = JSON.stringify({ pr: 1234, repo: 'web-everything/web-everything', head: 'a'.repeat(40) });
 
 const REAL_TEMPLATE_STUB = [
   '# brief for {{PR}} in {{REPO}}',
@@ -162,13 +215,15 @@ describe('dispatchReview — the composition: plan → fill → mint → spawn',
       // #3331 — no `--session-id`: `claude --bg` discards it and assigns its own id.
       '--bg',
       '-n', 'review-1234',
-      '--settings', JSON.stringify({ env: { WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' } }), // xgqz204 — the worker marker, always
+      '--settings', JSON.stringify({ env: { WE_REVIEW_SESSION_PIN: SESSION_PIN, WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' } }),
       '--append-system-prompt-file', REVIEW_DISPATCH_SYSTEM_PROMPT_FILE,
       '--effort', 'high', '--model', 'sonnet',
       ...DISALLOWED_TOOLS_ARGV,
       '# brief for 1234 in web-everything/web-everything\n'
       + 'acquire: node scripts/lane-pool.mjs acquire --session=review-1234\n'
-      + 'this brief documents {{LIKE_THIS}} as an example convention, not a real token',
+      + 'this brief documents {{LIKE_THIS}} as an example convention, not a real token'
+      + `\n\nPINNED HEAD: ${'a'.repeat(40)}. Before running review-loop-cli and again before any verdict write, `
+      + `read the live head of web-everything/web-everything#1234; if it is not exactly ${'a'.repeat(40)}, exit without reviewing.\n`,
     ]);
 
     expect(result.sessionId).toBe('11111111-1111-4111-8111-111111111111');
@@ -195,6 +250,15 @@ describe('dispatchReview — the composition: plan → fill → mint → spawn',
     expect(argv[argv.indexOf('--model') + 1]).toBe(model);
   });
 
+  it.each([false, true])('lost dispatch ownership refuses session spawn with wrapped=%s', wrapReview => {
+    const spawnAgent = vi.fn(), launchWrapped = vi.fn();
+    expect(() => dispatchReview({ ciGate: GREEN_CI, pr: 1234, repo: 'web-everything/web-everything', root: '/repo',
+      readBrief: () => REAL_TEMPLATE_STUB, checkStaleness: FRESH, spawnAgent, launchWrapped, wrapReview,
+      ensureSessionCwd: d => d, resolveSettingsEnv: () => null, isolateSession: () => ({ worktreeSettings: null }),
+      leaseHeld: () => false })).toThrow('dispatch lease lost');
+    expect(spawnAgent).not.toHaveBeenCalled(); expect(launchWrapped).not.toHaveBeenCalled();
+  });
+
   // #x8mpubm follow-up (live-caught 2026-09-24, review-2591/2593/2600/2599/2594/2582) — this dispatch NEVER
   // wired the gh-app-shim: `resolveSettingsEnv` was called nowhere and `settingsEnv` was never passed to
   // `buildAgentArgv`, so no review session ever got the App-token shim on PATH by any mechanism at all. This
@@ -216,10 +280,10 @@ describe('dispatchReview — the composition: plan → fill → mint → spawn',
     // #4174 — the session's OWN cwd (a scratch dir, never `root` any more).
     expect(resolveSettingsEnv).toHaveBeenCalledWith(dispatchSessionCwd('11111111-1111-4111-8111-111111111111', { root: '/repo' }));
     expect(calls[0].argv).toContain('--settings');
-    expect(calls[0].argv[calls[0].argv.indexOf('--settings') + 1]).toBe(JSON.stringify({ env: { PATH: '/shim:/usr/bin', WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' } }));
+    expect(calls[0].argv[calls[0].argv.indexOf('--settings') + 1]).toBe(JSON.stringify({ env: { PATH: '/shim:/usr/bin', WE_REVIEW_SESSION_PIN: SESSION_PIN, WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' } }));
   });
 
-  it('#x8mpubm follow-up — resolveSettingsEnv returning null (the real default, unconfigured host) emits no --settings at all', () => {
+  it('null shim settings retain the worker marker and admitted session head', () => {
     const calls = [];
     dispatchReview({ ciGate: GREEN_CI,
       pr: 1234,
@@ -231,7 +295,7 @@ describe('dispatchReview — the composition: plan → fill → mint → spawn',
       checkStaleness: FRESH,
       resolveSettingsEnv: () => null,
     });
-    expect(calls[0].argv[calls[0].argv.indexOf('--settings') + 1]).toBe(JSON.stringify({ env: { WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' } })); // xgqz204
+    expect(calls[0].argv[calls[0].argv.indexOf('--settings') + 1]).toBe(JSON.stringify({ env: { WE_REVIEW_SESSION_PIN: SESSION_PIN, WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' } }));
   });
 
   it('refuses to dispatch from inside a lane checkout, same guard dispatch-lane-io.mjs uses', () => {
@@ -273,14 +337,16 @@ describe('dispatchReview — the composition: plan → fill → mint → spawn',
       // #3331 — no `--session-id`: `claude --bg` discards it and assigns its own id.
       '--bg',
       '-n', 'review-1234',
-      '--settings', JSON.stringify({ env: { WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' } }), // xgqz204 — the worker marker, always
+      '--settings', JSON.stringify({ env: { WE_REVIEW_SESSION_PIN: SESSION_PIN, WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' } }),
       '--append-system-prompt-file', REVIEW_DISPATCH_SYSTEM_PROMPT_FILE,
       '--effort', 'high', '--model', 'sonnet',
       ...DISALLOWED_TOOLS_ARGV,
       '--permission-mode', 'plan',
       '# brief for 1234 in web-everything/web-everything\n'
       + 'acquire: node scripts/lane-pool.mjs acquire --session=review-1234\n'
-      + 'this brief documents {{LIKE_THIS}} as an example convention, not a real token',
+      + 'this brief documents {{LIKE_THIS}} as an example convention, not a real token'
+      + `\n\nPINNED HEAD: ${'a'.repeat(40)}. Before running review-loop-cli and again before any verdict write, `
+      + `read the live head of web-everything/web-everything#1234; if it is not exactly ${'a'.repeat(40)}, exit without reviewing.\n`,
     ]);
   });
 
@@ -890,4 +956,29 @@ it('dispatchReview refuses capability-off before spawning any agent', () => {
   expect(() => dispatchReview({ pr: 1, repo: 'longshoreai/longshore', checkoutExists: () => true, spawnAgent }))
     .toThrow(/not a constellation repo/);
   expect(spawnAgent).not.toHaveBeenCalled();
+});
+
+describe('session expectedHead binding immediately before spawn', () => {
+  it.each([false, true])('refuses changed or unreadable heads for wrapped=%s', wrapReview => {
+    for (const readExpectedHead of [() => 'b'.repeat(40), () => { throw Error('head unreadable'); }]) {
+      const spawnAgent = vi.fn(), launchWrapped = vi.fn();
+      const out = dispatchReview({ ciGate: GREEN_CI, pr: 1234, repo: 'web-everything/web-everything', root: '/repo',
+        readBrief: () => REAL_TEMPLATE_STUB, checkStaleness: FRESH, expectedHead: 'a'.repeat(40), readExpectedHead,
+        wrapReview, spawnAgent, launchWrapped });
+      expect(out).toMatchObject({ refused: true, outcome: 'refused-head-moved' });
+      expect(spawnAgent).not.toHaveBeenCalled(); expect(launchWrapped).not.toHaveBeenCalled();
+    }
+  });
+  it('allows an unchanged pinned session head', () => {
+    const spawnAgent = vi.fn();
+    dispatchReview({ ciGate: GREEN_CI, pr: 1234, repo: 'web-everything/web-everything', root: '/repo',
+      readBrief: () => REAL_TEMPLATE_STUB, checkStaleness: FRESH, expectedHead: 'a'.repeat(40), readExpectedHead: () => 'a'.repeat(40), wrapReview: false, spawnAgent });
+    expect(spawnAgent).toHaveBeenCalledOnce();
+  });
+  it('pins the admitted head into the session worker prompt', () => {
+    const out = dispatchReview({ ciGate: GREEN_CI, pr: 1234, repo: 'web-everything/web-everything', root: '/repo',
+      readBrief: () => REAL_TEMPLATE_STUB, checkStaleness: FRESH, expectedHead: 'a'.repeat(40), readExpectedHead: () => 'a'.repeat(40),
+      wrapReview: false, spawnAgent: vi.fn() });
+    expect(out.prompt).toContain(`PINNED HEAD: ${'a'.repeat(40)}`);
+  });
 });

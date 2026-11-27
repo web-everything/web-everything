@@ -408,7 +408,7 @@ describe('automatic card filing with shared durable claims', () => {
       resolveCard: ref => ({ ref, readable: !ref.includes('xoldone')
         || (existingReadable && !(evidence === 'landed on main' && ref.endsWith('@pr111'))) }) });
     f.act(p);
-    const filedDigests = [];
+    const filedDigests = [], landingCalls = [];
     const landed = await runCardLandingWithReceipt(f.cards[0], landingArgv(p), {
       actions: f.actions, dedupe,
       land: (args, deps = {}) => runLandPreventionCardCli(args, {
@@ -417,7 +417,8 @@ describe('automatic card filing with shared durable claims', () => {
         readFile: () => '---\nstatus: open\n---\n# Card\n',
         batch: async () => step === 'done' ? { disabled: true } : step === 'batched' ? { batched: true, batchRef: 'batch' } : { reason: 'paused' },
         loadPreventionBatchSettings: () => ({ batchLeaseWaitMinutes: 0 }),
-        exec: (_cmd, args) => {
+        exec: (cmd, args) => {
+          landingCalls.push({ cmd, args });
           if (args.includes('acquire')) return JSON.stringify({ lane: 1, path: lane });
           if (args.includes('file-item')) {
             filedDigests.push(args.find(a => a.startsWith('--digest=')).slice(9));
@@ -425,11 +426,19 @@ describe('automatic card filing with shared durable claims', () => {
           }
           if (args.includes('open-pr')) return JSON.stringify({ findings: { submit: { effects: [{ result: { outcome: 'opened', pr: 222 } }] } } });
           if (args.includes('verify')) return JSON.stringify({ verdict: { ok: true } });
+          // Per-card publication now audits the committed head; batch/mention paths do not reach it.
+          if (args.includes('rev-parse')) return OTHER;
+          if (args.includes('codex-audit')) return JSON.stringify({ verdict: { ok: true, code: 0, stdout: 'NOT WEAKENED\n', stderr: '' } });
           return '';
         },
       }),
     });
     expect(landed).toMatchObject({ code: 0, result: { step, rel: step === 'mentioned' ? null : result.rel } });
+    expect(landingCalls.filter(c => c.args.includes('codex-audit'))).toEqual(step === 'done' ? [{
+      cmd: 'node', args: [join(lane, 'scripts/operations/run.mjs'), 'codex-audit', '--base=origin/main', `--head=${OTHER}`, '--json'],
+    }] : []);
+    expect(landingCalls.flatMap(c => c.args.filter(a => ['commit', 'verify', 'rev-parse', 'codex-audit', 'open-pr'].includes(a))))
+      .toEqual(step === 'done' ? ['commit', 'verify', 'rev-parse', 'codex-audit', 'open-pr'] : []);
     expect(filedDigests).toHaveLength(step === 'mentioned' ? 0 : 1);
     if (step !== 'mentioned') {
       expect(filedDigests[0]).not.toContain('we:a.mjs');

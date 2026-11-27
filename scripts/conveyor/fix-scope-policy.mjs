@@ -201,9 +201,9 @@ export function createLiveRegionOverlap({ holderEntries = new Map(), readPrHeads
     }
     const file = sharedFile.replace(/^[^:]+:/, '');
     const a = headFor(candidate), b = headFor(holder);
-    return regionOverlapDecision({ file, hunksA: regionReader.hunksFor(a, candidate.pr),
+    return { holderHead: b, ...regionOverlapDecision({ file, hunksA: regionReader.hunksFor(a, candidate.pr),
       hunksB: regionReader.hunksFor(b, holder.pr), margin: policy.value.regionMarginLines,
-      mergeConflict: a && b ? regionReader.mergeConflicts(a, b) : null });
+      mergeConflict: a && b ? regionReader.mergeConflicts(a, b) : null }) };
   };
 }
 

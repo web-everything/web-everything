@@ -1,0 +1,425 @@
+{
+ "tableType": "https://everstandards.dev/ship/strategy-table/v0.1",
+ "id": "https://everstandards.dev/ship/fixtures/ours/strategy-tables/ours-next",
+ "name": "ours-next",
+ "version": "r0-r11-draft-1",
+ "description": "OURS: proposal, not ratified; placeholder numbers. Rule order R0-R11 of the DST1 research; our set is closed to the six; prototype-first only for daemon or tooling fixes",
+ "hitPolicy": "first",
+ "inputs": [
+  {
+   "name": "security-open",
+   "type": "boolean",
+   "required": true
+  },
+  {
+   "name": "step-kind",
+   "type": "enum",
+   "values": [
+    "daemon-fix",
+    "tooling-fix",
+    "product",
+    "revert"
+   ],
+   "required": true
+  },
+  {
+   "name": "blocker",
+   "type": "enum",
+   "values": [
+    "none",
+    "stage",
+    "hold"
+   ],
+   "required": true
+  },
+  {
+   "name": "hold-causer",
+   "type": "boolean",
+   "required": true
+  },
+  {
+   "name": "targets-can-adopt",
+   "type": "boolean",
+   "required": true
+  },
+  {
+   "name": "overlay-loadable",
+   "type": "boolean",
+   "required": true
+  },
+  {
+   "name": "live-overlays",
+   "type": "count",
+   "required": true
+  },
+  {
+   "name": "audit-state",
+   "type": "enum",
+   "values": [
+    "pass",
+    "fail",
+    "stale",
+    "delta-owed",
+    "none"
+   ],
+   "required": true
+  },
+  {
+   "name": "loaded-stage-stress",
+   "type": "enum",
+   "values": [
+    "clear",
+    "stressed"
+   ],
+   "required": true
+  },
+  {
+   "name": "stress-incident",
+   "type": "enum",
+   "values": [
+    "none",
+    "fix-not-landed",
+    "fix-landed"
+   ],
+   "required": true
+  },
+  {
+   "name": "loads-stalled-stage",
+   "type": "boolean",
+   "required": true
+  },
+  {
+   "name": "free-slots",
+   "type": "count",
+   "required": true
+  },
+  {
+   "name": "review-rounds",
+   "type": "count",
+   "required": true
+  },
+  {
+   "name": "non-convergence-evidence",
+   "type": "boolean",
+   "required": true
+  },
+  {
+   "name": "ci-state",
+   "type": "enum",
+   "values": [
+    "pass",
+    "fail",
+    "pending"
+   ],
+   "required": true
+  },
+  {
+   "name": "admission-clear",
+   "type": "boolean",
+   "required": true
+  },
+  {
+   "name": "red-interval-open",
+   "type": "boolean",
+   "required": false
+  },
+  {
+   "name": "red-recovery-candidate",
+   "type": "boolean",
+   "required": false
+  },
+  {
+   "name": "prepped-independent",
+   "type": "boolean",
+   "required": false
+  },
+  {
+   "name": "stack-declared",
+   "type": "boolean",
+   "required": false
+  },
+  {
+   "name": "stack-depth",
+   "type": "count",
+   "required": false
+  }
+ ],
+ "settings": [
+  "overlay-cap",
+  "design-pass-after-rounds",
+  "stack-max-depth",
+  "land-by-budget",
+  "override-window",
+  "override-threshold"
+ ],
+ "reasonCodes": [
+  {
+   "code": "EVIDENCE_UNKNOWN",
+   "class": "unhandled"
+  },
+  {
+   "code": "SECURITY_FLOOR",
+   "class": "floor"
+  },
+  {
+   "code": "HOLD_CLEAR_NO_ADOPT",
+   "class": "strategy"
+  },
+  {
+   "code": "BLOCKER_OVERLAY_ELIGIBLE",
+   "class": "strategy"
+  },
+  {
+   "code": "RED_MAIN_RECOVERY",
+   "class": "strategy"
+  },
+  {
+   "code": "REVIEW_NON_CONVERGING",
+   "class": "strategy"
+  },
+  {
+   "code": "STALLED_GATE",
+   "class": "hold"
+  },
+  {
+   "code": "KNOWN_INCIDENT_FIX_LANDED",
+   "class": "strategy"
+  },
+  {
+   "code": "STAGE_STRESSED",
+   "class": "hold"
+  },
+  {
+   "code": "STACK_VIABLE",
+   "class": "strategy"
+  },
+  {
+   "code": "NORMAL_CAPACITY",
+   "class": "strategy"
+  },
+  {
+   "code": "NO_ELIGIBLE_STRATEGY",
+   "class": "unhandled"
+  }
+ ],
+ "overrideReasons": [
+  "INPUT_WRONG",
+  "RULE_MISSING",
+  "OPERATOR_PRIORITY"
+ ],
+ "strategies": {
+  "names": [
+   "normal-pr",
+   "prototype-first",
+   "build-ahead",
+   "stacked",
+   "incident",
+   "design-pass-first"
+  ],
+  "closed": true
+ },
+ "prototypeStepKinds": [
+  "daemon-fix",
+  "tooling-fix"
+ ],
+ "onUnknown": {
+  "rule": "R0",
+  "reason": "EVIDENCE_UNKNOWN"
+ },
+ "onNoMatch": {
+  "rule": "R11",
+  "reason": "NO_ELIGIBLE_STRATEGY"
+ },
+ "rules": [
+  {
+   "id": "R1",
+   "rank": 1,
+   "when": {
+    "security-open": {
+     "eq": true
+    }
+   },
+   "output": {
+    "strategy": "unhandled",
+    "reason": "SECURITY_FLOOR"
+   }
+  },
+  {
+   "id": "R2",
+   "rank": 2,
+   "when": {
+    "blocker": {
+     "eq": "hold"
+    },
+    "hold-causer": {
+     "eq": true
+    },
+    "targets-can-adopt": {
+     "eq": false
+    },
+    "audit-state": {
+     "eq": "pass"
+    },
+    "ci-state": {
+     "eq": "pass"
+    }
+   },
+   "output": {
+    "strategy": "incident",
+    "reason": "HOLD_CLEAR_NO_ADOPT"
+   }
+  },
+  {
+   "id": "R3",
+   "rank": 3,
+   "when": {
+    "step-kind": {
+     "in": [
+      "daemon-fix",
+      "tooling-fix"
+     ]
+    },
+    "blocker": {
+     "in": [
+      "stage",
+      "hold"
+     ]
+    },
+    "targets-can-adopt": {
+     "eq": true
+    },
+    "overlay-loadable": {
+     "eq": true
+    },
+    "audit-state": {
+     "eq": "pass"
+    },
+    "ci-state": {
+     "eq": "pass"
+    },
+    "live-overlays": {
+     "belowSetting": "overlay-cap"
+    }
+   },
+   "output": {
+    "strategy": "prototype-first",
+    "reason": "BLOCKER_OVERLAY_ELIGIBLE"
+   }
+  },
+  {
+   "id": "R4",
+   "rank": 4,
+   "when": {
+    "red-interval-open": {
+     "eq": true
+    },
+    "red-recovery-candidate": {
+     "eq": true
+    }
+   },
+   "output": {
+    "strategy": "incident",
+    "reason": "RED_MAIN_RECOVERY"
+   }
+  },
+  {
+   "id": "R5",
+   "rank": 5,
+   "when": {
+    "review-rounds": {
+     "atLeastSetting": "design-pass-after-rounds"
+    },
+    "non-convergence-evidence": {
+     "eq": true
+    }
+   },
+   "output": {
+    "strategy": "design-pass-first",
+    "reason": "REVIEW_NON_CONVERGING"
+   }
+  },
+  {
+   "id": "R6",
+   "rank": 6,
+   "when": {
+    "loads-stalled-stage": {
+     "eq": true
+    }
+   },
+   "output": {
+    "strategy": "hold",
+    "reason": "STALLED_GATE"
+   }
+  },
+  {
+   "id": "R7",
+   "rank": 7,
+   "when": {
+    "loaded-stage-stress": {
+     "eq": "stressed"
+    },
+    "stress-incident": {
+     "eq": "fix-landed"
+    },
+    "prepped-independent": {
+     "eq": true
+    }
+   },
+   "output": {
+    "strategy": "build-ahead",
+    "reason": "KNOWN_INCIDENT_FIX_LANDED"
+   }
+  },
+  {
+   "id": "R8",
+   "rank": 8,
+   "when": {
+    "loaded-stage-stress": {
+     "eq": "stressed"
+    }
+   },
+   "output": {
+    "strategy": "hold",
+    "reason": "STAGE_STRESSED"
+   }
+  },
+  {
+   "id": "R9",
+   "rank": 9,
+   "when": {
+    "stack-declared": {
+     "eq": true
+    },
+    "stack-depth": {
+     "atMostSetting": "stack-max-depth"
+    },
+    "free-slots": {
+     "positive": true
+    },
+    "admission-clear": {
+     "eq": true
+    }
+   },
+   "output": {
+    "strategy": "stacked",
+    "reason": "STACK_VIABLE"
+   }
+  },
+  {
+   "id": "R10",
+   "rank": 10,
+   "when": {
+    "admission-clear": {
+     "eq": true
+    },
+    "free-slots": {
+     "positive": true
+    }
+   },
+   "output": {
+    "strategy": "normal-pr",
+    "reason": "NORMAL_CAPACITY"
+   }
+  }
+ ]
+}

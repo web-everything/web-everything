@@ -32,8 +32,12 @@ import { resolvePreventionBatchSettings } from '../../lib/card-batch-settings.mj
 import { loadCardBatchPolicy } from '../../lib/card-batch-policy.mjs';
 import { removeFiledCards, salvageLaneCards } from '../../lib/lane-card-salvage.mjs';
 import { execFileSync } from 'node:child_process';
+import { checkCanonicalAuditForOpen } from '../canonical-audit-gate.mjs';
 
 const landPreventionCard = (input, deps) => realLandPreventionCard(input, {
+  // Existing filing fixtures isolate the new audit subprocesses; dedicated cases below exercise them.
+  auditExec: (_cmd, args) => args.includes('rev-parse') ? 'a'.repeat(40)
+    : JSON.stringify({ verdict: { ok: true, code: 0, stdout: 'NOT WEAKENED\n', stderr: '' } }),
   pendingDir: '/tmp/no-prevention-spool-for-unit-tests',
   batch: async () => ({ batched: false, disabled: true, reason: 'per-card test' }),
   removeCards: () => [], salvageCards: () => ({ status: 'none', removed: [] }), ...deps,
@@ -68,6 +72,86 @@ const VERIFY_GREEN = JSON.stringify({ verdict: { ok: true, passed: 2, failed: 0,
 const OPEN_PR_OPENED = JSON.stringify({
   runId: 'r1', op: 'open-pr', stopped: 'complete', applied: [], inFlight: [], pending: null,
   findings: { submit: { effects: [{ result: { outcome: 'opened', pr: 5555, url: 'https://github.com/web-everything/web-everything/pull/5555' } }] } },
+});
+
+
+describe('landPreventionCard — canonical audit before publication', () => {
+  const head = 'a'.repeat(40);
+  const audit = (stdout, code = 0, stderr = '') => JSON.stringify({
+    verdict: { ok: code === 0, code, stdout, stderr },
+  });
+  const run = async (answer, sha = head) => {
+    const { exec, calls } = scriptedExec([
+      ACQUIRE_OK, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, sha, ...(sha === head ? [answer] : []),
+      ...(sha === head && typeof answer === 'string' && answer === audit('NOT WEAKENED\n')
+        ? [OPEN_PR_OPENED, 'labelled'] : []), 'released',
+    ]);
+    const written = [];
+    const result = await landPreventionCard(INPUT, {
+      exec, auditExec: undefined, write: () => {},
+      mkTmp: () => join(tmpdir(), 'card-audit-fixture'), rmTmp: () => {},
+      writeFile: (path, text) => written.push({ path, text }),
+    });
+    return { result, calls, written };
+  };
+
+  it('runs the canonical audit on the card commit before open-pr and stops on WEAKENED', async () => {
+    const { result, calls, written } = await run(audit('WEAKENED\nbacklog/card.md:1: unsafe prose\n', 1));
+    expect(result).toMatchObject({ ok: false, step: 'codex-audit' });
+    expect(result.reason).toContain('unsafe prose');
+    expect(calls[5]).toMatchObject({ cmd: 'git', args: ['-C', '/workspace/.lanes/web-everything/lane-7', 'rev-parse', 'HEAD'] });
+    expect(calls[6]).toMatchObject({ cmd: 'node', args: [
+      '/workspace/.lanes/web-everything/lane-7/scripts/operations/run.mjs',
+      'codex-audit', '--base=origin/main', `--head=${head}`, '--json',
+    ], opts: { cwd: '/workspace/.lanes/web-everything/lane-7' } });
+    expect(calls.some(c => c.args.includes('open-pr') || c.args.some(a => /waiver|ruled-weakened/.test(a)))).toBe(false);
+    expect(written.some(w => w.path.endsWith('pr-body.md'))).toBe(false);
+    expect(calls.at(-1).args).toContain('release');
+  });
+
+  it('opens the PR normally only after a successful NOT WEAKENED audit', async () => {
+    const { result, calls } = await run(audit('NOT WEAKENED\n'));
+    expect(result.ok).toBe(true);
+    expect(calls[3].args).toContain('commit');
+    expect(calls[6].args).toContain(`--head=${head}`);
+    expect(calls[7].args).toContain('open-pr');
+    expect(calls[7].args).toContain('--mode=label-on-green');
+    expect(calls[8].args).toContain('review:pending');
+  });
+
+  it.each([
+    ['crash', Object.assign(new Error('audit crashed'), { stderr: 'auditor unavailable' })],
+    ['WEAKENED nonzero exit', Object.assign(new Error('exit 1'), { stdout: audit('WEAKENED\ncard.md:1: unsafe\n', 1) })],
+    ['nonzero exit with passing stdout', Object.assign(new Error('record write failed'), { stdout: audit('NOT WEAKENED\n') })],
+    ['unreadable output', 'not JSON'],
+    ['missing verdict', '{}'],
+    ['unknown verdict', audit('UNKNOWN\n')],
+    ['failed result', audit('NOT WEAKENED\n', 3, 'record write failed')],
+    ['contradictory verdict', audit('NOT WEAKENED\nWEAKENED\n')],
+  ])('fails closed on %s, with diagnostics and no PR or waiver', async (_name, answer) => {
+    const { result, calls } = await run(answer);
+    expect(result).toMatchObject({ ok: false, step: 'codex-audit' });
+    expect(result.reason).toBeTruthy();
+    expect(result.reason).toMatch(/retry|human review/i);
+    expect(calls.some(c => c.args.includes('open-pr') || c.args.some(a => /waiver|ruled-weakened/.test(a)))).toBe(false);
+    expect(calls.at(-1).args).toContain('release');
+  });
+
+  it('refuses an unresolved card head before running the audit or opening a PR', async () => {
+    const { result, calls } = await run(audit('NOT WEAKENED\n'), 'unresolved');
+    expect(result).toMatchObject({ ok: false, step: 'codex-audit' });
+    expect(calls.some(c => c.args.includes('codex-audit') || c.args.includes('open-pr'))).toBe(false);
+    expect(calls.at(-1).args).toContain('release');
+  });
+
+  it('leaves the canonical gate unchanged and an unaudited card head refused', () => {
+    expect(execFileSync('git', ['diff', 'HEAD', '--', 'scripts/operations/canonical-audit-gate.mjs'], { encoding: 'utf8' })).toBe('');
+    const result = checkCanonicalAuditForOpen({
+      repo: 'card-lane', ref: 'lane/card', sha: head,
+      exec: () => head, readFile: () => { throw new Error('no audit record'); }, warn: () => {},
+    });
+    expect(result).toMatchObject({ ok: false, reason: 'canonical-audit-missing' });
+  });
 });
 
 describe('landPreventionCard — the real acquire → file-item → commit → verify → open-pr → release sequence', () => {
@@ -314,7 +398,9 @@ describe('landPreventionCard — dedupe before filing', () => {
   it('lands a mention-only filing through the ordinary PR path when every member has batching disabled', async () => {
     const acquire = setup();
     try {
-      const { exec, calls } = scriptedExec([acquire, 'staged', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'labelled', 'released']);
+      const { exec, calls } = scriptedExec([acquire, 'staged', 'committed', VERIFY_GREEN, 'a'.repeat(40),
+        JSON.stringify({ verdict: { ok: true, code: 0, stdout: 'NOT WEAKENED\n', stderr: '' } }),
+        OPEN_PR_OPENED, 'labelled', 'released']);
       const batch = vi.fn(async () => ({ batched: false, disabled: true }));
       const result = await realLandPreventionCard(input(), {
         exec, dedupe, batch, pendingDir: join(lane, 'pending'), write: () => {},
@@ -323,9 +409,9 @@ describe('landPreventionCard — dedupe before filing', () => {
       expect(result).toMatchObject({ ok: true, step: 'done', num: null, rel: null, pr: 5555, mentions: 1 });
       expect(batch).toHaveBeenCalledTimes(1);
       expect(batch.mock.calls[0][0].cardPath).toMatch(/^backlog\/raised-by\/4706\//);
-      expect(calls.filter(({ args }) => ['commit', 'verify', 'open-pr'].some(op => args.includes(op)))
-        .map(({ args }) => args.find(arg => ['commit', 'verify', 'open-pr'].includes(arg))))
-        .toEqual(['commit', 'verify', 'open-pr']);
+      expect(calls.filter(({ args }) => ['commit', 'verify', 'codex-audit', 'open-pr'].some(op => args.includes(op)))
+        .map(({ args }) => args.find(arg => ['commit', 'verify', 'codex-audit', 'open-pr'].includes(arg))))
+        .toEqual(['commit', 'verify', 'codex-audit', 'open-pr']);
       expect(calls.some(({ args }) => args.includes('file-item'))).toBe(false);
       expect(calls.at(-1).args).toContain('release');
     } finally { cleanup(); }
@@ -1112,11 +1198,14 @@ describe('prevention batch landing', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('policy disable opens a labelled single PR', async () => {
-    const { exec, calls } = scriptedExec([ACQUIRE_OK, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'labelled', 'released']);
+    const { exec, calls } = scriptedExec([ACQUIRE_OK, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, 'a'.repeat(40),
+      JSON.stringify({ verdict: { ok: true, code: 0, stdout: 'NOT WEAKENED\n', stderr: '' } }),
+      OPEN_PR_OPENED, 'labelled', 'released']);
     const result = await realLandPreventionCard(INPUT, { ...deps, exec,
       batch: async () => ({ batched: false, disabled: true, reason: 'policy off' }), write: () => {} });
     expect(result.step).toBe('done');
-    expect(calls[6]).toMatchObject({ cmd: 'gh', args: ['pr', 'edit', '5555', '--repo', 'web-everything/web-everything', '--add-label', 'review:pending'] });
+    expect(calls[6].args).toContain('codex-audit');
+    expect(calls[8]).toMatchObject({ cmd: 'gh', args: ['pr', 'edit', '5555', '--repo', 'web-everything/web-everything', '--add-label', 'review:pending'] });
   });
   it('drains a pending entry before its own filing', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'pending-prevention-test-'));

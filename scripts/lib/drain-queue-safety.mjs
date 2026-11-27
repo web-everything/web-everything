@@ -49,6 +49,59 @@ function pendingFreezeLogComplete(log, pr) {
   const blocking = [...seen].filter(([, status]) => status === 'hold' || status === 'fail-closed');
   return blocking.length === 1 && blocking[0][0] === 'red-main-freeze' && blocking[0][1] === 'fail-closed';
 }
+// Code-owned and read only by the pending-freeze proof; ordinary aggregates keep their own registry.
+export const MQ_FREEZE_SUMMARY_NEEDS = {
+  integration: { step: 'Gate on integration results', needs: {
+    changes: { allow: ['success'] },
+    'integration-part': { members: ['scan-chain', 'sim-scenarios', 'lane-pool-a', 'lane-pool-b', 'parallel'], allow: ['success', 'cancelled'] },
+  } },
+  'coverage-merge': { step: 'Require successful shards', needs: {
+    changes: { allow: ['success'] },
+    'test-shard': { members: Array.from({ length: 10 }, (_, i) => String(i + 1)), allow: ['success', 'cancelled'] },
+  } },
+  test: { step: 'Gate on shard results', needs: {
+    changes: { allow: ['success'] },
+    'test-shard': { members: Array.from({ length: 10 }, (_, i) => String(i + 1)), allow: ['success', 'cancelled'] }, integration: { allow: ['success', 'cancelled'] },
+    standards: { allow: ['success', 'cancelled'] }, 'coverage-merge': { allow: ['success', 'cancelled'] },
+    'host-paths': { allow: ['success', 'cancelled'] },
+  } },
+};
+
+function provePendingFreezeSummary({ check, repo, oid, read, readJobs }) {
+  const proof = Object.hasOwn(MQ_FREEZE_SUMMARY_NEEDS, localJob(check.name))
+    ? MQ_FREEZE_SUMMARY_NEEDS[localJob(check.name)] : null;
+  if (!proof || check.conclusion !== 'failure') return false;
+  const url = new URL(check.details_url);
+  const match = /^\/([^/]+)\/([^/]+)\/actions\/runs\/([1-9][0-9]*)\/job\/([1-9][0-9]*)$/.exec(url.pathname);
+  if (url.origin !== 'https://github.com' || url.search || url.hash || !match
+    || `${match[1]}/${match[2]}` !== repo) return false;
+  const runId = Number(match[3]), jobId = Number(match[4]);
+  if (!Number.isSafeInteger(runId) || !Number.isSafeInteger(jobId)) return false;
+  const job = read(`repos/${repo}/actions/jobs/${jobId}`);
+  if (job?.id !== jobId || job.name !== check.name || job.run_id !== runId
+    || mqOid(job.head_sha) !== oid || job.status !== 'completed' || job.conclusion !== 'failure'
+    || !Number.isSafeInteger(job.run_attempt) || job.run_attempt < 1
+    || !Array.isArray(job.steps) || job.steps.length === 0
+    || job.steps.filter(s => s?.name === proof.step && s.conclusion === 'failure').length !== 1
+    || !job.steps.every(s => typeof s?.name === 'string' && (['success', 'skipped', 'neutral'].includes(s.conclusion)
+      || s.name === proof.step && s.conclusion === 'failure'))) return false;
+  const run = read(`repos/${repo}/actions/runs/${runId}`);
+  if (run?.id !== runId || run.path !== '.github/workflows/ci.yml'
+    || run.event !== 'merge_group' || mqOid(run.head_sha) !== oid) return false;
+  const jobs = readJobs(`repos/${repo}/actions/runs/${runId}/attempts/${job.run_attempt}/jobs`);
+  if (jobs.some(j => j.run_id !== runId || j.run_attempt !== job.run_attempt || mqOid(j.head_sha) !== oid)
+    || jobs.filter(j => j.id === jobId && j.name === job.name && j.status === 'completed' && j.conclusion === 'failure').length !== 1) return false;
+  let cancelled = false;
+  for (const [name, need] of Object.entries(proof.needs)) {
+    const expected = need.members ? need.members.map(m => `${name} (${m})`) : [name];
+    const found = jobs.filter(j => j.name === name || j.name?.startsWith(`${name} (`));
+    if (found.length !== expected.length || expected.some(n => found.filter(j => j.name === n).length !== 1)
+      || found.some(j => j.status !== 'completed' || !need.allow.includes(j.conclusion))) return false;
+    cancelled ||= found.some(j => j.conclusion === 'cancelled');
+  }
+  return cancelled;
+}
+
 const MQ_AGGREGATE_JOBS = ['test', 'coverage-merge'];
 const MQ_AGGREGATE_SUMMARY_STEPS = new Map([
   ['test', 'Gate on shard results'], ['coverage-merge', 'Require successful shards'],
@@ -731,10 +784,11 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
     if (!oid || !Number.isFinite(removedAt)) return null;
     // Reserve two calls for deciding main CI even when job evidence exhausts its allowance.
     let budget = 30;
-    const readPages = (endpoint, key) => {
+    const readPages = (endpoint, key, beforeRead = () => {}) => {
       const items = [], ids = new Set();
       let total;
       for (let page = 1; page <= 5; page++) {
+        beforeRead();
         if (budget-- <= 0) throw new Error('retry evidence budget exhausted');
         const result = JSON.parse(exec('gh', ['api', `${endpoint}${endpoint.includes('?') ? '&' : '?'}per_page=100&page=${page}`],
           { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
@@ -807,7 +861,10 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
     // `blocked`: the gate log or shared freeze could not prove the failure main-caused. No fallback may authorize a retry.
     let blocked = false;
     let freezeProven = false, freezePending = false, freezeRunId = NaN, freezeAttempt = NaN;
-    if (gates.length === 1 && failed.every(check => check === gates[0] || cancelledOnly(check)) && budget > 2) {
+    const freezeOriginalSet = failed.every(check => check === gates[0] || cancelledOnly(check));
+    const freezeSummarySet = failed.every(check => check === gates[0] || cancelledOnly(check)
+      || check.conclusion === 'failure' && Object.hasOwn(MQ_FREEZE_SUMMARY_NEEDS, localJob(check.name)));
+    if (gates.length === 1 && (freezeOriginalSet || freezeSummarySet) && budget > 2) {
       try {
         const jobPath = /^\/([^/]+)\/([^/]+)\/actions\/runs\/([1-9][0-9]*)\/job\/([1-9][0-9]*)$/.exec(new URL(gates[0].details_url).pathname);
         if (jobPath && `${jobPath[1]}/${jobPath[2]}` === repo && new URL(gates[0].details_url).origin === 'https://github.com') {
@@ -822,8 +879,10 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
           freezeProven = holds.length === 1
             && /^\S+\s+(?:hold\s{2,}red-main-freeze\s+main is RED \(freeze:|fail-closed\s{2,}red-main-freeze\s+red-main freeze unreadable: main CI run ([1-9][0-9]*) is being re-run \(attempt ([1-9][0-9]*)\) — verdict pending\s*$)/.test(holds[0]);
           freezePending = freezeProven && /fail-closed/.test(holds[0]);
+          if (!freezePending && !freezeOriginalSet) freezeProven = false;
           if (freezePending && !pendingFreezeLogComplete(log, pr)) { freezeProven = freezePending = false; blocked = true; }
           if (freezePending) {
+            if (budget <= 2) throw new Error('retry evidence budget exhausted');
             // Bind the log to the expected merge_group run: workflow "Merge gate", job merge-gate, the merge-group commit.
             budget--;
             const job = JSON.parse(exec('gh', ['api', `repos/${repo}/actions/jobs/${Number(jobPath[4])}`], {
@@ -834,6 +893,8 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
             else if (!(() => {
               // Display names are not identity: the run itself must be the merge-gate workflow's merge_group run for this commit.
               if (!Number.isSafeInteger(job.run_id) || job.run_id !== Number(jobPath[3])) return false;
+              if (budget <= 2) throw new Error('retry evidence budget exhausted');
+              budget--;
               const run = JSON.parse(exec('gh', ['api', `repos/${repo}/actions/runs/${job.run_id}`], {
                 encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
               return run?.id === job.run_id && run.path === '.github/workflows/merge-gate.yml' && run.event === 'merge_group' && mqOid(run.head_sha) === oid;
@@ -847,10 +908,30 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
           if (freezePending) {
             const named = /main CI run ([1-9][0-9]*) is being re-run \(attempt ([1-9][0-9]*)\)/.exec(holds[0]);
             freezeRunId = Number(named?.[1]); freezeAttempt = Number(named?.[2]);
+            const reserveMain = () => { if (budget <= 2) throw new Error('retry evidence budget exhausted'); };
+            const read = endpoint => {
+              reserveMain(); budget--;
+              return JSON.parse(exec('gh', ['api', endpoint], { encoding: 'utf8', timeout: 60_000,
+                maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
+            };
+            try {
+              for (const check of failed.filter(check => check !== gates[0] && !cancelledOnly(check))) {
+                if (!provePendingFreezeSummary({ check, repo, oid, read,
+                  readJobs: endpoint => readPages(endpoint, 'jobs', reserveMain) }))
+                  throw new Error('pending freeze summary proof incomplete');
+              }
+            } catch {
+              return { logReason: 'pending freeze summary evidence unreadable or incomplete; operator must inspect failed jobs and enqueue manually' };
+            }
           }
         }
       } catch { blocked = true; /* unreadable gate log: the hold stays */ }
     }
+    // A failed P-map summary rides only on a fully proven pending freeze: any other outcome (unrecognized log,
+    // invalid gate URL, skipped block) must hold, never reach the main-red fallback.
+    if (gates.length === 1 && freezeSummarySet && !freezeOriginalSet && !freezePending) blocked = true;
+    if (!freezeOriginalSet && blocked)
+      return { logReason: 'pending freeze evidence unreadable or incomplete; operator must inspect failed jobs and enqueue manually' };
     const noLogInfra = failed.every(cancelledOnly) || freezeProven;
     let logReason = null;
     const unreadable = new Set();
@@ -1076,12 +1157,37 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         if (!flaky && headGreen && !flakeReason) flakeReason = 'per-test pass proof missing, unreadable, expired or not from this shard (fails closed)';
       } catch { flaky = false; }
     }
-    // A pending-rerun freeze proof needs main settled: any unfinished main run keeps the verdict unknown.
-    return { mainGreen: !!deciding && !stale && deciding.conclusion === 'success'
-        && !(freezePending && (newest.some(run => run.status !== 'completed')
-          || !newest.some(run => run.id === freezeRunId && run.run_attempt === freezeAttempt && run.status === 'completed' && run.conclusion === 'success'))),
+    // P settles the named run's latest attempt; the historical named attempt need only be completed.
+    let settledGreen = true, freezeMainReason = null;
+    if (freezePending) {
+      settledGreen = false;
+      const entries = newest.filter(run => run.id === freezeRunId), latest = entries[0];
+      freezeMainReason = `freeze run ${freezeRunId} named attempt ${freezeAttempt}; latest attempt ${Number.isSafeInteger(latest?.run_attempt) ? latest.run_attempt : 'unknown'} concluded ${conclusions.has(latest?.conclusion) ? latest.conclusion : 'unknown'}; evidence incomplete or unsettled; operator must inspect main CI before retrying`;
+      try {
+        if (!Number.isSafeInteger(freezeRunId) || !Number.isSafeInteger(freezeAttempt) || freezeAttempt < 1
+          || entries.length !== 1 || latest.status !== 'completed' || latest.conclusion !== 'success'
+          || !Number.isSafeInteger(latest.run_attempt) || latest.run_attempt < freezeAttempt || !mqOid(latest.head_sha))
+          throw new Error('named run missing, regressed or not green');
+        const read = endpoint => {
+          if (budget <= 0) throw new Error('retry evidence budget exhausted');
+          budget--;
+          return JSON.parse(exec('gh', ['api', endpoint], { encoding: 'utf8', timeout: 60_000,
+            maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
+        };
+        const live = read(`repos/${repo}/actions/runs/${freezeRunId}`);
+        if (live?.id !== freezeRunId || live.path !== '.github/workflows/ci.yml' || live.event !== 'push'
+          || live.head_branch !== 'main' || live.status !== 'completed' || live.run_attempt !== latest.run_attempt
+          || live.conclusion !== latest.conclusion || mqOid(live.head_sha) !== mqOid(latest.head_sha))
+          throw new Error('latest attempt mismatch');
+        const named = read(`repos/${repo}/actions/runs/${freezeRunId}/attempts/${freezeAttempt}`);
+        settledGreen = named?.id === freezeRunId && named.run_attempt === freezeAttempt && named.status === 'completed'
+          && !newest.some(run => run.status !== 'completed');
+      } catch { /* Unknown evidence leaves P held, with the named and latest attempt in the decline. */ }
+    }
+    return { mainGreen: !!deciding && !stale && deciding.conclusion === 'success' && settledGreen,
       mainRunId: deciding?.id ?? null,
-      mainGreenReason: !deciding ? 'no completed run in latest 100 runs; operator must inspect main CI before retrying'
+      mainGreenReason: freezePending && !settledGreen ? freezeMainReason
+        : !deciding ? 'no completed run in latest 100 runs; operator must inspect main CI before retrying'
         : `newest completed run ${deciding.id} ${stale ? 'stale (older than 2h); wait for fresh main CI before retrying' : `concluded ${deciding.conclusion}`}`,
       failedNames,
       derivedNames,

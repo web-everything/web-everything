@@ -201,19 +201,26 @@ describe('operator ruling with a direction on the blocked-findings round cap (#4
     });
 
     // Self-review variant (truncated read): the PR list read returns at most 100 comments, so a withdrawal (or a spent
-    // takeover marker) past comment 100 is invisible. A list cut at exactly the cap grants nothing; a full re-read is
-    // longer than the cap and is trusted.
+    // takeover marker) past comment 100 is invisible. At or above the cap, only a reader's explicit completeness
+    // proof allows a grant; a longer array alone proves nothing.
     it('a thread cut at the list cap grants nothing: the withdrawal past comment 100 may be missing', async () => {
       const { GH_LIST_COMMENT_CAP } = await import('../review-referral-hold.mjs');
       const head = [recordComment(run4, 1), rulingOn(run4, { min: 2 })];
       const filler = (n) => Array.from({ length: n }, (_, i) => trusted(`note ${i}`, 3));
       const full = [...head, ...filler(GH_LIST_COMMENT_CAP - head.length), rulingOn(run4, { min: 85, result: 'not-real', reason: 'withdrawn' })];
       const cut = full.slice(0, GH_LIST_COMMENT_CAP);
-      const directed = (comments) => planOn(comments, {}, { blockRuledReferrals: [{ key: run4.referrals[0].key, findingId: null, finding: {} }] })
+      const directed = (comments, commentsComplete) => planOn(comments, {}, { commentsComplete,
+        blockRuledReferrals: [{ key: run4.referrals[0].key, findingId: null, finding: {} }] })
         .dispatch.filter((d) => d.operatorRulingRound).length;
       expect(directed(cut)).toBe(0);
-      // control: the same live ruling on a full (longer than the cap) thread still grants its round
-      expect(directed([...head, ...filler(GH_LIST_COMMENT_CAP)])).toBe(1);
+      const live = [...head, ...filler(GH_LIST_COMMENT_CAP)];
+      expect(directed(live)).toBe(0);
+      expect(directed(live, false)).toBe(0);
+      expect(directed(live, 'true')).toBe(0);
+      // Controls: a verified complete live ruling grants once; a visible withdrawal still grants nothing.
+      expect(directed(live, true)).toBe(1);
+      expect(directed(cut, true)).toBe(1);
+      expect(directed(full, true)).toBe(0);
     });
 
     it('a block re-issued after the withdrawal covers again (the latest operator ruling decides)', () => {

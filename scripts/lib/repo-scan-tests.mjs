@@ -45,6 +45,13 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
   {
+    test: 'scripts/operations/__tests__/audit-nonconvergence.test.mjs',
+    scope: 'files',
+    why: 'keeps the explicitly invoked diagnostic free of production consumers and mutating adapters',
+    matches: (f) => f.startsWith('scripts/') && /\.(mjs|cjs|js|ts)$/.test(f) && !skipped(f),
+    inputs: ['scripts/operations/__tests__/audit-nonconvergence.test.mjs'],
+  },
+  {
     test: 'scripts/__tests__/push-gate-boundary.test.mjs',
     scope: 'files',
     why: 'pins raw-push site counts per tracked non-test script; rule or allowlist edits require the full inventory',
@@ -59,6 +66,13 @@ export const REPO_SCAN_TESTS = Object.freeze([
       || f.startsWith('docs/agent/testing/') || f === 'scripts/check-standards.mjs',
     inputs: ['scripts/__tests__/testing-notes-advisory.test.mjs', 'scripts/__tests__/fixtures/testing-notes-main-links.json',
       'scripts/lib/testing-notes-advisory.mjs', 'scripts/lib/rules-loader.cjs'],
+  },
+  {
+    test: 'scripts/__tests__/agent-launch-structure.test.mjs',
+    scope: 'full',
+    why: 'counts literal agent process launches under scripts and symlinked skills; a new launch site anywhere must be seen',
+    matches: (f) => /\.mjs$/.test(f) && /^(scripts|skills-src)\//.test(f) && !/(?:^|\/)__tests__\//.test(f) && !/\.(test|spec)\./.test(f),
+    inputs: ['scripts/__tests__/agent-launch-structure.test.mjs', 'scripts/lib/agent-launch-approved.json'],
   },
   {
     test: 'scripts/__tests__/capability-dispatch-only.test.mjs',

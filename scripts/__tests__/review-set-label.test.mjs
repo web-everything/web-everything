@@ -5111,3 +5111,29 @@ describe('new-head rearm merge clearance', () => {
     expect(plan.removeLabels).toEqual(expect.arrayContaining(['ready-to-merge', 'red-team:clear']));
   });
 });
+
+describe('generic label readback observation', () => {
+  it.each([
+    ['strings', ['review:pending'], true],
+    ['named labels', [{ name: 'review:pending' }], true],
+    ['read failure', null, false],
+    ['missing name', ['review:pending', {}], false],
+    ['null entry', ['review:pending', null], false],
+    ['numeric name', ['review:pending', { name: 7 }], false],
+    ['empty string', ['review:pending', ''], false],
+    ['blank string', ['review:pending', '  \t'], false],
+    ['empty label name', ['review:pending', { name: '' }], false],
+    ['blank label name', ['review:pending', { name: '  \t' }], false],
+  ])('labelsObserved requires a complete string label readback: %s', (_name, readback, observed) => {
+    const chunks = [];
+    const exit = vi.spyOn(process, 'exit').mockImplementation(code => { throw Object.assign(Error('exit'), { exitCode: code }); });
+    try {
+      try { runReviewLabelCliRaw({ argv: ['42', '--repo=o/n'], fixedTo: 'rearm', defaultActor: 'test', usage: 'test', buildComment: () => 'rearm', successResult: o => ({ ok: true, ...o }), refusalResult: ({ decision }) => ({ error: decision.reason }), emit: line => chunks.push(line), provider: { readPrState: () => ({ state: 'OPEN', headRefOid: 'a'.repeat(40), labels: ['review:changes'], comments: [] }), setLabels: () => {}, postComment: () => {}, readLabels: () => { if (readback === null) throw Error('readback unavailable'); return readback; } } }); } catch (e) { expect(e.exitCode).toBe(0); }
+    } finally { exit.mockRestore(); }
+    const result = JSON.parse(chunks.join(''));
+    expect(result.ok).toBe(true);
+    if (observed || readback === null) expect(result.labels).toEqual(['review:pending']);
+    if (observed) expect(result.labelsObserved).toBe(true);
+    else expect(result).not.toHaveProperty('labelsObserved');
+  });
+});

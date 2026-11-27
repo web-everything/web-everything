@@ -37,3 +37,22 @@ export function decideMemoryFloor({ availableMb, floorMb, pressureLevel, snapsho
   if (availableMb < floorMb) return { admit: false, reason: `available ${availableMb} MB < floor ${floorMb} MB` };
   return { admit: true, reason: `available ${availableMb} MB >= floor ${floorMb} MB, pressure ${PRESSURE_NAME[pressureLevel]}` };
 }
+
+/**
+ * PURE snapshot verdict shared by the fixer gate and host-load admission: freshness, metric match, then decideMemoryFloor.
+ * Fresh means sampledAt <= freshUntil, a bounded window, not from the future, and not expired. Missing bounds are not fresh.
+ */
+export function decideSnapshotMemoryFloor({ snap, floor = {}, nowMs, pressureLevel = snap?.memory?.pressureLevel, ...pressureInputs } = {}) {
+  const m = snap?.memory ?? {};
+  const sampledAt = Date.parse(snap?.sampledAt);
+  const freshUntil = Date.parse(snap?.freshUntil);
+  const fresh = !!snap && Number.isFinite(sampledAt) && Number.isFinite(freshUntil) && sampledAt <= freshUntil
+    && freshUntil - sampledAt <= floor.snapshotMaxFreshMs && sampledAt <= nowMs + floor.snapshotClockSkewMs && nowMs <= freshUntil;
+  // R559: the reading must be taken under the same metric the policy names; a missing or different stamp refuses.
+  const metricOk = typeof floor.metric === 'string' && m.metric === floor.metric;
+  if (!metricOk && fresh && floor.floorMb != null) {
+    return { admit: false, reason: `memory metric mismatch (snapshot ${m.metric ?? 'unstamped'}, policy ${floor.metric ?? 'unknown'})` };
+  }
+  return decideMemoryFloor({ availableMb: m.availableMb, floorMb: floor.floorMb, pressureLevel, snapshotFresh: fresh,
+    freePct: m.freePct, swapGrowthMb: m.swapGrowthMb, ...pressureInputs });
+}

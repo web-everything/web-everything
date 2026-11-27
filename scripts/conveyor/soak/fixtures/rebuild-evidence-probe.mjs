@@ -137,7 +137,7 @@ export async function probeTickCompatibility() {
 }
 
 /** Real Git: publish a smoke-passed pinned candidate, move its tip, then run tick-start. */
-export async function probeStalePinnedReady({ auditedOnly = false } = {}) {
+export async function probeStalePinnedReady({ auditedOnly = false, fastForward = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'stale-ready-soak-'));
   const root = join(dir, 'clone'), author = join(dir, 'author'), origin = join(dir, 'origin.git');
   const env = { ...process.env, HOME: dir, WE_DAEMON_STATE_DIR: join(dir, 'state'),
@@ -158,15 +158,15 @@ export async function probeStalePinnedReady({ auditedOnly = false } = {}) {
     git(dir, ['init', '--bare', '-q', '-b', 'main', origin]);
     git(author, ['init', '-q', '-b', 'main']);
     git(author, ['remote', 'add', 'origin', origin]);
-    const push = (ref, file, content, base) => {
+    const push = (ref, file, content, base, force = false) => {
       if (base) git(author, ['checkout', '-q', '-B', ref, base]);
       writeFileSync(join(author, file), content);
       git(author, ['add', '.']); git(author, ['commit', '-qm', `change ${ref}`]);
-      git(author, ['push', '-q', 'origin', `HEAD:refs/heads/${ref}`]);
+      git(author, ['push', '-q', ...(force ? ['--force'] : []), 'origin', `HEAD:refs/heads/${ref}`]);
       return git(author, ['rev-parse', 'HEAD']);
     };
     push('main', 'shared.txt', 'base\n');
-    push('lane/moving', 'moving.txt', 'old\n', 'main');
+    const applied = push('lane/moving', 'moving.txt', 'old\n', 'main');
     push('lane/blocker', 'shared.txt', 'blocker\n', 'main');
     git(dir, ['clone', '-q', origin, root]);
     addOverlay(root, { ref: 'lane/moving' }, { env });
@@ -196,10 +196,17 @@ export async function probeStalePinnedReady({ auditedOnly = false } = {}) {
       throw new Error('fixture did not publish a pinned ready candidate');
     }
     if (!auditedOnly) {
-      push('lane/moving', 'new-tip.txt', 'new\n', 'lane/moving');
+      // A stale pin must lose the held tip, even if it still descends from the
+      // applied SHA. A fast-forward deliberately retains the ready smoke proof.
+      push('lane/moving', 'new-tip.txt', 'new\n', fastForward ? 'lane/moving' : applied, !fastForward);
       push('main', 'later.txt', 'later\n', 'main');
     }
     git(root, ['fetch', '-q', 'origin']);
+    const heldTipAncestor = spawnSync('git', ['merge-base', '--is-ancestor', pin, 'origin/lane/moving'],
+      { cwd: root, encoding: 'utf8', env, timeout: 20_000, maxBuffer: 65536 }).status;
+    if (heldTipAncestor !== ((!auditedOnly && !fastForward) ? 1 : 0)) {
+      throw new Error('fixture did not establish the expected held-tip ancestry');
+    }
     let smokes = 0;
     const result = await rebuild({ launchedBy: 'tick-start', runSmoke: async () => { smokes += 1; return pass; } });
     return { adopted: result.adopted === true, reason: result.reason, smokes,

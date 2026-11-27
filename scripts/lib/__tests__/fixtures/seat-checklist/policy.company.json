@@ -8,7 +8,7 @@
    "rubric": {
     "uri": "https://github.com/plateauapp/plateau-settings/blob/main/review/rubrics/security",
     "digest": {
-     "sha256": "0408de01d027fd53f0520b8ba32814ecea26b9e1a6462891e5f873fb873ba7eb"
+     "sha256": "0ec75b608b61f26b8ee39477dc04d1fe9fb8347f1cac1735528a8cca4b3316f3"
     }
    },
    "required": "all",

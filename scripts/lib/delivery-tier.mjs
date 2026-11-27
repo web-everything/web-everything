@@ -2,6 +2,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
+import { cascadePolicy } from './policy-cascade.mjs';
 import { GUARD_FLOOR, REVIEW_AUTH_FLOOR, AUDITOR_FLOOR } from './protected-path-floor.mjs';
 
 // TRUST_CHAIN basenames from gate-config.mjs, deliberately listed here rather than
@@ -168,4 +169,63 @@ export function classifyTier(paths, opts = {}) {
   const tier = perFile.some(file => file.tier === 'HIGH') ? 'HIGH'
     : perFile.some(file => file.tier === 'MEDIUM') ? 'MEDIUM' : 'LOW';
   return { tier, perFile };
+}
+
+
+const PRESET_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+const presetOff = () => ({ active: false, expiresAt: null });
+const validPresetClock = now => Number.isSafeInteger(now) && Math.abs(now) < 8.64e15;
+function validPresetExpiry(value) {
+  return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)
+    && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value;
+}
+
+/** PURE: prepare settings for S13's activation op; no write or gate enrollment.
+ * Seven elapsed UTC days, independent of local timezone and DST. Invalid clocks refuse activation.
+ */
+export function activatePrereleasePreset(settings, now = Date.now()) {
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) throw Error('Expected settings object');
+  if (!validPresetClock(now) || !validPresetClock(now + PRESET_WINDOW_MS)) throw Error('Invalid activation clock');
+  return { ...settings, prereleasePresetActive: true,
+    prereleasePresetExpiresAt: new Date(now + PRESET_WINDOW_MS).toISOString() };
+}
+
+/** Observe-only settings reader. Unknown evidence disables the preset; restore valid
+ * settings through a reviewed PR. Activation and expiry must come from the same layer.
+ * Expiry remains null until activation; expiry at or before now is inactive.
+ */
+export function readPrereleasePreset(opts = {}) {
+  try {
+    const settings = Object.hasOwn(opts, 'settings') ? opts.settings
+      : parseSettings((opts.readSettings ?? readFileSync)(SETTINGS_PATH, 'utf8'));
+    const now = Object.hasOwn(opts, 'now') ? opts.now : Date.now();
+    if (!validPresetClock(now) || !settings || typeof settings !== 'object' || Array.isArray(settings)) return presetOff();
+    const warnActive = () => (opts.log ?? console.error)(
+      'prereleasePresetActive must be a boolean; preset inactive. Restore valid settings through a reviewed PR.');
+    if (typeof settings.prereleasePresetActive !== 'boolean') {
+      warnActive();
+      return presetOff();
+    }
+    if (!(settings.prereleasePresetExpiresAt === null || validPresetExpiry(settings.prereleasePresetExpiresAt))) return presetOff();
+    const active = cascadePolicy('prereleasePresetActive', settings.prereleasePresetActive, {
+      standard: false, valid: value => typeof value === 'boolean',
+      platform: opts.platform?.prereleasePresetActive, env: opts.env, log: opts.log,
+    });
+    // The shared cascade validates object leaves, not the reconstructed scalar.
+    if (typeof active.value !== 'boolean') {
+      warnActive();
+      return presetOff();
+    }
+    // A named leaf preserves deliberate nulls: scalar null means "unset" to the cascade.
+    const expiry = cascadePolicy('prereleasePresetExpiresAt', { expiresAt: settings.prereleasePresetExpiresAt }, {
+      standard: { expiresAt: null }, valid: value => value === null || validPresetExpiry(value),
+      platform: { expiresAt: opts.platform?.prereleasePresetExpiresAt }, env: opts.env, log: opts.log,
+    });
+    const expiresAt = expiry.value.expiresAt;
+    if (active.value === true && (!validPresetExpiry(expiresAt)
+      || active.sources[''] !== expiry.sources.expiresAt)) return presetOff();
+    return { active: active.value === true && Date.parse(expiresAt) > now, expiresAt };
+  } catch {
+    return presetOff();
+  }
 }

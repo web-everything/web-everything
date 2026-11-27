@@ -323,3 +323,72 @@ describe('hostLoadAdmission with the default memoryReading', () => {
     expect(native.free).not.toHaveBeenCalled();
   });
 });
+
+describe('hostLoadAdmission memory pressure warn corroboration (MEM-ADMIT-CORROBORATE)', () => {
+  const T = Date.parse('2026-11-25T12:00:10Z');
+  const capPolicy = { ...policy, settings: { host: { ...policy.settings.host, capacity: {
+    memAvailableFloorMb: 2048, memoryMetric: 'available', snapshotMaxFreshMs: 60000, snapshotClockSkewMs: 5000 } } } };
+  const snap = (memory, over = {}) => ({ sampledAt: '2026-11-25T12:00:00Z', freshUntil: '2026-11-25T12:00:20Z',
+    memory: { metric: 'available', availableMb: 30000, freePct: 27, swapGrowthMb: 0, ...memory }, ...over });
+  const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+  beforeEach(() => { Object.defineProperty(process, 'platform', { ...platformDescriptor, value: 'darwin' }); native.exec.mockReset(); });
+  afterEach(() => { Object.defineProperty(process, 'platform', platformDescriptor); });
+  const run = (pressure, readSnap, p = capPolicy) => {
+    native.exec.mockImplementation(probes({ pressure }).exec);
+    return hostLoad.hostLoadAdmission({ policy: p, interactive: false, env: {}, load: () => [1], cores: () => 8, readSnap, now: () => T });
+  };
+  const warn = (s, p) => run('2', () => s, p);
+
+  it('(a) admits uncorroborated warn with a fresh clean snapshot', () => {
+    const r = warn(snap());
+    expect(r.admitted).toBe(true);
+    expect(r.reason).toContain('warn uncorroborated');
+    expect(r.reason).not.toContain('reclaimable headroom');
+  });
+  it('(b) corroborated by low free memory holds', () => {
+    const r = warn(snap({ freePct: 18 }));
+    expect(r.admitted).toBe(false);
+    expect(r.reason).toContain('corroborated');
+  });
+  it('(c) swap growth holds', () => { expect(warn(snap({ swapGrowthMb: 3428 })).admitted).toBe(false); });
+  it('(d) available below the floor holds', () => {
+    const r = warn(snap({ availableMb: 1500 }));
+    expect(r.admitted).toBe(false);
+    expect(r.reason).toContain('< floor 2048');
+  });
+  it.each([
+    ['stale', snap({}, { freshUntil: '2026-11-25T12:00:05Z' })],
+    ['null', null],
+    ['reversed', snap({}, { sampledAt: '2026-11-25T12:00:30Z', freshUntil: '2026-11-25T12:00:05Z' })],
+    ['wrong metric', snap({ metric: 'free' })],
+    ['swap missing', snap({ swapGrowthMb: undefined })],
+    ['swap string', snap({ swapGrowthMb: '0' })],
+  ])('(e) %s snapshot holds', (_name, s) => { expect(warn(s).admitted).toBe(false); });
+  it('a policy without capacity leaves holds', () => { expect(warn(snap(), policy).admitted).toBe(false); });
+  it('an unreadable snapshot reader holds', () => {
+    expect(run('2', () => { throw new Error('boom'); }).admitted).toBe(false);
+  });
+  it('(f) critical holds with no 0MB reason', () => {
+    const r = run('4', () => snap());
+    expect(r.admitted).toBe(false);
+    expect(r.reason).not.toMatch(/headroom 0MB/);
+    expect(r.reason).toContain('critical');
+  });
+  it('(g) level 1 ignores the snapshot', () => {
+    const r = run('1', () => { throw new Error('must not read'); });
+    expect(r.admitted).toBe(true);
+  });
+  it('(h) parity with decideSnapshotMemoryFloor', async () => {
+    const { decideSnapshotMemoryFloor } = await import('../memory-warn-corroboration.mjs');
+    const cap = capPolicy.settings.host.capacity;
+    const table = [snap(), snap({ freePct: 18 }), snap({ swapGrowthMb: 3428 }), snap({ availableMb: 1500 }), snap({ availableMb: 2048 }),
+      snap({ metric: 'free' }), snap({ swapGrowthMb: undefined }), snap({ swapGrowthMb: '0' }), snap({ freePct: undefined }),
+      snap({}, { freshUntil: '2026-11-25T12:00:05Z' }), snap({}, { sampledAt: '2026-11-25T12:00:30Z', freshUntil: '2026-11-25T12:00:05Z' }), null];
+    for (const s of table) {
+      const expected = Number.isFinite(s?.memory?.swapGrowthMb) && decideSnapshotMemoryFloor({ snap: s, nowMs: T, pressureLevel: 2,
+        floor: { floorMb: Math.max(cap.memAvailableFloorMb, 2048), metric: cap.memoryMetric, snapshotMaxFreshMs: cap.snapshotMaxFreshMs,
+          snapshotClockSkewMs: cap.snapshotClockSkewMs } }).admit;
+      expect(warn(s).admitted).toBe(expected);
+    }
+  });
+});

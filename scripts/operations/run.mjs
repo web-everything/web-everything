@@ -164,6 +164,8 @@ import { createRunReader, createRecordVerdictSinks } from './record-verdict-io.m
 import { validateRequest, APPLIABLE_TARGETS } from '../apply-review-request.mjs';
 import { verifyOperation, VERIFY_OP } from './verify.mjs';
 import { createChecksRunner } from './verify-io.mjs';
+import { spawnSync } from 'node:child_process';
+import { selectionRefusalFromOutput } from '../lib/verify-lane-gate.mjs';
 import { prSizeOperation, PR_SIZE_OP, finishPrSize } from './pr-size.mjs';
 import { createPrSizeReader } from './pr-size-io.mjs';
 import { deliveryFlowOperation, DELIVERY_FLOW_OP, finishDeliveryFlow } from './delivery-flow.mjs';
@@ -361,9 +363,31 @@ export const OPERATIONS = Object.freeze({
   // #xp240uk — the step between "work done" and "open a PR", which was hand-rolled shell every time. Two
   // compute steps and no sink, so the HTTP adapter derives a GET with no run record, exactly as `suggest-next`
   // and `gate-health` do.
-  [VERIFY_OP]: () => ({
-    declaration: verifyOperation({ runChecks: createChecksRunner() }),
-  }),
+  [VERIFY_OP]: ({ verifyIO = {} } = {}) => {
+    let refusal;
+    const checks = createChecksRunner({ ...verifyIO, spawn: (...args) => {
+      const result = verifyIO.spawn ? verifyIO.spawn(...args) : spawnSync(...args);
+      refusal = selectionRefusalFromOutput(result);
+      return result;
+    } });
+    return {
+      declaration: verifyOperation({ runChecks: input => {
+        refusal = null;
+        const finding = checks(input);
+        if (refusal) finding.checks = finding.checks.map(check => ({ ...check, outcome: 'unrun', reason: refusal.detail }));
+        return finding;
+      } }),
+      finish: ({ run, code, lines, json }) => {
+        if (!refusal) return { code, lines };
+        const verdict = { ...run.verdict, ...refusal };
+        if (json) {
+          const payload = JSON.parse(lines.join('\n'));
+          return { code: 3, lines: [JSON.stringify({ ...payload, verdict }, null, 2)] };
+        }
+        return { code: 3, lines: [...lines, `verify: refused (exit 3) — ${refusal.detail}`] };
+      },
+    };
+  },
   [PR_SIZE_OP]: () => ({
     declaration: prSizeOperation({ readDiff: createPrSizeReader() }),
     finish: finishPrSize,

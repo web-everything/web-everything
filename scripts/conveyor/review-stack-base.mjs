@@ -431,13 +431,13 @@ export function readBottomLanded({ marker, repo, root = ROOT, run = gitRun(root)
  *   `prs` — the open-PR list when the caller already has it (the reconcile pass does); otherwise it is read.
  * @returns {Map<number, {pr:number|null, ref:string, head:string, contained:string, tree:string, topHead:string}>}
  */
-export function readStackBases({ root = ROOT, env = process.env, prs = null, readRefs = readOpenPrRefs,
+export function readStackBases({ strict = false, root = ROOT, env = process.env, prs = null, readRefs = readOpenPrRefs,
   readLanes = readOriginLaneTips, run = gitRun(root), settingOn = resolveStackAwareReview(env),
-  prlessBase = false, diag = null, log = (m) => process.stderr.write(m + '\n') } = {}) {
+  prlessBase = false, diag = null, requirePr = null, log = (m) => process.stderr.write(m + '\n') } = {}) {
   const out = new Map();
   let rows = [];
   let failure = 'refs-read-threw';
-  const diagnose = (pr, cause) => { try { diag?.set(pr, { cause }); } catch { /* best effort */ } };
+  const diagnose = (pr, cause) => { if (strict && (requirePr === null || pr === requirePr)) throw Error(`stack evidence unknown: ${cause}`); try { diag?.set(pr, { cause }); } catch { /* best effort */ } };
   const diagnoseAll = (cause) => {
     for (const row of rows) if (!out.has(row.pr) && LANE_REF.test(row.baseRefName ?? '')) diagnose(row.pr, cause);
   };
@@ -452,6 +452,14 @@ export function readStackBases({ root = ROOT, env = process.env, prs = null, rea
       ? prs.map((p) => ({ pr: Number(p.number), headRefName: p.headRefName ?? null, headRefOid: p.headRefOid ?? null }))
       : [...refs.entries()].map(([n, r]) => ({ pr: n, headRefName: r.headRefName, headRefOid: r.headRefOid }));
     rows = listed.map((r) => ({ ...r, baseRefName: refs.get(r.pr)?.baseRefName ?? null, ...stackRowFlags(refs.get(r.pr)) }));
+    if (strict && (!refs.size || refs.size >= OPEN_PR_REF_LIMIT || refs.failure)) throw Error('stack refs incomplete');
+    // A strict single-PR lookup refuses when the target has no record: absent is unknown, never unstacked.
+    if (strict && requirePr !== null) {
+      const rec = refs.get(requirePr);
+      if (!rec || !SHA.test(String(rec.headRefOid ?? '')) || !rec.headRefName || !rec.baseRefName) {
+        throw Error('stack evidence unknown: pr-record-missing-or-incomplete');
+      }
+    }
     if (!refs.size) {
       const cause = ['refs-auth-failed', 'refs-rate-limited', 'refs-timeout', 'refs-parse-failed'].includes(refs.failure)
         ? refs.failure : 'refs-unreadable';
@@ -461,8 +469,11 @@ export function readStackBases({ root = ROOT, env = process.env, prs = null, rea
     for (const row of listed) if (!refs.has(row.pr)) diagnose(row.pr, 'pr-record-missing');
     failure = 'tips-unreadable';
     const tips = readLanes(root);
-    if (!tips) { diagnoseAll(failure); return out; }
+    if (!tips) { if (strict) throw Error('stack tips unreadable'); diagnoseAll(failure); return out; }
     rows = flagUntrustedStackRows(rows, tips);
+    if (strict && requirePr !== null && rows.find(row => row.pr === requirePr)?.untrusted) {
+      throw Error('stack evidence unknown: target-head-untrusted');
+    }
     const rowsByPr = new Map(rows.map((row) => [row.pr, row]));
     const openBases = new Map();
     for (const [pr, ref] of refs) {
@@ -490,6 +501,11 @@ export function readStackBases({ root = ROOT, env = process.env, prs = null, rea
       try { run(['fetch', '-q', '--end-of-options', 'origin', ...missing.map((r) => r.headRefName)]); } catch { /* left unknown */ }
     }
     const sets = readOffMainSets(heads.map((r) => r.headRefOid), { root, run });
+    const target = rows.find(row => row.pr === requirePr);
+    if (strict && trusted.some(row => !sets.has(row.headRefOid)
+      && (requirePr === null || row.pr === requirePr
+        || target?.baseRefName === row.headRefName
+        || (target && sameStackActor(target, row))))) throw Error('stack heads unreadable');
     const bases = findStackBases(trusted, sets, { log });
     for (const top of rows) {
       if (!LANE_REF.test(top.baseRefName ?? '')) continue;
@@ -534,7 +550,8 @@ export function readStackBases({ root = ROOT, env = process.env, prs = null, rea
       if (tree) out.set(top, { ...base, tree, topHead });
       else diagnose(top, 'tree-unreadable');
     }
-  } catch {
+  } catch (error) {
+    if (strict) throw error;
     // A failed GitHub read may leave no rows from which to recover the declared bases.
     if (!rows.length && Array.isArray(prs)) {
       for (const pr of prs) diagnose(Number(pr?.number), failure);
@@ -545,5 +562,5 @@ export function readStackBases({ root = ROOT, env = process.env, prs = null, rea
 
 /** The stack base for one open PR, or null. Fails open. */
 export function readStackBase({ pr, ...opts } = {}) {
-  return readStackBases(opts).get(Number(pr)) ?? null;
+  return readStackBases({ ...opts, requirePr: Number(pr) }).get(Number(pr)) ?? null;
 }

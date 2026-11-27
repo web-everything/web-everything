@@ -861,7 +861,8 @@ describe('pr-land contract guards (source-level, mirrors gated-push-wiring)', ()
     // injected param), with the CLI passing `readMarker: readVerifyMarker` — still the one shared reader, never
     // re-inlined; the two assertions below cover both ends of that indirection.
     expect(src).toMatch(/readMarker\(gitDir\)/);
-    expect(src).toMatch(/readMarker: readVerifyMarker/);
+    expect(src).toMatch(/const local = readVerifyMarker\(gitDir\)/);
+    expect(src).toMatch(/readMarker: gitDir => readFinishGuardMarker\(/);
     expect(src).not.toMatch(/JSON\.parse\([^)]*VERIFY_FILENAME/);
     expect(src).not.toMatch(/JSON\.parse\(readFileSync\(markerPath/);
     // It reads the HEAD's marker and refuses (non-ok) on the source commit BEFORE publishing to the lane ref.
@@ -892,7 +893,7 @@ describe('pr-land contract guards (source-level, mirrors gated-push-wiring)', ()
     expect(src).toMatch(/const gate = resolveFinishGuardVerdict\(\{/);
     // Pinned to THIS land's base (remote/base params), not a hardcoded 'origin/main' — correct under a POC branch too.
     expect(src).toMatch(/base: `\$\{remote\}\/\$\{base\}`/);
-    expect(src).toMatch(/base: BASE, runGit: gitC, readMarker: readVerifyMarker/);
+    expect(src).toMatch(/base: BASE, runGit: gitC,\s+readMarker: gitDir => readFinishGuardMarker\(/);
   });
   it('#984 R4: the --park emit carries held:true (a parked PR is held by definition → the workflow never re-labels it)', () => {
     // The park branch emits `held: true` alongside `reason: 'parked'` so Finalize does not mistake a deliberate

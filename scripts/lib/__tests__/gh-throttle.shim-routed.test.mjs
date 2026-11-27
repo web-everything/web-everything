@@ -13,7 +13,7 @@ import { describe, it, expect, afterAll } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, existsSync, readFileSync, statSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runGhSync, writeBudgetBlock, readBudgetBlock, ghBinIsWeShim, ghThrottleLogPath, rotateGhCallLogIfLarge, resolveGhCallLogMaxBytes, DEFAULT_GH_CALL_LOG_MAX_BYTES } from '../gh-throttle.mjs';
+import { runGhSync, writeBudgetBlock, readBudgetBlock, ghBinIsWeShim, ghThrottleLogPath, rotateGhCallLogIfLarge, resolveGhCallLogMaxBytes, DEFAULT_GH_CALL_LOG_MAX_BYTES } from './gh-throttle.window-fixture.mjs';
 
 const NOW = Date.parse('2026-10-10T21:30:00Z');
 const made = [];

@@ -45,6 +45,15 @@ test('missing top-level setting metadata blocks generation', t => {
   const r = f.build(); assert.ok(r.problems.includes('missing setting metadata: beta'));
   assert.throws(() => renderMarkdown(r), /missing setting metadata: beta/);
 });
+test('standalone delivery strategy documents do not become registry keys or block docs generation', t => {
+  const f = fixture(t);
+  f.write('scripts/settings/delivery-strategy.json', JSON.parse(readFileSync(join(ROOT, 'scripts/settings/delivery-strategy.json'), 'utf8')));
+  f.write('scripts/settings/delivery-strategy-table.json', JSON.parse(readFileSync(join(ROOT, 'scripts/settings/delivery-strategy-table.json'), 'utf8')));
+  const registry = f.build();
+  assert.deepEqual(registry.problems, []);
+  assert.deepEqual([...new Set(registry.rows.map(row => row.key))].sort(), ['alpha', 'beta', 'empty']);
+  assert.equal(ensureRegistryDoc({ root: f.root }), renderMarkdown(registry));
+});
 test('missing platform-only setting metadata blocks generation', t => {
   const f = fixture(t); f.write('scripts/lib/delivery-priority-settings.json', { newPlatform: true });
   assert.ok(f.build().problems.includes('missing setting metadata: newPlatform'));
@@ -454,18 +463,20 @@ test('generated documentation preserves original bytes except the intentional pe
   // The original declaration fixture no longer advertises the retired MQ signature setting.
   assert.equal(createHash('sha256').update(original).digest('hex'), '307ab2610c6c0c5efe3bd91c0d6a1c9d7afa5fe5e6e3d3152de798299783bd9d');
 });
-test('generated documentation retains rotation, rerun, audit debounce/delta, audit-owed and build-priority scope rows and authoring instructions', () => {
+test('generated documentation retains rotation, rerun, audit hunk/debounce/delta, audit-owed and build-priority scope rows and authoring instructions', () => {
   const registry = buildRegistry(), doc = renderMarkdown(registry);
   for (const key of ['providerRotation', 'ciUnitRerun', 'audit', 'reviewAutoAudit', 'allowedFiles']) assert.match(doc, new RegExp(`^\\| ${key} \\|`, 'm'));
   const reviewAutoAudit = registry.rows.find(row => row.key === 'reviewAutoAudit');
   assert.deepEqual(reviewAutoAudit.owners, ['scripts/settings/review-auto-audit.json']);
   assert.equal(reviewAutoAudit.value.mode, 'shadow');
   const audit = registry.rows.find(row => row.key === 'audit');
+  assert.equal(audit.value.hunkContextLines, 3);
   assert.deepEqual(audit.value.debounce, { minutes: 5 });
   assert.deepEqual(audit.value.delta, { maxFiles: 0 });
   const auditRow = doc.split('\n').find(line => line.startsWith('| audit |'));
-  assert.ok(auditRow.includes('"debounce":{"minutes":5}'));
-  assert.ok(auditRow.includes('"delta":{"maxFiles":0}'));
+  // The new hunk leaf pushes delta beyond the documented 60-character preview;
+  // retain the full defaults above and pin the rendered abbreviation separately.
+  assert.ok(auditRow.includes(' | {"hunkContextLines":3,"debounce":{"minutes":5},"delta":{"ma… | '));
   // Forge host sizes are operator-private: the repo default names no hosts.
   assert.deepEqual(registry.rows.find(row => row.key === 'forgeSlots').value, { default: 8, hosts: {} });
   assert.ok(doc.split('\n').find(line => line.startsWith('| forgeSlots |')).includes('{"default":8,"hosts":{}}'));
@@ -480,6 +491,17 @@ test('standalone timeout policy does not claim conveyor setting metadata', t => 
   const r = f.build();
   assert.deepEqual(r.problems, []);
   assert.ok(!r.rows.some(row => row.owners.includes('scripts/settings/test-timeout-policy.json')));
+});
+
+test('standalone selector documents do not claim metadata or collide with declared conveyor leaves', t => {
+  const f = fixture(t);
+  f.write('scripts/settings/delivery-strategy-table.json', { version: 'draft', description: 'Table', inputs: [], rules: [] });
+  f.write('scripts/settings/delivery-strategy.json', { revision: 'draft', values: { 'overlay-cap': 3 } });
+  const registry = f.build();
+  assert.deepEqual(registry.problems, []);
+  assert.ok(!registry.rows.some(row => row.owners.some(owner => /\/delivery-strategy(?:-table)?\.json$/.test(owner))));
+  assert.ok(!registry.rows.some(row => ['version', 'description', 'inputs', 'rules', 'revision', 'values'].includes(row.key)));
+  assert.doesNotThrow(() => renderMarkdown(registry));
 });
 
 function authoredFixture(t) {
@@ -539,4 +561,17 @@ test('list metadata rejects non-arrays, unreadable evidence and duplicate legacy
   const f = authoredFixture(t);
   f.write(META, { instantGaps: [] });
   assert.throws(() => readMetadata({ root: f.root }), /duplicate metadata key: instantGaps/);
+});
+
+
+test('prerelease preset leaves are registered with reviewed inactive defaults', () => {
+  const registry = buildRegistry({ root: ROOT });
+  const metadata = readMetadata({ root: ROOT });
+  for (const [key, value] of Object.entries({ prereleasePresetActive: false, prereleasePresetExpiresAt: null })) {
+    const row = registry.rows.find(row => row.key === key && row.owners.includes('scripts/settings/delivery-tiers.json'));
+    assert.ok(row, `missing preset leaf: ${key}`);
+    assert.equal(row.value, value);
+    assert.equal(metadata.settings[key].changeVia, 'pr');
+    assert.equal(metadata.settings[key].instant, false);
+  }
 });

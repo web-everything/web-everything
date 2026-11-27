@@ -58,10 +58,12 @@ function probe({ mode, startAfter, state = 'matching' }) {
       })),
       checkoutExists: () => true, checkStaleness: () => ({ fresh: true, behind: 0 }), stackCheck: () => ({ base: null }),
       readCompletion: () => null, resolveSettingsEnv: () => ({}),
-      readBrief: () => 'review {{PR}}', mintSessionId: () => 'advisory-waiver-test',
-      wrapReview: false, sessionCwdFor: () => dir,
-      ensureSessionCwd: path => path, isolateSession: () => ({ worktreeSettings: {} }),
-      spawnAgent: () => { spawns++; return ''; }, spawnJob: () => { spawns++; return 4242; },
+      ...(mode === 'job' ? { spawnJob: () => { spawns++; return 4242; } } : {
+        readBrief: () => 'review {{PR}}', mintSessionId: () => 'advisory-waiver-test',
+        wrapReview: false, sessionCwdFor: () => dir,
+        ensureSessionCwd: path => path, isolateSession: () => ({ worktreeSettings: {} }),
+        spawnAgent: () => { spawns++; return ''; },
+      }),
     });
     return { out, ci, spawns };
   } finally {

@@ -3,14 +3,30 @@
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { rearmWindow } from './rearm-review.mjs';
-import { buildOperatorAnswer, latestUnresolvedStandDown, parseOperatorAnswer, isTerminalStandDown } from './stand-down-answer-core.mjs';
+import { standDownHead } from './stand-down.mjs';
+import { buildOperatorAnswer, latestUnresolvedStandDown, parseOperatorAnswer, isTerminalStandDown, noCodeRearmPlan, noCodeRearmWindowHonours } from './stand-down-answer-core.mjs';
 
-const namedStandDownHead = c => /\n<!-- stand-down [^>\n]*\bhead=([0-9a-f]{7,40})\b[^>\n]* -->\s*$/.exec(c.body ?? '')?.[1];
+const namedStandDownHead = c => standDownHead(c.body)?.toLowerCase();
 function requireNoCodeHead(snapshot, target) {
   const live = String(snapshot.headRefOid ?? '').toLowerCase();
   const named = namedStandDownHead(target);
+  if (live.length !== 40 || !/^[0-9a-f]{40}$/.test(live)) throw new Error('rearm-review --no-code-owed refused: live head is not a 40-hex SHA');
   if (named && !live.startsWith(named)) throw new Error('rearm-review --no-code-owed refused: head moved since the stand-down');
-  if (!/^[0-9a-f]{40}$/.test(live)) throw new Error('rearm-review --no-code-owed refused: live head is not a 40-hex SHA');
+  if (!named) throw new Error('rearm-review --no-code-owed refused: stand-down has no head; record a new stand-down with the current head');
+  return live;
+}
+
+function failedNoCodeStandDownToRearm(snapshot, noCodeOwed) {
+  if (!noCodeOwed) return null;
+  const { comments, headRefOid } = snapshot;
+  const plan = noCodeRearmPlan({ comments, headRefOid, labels: snapshot.labels?.map(l => l.name) });
+  if (plan.state !== 'spent') return null;
+  const prior = comments.find(c => String(c.id) === plan.answerId);
+  const answer = parseOperatorAnswer(prior);
+  const replacement = { ...answer, supersedes: plan.answerId };
+  if (!noCodeRearmWindowHonours(comments, replacement, headRefOid)) return null;
+  const target = comments.find(c => String(c.id) === answer.standDownId && isTerminalStandDown(c));
+  return target ? { target, supersedes: plan.answerId } : null;
 }
 
 /**
@@ -37,7 +53,7 @@ function answeredStandDownToRearm(snapshot, noCodeOwed) {
     // Same head: SHA identity when the stand-down names its head; else the head's commit must not post-date it
     // (and the last listed commit must be the live head).
     if (noCodeOwed) requireNoCodeHead(snapshot, c);
-    const named = namedStandDownHead(c); // the TRAILER only
+    const named = namedStandDownHead(c); // shared machine-trailer / legacy-head reader
     const live = String(snapshot.headRefOid ?? '').toLowerCase();
     if (!/^[0-9a-f]{40}$/.test(live)) return null;
     if (named) return live.startsWith(named) ? { target: c, supersedes: String(prior.id) } : null;
@@ -57,8 +73,9 @@ export function runStandDownAnswer(argv, { gh = (args) => execFileSync('gh', arg
   if (!/^[1-9]\d*$/.test(pr ?? '')) throw new Error('PR must be a positive integer');
   const flags = {};
   for (const arg of args) {
-    if (arg === '--no-code-owed' && !Object.hasOwn(flags, 'noCodeOwed')) {
-      flags.noCodeOwed = true;
+    const booleanFlag = arg === '--no-code-owed' ? 'noCodeOwed' : arg === '--preview' ? 'preview' : null;
+    if (booleanFlag && !Object.hasOwn(flags, booleanFlag)) {
+      flags[booleanFlag] = true;
       continue;
     }
     const m = arg.match(/^--(repo|reason|actor|channel|disposition)=([\s\S]*)$/);
@@ -90,7 +107,8 @@ export function runStandDownAnswer(argv, { gh = (args) => execFileSync('gh', arg
   }
   let target = latestUnresolvedStandDown(snapshot.comments);
   let supersedes;
-  if (!target && flags.disposition === 'rearm-review') ({ target, supersedes } = answeredStandDownToRearm(snapshot, flags.noCodeOwed) ?? {});
+  if (!target && flags.disposition === 'rearm-review') ({ target, supersedes } = failedNoCodeStandDownToRearm(snapshot, flags.noCodeOwed)
+    ?? answeredStandDownToRearm(snapshot, flags.noCodeOwed) ?? {});
   if (!target) throw new Error('no unresolved stand-down on this PR');
   if (flags.disposition === 'rearm-review' && !supersedes) {
     // Every rearm-review answer is checked by the guard's own window (rearm-review.mjs#rearmWindow): refuse what it would ignore.
@@ -100,9 +118,10 @@ export function runStandDownAnswer(argv, { gh = (args) => execFileSync('gh', arg
     }
   }
   if (!target.id) throw new Error('unresolved stand-down has no durable comment id');
-  if (flags.noCodeOwed) requireNoCodeHead(snapshot, target);
-  const body = buildOperatorAnswer({ standDownId: String(target.id), ...flags, ...(supersedes ? { supersedes } : {}) });
+  const head = flags.noCodeOwed ? requireNoCodeHead(snapshot, target) : null;
+  const body = buildOperatorAnswer({ standDownId: String(target.id), ...flags, ...(supersedes ? { supersedes } : {}), ...(head ? { head } : {}) });
   if (body.length > 65536) throw new Error('operator answer exceeds GitHub comment limit');
+  if (flags.preview) return JSON.stringify({ ok: true, preview: true, pr: Number(pr), target: String(target.id), supersedes: supersedes ?? null, head, body });
   // ONE durable write; no label swap, deletion, or automatic retry after an ambiguous write failure.
   return gh(['pr', 'comment', pr, `--repo=${flags.repo}`, '--body', body]);
 }

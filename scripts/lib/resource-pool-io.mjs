@@ -21,7 +21,7 @@ import { cascadePolicy, readPlatformPreferences, formatCascadeSourcesLine } from
 import { parseSessionSlug } from '../conveyor/session-slug.mjs';
 import { readEnumOverride } from './operator-enum-store.mjs';
 import { readSettingsChecked, SETTINGS_DIR, LEGACY_SETTINGS_PATH } from './settings-files.mjs';
-// No red-team job can legitimately retain a lease beyond one day.
+// Diagnostic age threshold only: active rows still require proven death before omission.
 export const RED_TEAM_HARD_LEASE_CEILING_MS = 24 * 60 * 60 * 1000;
 const object = v => v !== null && typeof v === 'object' && !Array.isArray(v);
 const integer = v => Number.isInteger(v) && v >= 0 && v <= 64;
@@ -36,7 +36,30 @@ export function readPoolJson(path, { io = fs } = {}) {
     let size = 0, n;
     while (size < buffer.length && (n = io.readSync(fd, buffer, size, buffer.length - size, null)) > 0) size += n;
     if (size > info.size || size > limit) throw Error('source grew during read; inspect source manually');
-    const text = buffer.toString('utf8', 0, size), data = JSON.parse(text);
+    const text = buffer.toString('utf8', 0, size);
+    // Consume string tokens atomically and track keys per object, including escaped aliases.
+    const containers = [];
+    for (let i = 0; i < text.length; i++) {
+      const char = text[i];
+      if (char === '{') containers.push(new Set());
+      else if (char === '[') containers.push(null);
+      else if (char === '}' || char === ']') containers.pop();
+      else if (char === '"') {
+        const start = i++;
+        while (i < text.length && text[i] !== '"') {
+          if (text[i] === '\\') i++;
+          i++;
+        }
+        let next = i + 1;
+        while (next < text.length && /\s/.test(text[next])) next++;
+        if (text[next] !== ':') continue;
+        const key = JSON.parse(text.slice(start, i + 1)), keys = containers.at(-1);
+        if (!(keys instanceof Set)) throw Error('invalid source object; inspect source manually');
+        if (keys.has(key)) throw Error('duplicate source key; repair source and rerun');
+        keys.add(key);
+      }
+    }
+    const data = JSON.parse(text);
     if (!object(data)) throw Error('expected source object; inspect source manually');
     return { data, text, mtimeMs: info.mtimeMs };
   } finally { io.closeSync(fd); }
@@ -169,13 +192,14 @@ export function poolPidAlive(pid, kill = (p, signal) => process.kill(p, signal))
   try { kill(pid, 0); return true; }
   catch (e) { return e.code === 'ESRCH' ? false : e.code === 'EPERM' ? true : null; }
 }
-export function readPoolSource(source, { paths, coord, env = process.env, nowMs = Date.now(),
+export function readPoolSource(source, { paths, coord, env = process.env, nowMs = Date.now(), cwd = process.cwd(), readRegistry,
   roundBudget = liveReviewRoundBudget, run = execFileSync,
   listCommands = () => run('ps', ['-Aww', '-o', 'pid=,ppid=,command='], { encoding: 'utf8', timeout: 10000, maxBuffer: 32 * 1024 * 1024 }),
   heavyStatus = () => readPoolHeavyHeld({ env }),
-  laneStatus = () => readPoolLaneStatus({ env, nowMs, run, readJson: json }),
+  laneStatus = () => readPoolLaneStatus({ env, nowMs, cwd, run, readJson: json, readRegistry }),
   processAlive = poolPidAlive, readStart = pidStartTime, host = hostname(), namespace = pidNamespace(),
-  slotAlive = (data, { statusAt }) => {
+  slotAlive } = {}) {
+  const processSlotAlive = data => {
     const killAlive = pid => {
       const alive = processAlive(pid);
       if (typeof alive !== 'boolean') throw Error('unknown process liveness');
@@ -183,7 +207,8 @@ export function readPoolSource(source, { paths, coord, env = process.env, nowMs 
     };
     if (data.host && data.host !== host) return null;
     return probeSlotAlive(data, { killAlive, readStart, host, namespace });
-  } } = {}) {
+  };
+  slotAlive ??= processSlotAlive;
   let expiredRedTeamRows = 0;
   try {
     const holders = [];
@@ -262,14 +287,17 @@ export function readPoolSource(source, { paths, coord, env = process.env, nowMs 
           || !['queued', 'running', 'finished', 'ok', 'failed', 'cancelled', 'canceled', 'timeout', 'timed-out', 'error'].includes(row.status)) throw Error('invalid red-team status');
         const statusAt = checked.mtimeMs;
         if (!Number.isFinite(statusAt)) throw Error('invalid red-team mtime; inspect status manually');
-        if (nowMs - statusAt > RED_TEAM_HARD_LEASE_CEILING_MS) { expiredRedTeamRows++; continue; }
         if (!['running', 'queued'].includes(row.status)) continue;
         if (row.pid == null) throw Error(`unknown red-team liveness: ${entry.name}; missing pid; inspect status manually`);
         if (!Number.isSafeInteger(row.pid) || row.pid <= 0) throw Error(`invalid red-team pid: ${entry.name}`);
         if (typeof row.pidStart !== 'string' || !row.pidStart.trim()) throw Error(`invalid red-team pidStart: ${entry.name}`);
-        const alive = slotAlive(row, { statusAt });
+        // Old rows bypass the slot callback only after direct process-identity evidence.
+        // Age alone never releases a live holder or excuses unreadable liveness.
+        const alive = nowMs - statusAt > RED_TEAM_HARD_LEASE_CEILING_MS
+          ? processSlotAlive(row) : slotAlive(row, { statusAt });
         if (typeof alive !== 'boolean') throw Error(`unknown red-team liveness: ${entry.name}; inspect host/process access`);
         if (alive) add('redTeam', `${row.repo}:${row.pr}:${row.head}`, 2, 1);
+        else if (nowMs - statusAt > RED_TEAM_HARD_LEASE_CEILING_MS) expiredRedTeamRows++;
       }
     } else throw Error('unknown source');
     return { source, ok: true, holders, budget, snapshot, expiredRedTeamRows };

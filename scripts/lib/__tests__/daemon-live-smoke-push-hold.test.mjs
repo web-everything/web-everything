@@ -1,4 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { dispatchFix as realDispatch } from '../../conveyor/reconcile-fix-dispatch.mjs';
+import { DISPATCH_DRY_RUN_SCRIPT, checkFilled } from '../daemon-live-smoke.mjs';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -44,4 +46,35 @@ describe('dispatch dry-run smoke live hold isolation', () => {
       expect(JSON.parse(result.stdout)).toEqual({ spawned: 1, ghReads: 0, outcome: { ok: true } });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+});
+
+
+it('a non-sentinel hold-label refusal still fails the smoke row with push-hold and hold-label evidence', () => {
+  vi.stubEnv('WE_SMOKE_DRYRUN_ONLY', '');
+  const spawnAgent = vi.fn();
+  const readPushHold = vi.fn(() => ({ code: 'hold-label', reason: 'review:human' }));
+  let outcome;
+  const dispatchFix = (planned, options) => realDispatch(planned, {
+    ...options, root: '/repo',
+    readBrief: () => '{{PR_NUM}} {{LANE_REF}} {{LANE}} {{SESSION_SLUG}} {{SCOPE}}',
+    grantConflictHelper: () => {}, advisorFor: () => ({ enabled: false }),
+    spawnAgent, readPushHold,
+  });
+  const start = DISPATCH_DRY_RUN_SCRIPT.indexOf("record('fix', 900002");
+  const end = DISPATCH_DRY_RUN_SCRIPT.indexOf('// 3a. ci-heal', start);
+  expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(start);
+  try {
+    new Function('record', 'dispatchFix', 'noopAcquire', 'noopRelease', 'checkFilled',
+      'canonicalPlaceholder', 'BRIEF_REQUIRED_BY_KIND',
+      DISPATCH_DRY_RUN_SCRIPT.slice(start, end).replaceAll('900002', '1764'))(
+      (kind, pr, fn) => { try { fn(); outcome = { ok: true }; }
+        catch (e) { outcome = { ok: false, error: e.message }; } },
+      dispatchFix, () => ({ ok: true }), () => {}, checkFilled, x => x, { fix: [] });
+    expect(outcome).toMatchObject({ ok: false });
+    expect(outcome.error).toContain('push-hold');
+    expect(outcome.error).toContain('hold-label');
+    expect(readPushHold).toHaveBeenCalledTimes(1);
+    expect(spawnAgent).not.toHaveBeenCalled();
+  } finally { vi.unstubAllEnvs(); }
 });

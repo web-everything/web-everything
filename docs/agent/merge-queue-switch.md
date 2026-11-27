@@ -227,6 +227,31 @@ Two paths get past this, so close both for the whole switch:
 - PR shows merged by the queue; the main commit is a merge commit (2 parents); the drain's post-land
   follow-up ran for it (`mergedBy: github-merge-queue`).
 
+## Same-head retry after a merge-group freeze ejection
+
+A same-head merge-queue ejection whose merge gate's sole blocking row is the pending-rerun
+red-main freeze (with its log, job, run and shared-freeze proofs) is main-caused, and may take
+one of the head's two infra retries, only when every other failed check is cancelled,
+startup_failure, or a summary in the code-owned freeze-summary map whose bound run attempt
+shows each need in its allowed set with at least one cancelled, main is settled green (the
+freeze-named run's latest attempt at or above the named one succeeded, and no run among the
+newest 100 main runs is unfinished), and the PR is CLEAN; anything unreadable holds, and
+every other retry path is unchanged.
+
+The map covers `integration`, `coverage-merge`, and `test`; it is independent of
+`drain.mqAggregateJobs`. Each summary needs its own failed dependency-gate step, passing,
+skipped or neutral other steps, and complete jobs bound to its CI merge-group run, attempt
+and commit. `changes` must succeed. Other mapped needs allow only success or cancellation,
+with every matrix member present exactly once. At least one need must be cancelled.
+
+The newest-100 main push page must contain the freeze-named run exactly once, completed and
+successful at an attempt at or above the named one. A live latest-run read must match that
+entry's identity, workflow, event, branch, attempt, conclusion and commit. A separate read
+must prove the named attempt completed; its own conclusion need not be success. Older
+unfinished runs are outside this newest-100 contract. The deciding main run must also be
+green and fresh. Unreadable, incomplete, oversized or budget-exhausted evidence holds for
+operator inspection and manual enqueue; the ten-job caps and two-retry budget stay unchanged.
+
 ## Rollback
 
 Freeze the drain for the whole rollback, for the same reason as above: between the settings revert and the

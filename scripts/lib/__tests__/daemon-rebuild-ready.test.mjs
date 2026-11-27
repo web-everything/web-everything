@@ -21,6 +21,7 @@ import { spawnSync } from 'node:child_process';
 import {
   rebuildClone, readRebuildState, rebuildStatePath, readReadyCandidate, readyCandidatePath, matchReadyCandidate,
 } from '../daemon-rebuild.mjs';
+import { assertReadyCandidatePins, StaleReadyPinError } from '../daemon-rebuild/state.mjs';
 import { acquireRead, releaseRead } from '../daemon-clone-lock.mjs';
 import { addOverlay, appendOverlayEvent, readOverlays, removeOverlay, overlayFilePath } from '../daemon-overlays.mjs';
 import { overlayRetiredByOperator, readyBuildVerified } from '../daemon-rebuild/adopt.mjs';
@@ -305,6 +306,76 @@ describe('a passed candidate blocked at finalize by a long reader tick is adopte
     expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).not.toBe(ready.adopt.finalSha);
     expect(readFileSync(join(cloneDir, 'main-later.txt'), 'utf8')).toBe('later\n');
     expect(git(cloneDir, ['merge-base', '--is-ancestor', old, 'HEAD']).status).toBe(0);
+  });
+
+  async function pinnedReadyFixture() {
+    const { originDir, cloneDir, env } = makeFixture();
+    env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
+    env.WE_DAEMON_OVERLAY_EDGE_RESOLVE = '0';
+    advanceMain(originDir, (dir) => writeFile(dir, 'shared.txt', 'base\n'));
+    const old = pushBranch(originDir, 'lane/moving', (dir) => writeFile(dir, 'moving.txt', 'old\n'));
+    pushBranch(originDir, 'lane/blocker', (dir) => writeFile(dir, 'shared.txt', 'blocker\n'));
+    for (const ref of ['lane/moving', 'lane/blocker']) addOverlay(cloneDir, { ref }, { env });
+    expect(await rebuildClone({ root: cloneDir, env, runSmoke: async () => PASS, lockOpts: LOCK_OPTS })).toMatchObject({ adopted: true });
+    const tip = pushBranch(originDir, 'lane/moving', (dir) => writeFile(dir, 'shared.txt', 'moving\n'), { base: 'origin/lane/moving' });
+    advanceMain(originDir, (dir) => writeFile(dir, 'main-moved.txt', 'new\n'));
+    const { runSmoke, endTick } = passWhileSiblingStartsTick(cloneDir, env);
+    try {
+      const blocked = await rebuildClone({ root: cloneDir, env, runSmoke, lockOpts: LOCK_OPTS });
+      expect(blocked.reason).toBe('tick-in-progress');
+    } finally { endTick(); }
+    const ready = readReadyCandidate(cloneDir, env);
+    expect(ready.adopt.applied.find((a) => a.ref === 'lane/moving')).toMatchObject({ sha: old, pinnedFrom: tip });
+    return { originDir, cloneDir, env, old, tip, ready };
+  }
+  const proveStale = (f) => () => assertReadyCandidatePins(f.cloneDir, readReadyCandidate(f.cloneDir, f.env), f.env);
+
+  it('adopts a pinned ready candidate after the overlay branch fast-forwards past its pin', async () => {
+    const f = await pinnedReadyFixture();
+    const later = pushBranch(f.originDir, 'lane/moving', (dir) => writeFile(dir, 'later.txt', 'later\n'), { base: 'origin/lane/moving' });
+    advanceMain(f.originDir, (dir) => writeFile(dir, 'main-later.txt', 'later\n'));
+    const main = f.ready.adopt.finalSha;
+    const noSmoke = vi.fn(async () => PASS);
+    const result = await rebuildClone({ root: f.cloneDir, env: f.env, runSmoke: noSmoke, lockOpts: LOCK_OPTS });
+    expect(result.alerts ?? []).not.toContainEqual(expect.objectContaining({
+      kind: 'ready-candidate-discarded', detail: expect.objectContaining({ reason: 'ready-pin-stale' }),
+    }));
+    expect(result.adopted).toBe(true);
+    expect(git(f.cloneDir, ['merge-base', '--is-ancestor', main, 'HEAD']).status).toBe(0);
+    expect(git(f.cloneDir, ['merge-base', '--is-ancestor', f.old, 'HEAD']).status).toBe(0);
+    // The build applies the audited pin, never the moved tips.
+    expect(git(f.cloneDir, ['merge-base', '--is-ancestor', later, 'HEAD']).status).toBe(1);
+    expect(git(f.cloneDir, ['merge-base', '--is-ancestor', f.tip, 'HEAD']).status).toBe(1);
+  });
+
+  it('a force-pushed pin stays ready-pin-stale', async () => {
+    const f = await pinnedReadyFixture();
+    pushBranch(f.originDir, 'lane/moving', (dir) => { writeFile(dir, 'moving.txt', 'old\n'); writeFile(dir, 'shared.txt', 'moving\n'); }, { force: true });
+    gitOk(f.cloneDir, ['fetch', '-q', 'origin', '+refs/heads/*:refs/remotes/origin/*']);
+    expect(proveStale(f)).toThrow(StaleReadyPinError);
+  });
+
+  it('a replace ref that fakes ancestry stays ready-pin-stale', async () => {
+    const f = await pinnedReadyFixture();
+    const forced = pushBranch(f.originDir, 'lane/moving', (dir) => { writeFile(dir, 'moving.txt', 'old\n'); writeFile(dir, 'shared.txt', 'moving\n'); }, { force: true });
+    gitOk(f.cloneDir, ['fetch', '-q', 'origin', '+refs/heads/*:refs/remotes/origin/*']);
+    // A replacement commit that claims the pin as its parent would make the forced tip look like a descendant.
+    const fake = gitOk(f.cloneDir, ['commit-tree', '-p', f.tip, '-m', 'fake', `${forced}^{tree}`]).trim();
+    gitOk(f.cloneDir, ['replace', forced, fake]);
+    expect(proveStale(f)).toThrow(StaleReadyPinError);
+  });
+
+  it('an unreadable overlay tip stays ready-pin-stale', async () => {
+    const f = await pinnedReadyFixture();
+    gitOk(f.cloneDir, ['update-ref', '-d', 'refs/remotes/origin/lane/moving']);
+    expect(proveStale(f)).toThrow(StaleReadyPinError);
+  });
+
+  it('a changed registration PR stays ready-pin-stale', async () => {
+    const f = await pinnedReadyFixture();
+    removeOverlay(f.cloneDir, 'lane/moving', { env: f.env });
+    addOverlay(f.cloneDir, { ref: 'lane/moving', pr: 4242 }, { env: f.env });
+    expect(proveStale(f)).toThrow(StaleReadyPinError);
   });
 
   it.each(['moved tip', 'retired overlay', 'HEAD mismatch'])('tick-start discards a stale pinned candidate after %s and freshly rebuilds', async (stale) => {

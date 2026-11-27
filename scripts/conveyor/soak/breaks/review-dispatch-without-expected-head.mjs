@@ -28,6 +28,8 @@ const src = process.env.SOAK_SOURCE_ROOT;
 const head = 'd'.repeat(40);
 const job = await import(pathToFileURL(join(src, 'scripts/operations/review-job.mjs')).href);
 const direct = await import(pathToFileURL(join(src, 'scripts/operations/review-dispatch.mjs')).href);
+const workerIo = await import(pathToFileURL(join(src, 'scripts/operations/review-pr-io.mjs')).href);
+const { REVIEW_EFFECTS } = await import(pathToFileURL(join(src, 'scripts/operations/review-pr.mjs')).href);
 const land = await import(pathToFileURL(join(src, 'scripts/operations/land-advance-io.mjs')).href);
 const landPlan = await import(pathToFileURL(join(src, 'scripts/operations/land-advance.mjs')).href);
 const daemon = await import(pathToFileURL(join(src, 'skills-src/conveyor/review-daemon.mjs')).href);
@@ -35,7 +37,7 @@ const runner = await import(pathToFileURL(join(src, 'skills-src/conveyor/runner.
 const manual = await import(pathToFileURL(join(src, 'scripts/operations/manual-daemon-pass.mjs')).href);
 const { parseOperationArgv } = await import(pathToFileURL(join(src, 'scripts/operations/cli-adapter.mjs')).href);
 const { projectReads } = await import(pathToFileURL(join(src, 'scripts/operations/engine.mjs')).href);
-const out = { noHead: null, withHead: null, daemonHead: null, runner: null, manual: null, sessions: [] };
+const out = { noHead: null, withHead: null, daemonHead: null, runner: null, manual: null, sessions: [], workers: [] };
 const SLUG = ['web-everything', 'web-everything'].join('/'); // built so the repo-literal scan sees no slug
 const base = { pr: 77, repo: SLUG, root: process.env.SOAK_ROOT, dir: process.env.SOAK_JOBS,
   ciGate: () => ({ allowed: true, headSha: head }), readCompletion: () => null, resolveSettingsEnv: () => null,
@@ -49,14 +51,27 @@ try { const r = job.dispatchReviewJob({ ...base, expectedHead: head, io, spawnJo
 catch (e) { out.withHead = { threw: String(e.message).split('\\n')[0] }; }
 for (const [entry, dispatch] of [['mode', job.dispatchReviewByMode], ['direct', direct.dispatchReview]]) {
 for (const [name, expectedHead, live] of [['missing', undefined, head], ['moved', head, 'e'.repeat(40)], ['matching', head, head]]) {
-  let sessionSpawns = 0, headReads = 0;
+  let sessionSpawns = 0, headReads = 0, workerEnv;
   try {
     const r = dispatch({ ...base, mode: 'session', expectedHead,
       stackCheck: () => ({ base: null }), io: { liveHead: () => { headReads++; return live; } },
       readBrief: () => 'review', wrapReview: false, resolveSettingsEnv: () => ({}),
       ensureSessionCwd: () => process.env.SOAK_ROOT, isolateSession: () => ({}),
-      spawnAgent: () => { sessionSpawns++; return ''; } });
+      spawnAgent: argv => { sessionSpawns++; workerEnv = JSON.parse(argv[argv.indexOf('--settings') + 1]).env; return ''; } });
     out.sessions.push({ entry, name, spawns: sessionSpawns, headReads, refused: r.refused === true, outcome: r.outcome });
+    if (name === 'matching' && workerEnv) {
+      let diffReads = 0, writes = 0, beforeReview = false, beforeVerdict = false;
+      try {
+        workerIo.readPr({ pr: 77, repo: SLUG, env: workerEnv, originRepo: () => SLUG,
+          readView: () => ({ number: 77, headRefOid: 'e'.repeat(40) }),
+          exec: () => { diffReads++; throw Error('unexpected diff read'); }, readStack: () => null });
+      } catch (error) { beforeReview = error.message.includes('session head pin'); }
+      const sinks = workerIo.createReviewPrSinks({ env: workerEnv, readPublishHead: () => 'e'.repeat(40),
+        runNode: () => { writes++; }, postComment: () => { writes++; } });
+      try { await sinks[REVIEW_EFFECTS.LABEL]({ pr: 77, repo: SLUG, reviewedHead: head, to: 'changes' }, {}); }
+      catch (error) { beforeVerdict = error.message.includes('head moved'); }
+      out.workers.push({ entry, diffReads, writes, beforeReview, beforeVerdict });
+    }
   } catch (e) { out.sessions.push({ entry, name, threw: String(e.message).split('\\n')[0] }); }
 }
 }
@@ -181,12 +196,15 @@ export default {
       for (const session of out.sessions ?? []) {
         const matching = session.name === 'matching';
         const outcome = session.name === 'missing' ? 'refused-no-expected-head' : 'refused-head-moved';
-        if (matching ? session.spawns !== 1 || session.headReads !== (session.entry === 'mode' ? 2 : 1) || session.refused
+        if (matching ? session.spawns !== 1 || session.headReads !== (session.entry === 'mode' ? 3 : 2) || session.refused
           : session.spawns !== 0 || !session.refused || session.outcome !== outcome) {
           violations.push({ invariant: 'session-head-admission', detail: JSON.stringify(session) });
         }
       }
       if (out.sessions?.length !== 6) violations.push({ invariant: 'session-scenarios-ran', detail: JSON.stringify(out.sessions) });
+      if (out.workers?.length !== 2 || out.workers.some(worker => worker.diffReads !== 0 || worker.writes !== 0 || !worker.beforeReview || !worker.beforeVerdict)) {
+        violations.push({ invariant: 'session-worker-head-checkpoints', detail: JSON.stringify(out.workers) });
+      }
       if (out.land?.spawns !== 0 || out.land?.fixes !== 1 || out.land?.errors?.length !== 0
         || JSON.stringify(out.land?.ledgerTargets) !== JSON.stringify(['fix'])
         || out.land?.deferred?.[0]?.reason !== 'refused-no-expected-head') {

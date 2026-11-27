@@ -490,22 +490,31 @@ describe('Forge key structure rescope: DSA and linear scan',()=>{
   });
   it('scans repeated comment openers in linear time',()=>{
     // Worker wall time includes scheduling pauses and other Vitest threads. Measure CPU
-    // in a dedicated child, after warming both sizes, while retaining the same growth limit.
+    // in a dedicated child. Warm and time equal batches to reduce the effect of JIT/GC
+    // on individual short scans; retain the same input sizes and growth limit.
     const probe=`
       import {keyStructureFinding} from ${JSON.stringify(new URL('../forge-key-structure.mjs',import.meta.url).href)};
       const cases=[n=>'/* '+${JSON.stringify(keyType)}+' '+'{/*'.repeat(n)+'*/',n=>'{/* '.repeat(n)];
       const cpuMs=content=>{
         const start=process.cpuUsage();
-        keyStructureFinding(content);
+        for(let i=0;i<16;i++) {
+          if(keyStructureFinding(content)!==null)throw new Error('comment scan did not complete');
+        }
         const used=process.cpuUsage(start);
         return (used.user+used.system)/1000;
       };
       const ratios=cases.map(make=>{
         const small=Buffer.from(make(7500)),large=Buffer.from(make(15000));
         cpuMs(small);cpuMs(large);
-        const smallTimes=[],largeTimes=[];
-        for(let i=0;i<3;i++){smallTimes.push(cpuMs(small));largeTimes.push(cpuMs(large));}
-        return Math.min(...largeTimes)/Math.max(Math.min(...smallTimes),1);
+        const samples=[];
+        for(let i=0;i<5;i++) {
+          // Alternate order so neither size consistently pays for the other's allocations.
+          let smallMs,largeMs;
+          if(i%2===0){smallMs=cpuMs(small);largeMs=cpuMs(large);}
+          else {largeMs=cpuMs(large);smallMs=cpuMs(small);}
+          samples.push(largeMs/Math.max(smallMs,1));
+        }
+        return samples.sort((a,b)=>a-b)[2];
       });
       process.stdout.write(JSON.stringify(ratios));
     `;

@@ -1,6 +1,13 @@
 {
-  "description": "Verification load and infrastructure retries and gate ceiling policy.",
+  "description": "Verification recovery policy and default-off shared-green reuse with shadow logs.",
   "owner": "scripts/settings/verify-recovery.json",
   "changeVia": "pr",
-  "instant": false
+  "instant": false,
+  "leaves": {
+    "sharedGreenReuse": {
+      "range": "boolean; default false",
+      "unit": "consumer reuse switch",
+      "note": "scripts/lib/verify-settings.mjs; WE_VERIFY_SHARED_GREEN_REUSE=0/1. Only readFinishGuardMarker reads it; off returns the local marker and logs the shared decision to stderr and verify-shared-shadow.log. Publishing is independent."
+    }
+  }
 }

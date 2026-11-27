@@ -1,5 +1,5 @@
 {
-  "description": "GitHub call concurrency, per-caller share and slot lifetime bounds.",
+  "description": "GitHub concurrency and slot bounds; pointsAlgorithm rollback, pointsClasses.batch fairness and pointsBucketAdoption ancestry gate.",
   "owner": "scripts/settings/gh-throttle.json",
   "changeVia": "pr",
   "instant": false

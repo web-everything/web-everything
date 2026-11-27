@@ -101,7 +101,7 @@ it('CLI routes red-team recovery through the FIFO queue: capacity 1 dispatches o
     expect(recovery.mock.calls[0][0].plan.refusals.map(row => row.prNumber)).toEqual([6001]);
     expect(recovery.mock.calls[0][0].rawPrs.map(pr => pr.number)).toEqual([6001]);
     expect(dispatch).toHaveBeenCalledTimes(1);
-    expect(dispatch).toHaveBeenCalledWith({ pr: 6001, repo, expectedHead: expect.stringMatching(/^[0-9a-f]{40}$/), redTeamOnly: true, redTeamMode: 'fresh' });
+    expect(dispatch).toHaveBeenCalledWith({ pr: 6001, repo, expectedHead: expect.stringMatching(/^[0-9a-f]{40}$/), redTeamOnly: true, redTeamMode: 'fresh', leaseHeld: expect.any(Function) });
     expect(result.dispatched).toEqual([{ prNumber: 6001, jobPid: 42, mode: 'fresh' }]);
     // The two held-out PRs stay queued, in FIFO order, in the persisted file.
     expect(JSON.parse(readQueueFile()).map(entry => entry.pr)).toEqual([6002, 6003]);
@@ -203,7 +203,7 @@ it('CLI label repair exception preserves original PRs and still dispatches red-t
     expect(sync.mock.invocationCallOrder[0]).toBeLessThan(recovery.mock.invocationCallOrder[0]);
     expect(rawPrs).toEqual(before);
     expect(dispatch).toHaveBeenCalledTimes(1);
-    expect(dispatch).toHaveBeenCalledWith({ pr, repo, expectedHead: expect.stringMatching(/^[0-9a-f]{40}$/), redTeamOnly: true, redTeamMode: 'fresh' });
+    expect(dispatch).toHaveBeenCalledWith({ pr, repo, expectedHead: expect.stringMatching(/^[0-9a-f]{40}$/), redTeamOnly: true, redTeamMode: 'fresh', leaseHeld: expect.any(Function) });
     expect(result.dispatched).toEqual([{ prNumber: pr, jobPid: 42, mode: 'fresh' }]);
   } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
 });
@@ -236,8 +236,33 @@ it.each(['fresh', 'resume'])('CLI tick options recover an already-reviewed head 
     expect(readEvidence).toHaveBeenCalledWith({ repo, pr, head });
     expect(readStatus).toHaveBeenCalledWith({ repo, pr, head });
     expect(dispatch).toHaveBeenCalledOnce();
-    expect(dispatch).toHaveBeenCalledWith({ pr, repo, expectedHead: head, redTeamOnly: true, redTeamMode: mode });
+    expect(dispatch).toHaveBeenCalledWith({ pr, repo, expectedHead: head, redTeamOnly: true, redTeamMode: mode, leaseHeld: expect.any(Function) });
     expect(take).toHaveBeenCalledOnce();
+  } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
+});
+
+it.each(['on', 'off'])('CLI recovery forwards the live lease and refuses a later start after lease loss (queue %s)', queue => {
+  const repo = 'web-everything/web-everything';
+  const { plan, rawPrs } = owedPrs(repo, [6041, 6042]);
+  let held = true;
+  const leaseHeld = vi.fn(() => held);
+  const dispatch = vi.spyOn(reviewJob, 'dispatchReviewJob').mockImplementation(options => {
+    expect(options.leaseHeld).toBe(leaseHeld);
+    expect(options.leaseHeld()).toBe(true);
+    held = false;
+    expect(options.leaseHeld()).toBe(false);
+    return { jobPid: 42 };
+  });
+  vi.stubEnv('WE_REVIEW_RED_TEAM_ON_SKIP', '1');
+  vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', QUEUE_FILE);
+  vi.stubEnv('WE_RED_TEAM_DISPATCH_QUEUE', queue);
+  try {
+    const production = cliReviewTickOpts({ leaseHeld, readLivePr: livePrReader(rawPrs), log: { error: vi.fn() } });
+    const result = production.redTeamOnSkip({ repo, plan, rawPrs, lastDispatch: new Map(),
+      capacity: { lanes: 2, budget: { left: 2 }, remainingStarts: 2, take: vi.fn() }, paused: false });
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(result.dispatched).toEqual([{ prNumber: 6041, jobPid: 42, mode: 'fresh' }]);
+    expect(result.notStarted).toContainEqual({ prNumber: 6042, reason: expect.stringContaining('dispatch lease lost') });
   } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
 });
 

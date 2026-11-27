@@ -235,7 +235,7 @@ function logHit(env, caller, repo) {
  */
 export function readSharedOpenPrs({
   repo, fields, env = process.env, now = () => Date.now(), exec,
-  dir = null, ttlMs = null, caller = null, lockWaitMs = LOCK_WAIT_MS, allowDeferred = false, cacheOnly = false,
+  dir = null, ttlMs = null, caller = null, lockWaitMs = LOCK_WAIT_MS, allowDeferred = false, cacheOnly = false, ignoreDirty = false,
   paging = null, spawnRefresh = null, smokeChild = isSmokeDryRunChild(),
 } = {}) {
   if (!prSnapshotEnabled(env) && !dir) return null;
@@ -261,7 +261,7 @@ export function readSharedOpenPrs({
       }
       return snap;
     }
-    return isServable(snap, { fields: want, nowMs: now(), ttlMs: ttl, dirtyMs: latestDirtyMs(root, repo) }) ? snap : null;
+    return isServable(snap, { fields: want, nowMs: now(), ttlMs: ttl, dirtyMs: ignoreDirty && cacheOnly ? 0 : latestDirtyMs(root, repo) }) ? snap : null;
   };
 
   const hit = servable();

@@ -14,6 +14,7 @@ import {
   watchDuplicatePrs,
   defaultListOpenPrs,
   defaultPostFinding,
+  runDuplicateWatchCli,
 } from '../duplicate-pr-watch.mjs';
 
 describe('the real incident that motivated this pass — the 2026-09-05 quadruple/double-PR storm', () => {
@@ -319,5 +320,87 @@ import { prFileContract } from './pr-file-test-helpers.mjs';
 prFileContract({
   name: 'duplicate-pr-watch', load: () => import('../duplicate-pr-watch.mjs'),
   reader: 'defaultListOpenPrs', run: 'watchDuplicatePrs',
+  cliMain: 'runDuplicateWatchCli',
   fields: 'number,headRefName,title,body,labels,files',
 });
+
+describe('repeatable CLI error paths', () => {
+  it('refuses an unknown verb before reading PRs', async () => {
+    const { execFileSync } = await import('node:child_process');
+    const { writeAllSync, writeLineSync } = await import('../../lib/write-all-sync.mjs');
+    const savedExitCode = process.exitCode;
+    execFileSync.mockClear();
+    writeAllSync.mockClear();
+    writeLineSync.mockClear();
+    try {
+      runDuplicateWatchCli(['unknown']);
+      expect(process.exitCode).toBe(2);
+      expect(execFileSync).not.toHaveBeenCalled();
+      expect(writeAllSync).not.toHaveBeenCalled();
+      expect(writeLineSync).toHaveBeenCalledWith(2, expect.stringContaining('usage:'));
+    } finally {
+      process.exitCode = savedExitCode;
+    }
+  });
+
+  it('treats an unreadable snapshot as an empty sweep without falling back to gh', async () => {
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { execFileSync } = await import('node:child_process');
+    const { writeAllSync, writeLineSync } = await import('../../lib/write-all-sync.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'duplicate-pr-cli-error-'));
+    const savedExitCode = process.exitCode;
+    execFileSync.mockClear();
+    writeAllSync.mockClear();
+    writeLineSync.mockClear();
+    try {
+      runDuplicateWatchCli(['sweep', '--dry-run', `--prs-file=${join(dir, 'missing.json')}`]);
+      expect(process.exitCode).toBe(savedExitCode);
+      expect(execFileSync).not.toHaveBeenCalled();
+      expect(writeAllSync).toHaveBeenCalledWith(1,
+        `${JSON.stringify({ checked: true, flagged: 0, results: [] })}\n`);
+      expect(writeLineSync).not.toHaveBeenCalled();
+    } finally {
+      process.exitCode = savedExitCode;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+it('the callable CLI rejects an invalid verb without discovering PRs', async () => {
+  const { execFileSync } = await import('node:child_process');
+  const { writeAllSync, writeLineSync } = await import('../../lib/write-all-sync.mjs');
+  execFileSync.mockClear();
+  writeAllSync.mockClear();
+  writeLineSync.mockClear();
+  const savedExitCode = process.exitCode;
+  try {
+    runDuplicateWatchCli(['invalid', '--dry-run']);
+    expect(process.exitCode).toBe(2);
+    expect(writeLineSync).toHaveBeenCalledWith(2, expect.stringContaining('usage: duplicate-pr-watch.mjs sweep'));
+    expect(writeAllSync).not.toHaveBeenCalled();
+    expect(execFileSync).not.toHaveBeenCalled();
+  } finally {
+    process.exitCode = savedExitCode;
+  }
+});
+
+it('the real script entry (spawned once) runs the CLI and rejects an invalid verb', async () => {
+  const { spawnSync } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+  const { join, dirname } = await import('node:path');
+  const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'duplicate-pr-watch.mjs');
+  const r = spawnSync(process.execPath, [script, 'invalid', '--dry-run'], { encoding: 'utf8', timeout: 120000 });
+  expect(r.status).toBe(2);
+  expect(r.stderr).toContain('usage: duplicate-pr-watch.mjs sweep');
+  // Valid path through the real entry: sweep over an empty snapshot, no gh.
+  const { mkdtempSync, writeFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const dir = mkdtempSync(join(tmpdir(), 'dup-pr-watch-'));
+  const prsFile = join(dir, 'prs.json');
+  writeFileSync(prsFile, '[]');
+  const ok = spawnSync(process.execPath, [script, 'sweep', '--dry-run', `--prs-file=${prsFile}`], { encoding: 'utf8', timeout: 120000 });
+  expect(ok.status).toBe(0);
+  expect(JSON.parse(ok.stdout)).toEqual({ checked: true, flagged: 0, results: [] });
+}, 300000);

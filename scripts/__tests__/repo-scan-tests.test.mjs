@@ -21,6 +21,15 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const MULTI = 'scripts/__tests__/multi-repo-checks.test.mjs';
 
 describe('selectScanTests', () => {
+  it('registers the audit nonconvergence scanner with its scoped in-file tag', () => {
+    const test = 'scripts/operations/__tests__/audit-nonconvergence.test.mjs';
+    const entry = REPO_SCAN_TESTS.find(e => e.test === test);
+    expect(entry?.scope).toBe('files');
+    expect(readFileSync(join(root, test), 'utf8')).toContain(`${SCAN_TEST_TAG} scope=files`);
+    expect(selectScanTests({ changedFiles: ['scripts/operations/new-consumer.mjs'] }).scoped).toContain(entry);
+    expect(selectScanTests({ changedFiles: [test] }).widened).toContain(entry);
+    expect(selectScanTests({ changedFiles: ['docs/readme.md'] }).scoped).not.toContain(entry);
+  });
   it('selects scoped push boundaries for scripts and widens for rule or allowlist edits', () => {
     const test = 'scripts/__tests__/push-gate-boundary.test.mjs';
     for (const ext of ['mjs', 'js', 'cjs', 'ts', 'mts', 'cts']) {
@@ -43,6 +52,16 @@ describe('selectScanTests', () => {
       expect(selectScanTests({ changedFiles: [path] }).full.map(e => e.test), path).not.toContain(test);
     }
     expect(selectScanTests({ changedFiles: ['docs/agent/testing/removed-topic.md'], fileExists: () => false }).full).toEqual([]);
+  });
+
+  it('selects the agent launch structure test for any new .mjs launch site under scripts or skills-src', () => {
+    const test = 'scripts/__tests__/agent-launch-structure.test.mjs';
+    for (const path of ['scripts/conveyor/x.mjs', 'scripts/lib/agent-launch.mjs', 'skills-src/conveyor/y.mjs', 'scripts/new.mjs']) {
+      expect(selectScanTests({ changedFiles: [path] }).full.map(e => e.test), path).toContain(test);
+    }
+    for (const path of ['scripts/__tests__/x.test.mjs', 'docs/x.mjs', 'scripts/x.md']) {
+      expect(selectScanTests({ changedFiles: [path] }).full.map(e => e.test), path).not.toContain(test);
+    }
   });
 
   it('scopes capability admission scans to production sources and widens when the rule changes', () => {
@@ -68,6 +87,7 @@ describe('selectScanTests', () => {
     expect(scopedFiles).toEqual(['scripts/lib/new-thing.mjs']);
     // The ownership, sole-writer, review-policy, and sandbox-list guards derive whole-tree facts.
     expect(full.map((e) => [e.test, e.scope])).toEqual([
+      ['scripts/__tests__/agent-launch-structure.test.mjs', 'full'],
       ['scripts/lib/__tests__/constellation-ownership.test.mjs', 'full'],
       ['scripts/conveyor/__tests__/pr-label-mirror.test.mjs', 'full'],
       ['scripts/lib/__tests__/review-policy.conformance.test.mjs', 'full'],

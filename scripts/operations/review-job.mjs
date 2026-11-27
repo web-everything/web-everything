@@ -116,6 +116,8 @@ import { assertMainNotStale, dispatchReview, expectedHeadRefusal, isReviewCodePa
 import { runReport } from './completion-cli.mjs';
 import { writeReviewJobDone, writeReviewJobStarted } from './review-job-envelope.mjs';
 import { reviewSeatLaunchEnv } from '../lib/review-seat-caps.mjs';
+import { workerTierFor } from '../lib/provider-routing.mjs';
+import { careLevelFromReasons } from '../lib/review-core.mjs';
 import { workerWrapperEnabledFor } from './worker-wrapper-launch.mjs';
 import { tryReadCompletion } from './completion-store.mjs';
 import { rateAndRecordReviewJob } from '../conveyor/run-rating.mjs';
@@ -415,7 +417,7 @@ function fetchPinnedPrHead({ lanePath, repo, pr, head, headChangedError, env, ex
 }
 
 /** The real effects, each one command. `root` is the checkout the arc runs from (the daemon's clone). */
-export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync, exec = execReadRaw, readConfig = spawnSync, spawnPack = spawnSync, readStatus = readRedTeamStatus, writeStatus = recordRedTeamStatus, readEvidence = readDrainRedTeamEvidence,
+export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root), readFile = readFileSync, exec = execReadRaw, spawnNode = spawnSync, readConfig = spawnSync, spawnPack = spawnSync, readStatus = readRedTeamStatus, writeStatus = recordRedTeamStatus, readEvidence = readDrainRedTeamEvidence,
   readSeatRecords = () => createRedTeamIo({ root, env }).readRecords({ strict: true }),
   readWitness = key => readRecoveryWitness({ ...key, env, readScorecards: readSeatRecords }), recoveryProbe = defaultRecoveryProbe(),
   queueBaseline = () => resolveLiveQueueBaseline({ checkoutRoot: root, env }),
@@ -430,7 +432,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     const admission = recoveryAdmissions.get(path);
     if (admission) restoreRecoveryWriter({ repo, pr, head, env }, admission.witness, admission.admissionId);
   };
-  const node = (args, { actorId, timeoutMs, extraEnv = null } = {}) => spawnSync(process.execPath, [...heapCapArgs(basename(args[0], '.mjs')), ...args], {
+  const node = (args, { actorId, timeoutMs, extraEnv = null } = {}) => spawnNode(process.execPath, [...heapCapArgs(basename(args[0], '.mjs')), ...args], {
     cwd: root,
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
@@ -635,10 +637,11 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       if (r.status === 0 && path.startsWith('/') && existsSync(path)) return { lanePath: path };
       return { lanePath: null, error: String(r.stderr || r.error?.message || `exit ${r.status}`).trim().split('\n').slice(-3).join(' | ').slice(0, 500) };
     },
-    runLoop: ({ pr, repo, lanePath, actorId, timeoutMs, readSink = null }) => {
+    runLoop: ({ pr, repo, lanePath, actorId, timeoutMs, readSink = null, reviewModel = null }) => {
       const r = node([
         'scripts/operations/review-loop-cli.mjs', `--pr=${pr}`, `--repo=${repo}`, `--cwd=${lanePath}`,
         '--provider=claude', '--json',
+        ...(reviewModel ? [`--model=${reviewModel}`] : []),
       ], { actorId, timeoutMs, ...(readSink ? { extraEnv: { [READ_SINK_ENV]: readSink } } : {}) });
       return {
         status: r.status, signal: r.signal ?? null, stdout: String(r.stdout ?? ''), stderr: String(r.stderr ?? ''),
@@ -1305,7 +1308,7 @@ function finalHeadSeatsGate(input, io) {
 export const NO_EXPECTED_HEAD_OUTCOME = 'refused-no-expected-head';
 
 function runReviewArc({
-  pr, repo, expectedHead, redTeamOnly = false, redTeamMode = 'fresh', preferLane = null, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, loopTimeoutMs = resolveLoopTimeoutMs(), pid = process.pid, onSessionSlug,
+  pr, repo, expectedHead, reviewModel = null, redTeamOnly = false, redTeamMode = 'fresh', preferLane = null, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, loopTimeoutMs = resolveLoopTimeoutMs(), pid = process.pid, onSessionSlug,
 } = {}, io, seatsBox = {}) {
   const planned = planReviewDispatch({ pr, repo });
   const slug = planned.sessionSlug;
@@ -1565,7 +1568,8 @@ function runReviewArc({
     io.log(`review-job ${slug}: running review-loop-cli in ${lanePath}`);
     const loopSpan = span('review.loop');
     const tL = io.now();
-    const loop = io.runLoop({ pr: planned.pr, repo: planned.repo, lanePath, actorId, timeoutMs: loopTimeoutMs, readSink: seatsBox.speculative?.readSink ?? seatsBox.concurrent?.readSink ?? null });
+    const loop = io.runLoop({ pr: planned.pr, repo: planned.repo, lanePath, actorId, timeoutMs: loopTimeoutMs, readSink: seatsBox.speculative?.readSink ?? seatsBox.concurrent?.readSink ?? null,
+      ...(reviewModel ? { reviewModel } : {}) });
     if (seatsBox.speculative) seatsBox.speculative.loopFinishedAt = io.now();
     timings.loopMs = io.now() - tL;
     const parsed = parseReviewLoopStdout(loop.stdout);
@@ -1629,6 +1633,8 @@ function runReviewArc({
  *   logPath:string, skipped?:string}}
  */
 export function dispatchReviewJob({
+  careLevel = 'none', scopePaths = [], escalationReason = [],
+  leaseHeld = () => true,
   ciGate = readReviewCiGate, advisoryCiWaiver = null, redTeamOnly = false, redTeamMode = 'fresh',
   pr, repo, preferLane = null, root = REPO_ROOT, env = process.env, now = Date.now(), checkStaleness,
   dir = reviewJobsDir(env, root),
@@ -1637,7 +1643,11 @@ export function dispatchReviewJob({
   resolveSettingsEnv = () => resolveGhShimSettingsEnv(undefined, { env }),
   isAlive = pidAlive,
   checkoutExists = existsSync, home = homedir(), expectedHead, io = createReviewJobIo({ root, env }),
+  ...unsupported
 } = {}) {
+  if (Object.keys(unsupported).length) throw Error(`unsupported review job option: ${Object.keys(unsupported).join(', ')}`);
+  const tier = workerTierFor({ kind: 'review', scopePaths,
+    risk: careLevel === 'high' || careLevelFromReasons(escalationReason) === 'high' ? 'high' : undefined }).tier;
   const refusal = expectedHeadRefusal(expectedHead, { pr, repo }, io, { required: true });
   if (refusal) return { pr, repo, ...refusal };
   const planned = planReviewDispatch({ pr, repo, checkoutExists, home });
@@ -1672,8 +1682,10 @@ export function dispatchReviewJob({
   // job mints its own per round.
   delete childEnv[ACTOR_ENV];
   mkdirSync(dir, { recursive: true });
+  if (leaseHeld() !== true) throw Error('dispatch lease lost');
   const jobPid = spawnJob({
     argv: [THIS_FILE, 'run', `--pr=${planned.pr}`, `--repo=${planned.repo}`,
+      ...(tier === 'opus' ? ['--review-model=opus'] : []),
       ...(redTeamOnly ? [`--red-team-only=${redTeamMode}`] : []),
       ...(expectedHead === undefined ? [] : [`--expected-head=${expectedHead}`]),
       ...(Number.isInteger(preferLane) && preferLane > 0 ? [`--prefer-lane=${preferLane}`] : [])], cwd: root, env: childEnv, logPath,
@@ -1704,7 +1716,7 @@ export function defaultSpawnJob({ argv, cwd, env, logPath }, { spawnChild = spaw
  * {@link REVIEW_DISPATCH_MODE_ENV}`=session` asks for it.
  */
 // Under test the stack check is inert unless a test injects one: the default reads `gh` and the network.
-export function dispatchReviewByMode({ mode = resolveReviewDispatchMode(), stackCheck = isUnderTest() ? () => ({ base: null }) : checkStackBeforeReview, ...opts } = {}) {
+export function dispatchReviewByMode({ strictStackEvidence = false, mode = resolveReviewDispatchMode(), stackCheck = isUnderTest() ? () => ({ base: null }) : checkStackBeforeReview, ...opts } = {}) {
   // Refuse before stack effects; dispatchReview also checks admission for its direct callers.
   if (mode === 'session') {
     const refusal = expectedHeadRefusal(opts.expectedHead, { pr: opts.pr, repo: opts.repo },
@@ -1714,8 +1726,9 @@ export function dispatchReviewByMode({ mode = resolveReviewDispatchMode(), stack
   // Held item 177 — a stacked top whose accept is recorded against its stack base is HELD (no review until the
   // bottom lands) or, once the stack collapsed with an identical net diff, CARRIED. Either way nothing is dispatched.
   let stack = null;
-  try { stack = stackCheck({ pr: opts.pr, repo: opts.repo, root: opts.root ?? REPO_ROOT, env: opts.env ?? process.env }); }
-  catch { stack = null; }
+  try { stack = stackCheck({ pr: opts.pr, repo: opts.repo, root: opts.root ?? REPO_ROOT, env: opts.env ?? process.env, strict: strictStackEvidence }); }
+  catch (error) { if (strictStackEvidence) throw error; stack = null; }
+  if (strictStackEvidence && (!stack || (!Object.hasOwn(stack, 'base') && !stack.skipped))) throw Error('stack evidence unknown');
   if (stack?.skipped) return { mode, pr: opts.pr, repo: opts.repo, skipped: stack.skipped };
   const named = (r) => (stack?.base && r && !r.skipped
     ? { ...r, mode: `${r.mode ?? mode} against stack base #${stack.base.pr} (${stack.base.ref}@${stack.base.contained.slice(0, 9)})` }
@@ -1735,8 +1748,8 @@ const STACK_CARRY_FINGERPRINT = /^[0-9a-f]{64}$/;
  * FAILS OPEN: any read error dispatches the review as before. Only the Web Everything repo (the clone this runs in).
  * @returns {{skipped?:string, base?:object|null}}
  */
-export function checkStackBeforeReview({ pr, repo, root = REPO_ROOT, env = process.env,
-  readStack = (n) => readStackBase({ pr: n, root, env }),
+export function checkStackBeforeReview({ pr, repo, strict = false, root = REPO_ROOT, env = process.env,
+  readStack = (n) => readStackBase({ pr: n, root, env, strict }),
   readThread = (n) => readStackThread(n, { repo, root }),
   stackText = (base) => stackNetDiffText({ tree: base.tree, topHead: base.topHead, root }),
   mainText = (pin) => mainNetDiffText(pin, { root }),
@@ -1746,7 +1759,8 @@ export function checkStackBeforeReview({ pr, repo, root = REPO_ROOT, env = proce
   if (!resolveStackAwareReview(env) || repoKeyForSlug(repo) !== 'we') return { base: null };
   const base = readStack(pr);
   let thread = null;
-  try { thread = readThread(pr); } catch { thread = null; }
+  try { thread = readThread(pr); } catch (error) { if (strict) throw error; thread = null; }
+  if (strict && !Array.isArray(thread?.comments)) throw Error('stack thread unreadable');
   const comments = Array.isArray(thread?.comments) ? thread.comments : [];
   if (base) log(`review-job: ${repo}#${pr} is stacked on #${base.pr} — its review reads the diff against ${base.ref}@${base.contained.slice(0, 9)} (the bottom's head), not main`);
   if (!liveStackMarkers(comments).some((m) => m.top === Number(pr))) return { base };
@@ -1758,6 +1772,7 @@ export function checkStackBeforeReview({ pr, repo, root = REPO_ROOT, env = proce
     // below is bound to that same commit and fingerprint.
     try { const net = mainText({ headRefName: thread.headRefName, headRefOid: thread.headRefOid }); mainFingerprint = net?.scored ? fingerprintOf(net.text) : null; } catch { mainFingerprint = null; }
   }
+  if (strict && ((base && !stackFingerprint) || (!base && !mainFingerprint))) throw Error('stack fingerprint unreadable');
   // The bottom is read only for a PR that would otherwise carry (collapsed stack, identical own diff): a bottom that
   // moved after the accept must be reviewed again, whatever the top's own diff says.
   let bottomLanded = null;
@@ -1765,12 +1780,14 @@ export function checkStackBeforeReview({ pr, repo, root = REPO_ROOT, env = proce
   if (!base && latest && mainFingerprint && mainFingerprint === latest.fingerprint) {
     try { bottomLanded = readBottom(latest); } catch (e) { bottomLanded = { ok: false, why: `the landing could not be read (${String(e?.message ?? e).slice(0, 120)})` }; }
   }
+  if (strict && !base && latest && mainFingerprint === latest.fingerprint && bottomLanded?.ok !== true) throw Error('stack bottom evidence unreadable');
   const decision = decideStackDispatch({ pr, stack: base, comments, stackFingerprint, mainFingerprint, bottomLanded });
   if (decision.action === 'review' && decision.why) log(`review-job: ${repo}#${pr} ${decision.why} — reviewing as usual`);
   if (decision.action === 'held') return { base, skipped: decision.why };
   if (decision.action === 'carry') {
     const done = carry(pr, { ...decision, head: thread.headRefOid, fingerprint: mainFingerprint });
     if (done?.ok) { log(`review-job: ${repo}#${pr} ${decision.why} — accept carried forward`); return { base, skipped: decision.why }; }
+    if (strict) throw Error('stack accept carry failed');
     log(`review-job: ${repo}#${pr} stack-accept carry failed (${done?.error ?? 'unknown'}) — reviewing as usual`);
   }
   return { base };
@@ -1844,6 +1861,8 @@ export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runRevi
     try {
       if (rest.some(arg => arg === '--red-team-plan' || arg.startsWith('--red-team-plan='))) throw Error('removed --red-team-plan; recovery is decided by the job');
       const lane = Number(flag('prefer-lane'));
+      const reviewModel = flag('review-model');
+      if (reviewModel !== undefined && reviewModel !== 'opus') throw Error('unsupported review model');
       // Bare legacy flag selects recovery automatically; explicit modes stay strict.
       const redTeamMode = flag('red-team-only') ?? (rest.includes('--red-team-only') ? 'auto' : 'fresh');
       const redTeamOnly = rest.includes('--red-team-only') || flag('red-team-only') !== undefined;
@@ -1854,6 +1873,7 @@ export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runRevi
         return;
       }
       const out = runJob({ pr: flag('pr'), repo: flag('repo'), redTeamOnly, redTeamMode, onSessionSlug,
+        ...(reviewModel ? { reviewModel } : {}),
         ...(flag('expected-head') === undefined ? {} : { expectedHead: flag('expected-head') }),
         preferLane: Number.isInteger(lane) && lane > 0 ? lane : null });
       onSessionSlug?.(out.sessionSlug);

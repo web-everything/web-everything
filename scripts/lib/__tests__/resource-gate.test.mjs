@@ -350,6 +350,10 @@ describe('dynamic fixer cap', () => {
       expect(d).toMatchObject({ admit: false, signal: 'mem-floor' });
       expect(d.why).toMatch(/stale|snapshot/i);
     });
+    it('refuses a reversed snapshot (freshUntil before sampledAt)', () => {
+      const d = mk(() => ({ ...snap(), sampledAt: new Date(NOW).toISOString(), freshUntil: new Date(NOW - 1000).toISOString() })).tryAdmit('fix');
+      expect(d).toMatchObject({ admit: false, signal: 'mem-floor' });
+    });
     it('R559 refuses a future sampledAt beyond the clock skew, admits within it', () => {
       const at = (offMs) => ({ sampledAt: new Date(NOW + offMs).toISOString(), freshUntil: new Date(NOW + offMs + 15000).toISOString() });
       expect(mk(() => ({ ...snap(), ...at(86400000) })).tryAdmit('fix')).toMatchObject({ admit: false, signal: 'mem-floor' });

@@ -348,7 +348,7 @@ describe('same-head holds with no referral finding (#7012)', () => {
     ['missing comments', undefined, {}, /thread is unreadable/],
     ['non-array comments', {}, {}, /thread is unreadable/],
     ['comments at the list cap', Array.from({ length: GH_LIST_COMMENT_CAP }, () => advisory), {}, /may be truncated/, { commentsComplete: false }, 'thread-truncated'],
-    ['comments above the list cap', Array.from({ length: GH_LIST_COMMENT_CAP + 1 }, () => advisory), {}, /may be truncated/, { commentsComplete: false }],
+    ['comments above the list cap', Array.from({ length: GH_LIST_COMMENT_CAP + 1 }, () => advisory), {}, /may be truncated/, { commentsComplete: false }, 'thread-truncated'],
     ['malformed referral', [...comments, { ...advisory, body: '<!-- mandatory-referrals-v1: broken -->' }], {}, /malformed/],
     ['pending referral', [...comments, recordComment({ rulings: [], carried: [], superseded: [] })], {}, /no readable ruling/],
     ['referral-kind hold without records', comments, { kind: 'referral' }, /no referral record names/],

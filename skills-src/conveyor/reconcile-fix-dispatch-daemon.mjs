@@ -1699,6 +1699,7 @@ export function formatRefusalLine(label, r) {
 /** ONE printable line per draft the promote half un-drafted (`gh pr ready`), the success half of "log every
  *  promote outcome" (live incident 2026-10-03, PR #3806). Mirrors {@link formatRefusalLine}'s shape. */
 export function formatPromoteActionLine(d) {
+  if (d?.kind === 'rearm-no-code') return `reconcile-fix-dispatch-daemon: re-armed ${d?.repo ?? '?'} PR #${d?.pr ?? '?'} (rearm-no-code) — operator ruling, no fix agent`;
   if (d?.kind === 'close-superseded') {
     return `reconcile-fix-dispatch-daemon: closed ${d?.repo ?? '?'} PR #${d?.pr ?? '?'} as superseded — operator disposition (close-superseded), no fix agent`;
   }

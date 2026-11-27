@@ -4,6 +4,8 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
 export const BUILT_IN_VERIFY_SETTINGS = Object.freeze({
+  // Shared greens soak in shadow mode until explicitly enabled by policy.
+  sharedGreenReuse: false,
   relatedMode: 'all', testTimeoutFactor: 3, standards: 'always', phaseAdmission: true, fastTargets: 5,
   // #66 — a dispatched child recognizes the requester's default gate under any declared settings variant.
   matchRequestVariants: true,
@@ -70,6 +72,7 @@ export function defaultVerifySettingsPath() {
 }
 
 const rules = {
+  sharedGreenReuse: value => typeof value === 'boolean',
   shardMinTests: value => Number.isSafeInteger(value) && value >= 0,
   shardSize: value => Number.isSafeInteger(value) && value >= 1,
   shardParallel: value => Number.isSafeInteger(value) && value >= 1,
@@ -99,6 +102,7 @@ const rules = {
     && value.every(f => typeof f === 'string' && /^(?:\.\/)?[\w@][\w./@-]*\.test\.[cm]?[jt]sx?$/.test(f) && !f.split('/').includes('..')),
 };
 const envKeys = {
+  sharedGreenReuse: 'WE_VERIFY_SHARED_GREEN_REUSE',
   shardMinTests: 'WE_VERIFY_SHARD_MIN_TESTS', shardSize: 'WE_VERIFY_SHARD_SIZE', shardParallel: 'WE_VERIFY_SHARD_PARALLEL',
   relatedMode: 'WE_VERIFY_RELATED', testTimeoutFactor: 'WE_VERIFY_TEST_TIMEOUT_FACTOR',
   standards: 'WE_VERIFY_STANDARDS', phaseAdmission: 'WE_VERIFY_PHASE_ADMISSION', fastTargets: 'WE_VERIFY_FAST_TARGETS',
@@ -110,7 +114,7 @@ const envKeys = {
   revertRed: 'WE_VERIFY_REVERT_RED', revertRedSince: 'WE_VERIFY_REVERT_RED_SINCE', revertRedMaxFiles: 'WE_VERIFY_REVERT_RED_MAX_FILES',
   selection: 'WE_VERIFY_SELECTION', phaseTimeoutMs: 'WE_VERIFY_PHASE_TIMEOUT_MS', slotHeartbeatMs: 'WE_VERIFY_SLOT_HEARTBEAT_MS',
 };
-const booleanKeys = new Set(['phaseAdmission', 'matchRequestVariants', 'runAllPhases', 'skipLocalForCardOnly']);
+const booleanKeys = new Set(['sharedGreenReuse', 'phaseAdmission', 'matchRequestVariants', 'runAllPhases', 'skipLocalForCardOnly']);
 // Preserve which keys survived validation without adding configuration keys to the file shape.
 const fileKeys = new WeakMap();
 

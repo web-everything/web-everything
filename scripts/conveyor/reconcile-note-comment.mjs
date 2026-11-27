@@ -80,6 +80,7 @@ export const INFO_NOTE_COMMENT_MARKER = 'ℹ️ conveyor — note';
  */
 export function noteEpisodeKey(note) {
   const pr = note?.prNumber ?? 'unknown';
+  if (note?.kind === 'landing-holder-stuck') return `landing-holder-stuck:${pr}:${note.holderHead ?? 'unknown-head'}`;
   if (note?.kind === 'ci-heal-exhausted') return `ci-heal-exhausted:${pr}:${note.attempts}/${note.cap}`;
   if (note?.kind === 'awaiting-permission') {
     return `awaiting-permission:${pr}:${note.sessionId ?? note.pid ?? 'unknown-session'}`;
@@ -114,6 +115,7 @@ export function noteEpisodeKey(note) {
  * @returns {string}
  */
 export function noteHeadline(note) {
+  if (note?.kind === 'landing-holder-stuck') return 'needs your decision: a landing PR has held conflicting fixes past the aging bound';
   if (note?.kind === 'ci-heal-exhausted') return 'needs your decision: fix attempts exhausted';
   if (note?.kind === 'awaiting-permission') return 'needs your decision: a session is blocked on a permission prompt';
   if (note?.kind === 'round-cap-exhausted') return 'needs your decision: auto-repair rounds exhausted';

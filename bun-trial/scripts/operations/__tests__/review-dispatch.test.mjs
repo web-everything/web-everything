@@ -48,6 +48,7 @@ const GREEN_CI = () => ({ allowed: true, headSha: 'a'.repeat(40) });
 const dispatchReview = options => realDispatchReview({ expectedHead: 'a'.repeat(40),
   io: { liveHead: () => 'a'.repeat(40) }, ...options });
 const FRESH = () => ({ fresh: true, behind: 0 });
+const SESSION_PIN = JSON.stringify({ pr: 1234, repo: 'web-everything/web-everything', head: 'a'.repeat(40) });
 
 const REAL_TEMPLATE_STUB = [
   '# brief for {{PR}} in {{REPO}}',
@@ -155,13 +156,15 @@ describe('dispatchReview — the composition: plan → fill → mint → spawn',
       // #3331 — no `--session-id`: `claude --bg` discards it and assigns its own id.
       '--bg',
       '-n', 'review-1234',
-      '--settings', JSON.stringify({ env: { WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' } }), // xgqz204 — the worker marker, always
+      '--settings', JSON.stringify({ env: { WE_REVIEW_SESSION_PIN: SESSION_PIN, WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' } }),
       '--append-system-prompt-file', REVIEW_DISPATCH_SYSTEM_PROMPT_FILE,
       '--effort', 'high', '--model', 'sonnet',
       ...DISALLOWED_TOOLS_ARGV,
       '# brief for 1234 in web-everything/web-everything\n'
       + 'acquire: node scripts/lane-pool.mjs acquire --session=review-1234\n'
-      + 'this brief documents {{LIKE_THIS}} as an example convention, not a real token',
+      + 'this brief documents {{LIKE_THIS}} as an example convention, not a real token'
+      + `\n\nPINNED HEAD: ${'a'.repeat(40)}. Before running review-loop-cli and again before any verdict write, `
+      + `read the live head of web-everything/web-everything#1234; if it is not exactly ${'a'.repeat(40)}, exit without reviewing.\n`,
     ]);
 
     expect(result.sessionId).toBe('11111111-1111-4111-8111-111111111111');
@@ -209,10 +212,10 @@ describe('dispatchReview — the composition: plan → fill → mint → spawn',
     // #4174 — the session's OWN cwd (a scratch dir, never `root` any more).
     expect(resolveSettingsEnv).toHaveBeenCalledWith(dispatchSessionCwd('11111111-1111-4111-8111-111111111111', { root: '/repo' }));
     expect(calls[0].argv).toContain('--settings');
-    expect(calls[0].argv[calls[0].argv.indexOf('--settings') + 1]).toBe(JSON.stringify({ env: { PATH: '/shim:/usr/bin', WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' } }));
+    expect(calls[0].argv[calls[0].argv.indexOf('--settings') + 1]).toBe(JSON.stringify({ env: { PATH: '/shim:/usr/bin', WE_REVIEW_SESSION_PIN: SESSION_PIN, WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' } }));
   });
 
-  it('#x8mpubm follow-up — resolveSettingsEnv returning null (the real default, unconfigured host) emits no --settings at all', () => {
+  it('null shim settings retain the worker marker and admitted session head', () => {
     const calls = [];
     dispatchReview({ ciGate: GREEN_CI,
       pr: 1234,
@@ -224,7 +227,7 @@ describe('dispatchReview — the composition: plan → fill → mint → spawn',
       checkStaleness: FRESH,
       resolveSettingsEnv: () => null,
     });
-    expect(calls[0].argv[calls[0].argv.indexOf('--settings') + 1]).toBe(JSON.stringify({ env: { WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' } })); // xgqz204
+    expect(calls[0].argv[calls[0].argv.indexOf('--settings') + 1]).toBe(JSON.stringify({ env: { WE_REVIEW_SESSION_PIN: SESSION_PIN, WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' } }));
   });
 
   it('refuses to dispatch from inside a lane checkout, same guard dispatch-lane-io.mjs uses', () => {
@@ -266,14 +269,16 @@ describe('dispatchReview — the composition: plan → fill → mint → spawn',
       // #3331 — no `--session-id`: `claude --bg` discards it and assigns its own id.
       '--bg',
       '-n', 'review-1234',
-      '--settings', JSON.stringify({ env: { WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' } }), // xgqz204 — the worker marker, always
+      '--settings', JSON.stringify({ env: { WE_REVIEW_SESSION_PIN: SESSION_PIN, WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' } }),
       '--append-system-prompt-file', REVIEW_DISPATCH_SYSTEM_PROMPT_FILE,
       '--effort', 'high', '--model', 'sonnet',
       ...DISALLOWED_TOOLS_ARGV,
       '--permission-mode', 'plan',
       '# brief for 1234 in web-everything/web-everything\n'
       + 'acquire: node scripts/lane-pool.mjs acquire --session=review-1234\n'
-      + 'this brief documents {{LIKE_THIS}} as an example convention, not a real token',
+      + 'this brief documents {{LIKE_THIS}} as an example convention, not a real token'
+      + `\n\nPINNED HEAD: ${'a'.repeat(40)}. Before running review-loop-cli and again before any verdict write, `
+      + `read the live head of web-everything/web-everything#1234; if it is not exactly ${'a'.repeat(40)}, exit without reviewing.\n`,
     ]);
   });
 

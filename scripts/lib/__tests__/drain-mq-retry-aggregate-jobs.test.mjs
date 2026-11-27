@@ -252,3 +252,30 @@ describe('drain.mqAggregateJobs settings contract', () => {
     expect(r.invalid).toEqual([]);
   });
 });
+
+
+describe('integration off branch P is classified as today', () => {
+  it('ordinary path: a failed integration beside a failed integration-part keeps today’s derived set, log reads and rerun eligibility (exact calls)', () => {
+    const checks = [check(21, 'CI / integration-part (parallel)'), check(24, 'CI / integration')];
+    const f = fixture({ checks });
+    expectHold(f.guard());
+    expect(f.jobReads).toEqual([]);
+    expect(f.logReads.map(r => r.id)).toEqual([9021, 9024]);
+    expect(f.exec.mock.calls.map(([, args]) => args.find(a => a.startsWith(`repos/${repo}/`))).filter(Boolean)).toEqual([
+      `repos/${repo}/commits/${commit}/check-runs?filter=all&per_page=100&page=1`,
+      `repos/${repo}/actions/jobs/9021/logs`, `repos/${repo}/actions/jobs/9024/logs`,
+      `repos/${repo}/actions/workflows/ci.yml/runs?branch=main&event=push&per_page=100`,
+      `repos/${repo}/actions/workflows/ci.yml/runs?branch=main&event=push&status=completed&created=<2026-11-01T13:45:00.000Z&per_page=100`,
+    ]);
+    expect(f.exec.mock.calls.some(([, args]) => args.includes('POST'))).toBe(false);
+  });
+  it('regroup: cancelled parts plus a failed integration hold as today', () => {
+    const f = fixture({ checks: [{ ...check(21, 'CI / integration-part (parallel)'), conclusion: 'cancelled' }, check(24, 'CI / integration')] });
+    expectHold(f.guard());
+    expect(f.jobReads).toEqual([]);
+    expect(f.logReads.map(r => r.id)).toEqual([9024]);
+  });
+  it('drain.mqAggregateJobs default is still test and coverage-merge', () => {
+    expect(readDrainQueueSafety({ env: {}, tool: {}, platform: {} }).value.mqAggregateJobs).toEqual(['test', 'coverage-merge']);
+  });
+});

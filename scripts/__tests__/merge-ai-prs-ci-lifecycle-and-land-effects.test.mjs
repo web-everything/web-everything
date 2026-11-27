@@ -621,6 +621,8 @@ describe('resolveRepos (#2257/#2287 — the single /drain lander sweeps all 3 co
 describe('siblingCloneName (#2263 — sibling-clone routing for remote-repo rebase-drop)', () => {
   it('a known constellation repo slug → its short directory name', () => {
     expect(siblingCloneName('frontier-ui/frontierui')).toBe('frontierui');
+    expect(siblingCloneName('chalbert/frontierui')).toBe('frontierui');
+    expect(siblingCloneName('frontierui')).toBe('frontierui');
     expect(siblingCloneName('plateauapp/plateau-app')).toBe('plateau-app');
     expect(siblingCloneName('web-everything/web-everything')).toBe('web-everything');
   });

@@ -13,7 +13,7 @@ export default {
   ] },
   fixPresent(root) {
     const result = spawnSync(process.execPath, ['--input-type=module', '-e',
-      "import { probeRebuildEvidence, probeStalePinnedReady, probeTickCompatibility, probeNullableRollback, probeLegacyReadyAdmission } from './scripts/conveyor/soak/fixtures/rebuild-evidence-probe.mjs'; const legacy = await Promise.all(['candidate', 'fallback'].map(probeLegacyReadyAdmission)); const r = await probeRebuildEvidence(); const s = await probeStalePinnedReady(); const a = await probeStalePinnedReady({ auditedOnly: true }); const t = await probeTickCompatibility(); const w = await probeNullableRollback(); process.exit(legacy.every(r => r.adopted && r.forced === false && r.preserved && r.jobs === 0 && r.reattachments === 0) && w.head === w.good && !w.errors.length && w.watch === null && !t.violations.length && r.changed === 'rebuild-job-started' && r.consumedReason === 'no-result' && s.adopted && s.discarded && s.readyCleared && s.freshHead && s.smokes === 1 && a.adopted && !a.discarded && a.readyCleared && !a.freshHead && a.smokes === 0 && a.heldTipExcluded ? 0 : 1);"],
+      "import b from './scripts/conveyor/soak/breaks/rebuild-evidence-compatibility.mjs'; process.exit(b.judge(await b.run()).length ? 1 : 0);"],
     { cwd: root, encoding: 'utf8', timeout: 30_000, maxBuffer: 65536 });
     return result.status === 0;
   },
@@ -22,10 +22,13 @@ export default {
       const result = await probeRebuildEvidence();
       const stale = await probeStalePinnedReady();
       const audited = await probeStalePinnedReady({ auditedOnly: true });
+      const moved = await probeStalePinnedReady({ fastForward: true });
       const tick = await probeTickCompatibility();
       const rollback = await probeNullableRollback();
       const legacy = await Promise.all(['candidate', 'fallback'].map(probeLegacyReadyAdmission));
-      return { result, stale, audited, tick, rollback, legacy, violations: [...tick.violations,
+      return { result, stale, audited, moved, tick, rollback, legacy, violations: [...tick.violations,
+        ...(moved.adopted && !moved.discarded && moved.readyCleared && !moved.freshHead && moved.smokes === 0 && moved.heldTipExcluded
+          ? [] : ['fast-forwarded pin blocked persisted ready adoption or repeated smoke']),
         ...(legacy.every(r => r.adopted && r.forced === false && r.preserved && r.jobs === 0 && r.reattachments === 0)
           ? [] : ['legacy ready record without forced blocked tick adoption']),
         ...(rollback.head === rollback.good && rollback.resets.length === 1 && rollback.errors.length === 0
