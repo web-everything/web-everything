@@ -6759,3 +6759,19 @@ plus its tested guards. It composes with [#deterministic-core-thin-judgment](#de
 writers to `main` keep no unlocked fallback.
 
 **Lineage:** `#4219`.
+
+### Delegated clear-human: required checks present (ADM-REVIEW-GATE-PIN slice 1)
+
+Delegated clear-human counts checks as passing only when every required check is present and green; a
+merge-gate or review-gate row never counts toward that, in any state. Adding or removing a review-gate
+row must leave the eligibility result and refusal reasons unchanged.
+
+The required names come from `DECLARED_REQUIRED_STATUS_CHECKS[repo]` in
+`scripts/lib/required-status-checks.mjs`; `evaluateEligibility` accepts an explicit `requiredChecks` list.
+A missing, non-array or empty list, a non-string or blank name, or a merge-gate/review-gate name
+(case-insensitive) refuses with `required check list invalid`. A missing required name refuses with
+`required check <name> missing`. Names use `name || context`; verdicts use `conclusion || state`.
+Green means SUCCESS, NEUTRAL or SKIPPED, case-insensitive. Any other verdict on any non-hold row
+refuses with `check <name> is <verdict>`, including a superseded failure beside a newer success of the
+same name. That conservative refusal may defer a clearance until the stale row leaves the rollup.
+Other eligibility conditions, modes and the sanctioned writer remain unchanged.
