@@ -35,7 +35,9 @@ import { resolveOperation } from '../operations/run.mjs';
 import { runOperationCli } from '../operations/cli-adapter.mjs';
 import { createMemoryRunStore } from '../operations/run-store.mjs';
 
-const namedSuitesCommand = `npx vitest run ${JSON.parse(readFileSync(resolve(process.cwd(), 'scripts/verify-settings.json'), 'utf8')).alwaysRunTests.slice().sort().map(shellQuote).join(' ')} --passWithNoTests`;
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+
+const namedSuitesCommand = `npx vitest run ${JSON.parse(readFileSync(resolve(REPO_ROOT, 'scripts/verify-settings.json'), 'utf8')).alwaysRunTests.slice().sort().map(shellQuote).join(' ')} --passWithNoTests`;
 
 // Selection fixtures explicitly opt into the related-selection policy.
 beforeEach(() => {
@@ -44,7 +46,7 @@ beforeEach(() => {
 });
 afterEach(() => vi.unstubAllEnvs());
 
-const VERIFY_LANE = resolve(process.cwd(), 'scripts/verify-lane.mjs');
+const VERIFY_LANE = resolve(REPO_ROOT, 'scripts/verify-lane.mjs');
 const OTHER_SHA = 'b'.repeat(40); // "Y" — the sha the overlapping run's marker belongs to (never this HEAD)
 
 function seedVerifyServer(root, options = {}) {
@@ -397,8 +399,8 @@ describe('verify-lane — slot heartbeat while the gate runs (verify-admission, 
     // Before: no refresh, so heartbeatAt stayed at acquire time and the lease expired under a long gate.
     const samples = join(dir, 'samples.json');
     const gateScript = join(dir, 'sample.mjs');
-    const admissionModule = resolve(process.cwd(), 'scripts/readiness/heavy-admission.mjs');
-    const locksModule = resolve(process.cwd(), 'scripts/readiness/file-locks.mjs');
+    const admissionModule = resolve(REPO_ROOT, 'scripts/readiness/heavy-admission.mjs');
+    const locksModule = resolve(REPO_ROOT, 'scripts/readiness/file-locks.mjs');
     writeFileSync(gateScript, `import { writeFileSync } from 'node:fs';
 import { admissionLockRoot, slotPath } from ${JSON.stringify(admissionModule)};
 import { readLockEntry } from ${JSON.stringify(locksModule)};
@@ -1658,7 +1660,7 @@ describe('local timeout-only retry under admission', () => {
     if (scan) { mkdirSync(join(dir, 'scripts/lib/__tests__'), { recursive: true }); writeFileSync(join(dir, scanTest), '// scanner\n'); }
     for (const file of files) writeFileSync(join(dir, file), live ? `
 import './source.mjs';
-import { it } from ${JSON.stringify(resolve(process.cwd(), 'node_modules/vitest/dist/index.js'))};
+import { it } from ${JSON.stringify(resolve(REPO_ROOT, 'node_modules/vitest/dist/index.js'))};
 import { existsSync, writeFileSync } from 'node:fs';
 it('first attempt times out', async () => {
   const attempt = ${JSON.stringify(file + '.attempt')};
@@ -1674,18 +1676,18 @@ it('first attempt times out', async () => {
     mkdirSync(join(dir, 'tmp'));
     if (live || liveGuard !== null) writeFileSync(join(dir, 'vitest.config.mjs'), 'export default { test: { environment: "node", include: ["*.test.mjs"] } };\n');
     writeFileSync(join(dir, 'package.json'), JSON.stringify({ type: 'module', scripts: { 'test:unit': 'node scripts/readiness/heavy-admission.mjs run -- vitest run', 'check:standards': 'true' } }));
-    const admissionModule = resolve(process.cwd(), 'scripts/readiness/heavy-admission.mjs');
+    const admissionModule = resolve(REPO_ROOT, 'scripts/readiness/heavy-admission.mjs');
     // Stub commands exit immediately too; drain their pipe writes before exiting.
     const fake = `#!/usr/bin/env node
 import { appendFileSync, writeFileSync } from 'node:fs';
 import { admissionLockRoot, heldSlots } from ${JSON.stringify(admissionModule)};
-import { writeAllSync } from ${JSON.stringify(resolve(process.cwd(), 'scripts/lib/write-all-sync.mjs'))};
+import { writeAllSync } from ${JSON.stringify(resolve(REPO_ROOT, 'scripts/lib/write-all-sync.mjs'))};
 const args = process.argv.slice(2);
 const held = heldSlots({ lockRoot: admissionLockRoot(process.cwd()), cap: 1, fastSlots: 1 });
 appendFileSync('calls.jsonl', JSON.stringify({ args, held, inherited: process.env.WE_HEAVY_ADMISSION_HELD, nonce: process.env.WE_VERIFY_MARKER_NONCE ?? null, scanFiles: process.env.VERIFY_SCAN_FILES ?? null, scanRoot: process.env.VERIFY_SCAN_ROOT ?? null }) + '\\n');
 if (args[0] === 'vitest' && (${live} || (${liveGuard !== null} && args.includes('guard.test.mjs')))) {
   const { spawnSync } = await import('node:child_process');
-  const result = spawnSync(process.execPath, [${JSON.stringify(resolve(process.cwd(), 'node_modules/vitest/vitest.mjs'))}, ...args.slice(1), ...(!args.includes('--maxWorkers=1') ? ['--maxWorkers=1', '--minWorkers=1'] : [])], { stdio: 'inherit', timeout: 20000, killSignal: 'SIGKILL' });
+  const result = spawnSync(process.execPath, [${JSON.stringify(resolve(REPO_ROOT, 'node_modules/vitest/vitest.mjs'))}, ...args.slice(1), ...(!args.includes('--maxWorkers=1') ? ['--maxWorkers=1', '--minWorkers=1'] : [])], { stdio: 'inherit', timeout: 20000, killSignal: 'SIGKILL' });
   if (result.error) throw result.error;
   if (result.signal) throw new Error('live Vitest terminated: ' + result.signal);
   if (!Number.isInteger(result.status)) throw new Error('live Vitest returned no exit status');
@@ -1827,8 +1829,8 @@ process.exit(${standardsExit});
   });
 
   function idleFallbackEnv({ timeout = false, standardsExit = 0, scripts = { 'test:unit': 'true' } } = {}) {
-    const saturationUrl = pathToFileURL(resolve(process.cwd(), 'scripts/lib/verify-ci-only.mjs')).href;
-    const admissionUrl = pathToFileURL(resolve(process.cwd(), 'scripts/readiness/heavy-admission.mjs')).href;
+    const saturationUrl = pathToFileURL(resolve(REPO_ROOT, 'scripts/lib/verify-ci-only.mjs')).href;
+    const admissionUrl = pathToFileURL(resolve(REPO_ROOT, 'scripts/readiness/heavy-admission.mjs')).href;
     const loader = join(dir, 'fallback-loader.mjs');
     writeFileSync(loader, `
 export async function load(url, context, nextLoad) {
@@ -2315,7 +2317,7 @@ export async function load(url, context, nextLoad) {
       ['one passing assertion', "it('guard', () => { expect(true).toBe(true); });", true, true],
       ['one failing assertion', "it('guard', () => { expect(true).toBe(false); });", true, false],
     ])('actual Vitest JSON for %s flows through the guard consumer and terminal marker', (_, source, executed, green) => {
-      const liveGuard = source ? `import { it, expect } from ${JSON.stringify(resolve(process.cwd(), 'node_modules/vitest/dist/index.js'))};\n${source}\n` : '';
+      const liveGuard = source ? `import { it, expect } from ${JSON.stringify(resolve(REPO_ROOT, 'node_modules/vitest/dist/index.js'))};\n${source}\n` : '';
       const f = fixture({ guard: true, liveGuard });
       const result = f.invoke();
       expect(result.code, result.stdout + result.stderr).toBe(green ? 0 : 2);
@@ -2597,7 +2599,8 @@ describe('verify-lane — unknown subcommands never run the gate', () => {
     `);
     const preferences = join(dir, 'preferences.json');
     writeFileSync(preferences, '{}');
-    env = { ...gateScrubbedEnv(), HOME: dir, TMPDIR: dir, WE_TOOLS_ROOT: '',
+    // Exercise this checkout's CLI, regardless of the host's tooling override.
+    env = { ...gateScrubbedEnv(), HOME: dir, TMPDIR: dir, WE_TOOLS_ROOT_REEXEC: 'fixture',
       WE_PLATFORM_PREFERENCES: preferences, WE_PLATFORM_PREFERENCES_FILE: preferences,
       WE_COORDINATION_ROOT: dir, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_LANE_SESSION: 'fixture-lane' };
   });

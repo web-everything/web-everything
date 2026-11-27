@@ -1423,6 +1423,10 @@ mutations as well as aliased cleanup wrappers imported from outside the owned mo
 
 ### Gates in git fixtures
 
+Resolve suite-owned scripts and settings from `import.meta.url`, not `process.cwd()`, so
+queued Vitest runs can start from a temporary cwd. CLI fixtures that pin local execution
+must set `WE_TOOLS_ROOT_REEXEC`; an empty `WE_TOOLS_ROOT` is an invalid absolute path.
+
 When a publish gate runs the suite that tests its own caller, use a fixture-local npm script in the
 temporary git repo to verify gate arguments and green/red handling without recursively launching the
 suite. Exercise real subprocesses and git transport. Emit gate chatter in the fixture too: a CLI's

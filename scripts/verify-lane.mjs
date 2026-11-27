@@ -127,10 +127,11 @@ const positionals = [];
 if (process.argv.slice(2).some((a) => a === '--help' || a === '-h')) {
   process.stdout.write(`verify-lane — verify a lane clone before it lands (writes the .lane-verify marker).
 
-Usage: node scripts/verify-lane.mjs [verify|request|check|reset|run] [flags]
+Usage: node scripts/verify-lane.mjs [verify|request|check|status|reset|run] [flags]
   (none)    run the diff-selected gate here and stamp the marker
   request   stamp a running marker; the verify daemon runs the gate
   check     read-only verdict for HEAD (--wait=<ms> blocks until it settles)
+  status    alias of check (read-only)
   reset     clear a stale marker
   run       synchronous marker-less run
 Flags: --gate-uncapped (preserve explicit related gate; audited) --repo=<dir> --json --require-verified --dry-run (print default gate only) --help/-h
@@ -138,8 +139,6 @@ Exit: 0 ok, 2 red, 3 usage/refused. Full docs: the header of scripts/verify-lane
 `);
   process.exit(0);
 }
-// Help is side-effect-free; verification freezes identity before parsing, admission or execution.
-const VERIFIER_AT_START = initializeVerifierIdentity();
 for (const a of process.argv.slice(2)) {
   if (a.startsWith('--')) {
     const eq = a.indexOf('=');
@@ -147,6 +146,17 @@ for (const a of process.argv.slice(2)) {
     else flags[a.slice(2, eq)] = a.slice(eq + 1);
   } else positionals.push(a);
 }
+
+// Reject typos before identity discovery, git reads or --dry-run gate selection.
+if (positionals[0] && !['verify', 'request', 'check', 'status', 'reset', 'run'].includes(positionals[0])) {
+  const result = { status: 'error', reason: 'unknown-subcommand',
+    detail: `unknown subcommand ${JSON.stringify(positionals[0])}; use check (or status) for a read-only verdict` };
+  if (flags.json) writeAllSync(1, JSON.stringify(result) + '\n');
+  else process.stderr.write(`verify-lane: ${result.detail}\n`);
+  process.exit(3);
+}
+// Help and usage errors are side-effect-free; accepted commands freeze identity before admission.
+const VERIFIER_AT_START = initializeVerifierIdentity();
 
 const expandHome = (p) => (p && p.startsWith('~') ? join(homedir(), p.slice(1)) : p);
 const REPO = resolve(expandHome(flags.repo) || process.cwd());
@@ -160,7 +170,7 @@ const { requireVerified: REQUIRE_VERIFIED, breakGlass: VERIFY_BREAK_GLASS } = re
 // commands nor any other child we spawn can read it. Later in-band queue markers echo it (see `timedRunGate`).
 const MARKER_NONCE_SUFFIX = markerNonceSuffix(process.env[VERIFY_MARKER_NONCE_ENV]);
 delete process.env[VERIFY_MARKER_NONCE_ENV];
-const MODE = flags['dry-run'] ? 'print-gate' : positionals[0] === 'check' ? 'check' : positionals[0] === 'reset' ? 'reset'
+const MODE = flags['dry-run'] ? 'print-gate' : ['check', 'status'].includes(positionals[0]) ? 'check' : positionals[0] === 'reset' ? 'reset'
   : positionals[0] === 'request' ? 'request' : positionals[0] === 'run' ? 'run' : 'verify';
 
 // The lane is agent-writable, and the fix daemon runs `request` against it: its `.git/config` must never be able to execute
