@@ -99,7 +99,7 @@ export function sharedSmokeIdentity(o) {
   const bindTarget = p => {
     const real = fs.realpathSync(p), checkout = findCheckout(real);
     if (checkout) {
-      if (['.operations', '.conveyor'].includes(relative(fs.realpathSync(checkout), real).split(sep)[0])) fail('runtime-target-ignored');
+      if (relative(fs.realpathSync(checkout), real).split(sep).some(p => p === 'node_modules' || p.startsWith('.'))) fail('runtime-target-ignored');
       return [state(checkout, true), deps(join(checkout, 'node_modules'))];
     }
     const snap = snapshotRoot(real); if (snap) return state(snap);
@@ -129,6 +129,7 @@ export function sharedSmokeIdentity(o) {
     const refresh = o.refresh, minted = refresh?.applied === true && refresh.before && refresh.after && refresh.before.GH_TOKEN !== refresh.after.GH_TOKEN && refresh.after.GH_TOKEN === runEnv.GH_TOKEN;
     const env = pack(Object.keys(runEnv).sort().filter(k => !SHARED_SMOKE_ENV_LOCATION.includes(k) && !(minted && SHARED_SMOKE_ENV_CREDENTIAL.includes(k))).map(k => {
       check(); const v = runEnv[k]; if (typeof v !== 'string') fail('env-value-invalid'); let file = '';
+      if (k === 'NODE_PATH' && v !== '') fail('env-node-path');
       if (/--(?:require|import|(?:experimental-)?loader)|(?:^|\s|["'])-r/.test(v)) fail('env-preload-unbound');
       if (isAbsolute(v)) { const st = maybe(() => fs.statSync(v)); if (st?.isFile()) { if (st.size > 4 * 1024 ** 2) fail('env-file-oversized: run full smoke; inspect input file'); file = digest(read(v)); } }
       return [k, v, file];
@@ -148,10 +149,10 @@ export function sharedSmokeIdentity(o) {
         }
         if (['GH_THROTTLE_CLI', 'REAL_GH_THROTTLE_CLI', 'APP_REFRESH_CLI'].some(k => !targets.has(k))) fail('runtime-shim-layout');
         const urls = new Set([...targets].filter(([k]) => k !== 'CACHE_PATH').map(([, p]) => pathToFileURL(p).href));
-        if (/^\s*import\s+(?!\()/m.test(text)) fail('runtime-shim-import');
-        for (const m of text.matchAll(/\b(?:require|import)\s*\(/g)) {
-          check(); const literal = text.slice(m.index + m[0].length).match(/^\s*("(?:[^"\\]|\\.)*"|'[^'\\]*')\s*\)/); if (!literal) fail('runtime-shim-import');
-          let spec; try { spec = literal[1][0] === '"' ? JSON.parse(literal[1]) : literal[1].slice(1, -1); } catch { fail('runtime-shim-import'); }
+        const calls = [...text.matchAll(/\b(?:require|import)\(("(?:[^"\\]|\\.)*"|'[^'\\]*')\)/g)];
+        if ((text.match(/\b(?:require|import)\b/g) ?? []).length !== calls.length) fail('runtime-shim-import');
+        for (const m of calls) {
+          check(); let spec; try { spec = m[1][0] === '"' ? JSON.parse(m[1]) : m[1].slice(1, -1); } catch { fail('runtime-shim-import'); }
           if (!spec.startsWith('node:') && !urls.has(spec)) fail('runtime-shim-import');
         }
         bound.push([...targets].filter(([k]) => k !== 'CACHE_PATH').sort().map(([k, p]) => [k, bindTarget(p)]));

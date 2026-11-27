@@ -533,6 +533,46 @@ function realRepo(dir, files) {
 }
 
 describe('audit: shared evidence never bypasses current inputs or ownership', () => {
+  it('F1: refuses any non-empty NODE_PATH with env-node-path', () => {
+    expect(f.key()?.key).toMatch(/^[a-f0-9]{64}$/);
+    f.env.NODE_PATH = '';
+    expect(f.key()?.key).toMatch(/^[a-f0-9]{64}$/);
+    const modules = join(base, 'external-modules');
+    write(join(modules, 'extra/index.js'), 'module.exports = 1;');
+    for (const value of [modules, `${modules}:${f.deps}`, 'relative/modules', ':', ' ']) {
+      f.env.NODE_PATH = value;
+      expect(f.key()).toBeNull();
+      expect(f.logs.at(-1)).toContain('"reason":"env-node-path"');
+    }
+  });
+  it('F2: refuses shim targets with any node_modules or dot-prefixed path segment', () => {
+    const { lines } = shim(), path = join(f.bins, 'gh');
+    expect(f.key()?.key).toMatch(/^[a-f0-9]{64}$/);
+    for (const rel of ['node_modules/entry.mjs', 'nested/node_modules/entry.mjs', '.hidden/entry.mjs',
+      'nested/.hidden/entry.mjs', 'nested/.operations/entry.mjs', 'nested/.conveyor/entry.mjs', 'nested/.entry.mjs']) {
+      const target = write(join(f.runningRoot, rel), 'export {};');
+      write(path, lines.map(line => line.startsWith('const GH_THROTTLE_CLI = ')
+        ? `const GH_THROTTLE_CLI = ${JSON.stringify(target)};` : line).join('\n'));
+      expect(f.key()).toBeNull();
+      expect(f.logs.at(-1)).toContain('"reason":"runtime-target-ignored"');
+    }
+  });
+  it('F3: refuses require/import tokens outside exact literal calls', () => {
+    const { lines } = shim(), path = join(f.bins, 'gh');
+    const safe = [...lines, 'const fs = require("node:fs");', 'const url = import("node:url");'].join('\n');
+    write(path, safe);
+    expect(f.key()?.key).toMatch(/^[a-f0-9]{64}$/);
+    for (const extra of ['const load = require; load("unbound-package");',
+      'const load = module.require; load("unbound-package");',
+      'const load = globalThis["require"]; load("unbound-package");',
+      'require/* gap */("node:fs");', 'import/* gap */("node:url");',
+      'require ("node:fs");', 'import ("node:url");',
+      'require( "node:fs");', 'import("node:url" );']) {
+      write(path, safe + '\n' + extra);
+      expect(f.key()).toBeNull();
+      expect(f.logs.at(-1)).toContain('"reason":"runtime-shim-import"');
+    }
+  });
   it('NODE_OPTIONS preload gives null', () => {
     expect(f.key()?.key).toMatch(/^[a-f0-9]{64}$/);
     for (const value of ['--require=fixture', '-r fixture', '-rfixture', '--import=fixture', '--loader fixture', '--experimental-loader=fixture']) {
