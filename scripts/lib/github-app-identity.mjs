@@ -50,6 +50,9 @@ import { platformPreference, logCascadeSources } from './policy-cascade.mjs';
 import { installationMap, remapLegacyInstallationId, ownerOfSlug } from './github-app-installations.mjs';
 
 export const GITHUB_APP_ROLES = Object.freeze(['worker', 'reviewer', 'merger', 'ledger', 'observer']);
+// The steward is an opt-in, isolated identity, outside the legacy five-App cutover fleet.
+export const STEWARD_ROLE = 'steward';
+const IDENTITY_ROLES = Object.freeze([...GITHUB_APP_ROLES, STEWARD_ROLE]);
 export const FALLBACK_ROLE = 'worker';
 export const LEGACY_ROLE = 'legacy';
 export const ROLE_ENV = 'WE_GITHUB_APP_ROLE';
@@ -65,6 +68,7 @@ export const LEGACY_BOT_LOGINS = Object.freeze(['web-everything', 'web-everythin
  * duplicate-pr-watch, health-responder) stay worker: they label, comment or dispatch, which observer cannot.
  */
 export const DEFAULT_CALLER_ROLES = Object.freeze({
+  'ops-steward.mjs': STEWARD_ROLE,
   'merge-ai-prs.mjs': 'merger',
   'pass-daemon.mjs:merge-orphan-sweep': 'merger',
   'review-daemon.mjs': 'reviewer',
@@ -99,10 +103,11 @@ export const ROLE_REQUIRED_PERMISSIONS = Object.freeze({
   merger: Object.freeze({ metadata: 'read', contents: 'write', pull_requests: 'write', issues: 'write', checks: 'read', statuses: 'read', actions: 'read', workflows: 'write' }),
   ledger: Object.freeze({ metadata: 'read', contents: 'write', pull_requests: 'read' }),
   observer: Object.freeze({ metadata: 'read', contents: 'read', pull_requests: 'read', issues: 'read', checks: 'read', statuses: 'read', actions: 'read' }),
+  steward: Object.freeze({ metadata: 'read', contents: 'read', pull_requests: 'write', issues: 'write' }),
 });
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
-const isRole = (r) => GITHUB_APP_ROLES.includes(r);
+const isRole = (r) => IDENTITY_ROLES.includes(r);
 
 /** PURE: a key reference, or null when invalid. Inline key material is never accepted. */
 function normaliseKeyRef(key) {
@@ -182,7 +187,7 @@ export function resolveDeliveryIdentity({ platform = {}, tool = {}, env = {}, pi
   const sources = {};
   // Pinned to none: the platform and repo layers are ignored; an explicit env JSON layer still applies.
   const layers = pinned ? [['env', envLayer.value]] : [['platform', platform], ['tool', tool], ['env', envLayer.value]];
-  for (const role of GITHUB_APP_ROLES) {
+  for (const role of IDENTITY_ROLES) {
     roles[role] = null;
     sources[role] = pinned ? 'pinned-none' : 'standard';
     for (const [name, layer] of layers) {
@@ -264,6 +269,19 @@ function primaryInstallation(installations) {
  */
 export function buildIdentityChain({ requestedRole = FALLBACK_ROLE, identity, env = {}, cachePath }) {
   const id = identity ?? resolveDeliveryIdentity({});
+  if (requestedRole === STEWARD_ROLE) {
+    const app = id.roles?.steward;
+    const keyRef = app && resolveKeyRef(app.key, env);
+    if (!app || !keyRef || id.invalid?.some(s => s.endsWith('.steward'))
+      || GITHUB_APP_ROLES.some(r => id.roles?.[r]?.appId === app.appId)) {
+      throw new Error('steward identity refused; operator must configure a distinct delivery.identity.steward App and key');
+    }
+    const candidate = { role: STEWARD_ROLE, appId: app.appId, installations: app.installations,
+      installationId: primaryInstallation(app.installations), keyRef,
+      privateKeyPath: keyRef.file ?? `keychain:${keyRef.keychain.service}`,
+      cachePath: roleCachePath(cachePath, app.appId), required: ROLE_REQUIRED_PERMISSIONS.steward };
+    return { requestedRole, candidates: [candidate], steps: [{ candidate }], skipped: [], loud: true };
+  }
   // `legacy` asks for today's App itself (the red-team check writer, #6535): no role App may stand in for it.
   const order = requestedRole === LEGACY_ROLE ? [] : requestedRole === FALLBACK_ROLE ? [FALLBACK_ROLE] : [requestedRole, FALLBACK_ROLE];
   const candidates = [];
@@ -300,11 +318,29 @@ export function buildIdentityChain({ requestedRole = FALLBACK_ROLE, identity, en
  */
 export function shimRoleTable({ identity, cachePath }) {
   const out = {};
-  for (const role of GITHUB_APP_ROLES) {
+  for (const role of IDENTITY_ROLES) {
     const app = identity?.roles?.[role];
     if (app) out[role] = { cachePath: roleCachePath(cachePath, app.appId), installations: { ...app.installations } };
   }
   return out;
+}
+
+/** Validate a steward token using a trusted App-token reader, never inherited gh/operator credentials.
+ * readToken must return verified App id, installation, expiry and permissions from the mint/cache authority.
+ */
+export async function stewardToken({ identity, installationId, readToken, now = Date.now }) {
+  const refuse = () => new Error('steward token refused; operator must provision or refresh the scoped App token');
+  const app = identity?.roles?.steward;
+  if (!app || typeof readToken !== 'function' || !Object.values(app.installations).includes(String(installationId))) throw refuse();
+  let receipt;
+  try { receipt = await readToken({ appId: app.appId, installationId: String(installationId), required: ROLE_REQUIRED_PERMISSIONS.steward }); }
+  catch { throw refuse(); }
+  if (!receipt || receipt.appId !== app.appId || receipt.installationId !== String(installationId)
+    || typeof receipt.token !== 'string' || !receipt.token || !Number.isFinite(Date.parse(receipt.expiresAt))
+    || Date.parse(receipt.expiresAt) <= now()
+    || Object.entries(ROLE_REQUIRED_PERMISSIONS.steward).some(([key, level]) =>
+      receipt.permissions?.[key] !== level && !(level === 'read' && receipt.permissions?.[key] === 'write'))) throw refuse();
+  return receipt.token;
 }
 
 /** PURE: `x[bot]` also trusted as `x`; lower-cased, de-duplicated, order kept. */

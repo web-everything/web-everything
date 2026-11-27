@@ -422,6 +422,42 @@ export function publishAttention(item, { path = feedPath(), now = Date.now() } =
     return result;
   });
 }
+/** Combination A producer contract (inert until the scheduler calls it).
+ * One caller-owned path per run/claim/round/stage. readHandler is the trusted registered-handler authority,
+ * not a process-name probe or feed text. The scheduler owns activation and must revalidate this evidence
+ * at successful recording. Publication alone is never an acknowledgement of the handling effect.
+ * Fixed evidence freshness: five minutes. Refusals require operator recovery, never a liveness guess.
+ */
+export async function publishHandlingStage({ stage, path, readStage, readHandler, activate, now = Date.now }) {
+  const refuse = what => new Error(`${what} refused; operator must restore current authorized handler evidence and retry`);
+  const fields = ['run', 'claim', 'round', 'stage', 'head', 'sequence'];
+  const text = value => typeof value === 'string' && value.length > 0 && value.length <= 512 && !/[\p{Cc}\p{Cf}]/u.test(value);
+  if (!stage || !['run', 'claim', 'stage'].every(k => text(stage[k])) || !/^[a-f0-9]{40}$/.test(stage.head ?? '')
+    || !Number.isSafeInteger(stage.round) || stage.round < 1 || !Number.isSafeInteger(stage.sequence) || stage.sequence < 1
+    || typeof readStage !== 'function' || typeof readHandler !== 'function' || typeof activate !== 'function'
+    || typeof path !== 'string' || !path) throw refuse('stage');
+  // Capture before any awaited IO: mutation of the caller's object cannot move the publication scope.
+  const scope = Object.fromEntries(fields.map(k => [k, stage[k]]));
+  const current = async () => {
+    let live; try { live = await readStage(); } catch { throw refuse('stage'); }
+    if (!live || fields.some(k => live[k] !== scope[k]) || live.held === true) throw refuse('stage');
+  };
+  await current();
+  let handler;
+  try { handler = await readHandler(scope); } catch { throw refuse('handler'); }
+  const observed = Date.parse(handler?.observedAt), timestamp = now();
+  if (!handler || handler.registered !== true || handler.authority !== scope.stage || handler.live !== true
+    || !text(handler.handler) || !text(handler.owner) || !Number.isFinite(observed) || !Number.isFinite(timestamp)
+    || timestamp < observed || timestamp - observed > 300000) throw refuse('handler');
+  const evidence = { ...scope, registered: true, handler: handler.handler, authority: handler.authority,
+    owner: handler.owner, live: true, observedAt: new Date(observed).toISOString(), publishedAt: new Date(timestamp).toISOString() };
+  await current();
+  try { mkdirSync(dirname(path), { recursive: true }); writeJsonAtomic(path, evidence); }
+  catch { throw refuse('handler publication'); }
+  await current();
+  await activate(evidence);
+  return evidence;
+}
 export async function main(argv = process.argv.slice(2)) {
   const [verb, ...flags] = argv;
   const settings = resolveSettings(); logSettings(settings);
