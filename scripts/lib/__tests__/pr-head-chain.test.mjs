@@ -37,4 +37,22 @@ describe('PR-HEAD-CHAIN-RECORD', () => {
     expect(lookupPrHead(indexPrHeads([row(), row({ at: '2026-11-26T22:00:00.000Z', authorship: 'human',
       commits: { ...fields.commits, ai: 0, nonAi: [HEAD] } })]), live)?.authorship).toBe('human');
   });
+  it('PR-HEAD-CHAIN-RECORD: loader fails closed on a later malformed human author row', async () => {
+    const { indexPrHeads, loadHeadChainIndex, lookupPrHead } = await import('../pr-head-chain.mjs');
+    const positive = row();
+    const invalidHuman = { ...positive, authorship: 'human' };
+    const live = { repo: positive.repo, pr: 1, ...fields };
+    const alerts = [];
+    const load = rows => {
+      const text = rows.map(r => JSON.stringify(r)).join('\n') + '\n';
+      return loadHeadChainIndex(positive.repo, { path: 'fixture-ledger.jsonl',
+        stat: () => ({ size: Buffer.byteLength(text) }), read: () => text,
+        alert: entry => alerts.push(entry) });
+    };
+    expect(validateLedgerEvent(invalidHuman).valid).toBe(false);
+    expect(lookupPrHead(load([positive]), live)?.authorship).toBe('ai');
+    expect(lookupPrHead(indexPrHeads([positive, invalidHuman]), live)).toBeNull();
+    expect(lookupPrHead(load([positive, invalidHuman]), live)).toBeNull();
+    expect(alerts).toEqual([]);
+  });
 });

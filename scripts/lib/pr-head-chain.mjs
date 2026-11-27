@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { canonicalRepoSlug } from './repo-slug.mjs';
-import { validateLedgerEvent, parseLedgerEvents, verdictLedgerPath, buildLedgerEvent, appendVerdict } from './verdict-ledger.mjs';
+import { validateLedgerEvent, verdictLedgerPath, buildLedgerEvent, appendVerdict } from './verdict-ledger.mjs';
 import { gitRangeCommits } from './git-pr-commits.mjs';
 import { laneGitConfigArgs, scrubInheritedGitEnv } from './lane-git-hardening.mjs';
 import { isAiCommit, isAiGeneratedPr, isMechanicalMergeCommit, isDrainBookkeepingCommit } from './ai-pr-authorship.mjs';
@@ -90,7 +90,10 @@ export function loadHeadChainIndex(repo, { path = headChainLedgerPath(repo), rea
     if (stat(path).size > HEAD_CHAIN_INDEX_MAX_BYTES) throw new Error('index-too-large');
     const text = read(path, 'utf8');
     if (Buffer.byteLength(text) > HEAD_CHAIN_INDEX_MAX_BYTES) throw new Error('index-too-large');
-    return indexPrHeads(parseLedgerEvents(text));
+    // Preserve invalid author rows so indexing can invalidate earlier positive evidence.
+    // Unparseable JSON makes the index unreadable and takes the fail-closed path below.
+    const rows = text.split('\n').filter(line => line.trim()).map(line => JSON.parse(line));
+    return indexPrHeads(rows);
   } catch (error) {
     const reason = error?.code === 'ENOENT' ? 'missing' : error?.message === 'index-too-large' ? 'index-too-large' : 'index-unreadable';
     alert({ kind: reason, repo: canonicalRepoSlug(repo), reason });
