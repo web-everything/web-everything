@@ -432,8 +432,6 @@ describe.each(['sync', 'cli'])('%s closed execution paths', mode => {
 // These children use the real shared mutex. The old writer deliberately knows only the legacy ledger.
 const moduleUrl = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../gh-throttle.mjs')).href;
 const lockUrl = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../../readiness/file-locks.mjs')).href;
-// A cold node child (module graph import) can exceed vitest's 5s default on a loaded shared runner (red main @ 943085234).
-const CHILD_TEST_TIMEOUT_MS = 60_000;
 function child(old, extra = {}) {
   const code = `import { acquireGhPointsSync } from ${JSON.stringify(moduleUrl)};
     import { reserve, releaseLockDir } from ${JSON.stringify(lockUrl)};
@@ -460,20 +458,20 @@ it('interleaved-old-new-processes-compat-respects-legacy', async () => {
   save(bucketFile(), state()); save(legacyFile(), { windowStartMs: clock, spent: 299 });
   expect((await child(true)).ok).toBe(true); expect((await child(false)).ok).toBe(false);
   expect(load(legacyFile()).spent).toBe(300); expect(load(bucketFile()).mode).toBe('compat');
-}, CHILD_TEST_TIMEOUT_MS);
+});
 it('two-processes-never-double-spend', async () => {
   save(bucketFile(), state({ tokens: 31 })); save(legacyFile(), { windowStartMs: clock, spent: 0 });
   const results = await Promise.all([child(false), child(false)]);
   expect(results.filter(r => r.ok)).toHaveLength(1); expect(load(bucketFile()).tokens).toBe(30);
-}, CHILD_TEST_TIMEOUT_MS);
+});
 it('old-timeout-execution-is-not-detectable-from-ledger', async () => {
   save(bucketFile(), state()); save(legacyFile(), { windowStartMs: clock, spent: 300 });
   const before = readFileSync(legacyFile(), 'utf8'); expect(await child(true)).toMatchObject({ ok: false, executed: true });
   expect(readFileSync(legacyFile(), 'utf8')).toBe(before); // Old runGhSync executes anyway; no ledger evidence exists.
-}, CHILD_TEST_TIMEOUT_MS);
+});
 it('old-child-spend-reverts-bucket-mode-at-the-next-decision', async () => {
   save(bucketFile(), state({ mode: 'bucket' })); save(legacyFile(), { windowStartMs: clock, spent: 0 });
   expect((await child(true)).ok).toBe(true);
   acquire({ testOnlyAdoptionCheck: () => true });
   expect(load(bucketFile()).mode).toBe('compat'); expect(load(legacyFile()).spent).toBe(2);
-}, CHILD_TEST_TIMEOUT_MS);
+});
