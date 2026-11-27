@@ -67,7 +67,10 @@ export const DEPS_JOB_KIND = defineJobKind({
   entry: 'scripts/lib/daemon-rebuild/deps-job.mjs',
   codeMode: 'readonly-tree',
   serial: true,
-  // The child needs no packages itself (node built-ins + this repo's scripts only): it BUILDS the store.
+  // The child builds the store without installed packages. deps-job-no-packages.test.mjs checks its
+  // bounded static import/re-export graph plus a literal require/import line heuristic. This is syntax
+  // evidence only: invoked-function loads, eval and aliased createRequire are outside its proof.
+  // Stronger runtime-import assurance needs a separately reviewed, isolated import trace.
   nodeModules: false,
   maxAttempts: 2,
 });
