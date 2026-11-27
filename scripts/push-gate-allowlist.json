@@ -257,6 +257,7 @@
     "scripts/lib/rules-loader.cjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":2},
     "scripts/lib/salvage-index.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":2},
     "scripts/lib/seat-assessment.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":2},
+    "scripts/lib/sibling-clone-provision.mjs": {"status":"pending-migration","reason":"Two unresolved gitRun argv sites wrap fixed remote get-url origin and rev-parse --is-shallow-repository reads in hardenLaneGitArgs; both use bounded reads with the full lane environment pins and neither pushes.","sites":2},
     "scripts/lib/soak-gate-merge-base-diff.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":2},
     "scripts/lib/standards-cache.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":4},
     "scripts/lib/testing-notes-advisory.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},

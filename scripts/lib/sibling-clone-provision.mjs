@@ -1,12 +1,22 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, parse, resolve } from 'node:path';
 import { stripVTControlCharacters } from 'node:util';
 import { boundedGitCommand, BOUNDED_GIT_GRACE_MS } from './git-bounded.mjs';
 import { NETWORK_GIT_TIMEOUT_MS } from './bounded-child.mjs';
 import { gitRun } from './git-run.mjs';
+import { hardenLaneGitArgs, laneGitHardeningEnv, scrubGitRepoEnv } from './lane-git-hardening.mjs';
 import { CONSTELLATION_REPOS, repoKeyForDir, repoKeyForSlug } from './constellation-repos.mjs';
+
+const NO_REPO_CWD = parse(resolve('/')).root;
+
+function templateFree(env) {
+  const out = { ...env };
+  // Templates can plant credential config in the new repository before its first fetch.
+  delete out.GIT_TEMPLATE_DIR;
+  return out;
+}
 
 /** Accept the shared keys, directory names and canonical/legacy slugs; refuse unknown repos. */
 export function resolveSiblingRepoName(slugOrName) {
@@ -21,9 +31,12 @@ function readGitOutput(result) {
   if (result.status !== 0) throw new Error(result.stderr || `git read failed (exit ${result.status})`);
   return result.stdout.trim();
 }
-const readOptions = cwd => ({ cwd, timeoutMs: 5_000, maxBuffer: 1024 * 1024 });
-const readOrigin = cwd => readGitOutput(gitRun('git', ['remote', 'get-url', 'origin'], readOptions(cwd)));
-const readShallow = cwd => readGitOutput(gitRun('git', ['rev-parse', '--is-shallow-repository'], readOptions(cwd)));
+const readOptions = cwd => ({ cwd, timeoutMs: 5_000, maxBuffer: 1024 * 1024,
+  // gitRun overlays process.env: mask removed keys so they cannot be inherited again.
+  env: { ...Object.fromEntries(Object.keys(process.env).map(key => [key, undefined])),
+    ...laneGitHardeningEnv(templateFree(scrubGitRepoEnv(process.env))) } });
+const readOrigin = cwd => readGitOutput(gitRun('git', hardenLaneGitArgs(['remote', 'get-url', 'origin']), readOptions(cwd)));
+const readShallow = cwd => readGitOutput(gitRun('git', hardenLaneGitArgs(['rev-parse', '--is-shallow-repository']), readOptions(cwd)));
 
 function originMatches(dir, slug, read) {
   try {
@@ -69,7 +82,9 @@ export function provisionMissingSiblingClones({ cwd = process.cwd(), run = execF
       const primary = join(home, 'workspace', name);
       const url = `https://github.com/${repo.slug}.git`;
       const runOptions = { stdio: ['ignore', 'ignore', 'inherit'],
-        timeout: NETWORK_GIT_TIMEOUT_MS + BOUNDED_GIT_GRACE_MS, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024 };
+        timeout: NETWORK_GIT_TIMEOUT_MS + BOUNDED_GIT_GRACE_MS, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
+        // Private clones need the account helper; a root cwd excludes lane-local credential config.
+        env: laneGitHardeningEnv(templateFree(scrubGitRepoEnv(process.env)), { credentialPins: false }), cwd: NO_REPO_CWD };
       let fullPrimary = false;
       if (exists(join(primary, '.git'))) {
         try { fullPrimary = shallow(primary).trim() === 'false'; } catch { /* unknown: plain clone */ }
@@ -79,7 +94,7 @@ export function provisionMissingSiblingClones({ cwd = process.cwd(), run = execF
         : ['clone', '--quiet', '-c', 'gc.auto=0', url, dir];
       mkdirSync(dir); // Reserve the absent path exclusively before taking cleanup ownership.
       created = true;
-      const bounded = boundedGitCommand(cloneArgs, NETWORK_GIT_TIMEOUT_MS);
+      const bounded = boundedGitCommand(hardenLaneGitArgs(cloneArgs), NETWORK_GIT_TIMEOUT_MS);
       run(bounded.file, bounded.args, runOptions);
       if (!exists(join(dir, '.git'))) throw new Error(`no .git at ${dir}`);
       if (!originMatches(dir, repo.slug, read)) throw new Error('origin mismatch');

@@ -1,19 +1,24 @@
 // @vitest-environment node
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { basename, join, resolve } from 'node:path';
+import { tmpdir, userInfo } from 'node:os';
+import { basename, join, parse, resolve } from 'node:path';
 import { boundedGitCommand, BOUNDED_GIT_GRACE_MS } from '../lib/git-bounded.mjs';
 import { NETWORK_GIT_TIMEOUT_MS } from '../lib/bounded-child.mjs';
 import { findRawPushes } from '../lib/push-gate-lint.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { gitRun } from '../lib/git-run.mjs';
+import { hardenLaneGitArgs, laneGitHardeningEnv, LANE_GIT_CONFIG_PINS, scrubGitRepoEnv } from '../lib/lane-git-hardening.mjs';
 import { resolveSiblingRepoName, siblingCloneStatus, provisionMissingSiblingClones } from '../lib/sibling-clone-provision.mjs';
 import { runInProcess, childProcessMock } from './fixtures/merge-ai-prs-cli-harness.mjs';
 import { createPrestageWorld } from './fixtures/merge-ai-prs-prestage-world.mjs';
 import { prestagePorts } from './fixtures/merge-ai-prs-fake-ports.mjs';
 
 vi.mock('../lib/git-run.mjs', () => ({ gitRun: vi.fn() }));
+vi.mock('node:os', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, userInfo: vi.fn(actual.userInfo) };
+});
 
 const roots = [];
 afterEach(() => {
@@ -22,6 +27,7 @@ afterEach(() => {
   vi.doUnmock('../lib/sibling-clone-provision.mjs');
   vi.doUnmock('../readiness/drain-lock.mjs');
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 function fixture() {
@@ -42,6 +48,182 @@ function fixture() {
   });
   return { cwd, home, run, read, shallow, origins };
 }
+
+function expectedGitEnv(options) {
+  const base = scrubGitRepoEnv(process.env);
+  delete base.GIT_TEMPLATE_DIR;
+  return laneGitHardeningEnv(base, options);
+}
+function expectedReadEnv() {
+  return { ...Object.fromEntries(Object.keys(process.env).map(key => [key, undefined])), ...expectedGitEnv() };
+}
+const childEnv = env => Object.fromEntries(Object.entries({ ...process.env, ...env }).filter(([, value]) => value !== undefined));
+const configPins = env => Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, i) =>
+  [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]);
+
+describe('sibling clone git hardening', () => {
+  beforeEach(() => {
+    const root = mkdtempSync(join(tmpdir(), 'sibling-git-env-'));
+    roots.push(root);
+    // Control every env input, including the CLT probe's short circuit and OS account lookup.
+    // Vitest 1.x stringifies undefined in stubEnv; delete explicitly after saving the original.
+    for (const key of Object.keys(process.env)) {
+      vi.stubEnv(key, '');
+      delete process.env[key];
+    }
+    vi.stubEnv('TMPDIR', root);
+    vi.stubEnv('HOME', join(root, 'account-home'));
+    vi.stubEnv('DEVELOPER_DIR', join(root, 'developer-tools'));
+    vi.mocked(userInfo).mockReturnValue({ homedir: join(root, 'account-home') });
+  });
+  afterEach(async () => vi.mocked(userInfo).mockImplementation((await vi.importActual('node:os')).userInfo));
+
+  function hostileEnv() {
+    for (const [key, value] of Object.entries({
+      GIT_DIR: '/evil', GIT_WORK_TREE: '/evil', GIT_CONFIG_PARAMETERS: "'core.hooksPath'='/evil'",
+      GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.fsmonitor', GIT_CONFIG_VALUE_0: '/evil',
+      GIT_CONFIG_GLOBAL: '/evil', GIT_SSH_COMMAND: '/evil', GIT_ASKPASS: '/evil', GIT_EXTERNAL_DIFF: '/evil',
+      GIT_TEMPLATE_DIR: '/evil-template', HTTPS_PROXY: '/evil', GIT_TRACE_CURL: '/evil',
+    })) vi.stubEnv(key, value);
+  }
+  function gitFixture({ fullPrimary = true } = {}) {
+    const options = fixture();
+    for (const name of ['frontierui', 'plateau-app']) {
+      mkdirSync(join(options.home, 'workspace', name, '.git'), { recursive: true });
+    }
+    vi.mocked(gitRun).mockImplementation((file, args, { cwd }) => {
+      if (file !== 'git') throw new Error('unexpected executable');
+      if (JSON.stringify(args) === JSON.stringify(['rev-parse', '--is-shallow-repository'])) {
+        return { status: 0, stdout: `${!fullPrimary}\n`, stderr: '' };
+      }
+      if (JSON.stringify(args) === JSON.stringify(['remote', 'get-url', 'origin']) && options.origins.has(cwd)) {
+        return { status: 0, stdout: options.origins.get(cwd) + '\n', stderr: '' };
+      }
+      throw new Error('unexpected git read');
+    });
+    return { ...options, read: undefined, shallow: undefined };
+  }
+  function provision(options) {
+    expect(provisionMissingSiblingClones(options)).toEqual({ provisioned: ['frontierui', 'plateau-app'], failed: [] });
+    expect(options.run).toHaveBeenCalledTimes(2);
+    expect(gitRun).toHaveBeenCalledTimes(4);
+  }
+
+  it('clone runs with the primary-form hardened env from the filesystem root, not the inherited env', () => {
+    hostileEnv();
+    const options = gitFixture();
+    const expected = expectedGitEnv({ credentialPins: false });
+    provision(options);
+    for (const [, , { env, cwd, ...bounds }] of options.run.mock.calls) {
+      expect(env).toEqual(expected);
+      expect(cwd).toBe(parse(resolve('/')).root);
+      expect(bounds).toEqual({ stdio: ['ignore', 'ignore', 'inherit'],
+        timeout: NETWORK_GIT_TIMEOUT_MS + BOUNDED_GIT_GRACE_MS, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024 });
+      for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_GLOBAL',
+        'GIT_SSH_COMMAND', 'GIT_ASKPASS', 'GIT_EXTERNAL_DIFF', 'GIT_TEMPLATE_DIR', 'HTTPS_PROXY', 'GIT_TRACE_CURL']) {
+        expect(env).not.toHaveProperty(key);
+      }
+      expect(env.GIT_TEMPLATE_DIR).toBeUndefined();
+      const pins = LANE_GIT_CONFIG_PINS.filter(([key]) => !['credential.helper', 'core.askPass'].includes(key));
+      expect(env.GIT_CONFIG_COUNT).toBe(String(pins.length));
+      expect(configPins(env)).toEqual(pins);
+      expect(configPins(env)).toContainEqual(['core.hooksPath', '/dev/null']);
+      expect(configPins(env)).toContainEqual(['core.fsmonitor', 'false']);
+      expect(Object.values(env)).not.toContain('/evil');
+      expect(env.GIT_TERMINAL_PROMPT).toBe('0');
+    }
+  });
+
+  it('origin and shallow reads mask every inherited git key and carry the full lane pins', () => {
+    hostileEnv();
+    const options = gitFixture();
+    const expected = expectedGitEnv();
+    provision(options);
+    expect(gitRun.mock.calls.map(([, args]) => args)).toEqual([
+      ['rev-parse', '--is-shallow-repository'], ['remote', 'get-url', 'origin'],
+      ['rev-parse', '--is-shallow-repository'], ['remote', 'get-url', 'origin'],
+    ]);
+    for (const [, , opts] of gitRun.mock.calls) {
+      expect(opts.env).toEqual(expectedReadEnv());
+      const env = childEnv(opts.env);
+      expect(env).toEqual(expected);
+      for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_TEMPLATE_DIR', 'GIT_CONFIG_PARAMETERS',
+        'GIT_CONFIG_GLOBAL', 'GIT_SSH_COMMAND', 'GIT_ASKPASS', 'GIT_EXTERNAL_DIFF']) expect(env).not.toHaveProperty(key);
+      expect(configPins(env)).toEqual(LANE_GIT_CONFIG_PINS);
+      expect(configPins(env)).toContainEqual(['credential.helper', '']);
+      expect(env.HTTPS_PROXY).toBe('/evil');
+      expect(env.GIT_TRACE_CURL).toBe('/evil');
+    }
+  });
+
+  it.each([false, true])('argv is unchanged by the companion rewrites (reference: %s)', fullPrimary => {
+    const options = gitFixture({ fullPrimary });
+    provision(options);
+    for (const [i, name] of ['frontierui', 'plateau-app'].entries()) {
+      const argv = ['clone', '--quiet', '-c', 'gc.auto=0',
+        ...(fullPrimary ? ['--reference', join(options.home, 'workspace', name)] : []),
+        `https://github.com/${CONSTELLATION_REPOS[name].slug}.git`, resolve(options.cwd, '..', name)];
+      expect(hardenLaneGitArgs(argv)).toEqual(argv);
+      const bounded = boundedGitCommand(argv, NETWORK_GIT_TIMEOUT_MS);
+      expect(options.run.mock.calls[i].slice(0, 2)).toEqual([bounded.file, bounded.args]);
+    }
+    for (const [i, [, argv]] of gitRun.mock.calls.entries()) {
+      expect(argv).toEqual(i % 2 === 0 ? ['rev-parse', '--is-shallow-repository'] : ['remote', 'get-url', 'origin']);
+      expect(argv).toEqual(hardenLaneGitArgs(argv));
+    }
+  });
+
+  it('environment changes between calls are observed', () => {
+    for (const sentinel of ['one', 'two']) {
+      vi.mocked(gitRun).mockClear();
+      vi.stubEnv('WEV_SENTINEL', sentinel);
+      if (sentinel === 'two') vi.stubEnv('GIT_TEMPLATE_DIR', '/evil-template');
+      const options = gitFixture();
+      provision(options);
+      for (const [, , { env }] of options.run.mock.calls) {
+        expect(env.WEV_SENTINEL).toBe(sentinel);
+        expect(env).toEqual(expectedGitEnv({ credentialPins: false }));
+        expect(env).not.toHaveProperty('GIT_TEMPLATE_DIR');
+      }
+      for (const [, , { env }] of gitRun.mock.calls) {
+        expect(childEnv(env).WEV_SENTINEL).toBe(sentinel);
+        expect(childEnv(env)).toEqual(expectedGitEnv());
+        expect(childEnv(env)).not.toHaveProperty('GIT_TEMPLATE_DIR');
+        if (sentinel === 'two') expect(env).toHaveProperty('GIT_TEMPLATE_DIR', undefined);
+      }
+    }
+  });
+
+  it('clone ignores caller HOME/XDG_CONFIG_HOME for credential config', () => {
+    vi.stubEnv('HOME', '/evil-home');
+    vi.stubEnv('XDG_CONFIG_HOME', '/evil-xdg');
+    vi.stubEnv('GIT_CONFIG_GLOBAL', '/evil.cfg');
+    vi.stubEnv('GIT_CONFIG_SYSTEM', '/evil-system.cfg');
+    const options = gitFixture();
+    provision(options);
+    for (const [, , { env }] of options.run.mock.calls) {
+      expect(env.HOME).toBe(userInfo().homedir);
+      expect(env.HOME).not.toBe(options.home);
+      for (const key of ['XDG_CONFIG_HOME', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM']) expect(env).not.toHaveProperty(key);
+    }
+  });
+
+  it('clone drops inherited GIT_TEMPLATE_DIR', () => {
+    vi.stubEnv('GIT_TEMPLATE_DIR', '/evil-template');
+    const options = gitFixture({ fullPrimary: false });
+    provision(options);
+    for (const [i, [, args, { env }]] of options.run.mock.calls.entries()) {
+      expect(env).not.toHaveProperty('GIT_TEMPLATE_DIR');
+      const name = ['frontierui', 'plateau-app'][i];
+      expect(args).toEqual(boundedGitCommand(['clone', '--quiet', '-c', 'gc.auto=0',
+        `https://github.com/${CONSTELLATION_REPOS[name].slug}.git`, resolve(options.cwd, '..', name)], NETWORK_GIT_TIMEOUT_MS).args);
+    }
+    for (const [, , { env }] of gitRun.mock.calls) {
+      expect(env).toHaveProperty('GIT_TEMPLATE_DIR', undefined);
+      expect(childEnv(env)).not.toHaveProperty('GIT_TEMPLATE_DIR');
+    }
+  });
+});
 
 describe('sibling clone provisioning', () => {
   it('resolves every constellation slug, key and directory name, including persisted legacy slugs', () => {
@@ -251,7 +433,7 @@ describe('sibling clone audit boundaries', () => {
     expect(siblingCloneStatus({ ...options, read: undefined })[0].present).toBe(status === 0);
     expect(gitRun).toHaveBeenCalledTimes(1);
     expect(gitRun).toHaveBeenCalledWith('git', ['remote', 'get-url', 'origin'], {
-      cwd: dir, timeoutMs: 5_000, maxBuffer: 1024 * 1024,
+      cwd: dir, timeoutMs: 5_000, maxBuffer: 1024 * 1024, env: expectedReadEnv(),
     });
   });
 
@@ -264,7 +446,7 @@ describe('sibling clone audit boundaries', () => {
     expect(options.run.mock.calls[0][1].includes('--reference')).toBe(status === 0);
     expect(gitRun).toHaveBeenCalledTimes(1);
     expect(gitRun).toHaveBeenCalledWith('git', ['rev-parse', '--is-shallow-repository'], {
-      cwd: primary, timeoutMs: 5_000, maxBuffer: 1024 * 1024,
+      cwd: primary, timeoutMs: 5_000, maxBuffer: 1024 * 1024, env: expectedReadEnv(),
     });
   });
 
