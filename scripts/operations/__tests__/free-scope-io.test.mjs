@@ -3,14 +3,15 @@
  * @description Filesystem and CLI probes with a private registry and executable fake gh. No real host
  * or home state is read or written; fixtures exercise the same subprocess and YAML boundaries as production.
  */
-import { beforeEach, afterEach, it, expect } from 'vitest';
+import { beforeEach, afterEach, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { lockIdFor } from '../../readiness/file-locks.mjs';
 import { withPathLock } from '../../readiness/with-lock.mjs';
-import { defaultRegistryPath, readRegistry, writeRegistry, updateRegistry, ghExec, readOpenPrs, findCardFile, readCardScope, collectFreeScope } from '../free-scope-io.mjs';
+import { defaultRegistryPath, readRegistry, writeRegistry, updateRegistry, ghExec, readOpenPrs, findCardFile, readCardScope, collectFreeScope, defaultGitDirFor } from '../free-scope-io.mjs';
+import { assessFreeScope } from '../free-scope.mjs';
 import { main } from '../free-scope-cli.mjs';
 let root, registry, env;
 const now = () => Date.parse('2026-10-05T10:00:00Z');
@@ -39,6 +40,37 @@ console.log(JSON.stringify(repo === 'full/repo' ? full : ['capped/repo', 'paged/
   fs.writeFileSync(path.join(root, 'backlog/1234-other.md'), '---\nscope: scalar.mjs\n---\n');
 });
 afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
+it('collects all three repos and resolves Frontier UI under the injected home', () => {
+  const home = path.join(root, 'home');
+  const fuiDir = path.join(home, 'workspace/frontierui');
+  fs.mkdirSync(path.join(fuiDir, '.git'), { recursive: true });
+  const fixtureEnv = { ...env, HOME: home };
+  const exec = vi.fn((args) => {
+    expect(args.slice(0, 2)).toEqual(['pr', 'list']);
+    return JSON.stringify([{ number: 55, title: 'Fixture', url: 'u', headRefOid: 'a'.repeat(40), files: [{ path: 'blocks/x.ts' }] }]);
+  });
+  const git = vi.fn(() => { throw new Error('fixture git unavailable'); });
+  const gitDirFor = vi.fn((repo) => defaultGitDirFor(repo, { root, env: fixtureEnv }));
+  const result = collectFreeScope({ files: 'fui:blocks/x.ts', root, env: fixtureEnv, now, exec, git, gitDirFor });
+  expect(exec.mock.calls.map(([args]) => args[args.indexOf('--repo') + 1]))
+    .toEqual(['web-everything/web-everything', 'frontier-ui/frontierui', 'plateauapp/plateau-app']);
+  expect(gitDirFor.mock.results.map(({ value }) => value)).toEqual([root, fuiDir, null]);
+  expect(git.mock.calls.some(([dir]) => dir === fuiDir)).toBe(true);
+  expect(result.unreadable).toEqual([]);
+  expect(assessFreeScope(result).status).toBe('occupied');
+});
+it('an unreadable Frontier UI PR list makes a WE-only scope unknown', () => {
+  const exec = vi.fn((args) => {
+    expect(args.slice(0, 2)).toEqual(['pr', 'list']);
+    if (args[args.indexOf('--repo') + 1] === 'frontier-ui/frontierui') throw new Error('fixture outage');
+    return '[]';
+  });
+  const result = collectFreeScope({ files: 'we:only.ts', root, env, now, exec,
+    git: () => { throw new Error('unexpected git'); }, gitDirFor: () => null });
+  expect(result.unreadable).toEqual([{ repo: 'frontier-ui/frontierui', error: 'fixture outage' }]);
+  expect(assessFreeScope(result)).toMatchObject({ status: 'unknown', freeFiles: [],
+    files: [{ file: 'we:only.ts', state: 'unknown', free: false }] });
+});
 it('reads missing, bare and wrapped registries, refusing corruption', () => {
   expect(defaultRegistryPath(env)).toBe(registry);
   expect(readRegistry(registry)).toEqual([]);

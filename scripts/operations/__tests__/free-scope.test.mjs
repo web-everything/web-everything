@@ -4,7 +4,7 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { qualifyFile, repoKeyFor, partitionRegistry, registerScope, releaseScope, heartbeatScope, assessFreeScope, formatFreeScope, freeScopeOperation, parseExcludePr,
-  choosePrFileSet, prHoldsFile, GH_LIST_FILE_CAP, GH_API_FILE_CAP } from '../free-scope.mjs';
+  choosePrFileSet, prHoldsFile, GH_LIST_FILE_CAP, GH_API_FILE_CAP, DEFAULT_REPOS } from '../free-scope.mjs';
 const startedAt = '2026-10-05T10:00:00.000Z';
 const nowMs = Date.parse(startedAt);
 const agent = { agent: 'build-x', purpose: 'build', files: ['we:scripts/lib/'], startedAt };
@@ -16,6 +16,23 @@ describe('free-scope core', () => {
       .toEqual(['we:a.mjs', 'we:a.mjs', 'we:a.mjs', 'plateau-app:a.mjs', 'other:a.mjs', '']);
     expect(qualifyFile('x.mjs', 'plateau-app')).toBe('plateau-app:x.mjs');
     expect(['web-everything/web-everything', 'plateauapp/plateau-app', 'org/project'].map(repoKeyFor)).toEqual(['we', 'plateau-app', 'project']);
+  });
+  it('scans Frontier UI by default and keeps WE first', () => {
+    expect(DEFAULT_REPOS[0]).toBe('web-everything/web-everything');
+    expect(DEFAULT_REPOS).toEqual(['web-everything/web-everything', 'frontier-ui/frontierui', 'plateauapp/plateau-app']);
+  });
+  it('qualifies fui as frontierui without changing the canonical prefix', () => {
+    expect(qualifyFile('fui:a.ts')).toBe('frontierui:a.ts');
+    expect(qualifyFile('frontierui:a.ts')).toBe('frontierui:a.ts');
+  });
+  it('parses a fui PR exclusion', () => {
+    expect(parseExcludePr('fui#55')).toEqual({ repo: 'frontier-ui/frontierui', number: 55 });
+  });
+  it('a Frontier UI PR occupies fui scope until that repo and PR are excluded', () => {
+    const input = { files: ['fui:blocks/x.ts'], prs: [{ ...pr, repo: 'frontier-ui/frontierui', number: 55, files: ['blocks/x.ts'] }] };
+    expect(assess(input)).toMatchObject({ status: 'occupied', files: [{ file: 'frontierui:blocks/x.ts', holders: [{ repo: 'frontier-ui/frontierui', number: 55 }] }] });
+    const excluded = parseExcludePr('fui#55');
+    expect(assess({ ...input, excludeRepo: excluded.repo, excludePr: excluded.number }).status).toBe('free');
   });
   it('expires at the exact TTL edge and rejects invalid dates', () => {
     expect(partitionRegistry([agent], nowMs + 4 * 3600e3 - 1).live).toEqual([agent]);
