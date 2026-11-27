@@ -90,6 +90,24 @@ describe('last-good hold alarm contract', () => {
     expect(result.transitions).toEqual([]);
   });
 
+  it('missing selfSync preserves the evaluator-error streak until a successful sample', () => {
+    const first = tick([clone('fixture-daemon', held(31))]);
+    const errorKey = `smell:${daemonHeldOnLastGood.id}`;
+    const failedOnce = tick({ malformed: true }, first.state, NOW + MINUTE);
+    const failedTwice = tick({ malformed: true }, failedOnce.state, NOW + 2 * MINUTE);
+    expect(failedTwice.state.probeErrors[errorKey].count).toBe(2);
+
+    const missing = runHealthTick(failedTwice.state, {}, [daemonHeldOnLastGood], NOW + 3 * MINUTE);
+    expect(missing.state.probeErrors[errorKey]).toEqual(failedTwice.state.probeErrors[errorKey]);
+    expect(missing.evaluations[0].results[0].measure.uncertainty).toContain('unconfirmed-adoption');
+    expect(missing.transitions.some(t => t.type === 'closed')).toBe(false);
+
+    const failedAgain = tick({ malformed: true }, missing.state, NOW + 4 * MINUTE);
+    expect(failedAgain.state.probeErrors[errorKey].count).toBe(3);
+    const recovered = tick([clone('fixture-daemon', held(31))], failedAgain.state, NOW + 5 * MINUTE);
+    expect(recovered.state.probeErrors[errorKey]).toBeUndefined();
+  });
+
   it('same-head recovery closes the episode so a later hold notifies again', () => {
     const first = tick([clone('fixture-daemon', held(31))]);
     const [firstRecord] = sink(first);

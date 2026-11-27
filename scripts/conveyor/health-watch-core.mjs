@@ -953,7 +953,9 @@ export function runHealthTick(prevState, probes, smells, now, { config = {}, act
     if (missing.length && !smell.evaluateMissingProbes) return { smell, results: null, skipped: missing };
     try {
       const results = smell.evaluate(probes, ctx);
-      delete errs[`smell:${smell.id}`];
+      // Missing-probe evaluations annotate uncertainty; only a complete successful sample
+      // confirms recovery from an evaluator failure. Preserve the streak until then.
+      if (!missing.length) delete errs[`smell:${smell.id}`];
       return { smell, results };
     } catch (e) {
       errs[`smell:${smell.id}`] = { count: (errs[`smell:${smell.id}`]?.count ?? 0) + 1, last: String(e?.message || e).slice(0, 200) };
