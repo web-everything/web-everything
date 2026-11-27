@@ -2,7 +2,7 @@
  * NON-CLAIMS: This lint is a tripwire for honest accidental pushes only.
  * Deliberate evasion (dynamic or concatenated command strings, executable variables,
  * reassigned aliases, dynamic imports, .call(), shell escapes such as g\it pu\sh,
- * unlisted git global flags, and call identity beyond the pinned per-file count)
+ * unlisted git global flags, and call identity in entries without callSites pins)
  * is NOT caught. The security boundary is the S1 gate (scripts/lib/authorized-push.mjs)
  * plus S6's shell refusal. authorized-push.mjs is exempt because it is the gate itself.
  * Inspect syntax only, never execute the source.
@@ -28,7 +28,7 @@ export function isLintedScript(path) {
 }
 
 /** One site per shell match or argv call; unreadable or unparsable evidence requires manual inspection. */
-export function findRawPushes(source, filename = 'scripts/source.mjs') {
+export function findRawPushes(source, filename = 'scripts/source.mjs', { includeText = false } = {}) {
   if (typeof source !== 'string') throw new Error(`${filename}: unreadable source; inspect manually`);
   const file = ts.createSourceFile(filename, source, ts.ScriptTarget.Latest, true,
     /\.(?:ts|mts|cts)$/.test(filename) ? ts.ScriptKind.TS : ts.ScriptKind.JS);
@@ -106,7 +106,8 @@ export function findRawPushes(source, filename = 'scripts/source.mjs') {
           : Array.from(node.arguments).filter(arg => !ts.isObjectLiteralExpression(arg));
         if ((gitCommand || /git/i.test(name)) && !argv.every(fullyStatic)) kind = { kind: 'unresolved', count: kind?.count || 1 };
         if (kind) for (let i = 0; i < kind.count; i++) {
-          sites.push({ line: file.getLineAndCharacterOfPosition(node.getStart(file)).line + 1, kind: kind.kind });
+          sites.push({ line: file.getLineAndCharacterOfPosition(node.getStart(file)).line + 1, kind: kind.kind,
+            ...(includeText ? { text: node.getText(file) } : {}) });
         }
       }
     }
@@ -114,4 +115,18 @@ export function findRawPushes(source, filename = 'scripts/source.mjs') {
   };
   visit(file);
   return sites;
+}
+
+/** Admit legacy counts and, where supplied, each reviewed call's exact syntax. */
+export function admitRawPushSites(source, filename, entry) {
+  const sites = findRawPushes(source, filename, { includeText: true });
+  if (!sites.length && !entry) return;
+  if (!entry || entry.status !== 'pending-migration' || String(entry.reason || '').length <= 5
+    || !Number.isInteger(entry.sites) || entry.sites < 1 || sites.length !== entry.sites) {
+    throw new Error(`${filename}: raw push count ${sites.length}, pinned ${entry?.sites ?? 'none'}; review sites and allowlist`);
+  }
+  if (entry.callSites !== undefined && (!Array.isArray(entry.callSites) || entry.callSites.length !== sites.length
+    || entry.callSites.some((pin, i) => !pin || typeof pin.reason !== 'string' || !pin.reason.trim() || pin.text !== sites[i].text))) {
+    throw new Error(`${filename}: raw push site drift; review exact calls and allowlist`);
+  }
 }

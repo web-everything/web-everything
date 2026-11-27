@@ -191,7 +191,8 @@ function productionAudit(root) {
 }
 function assertProductionAudit(audit, scope = null) {
   const selected = file => !scope || scope.has(file);
-  if (JSON.stringify(audit.unsupported.filter(([file]) => selected(file))) !== JSON.stringify(PRODUCTION_REFUSED_LOADS.filter(([file]) => selected(file)))) {
+  // A changed importer can reach an unchanged dependency. Audit its loads too.
+  if (JSON.stringify(audit.unsupported) !== JSON.stringify(PRODUCTION_REFUSED_LOADS)) {
     throw new Error(`production-dynamic-load-drift:${JSON.stringify(audit.unsupported)}`);
   }
   if (JSON.stringify(audit.readers.filter(selected)) !== JSON.stringify(['scripts/lane-pool.mjs'].filter(selected))) {
@@ -607,11 +608,13 @@ describe('K4: effective env and pinned read collection', () => {
     const f = fixture(); const base = effectiveEnvHash({ root: f.root, env: f.env, ownershipOk: true });
     const ignored = Object.fromEntries([...PER_LAUNCH_ENV, ...Object.values(SMOKE_BUDGET_ENV), ...Object.values(REBUILD_SMOKE_BUDGET_ENV)].map(n => [n, 'changed']));
     expect(effectiveEnvHash({ root: f.root, env: { ...f.env, ...ignored }, ownershipOk: true })).toBe(base);
-    const opts = { root: f.root, ownershipOk: true, envIgnore: ['WE_IGNORED'], env: { ...f.env, WE_IGNORED: 'x', GH_TOKEN: 'sensitive', WE_EMPTY: '' } };
+    const opts = { root: f.root, ownershipOk: true, envIgnore: [PER_LAUNCH_ENV[0]], env: { ...f.env, [PER_LAUNCH_ENV[0]]: 'x', GH_TOKEN: 'sensitive', WE_EMPTY: '' } };
     const entries = effectiveEnvEntries(opts);
-    expect(entries).toContainEqual(['GH_TOKEN', '<present>']); expect(entries).toContainEqual(['WE_EMPTY', '']);
+    expect(entries).toContainEqual(['GH_TOKEN', hash('sensitive')]); expect(entries).toContainEqual(['WE_EMPTY', '']);
+    expect(entries.map(([name]) => name)).not.toContain(PER_LAUNCH_ENV[0]);
     expect(entries).toContainEqual(['WE_SMOKE_LIVE_CLONE', '<present>']); expect(JSON.stringify(entries)).not.toContain('sensitive');
-    expect(effectiveEnvHash(opts)).toBe(effectiveEnvHash({ ...opts, env: Object.fromEntries(Object.entries({ ...opts.env, GH_TOKEN: 'other' }).reverse()) }));
+    expect(effectiveEnvHash(opts)).toBe(effectiveEnvHash({ ...opts, env: Object.fromEntries(Object.entries(opts.env).reverse()) }));
+    expect(effectiveEnvHash(opts)).not.toBe(effectiveEnvHash({ ...opts, env: { ...opts.env, GH_TOKEN: 'other' } }));
     expect(effectiveEnvHash({ ...opts, env: { ...opts.env, GH_TOKEN: '' } })).not.toBe(effectiveEnvHash(opts));
     expect(effectiveEnvHash({ ...opts, env: { ...opts.env, WE_EMPTY: undefined } })).not.toBe(effectiveEnvHash(opts));
     expect(effectiveEnvEntries({ ...opts, ownershipOk: false })).toBeNull();

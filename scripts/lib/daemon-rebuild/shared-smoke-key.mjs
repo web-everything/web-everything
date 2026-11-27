@@ -165,13 +165,27 @@ function walk({ root, entries, env, readFile = readFileSync, git = gitAt, checkE
     const ast = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
     if (ast.parseDiagnostics.length) throw new Error(`malformed-source:${file}`);
     const createNames = new Set(['createRequire']); const requireNames = new Set(['require']);
+    const memberName = n => ts.isPropertyAccessExpression(n) ? n.name.text
+      : ts.isElementAccessExpression(n) && ts.isStringLiteralLike(n.argumentExpression) ? n.argumentExpression.text : null;
+    const creator = n => createNames.has(n.getText(ast)) || memberName(n) === 'createRequire';
     function bindings(n) {
       if (ts.isImportSpecifier(n) && (n.propertyName?.text ?? n.name.text) === 'createRequire') createNames.add(n.name.text);
-      if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.initializer && ts.isCallExpression(n.initializer)
-        && createNames.has(n.initializer.expression.getText(ast))) requireNames.add(n.name.text);
+      if (ts.isVariableDeclaration(n) && n.initializer) {
+        if (ts.isIdentifier(n.name)) {
+          if (requireNames.has(n.initializer.getText(ast))
+            || ts.isCallExpression(n.initializer) && creator(n.initializer.expression)) requireNames.add(n.name.text);
+          if (creator(n.initializer)) createNames.add(n.name.text);
+        }
+        if (ts.isObjectBindingPattern(n.name)) for (const binding of n.name.elements) {
+          if ((binding.propertyName ?? binding.name).text === 'createRequire' && ts.isIdentifier(binding.name)) createNames.add(binding.name.text);
+        }
+      }
       ts.forEachChild(n, bindings);
     }
-    bindings(ast);
+    // Resolve chains regardless of declaration order, without executing source.
+    let previousBindings;
+    do { previousBindings = createNames.size + requireNames.size; bindings(ast); }
+    while (previousBindings !== createNames.size + requireNames.size);
     function envRead(n, name) {
       const line = text.split('\n')[ast.getLineAndCharacterOfPosition(n.getStart(ast)).line];
       const pin = K6_AUDITED_READS.find(p => p.file === file && p.name === name && p.exactLineText === line);
@@ -186,7 +200,7 @@ function walk({ root, entries, env, readFile = readFileSync, git = gitAt, checkE
       if (ts.isCallExpression(n)) {
         const expr = n.expression;
         const load = expr.kind === ts.SyntaxKind.ImportKeyword || requireNames.has(expr.getText(ast))
-          || (ts.isCallExpression(expr) && createNames.has(expr.expression.getText(ast)));
+          || (ts.isCallExpression(expr) && creator(expr.expression));
         if (load) {
           const arg = n.arguments[0];
           if (arg && ts.isStringLiteralLike(arg)) resolveLoad(path, arg.text);

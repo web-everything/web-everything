@@ -6,7 +6,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { scanScope, scanRoot, scopedScanFiles } from '../lib/repo-scan-tests.mjs';
 import { fileURLToPath } from 'node:url';
-import { findRawPushes, isLintedScript } from '../lib/push-gate-lint.mjs';
+import { admitRawPushSites, findRawPushes, isLintedScript } from '../lib/push-gate-lint.mjs';
 
 const root = fileURLToPath(new URL('../..', import.meta.url));
 const cp = "import { execFileSync, spawnSync, execSync } from 'node:child_process';\n";
@@ -46,18 +46,8 @@ describe('push-gate lint (negative test 14)', () => {
 
 // The fixture and live inventory must pass exactly the same admission checks.
 function admit(sources, entries) {
-  const found = {};
-  for (const [file, source] of Object.entries(sources)) {
-    const sites = findRawPushes(source, file); // Parse errors must never become allowlisted sites.
-    if (sites.length) found[file] = sites.length;
-  }
   for (const file of new Set([...Object.keys(sources), ...Object.keys(entries)])) {
-    const count = found[file] || 0, entry = entries[file];
-    if (!count && !entry) continue;
-    if (!entry || entry.status !== 'pending-migration' || String(entry.reason || '').length <= 5
-      || !Number.isInteger(entry.sites) || entry.sites < 1 || count !== entry.sites) {
-      throw new Error(`${file}: raw push count ${count}, pinned ${entry?.sites ?? 'none'}; review sites and allowlist`);
-    }
+    admitRawPushSites(sources[file] ?? '', file, entries[file]);
   }
 }
 

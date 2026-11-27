@@ -6519,3 +6519,12 @@ Before changing an admission gate, compare each PREP acceptance line with the ne
 behavior change. Every new refusal path needs explicit authorization in the card;
 keep a deterministic test for admission without timing metadata so a separate
 measurement policy cannot silently reintroduce per-PR timing work.
+
+### Shared smoke identity audit regressions
+
+Keep the shared-smoke-key fixtures on private roots and injected Git evidence. A scoped
+source selection still audits unsupported loads throughout the reachable dependency closure.
+Credential assertions bind content hashes (including empty strings); canonical ordering
+compares the same values in a different insertion order. Only enumerated per-launch and
+budget names may be ignored. The push boundary uses `admitRawPushSites` for both fixtures
+and the installed inventory; `callSites` pins exact syntax as well as the legacy count.
