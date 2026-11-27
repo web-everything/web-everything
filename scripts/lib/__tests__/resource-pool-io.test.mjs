@@ -536,6 +536,19 @@ it('unknown settings hold every pool decision even with complete sources', () =>
   expectPoolClosed(collectPool({ settings: { value: structuredClone(POOL_DEFAULTS), unknown: true } }));
 });
 
+it.each(['holders', 'result'])('collector fails closed for truthy %s.unknown', target => {
+  const readSource = vi.fn(source => {
+    const result = validPoolSource(source);
+    if (source === 'workers') (target === 'result' ? result : result.holders).unknown = 'incomplete inventory';
+    return result;
+  });
+  const report = collectPool({ readSource });
+  expectPoolClosed(report);
+  expect(report.sources.find(row => row.source === 'workers'))
+    .toMatchObject({ ok: false, error: 'invalid source result' });
+  expect(readSource.mock.calls.map(([name]) => name)).toEqual(Object.keys(SOURCES));
+});
+
 it('duplicate job evidence with unknown or failed-source flags still holds every grant', () => {
   for (const patch of [{ unknown: true }, { sourceOk: false }]) {
     for (const taintedSource of ['workers', 'fix']) {
@@ -584,6 +597,21 @@ it('same fix jobId in different repos stays counted while each claim/worker pair
   expect(report.unknown).toBe(false);
   expect(report.holders.map(holder => holder.repo)).toEqual(['owner/first', 'owner/second']);
   expect(report.summary['studio.units'].classes[3]).toBe(4);
+});
+
+it('three same-jobId workers in one source make the next fix a class-max hold', () => {
+  for (const [claims, workers] of [[0, 3], [1, 3], [3, 1], [3, 3]]) {
+    const report = collectPool({ readSource: source => ({ ...validPoolSource(source),
+      holders: Array.from({ length: source === 'fix' ? claims : source === 'workers' ? workers : 0 },
+        (_, index) => ({ resource: 'studio.units', source, kind: 'fix', class: 3, size: 2,
+          repo: 'owner/fixture', jobId: 'same-job', id: `${source}-${index}` })),
+    }) });
+    expect(report.unknown).toBe(false);
+    expect(report.holders).toHaveLength(3);
+    expect(report.summary['studio.units'].classes[3]).toBe(6);
+    expect(report.rows.find(row => row.kind === 'fix'))
+      .toMatchObject({ poolDecision: 'hold', reason: 'class max', unknown: false });
+  }
 });
 
 it('legacy throw produces unknown comparison without changing pool admission', () => {

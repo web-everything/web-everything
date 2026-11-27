@@ -7,11 +7,13 @@
 authoritative; nothing reads `pool-shadow.jsonl` to grant capacity.
 
 The collector checks every named source in `SOURCES`. A throwing (including a
-non-Error throw), missing, malformed, wrong-source or invalid-budget source
+non-Error throw), missing, malformed, wrong-source, unknown or invalid-budget source
 makes the entire report `unknown` and holds every pool decision. Unknown
 settings do the same. Inspect the failed source and repair it before rerunning;
-incomplete evidence never means an empty, safe pool. Collection writes nothing.
-A fix job is counted once per repo/jobId across claims and workers; unidentified
+incomplete evidence never means an empty, safe pool. A truthy `unknown` flag on
+either a source result or its holder array invalidates that source. Collection
+writes nothing. Fix jobs deduplicate only across sources: each repo/jobId is
+counted as many times as its largest count in any single source. Unidentified
 jobs stay separately counted and identical jobIds in different repos stay distinct.
 
 Every report contains exactly one comparison row per kind, in this order:

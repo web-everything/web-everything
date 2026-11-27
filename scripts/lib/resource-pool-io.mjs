@@ -317,23 +317,30 @@ export function collectResourcePool({ env = process.env, nowMs = Date.now(), coo
     try { result = readSource(source, { paths, coord, env, nowMs }); }
     catch (e) { result = { source, ok: false, holders: [], error: errorText(e) }; }
     if (result?.source !== source || !Array.isArray(result?.holders) || typeof result?.ok !== 'boolean'
+      || result.unknown || result.holders.unknown
       || result.holders.some(h => !h || h.source !== source || ![2, 3].includes(h.class) || ![1, 2].includes(h.size))
       || (source === 'snapshot' && result.ok && (result.budget?.unknown !== false
         || !Number.isInteger(result.budget.units) || result.budget.units < 0 || result.budget.units > 30))) result = { ok: false, holders: [], error: 'invalid source result' };
     return { ...result, source, description, path: paths[source] ?? (source === 'workers' ? 'lane lease files / heavy-admission' : 'ps process inventory') };
   });
-  // Claims bridge dispatch to worker startup: both observations describe one job.
+  // Claims bridge dispatch to worker startup: overlap across sources describes one job.
+  // Preserve each source's multiplicity: retain the largest per-source count for a job.
   // Missing job identity stays separately counted; never guess from a lane or display ID.
   // An explicit repo scopes a jobId; identical IDs from different repos are distinct jobs.
-  const jobs = new Set();
-  const holders = sources.flatMap(s => s.ok ? s.holders : []).filter(holder => {
-    // Preserve refusal flags for grantDecision, even behind a healthy duplicate.
-    if (holder.unknown || holder.sourceOk === false) return true;
-    if (holder.kind !== 'fix' || typeof holder.jobId !== 'string' || !holder.jobId) return true;
-    const jobKey = JSON.stringify([holder.repo ?? null, holder.jobId]);
-    if (jobs.has(jobKey)) return false;
-    jobs.add(jobKey);
-    return true;
+  const jobs = new Map();
+  const holders = sources.flatMap(s => {
+    const sourceJobs = new Map();
+    return (s.ok ? s.holders : []).filter(holder => {
+      // Preserve refusal flags for grantDecision, even behind a healthy duplicate.
+      if (holder.unknown || holder.sourceOk === false) return true;
+      if (holder.kind !== 'fix' || typeof holder.jobId !== 'string' || !holder.jobId) return true;
+      const jobKey = JSON.stringify([holder.repo ?? null, holder.jobId]);
+      const count = (sourceJobs.get(jobKey) ?? 0) + 1;
+      sourceJobs.set(jobKey, count);
+      if (count <= (jobs.get(jobKey) ?? 0)) return false;
+      jobs.set(jobKey, count);
+      return true;
+    });
   });
   const unknown = !!settings.unknown || sources.some(s => !s.ok)
     || sources.find(s => s.source === 'snapshot')?.budget?.unknown !== false;
