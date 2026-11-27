@@ -141,6 +141,44 @@ describe('bounded dependency syntax evidence (hermetic fixtures)', () => {
     expect(f.read).toHaveBeenCalledTimes(1);
   });
 
+  it.each(['require', 'import'].flatMap((load) =>
+    ['relative path', 'absolute path', 'file URL'].flatMap((form) =>
+      ['call', 'quoted heuristic'].map((syntax) => [load, form, syntax]))))(
+    'follows a local %s load by %s in a %s and rejects its external dependency at the no-packages gate',
+    (load, form, syntax) => {
+      const f = syntaxFixture({
+        'entry.mjs': '',
+        'target.mjs': "import 'external';",
+        'safe.mjs': '',
+      });
+      const absolute = resolve(f.root, 'target.mjs');
+      const specifier = form === 'relative path' ? './target.mjs'
+        : form === 'file URL' ? pathToFileURL(absolute).href : absolute;
+      const call = `${load}(${JSON.stringify(specifier)})`;
+      const source = syntax === 'call' ? `${call};` : `const source = \`${call}\`;`;
+      writeFileSync(resolve(f.root, 'entry.mjs'), `${source}\nimport './safe.mjs';`);
+
+      expect(inspectImports('entry.mjs', f).packages).toEqual(['entry.mjs -> target.mjs -> external']);
+      expect(f.read.mock.calls.map(([path]) => path)).toContain('target.mjs');
+    },
+  );
+
+  it.each(['require', 'import'].flatMap((load) =>
+    ['absolute path', 'file URL'].map((form) => [load, form])))(
+    'refuses an unresolvable local %s load by %s without returning empty package evidence',
+    (load, form) => {
+      const f = syntaxFixture({ 'entry.mjs': '' });
+      const absolute = resolve(f.root, 'missing.mjs');
+      const specifier = form === 'file URL' ? pathToFileURL(absolute).href : absolute;
+      writeFileSync(resolve(f.root, 'entry.mjs'), `${load}(${JSON.stringify(specifier)});`);
+
+      expect(() => inspectImports('entry.mjs', f)).toThrow(
+        /incomplete.*read-failed: missing\.mjs.*repair.*retry/i,
+      );
+      expect(f.read.mock.calls.map(([path]) => path)).toEqual(['entry.mjs', 'missing.mjs']);
+    },
+  );
+
   it.each(['absolute path', 'file URL'])('reports a non-local startup package loaded by %s without reading outside the root', (form) => {
     const f = syntaxFixture({ 'repo/entry.mjs': '', 'packages/external/index.mjs': '' });
     const target = resolve(f.root, 'packages/external/index.mjs');

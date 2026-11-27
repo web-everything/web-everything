@@ -51,12 +51,11 @@ const COMPLETE_MARKER = '.snapshot-complete';
 const SYNTAX_LIMITS = Object.freeze({ maxFiles: 128, maxBytes: 4 * 1024 * 1024, maxMs: 10_000 });
 const NON_CLAIMS = Object.freeze([
   'invoked-function loads', 'eval', 'aliased createRequire', 'computed specifiers',
-  'local require/import calls are classified but not followed',
 ]);
 
 /**
  * Bounded syntax evidence, never a proof of the runtime import closure. Follow import/re-export
- * declarations; additionally flag require/import calls on non-indented lines, refusing nonliteral
+ * declarations and local require/import targets on non-indented lines, refusing nonliteral
  * specifiers as UNKNOWN. Keep the previous conservative text heuristic, including quoted eval
  * loads: runtime non-claims must never exempt a previously rejected load. No source is executed.
  * All IO, paths, time and the TypeScript syntax API are supplied by the caller; this module
@@ -121,6 +120,7 @@ export function inspectDepsImports(entry, { root: repoRoot, read, now, syntax: t
     if (source.parseDiagnostics.length) refuse(`malformed-module: ${path}`);
     const lines = text.split('\n');
     const startupPackages = new Set();
+    const startupLocals = new Set();
     const calls = [source];
     while (calls.length) {
       checkTime();
@@ -135,6 +135,7 @@ export function inspectDepsImports(entry, { root: repoRoot, read, now, syntax: t
         if (/^\S/.test(line)) {
           if (!argument || !ts.isStringLiteral(argument)) refuse(`unknown-specifier: ${path}`);
           const target = classify(argument.text, path);
+          if (target.local) startupLocals.add(target.local);
           if (target.package) startupPackages.add(target.package);
         }
       }
@@ -146,10 +147,12 @@ export function inspectDepsImports(entry, { root: repoRoot, read, now, syntax: t
       for (const match of line.matchAll(/\b(?:require|import)\s*\(\s*(['"])([^'"]+)\1/g)) {
         checkTime();
         const target = classify(match[2], path);
+        if (target.local) startupLocals.add(target.local);
         if (target.package) startupPackages.add(target.package);
       }
     }
     for (const name of startupPackages) packages.push([...chain, path, name].join(' -> '));
+    for (const target of startupLocals) walk(target, [...chain, path]);
     for (const statement of source.statements) {
       checkTime();
       if (!ts.isImportDeclaration(statement) && !ts.isExportDeclaration(statement)) continue;
