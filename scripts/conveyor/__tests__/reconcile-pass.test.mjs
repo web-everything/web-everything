@@ -1307,7 +1307,10 @@ describe('failed CI step timeout attribution', () => {
   });
 
   const plan = (f, result) => timeoutPlanReconcile({ prs: [{ ...f.pr, timeoutRetry: result,
-    timeoutRetryBudget: { confirmed: 0, pending: false } }], requiredChecks: ['test'] });
+    timeoutRetryBudget: { confirmed: 0, pending: false } }], repo: 'we', now: Date.parse(at(50)), requiredChecks: ['test'],
+    ciHealBudget: { cap: 3, capSource: 'fixture', resetOnFixHead: true, resetSource: 'fixture' },
+    ciHealBudgetRestore: true, codeqlOwnBudget: true, reviewLabelHeal: 'off',
+    verdictSettings: { recheckNotCiBreak: false, voidNeedsHumanWhenCiGreen: false } });
   const expectInvestigation = (f, result) => {
     expect(result.eligible).toBe(false);
     expect(result.reason).toContain('ordinary CI investigation required');
@@ -1407,6 +1410,25 @@ describe('failed CI step timeout attribution', () => {
     const f = fixture();
     f.data[`${prefix}/actions/jobs/20`].steps.push({ number: 3, name: 'Skipped', status: 'completed', conclusion: 'skipped', started_at: null, completed_at: null });
     expectInvestigation(f, f.collect());
+  });
+
+  it('ignores an untimed skipped step when the failed step has its own complete timeout inventory', () => {
+    const f = fixture();
+    f.data[`${prefix}/actions/jobs/20`].steps.push({ number: 3, name: 'Skipped', status: 'completed', conclusion: 'skipped', started_at: null, completed_at: null });
+    f.data[`${prefix}/actions/jobs/20/logs`] = stamped('Starting job', 0) + stamped(timeout, 25) + stamped('Complete job', 40);
+    const result = readTimeoutEvidence(f.pr, { repo, exec: f.exec, ts: timeoutTs, clock: () => Date.parse(at(50)) });
+    expect(result).toMatchObject({ eligible: true, failures: [{ step: { number: 2, name: 'Deploy' } }] });
+  });
+
+  it.each([
+    ['unowned timeout', stamped('Starting job', 0) + stamped(timeout, 15) + stamped(timeout, 25) + stamped('Complete job', 40)],
+    ['invalid log date', stamped('Starting job', 0) + stamped(timeout, 25).replaceAll('2026-11-24', '2026-02-30') + stamped('Complete job', 40)],
+  ])('refuses %s even alongside a complete failed-step timeout', (_name, log) => {
+    const f = fixture();
+    f.data[`${prefix}/actions/jobs/20/logs`] = log;
+    const result = readTimeoutEvidence(f.pr, { repo, exec: f.exec, ts: timeoutTs, clock: () => Date.parse(at(50)) });
+    expect(result).toMatchObject({ eligible: false, attribution: 'unknown' });
+    expectInvestigation(f, result);
   });
 });
 
@@ -2330,10 +2352,11 @@ it('logs one timing line per planner step (name, repo, ms, startedAt) so a slow 
 
 // Frozen raw-reader verdicts replay the old serial map, including its live infra policy.
 import { keepAliveScript } from '../../lib/test-keepalive.mjs';
+import { URL as NodeURL } from 'node:url';
 import { resolveTimeoutEvidenceConcurrency, runTimeoutEvidencePool } from '../timeout-evidence-pool.mjs';
 import { writeFileSync as evidenceWrite, existsSync as evidenceExists, readFileSync as evidenceRead } from 'node:fs';
 import { join as evidenceJoin } from 'node:path';
-const recordedTimeouts = JSON.parse(evidenceRead('scripts/conveyor/__tests__/fixtures/timeout-evidence-verdicts.json', 'utf8'));
+const recordedTimeouts = JSON.parse(evidenceRead(new NodeURL('./fixtures/timeout-evidence-verdicts.json', import.meta.url), 'utf8'));
 const evidenceRepo = 'fixture/repo';
 const evidenceOptions = { repo: evidenceRepo, enabled: true, readBudget: () => ({ confirmed: 0, pending: false }),
   readCheckOrigin: () => null, log: () => {} };

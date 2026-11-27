@@ -68,6 +68,7 @@ import { GH_TIMEOUT_MS } from '../operations/pr-status-io.mjs';
 import { readReviewChecks } from '../lib/review-ci-gate-io.mjs';
 import { isGhDeferred } from '../lib/gh-deferred.mjs';
 import { readTimeoutBudget } from './timeout-retry-state.mjs';
+import { attributeCiJobLog } from '../lib/ci-log-evidence.mjs';
 import { resolveTimeoutEvidenceConcurrency, runTimeoutEvidencePool } from './timeout-evidence-pool.mjs';
 import { EVIDENCE_READ_BACKOFF_MS, isEvidenceReadTimeout, syncSleep } from './evidence-read-retry.mjs';
 import { isInfraCancelledOnlyRun, isInfraCancelledJob, isAggregateGateFailure, classifyInfraCancelled, resolveInfraCancelledMode, DEFAULT_INFRA_CANCELLED_MAX_RERUNS, authoritativeCheckRuns } from './infra-cancelled.mjs';
@@ -2142,6 +2143,8 @@ export function timeoutImpact({ changed, sources, roots, head, sourceHead }, ts)
   return null;
 }
 
+/** Classify complete test inventories and their impact. The collector must establish
+ * failed-step ownership before supplying log fragments; this pure core does no IO. */
 export function classifyTimeoutEvidence(evidence, { repo, pr, head, ts }) {
   const no = (reason) => ({ eligible: false, reason });
   if (!evidence || evidence.repo !== repo || evidence.pr !== pr || evidence.head !== head) return no('wrong-repo-pr-head');
@@ -2158,12 +2161,12 @@ export function classifyTimeoutEvidence(evidence, { repo, pr, head, ts }) {
     if (!inventory.complete) return no(inventory.reason);
     if (inventory.failures.some((f) => f.kind !== 'test-timeout')) return no('mixed-failure-kinds');
     covered.add(job.job);
-    failures.push(...inventory.failures);
+    failures.push(...inventory.failures.map(failure => job.step ? { ...failure, step: job.step } : failure));
   }
   if (evidence.failedChecks.some((id) => !covered.has(id)) || covered.size !== evidence.failedChecks.length) return no('unaccounted-failing-check');
   const reason = timeoutImpact({ ...evidence, roots: [...(evidence.roots ?? []), ...failures.map((f) => f.path)] }, ts);
   if (reason) return no(reason);
-  const signature = createHash('sha256').update(JSON.stringify(failures.map((f) => [f.path, f.name, f.kind]).sort())).digest('hex');
+  const signature = createHash('sha256').update(JSON.stringify(failures.map((f) => [f.path, f.name, f.kind, f.step]).sort())).digest('hex');
   return { eligible: true, repo, pr, head, signature, failures, jobs: evidence.jobs.map(({ log, ...job }) => job) };
 }
 
@@ -2215,8 +2218,9 @@ function readWithTimeoutRetry(readOnce, pause = syncSleep) {
   }
 }
 
-function readTimeoutEvidenceOnce(pr, { repo, exec = execFileSyncThrottled, ts, reader: readerOverride = null, facts: factsOverride = null } = {}) {
-  const deadline = Date.now() + 15_000;
+function readTimeoutEvidenceOnce(pr, { repo, exec = execFileSyncThrottled, ts, reader: readerOverride = null, facts: factsOverride = null,
+  clock = Date.now } = {}) {
+  const deadline = clock() + 15_000;
   // perf C1d — facts-first stale-head refusal, ETag reads and the immutable job/log/file cache live in `fix-facts.mjs`
   // (`WE_FIX_FACTS=0` = the plain `gh api` reads this function always made). An injected `exec` (tests, soak) keeps
   // the plain path unless the caller also injects `reader`.
@@ -2224,7 +2228,7 @@ function readTimeoutEvidenceOnce(pr, { repo, exec = execFileSyncThrottled, ts, r
     ? makeFixEvidenceReader({ repo, pr: pr.number, head: pr.headRefOid, exec, deadline })
     : null);
   const plainApi = (path, raw = false) => {
-    const remaining = deadline - Date.now();
+    const remaining = deadline - clock();
     if (remaining <= 0) throw new Error('evidence-read-deadline');
     const value = exec('gh', ['api', path], { encoding: 'utf8', timeout: remaining, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
     return raw ? String(value) : JSON.parse(value);
@@ -2281,10 +2285,15 @@ function readTimeoutEvidenceOnce(pr, { repo, exec = execFileSyncThrottled, ts, r
       // Outage fix: a cancelled / startup_failure / no-runner job has NO log, so the read below 404'd and the PR
       // was refused forever. Classify first; never read a log that cannot exist.
       const cancelledShard = /^(?:test|soak)-shard(?:\s|$)/.test(job.name ?? '') && String(job.conclusion).toLowerCase() === 'cancelled';
-      const infra = cancelledShard || isInfraCancelledJob(job);
+      // Missing runner fields are not proof that no runner was assigned. Otherwise
+      // an empty/missing step inventory can escape attribution via the infra route.
+      const noRunner = job.conclusion === 'failure' && (job.runner_id === null || job.runner_id === 0)
+        && (job.runner_name === null || job.runner_name === '');
+      const infra = job.status === 'completed' && (cancelledShard
+        || ((['cancelled', 'startup_failure'].includes(job.conclusion) || noRunner) && isInfraCancelledJob(job)));
       return { repo, head, run: run.id, job: job.id, name: job.name, attempt: job.run_attempt, workflow: run.path,
         aggregateGate: isAggregateGateFailure(job), status: job.status, conclusion: job.conclusion, logJob: job.id, logAttempt: job.run_attempt,
-        url: job.html_url, infra, cancelledShard, log: infra ? '' : readLog(job) };
+        url: job.html_url, steps: job.steps, infra, cancelledShard, log: infra ? '' : readLog(job) };
     });
     const infraClass = classifyInfraCancelled(jobs);
     if (infraClass.kind === 'infra-only') {
@@ -2301,7 +2310,26 @@ function readTimeoutEvidenceOnce(pr, { repo, exec = execFileSyncThrottled, ts, r
     // ("incomplete failure inventory ... rerun spent") for a PR whose CI is green (live 2026-11-09, #6612/#6621).
     // Only when review-gate is the SOLE red check; any other empty-jobs case (e.g. a superseded shard hiding a red aggregate) stays an incomplete inventory.
     if (!jobs.length && reviewHoldOnly) throw new Error('no-primary-failed-checks');
-    if (!jobs.length || jobs.some((j) => !parseTimeoutFailures(j.log).complete)) throw new Error('incomplete-failure-inventory');
+    if (!jobs.length) throw new Error('incomplete-failure-inventory');
+    // The classifier consumes complete test inventories. Establish their failed-step
+    // provenance here, before any source reads: a whole-job timeout cannot qualify
+    // another step's failure. Keep the original numbered metadata on the result.
+    const timeoutJobs = [], failedSteps = [];
+    for (const job of jobs) {
+      const attributed = attributeCiJobLog(job.log, job.steps);
+      failedSteps.push(...attributed.failedSteps.map(step => ({ job: job.job, ...step })));
+      const refuse = (reason, attribution) => ({ eligible: false, attribution, failedSteps,
+        reason: `${reason}: job ${job.job}; failed steps ${attributed.failedSteps.map(step => `${step.number}:${JSON.stringify(step.name).slice(1, -1)}`).join(', ') || 'unknown'}; ordinary CI investigation required` });
+      if (!attributed.complete) return refuse(`failed-step-attribution-unknown:${attributed.reason}`, 'unknown');
+      for (const { step, log } of attributed.logs) {
+        const inventory = parseTimeoutFailures(log);
+        if (!inventory.complete) return refuse(`failed-step-timeout-ineligible:step-${step.number}:incomplete-timeout-inventory`, 'complete');
+        if (inventory.failures.some(failure => failure.kind !== 'test-timeout')) {
+          return refuse(`failed-step-timeout-ineligible:step-${step.number}:mixed-failure-kinds`, 'complete');
+        }
+        timeoutJobs.push({ ...job, step, log });
+      }
+    }
     const tree = api(`repos/${repo}/git/trees/${head}?recursive=1`);
     if (tree.truncated) throw new Error('truncated-source-tree');
     const sourceEntries = tree.tree.filter((e) => e.type === 'blob' && /\.[cm]?[jt]sx?$/.test(e.path));
@@ -2325,10 +2353,10 @@ function readTimeoutEvidenceOnce(pr, { repo, exec = execFileSyncThrottled, ts, r
     });
     const parser = ts ?? createRequire(import.meta.url)('typescript');
     const result = classifyTimeoutEvidence({ repo, pr: pr.number, head, sourceHead: head, changed, diffComplete: true,
-      checksComplete: true, failedChecks: jobs.map((j) => j.job), jobs, sources, roots }, { repo, pr: pr.number, head, ts: parser });
+      checksComplete: true, failedChecks: jobs.map((j) => j.job), jobs: timeoutJobs, sources, roots }, { repo, pr: pr.number, head, ts: parser });
     const after = api(`repos/${repo}/pulls/${pr.number}`);
     if (after.head.sha !== head || after.base.sha !== pull.base.sha || after.changed_files !== pull.changed_files) throw new Error('stale-head-or-diff');
-    return result;
+    return { ...result, failedSteps, jobs: jobs.map(({ log, ...job }) => job) };
   } catch (error) {
     if (isEvidenceReadTimeout(error)) return { eligible: false, unknown: true, reason: `timeout-evidence-unknown:${error.message}` };
     return error.reason === 'log-unreadable'

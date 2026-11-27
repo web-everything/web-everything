@@ -1,5 +1,74 @@
 import { stripVTControlCharacters } from 'node:util';
 
+// Date.parse normalizes invalid calendar dates. Require the canonical UTC date too,
+// while accepting Actions' sub-millisecond log timestamps.
+function ciTimestamp(value) {
+  if (typeof value !== 'string') return null;
+  const match = /^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,9}))?Z$/.exec(value);
+  if (!match) return null;
+  const canonical = `${match[1]}.${(match[2] ?? '').padEnd(3, '0').slice(0, 3)}Z`;
+  const time = Date.parse(canonical);
+  return Number.isFinite(time) && new Date(time).toISOString() === canonical ? time : null;
+}
+
+/** Attribute a whole Actions log using the numbered, terminal job-step inventory.
+ * Reject partial or ambiguous evidence rather than guessing ownership from step names
+ * or carrying ownership across untimestamped lines. Untimed skipped steps own nothing.
+ * This is evidence for eligibility, unlike the context-only extractors below.
+ */
+export function attributeCiJobLog(log, steps) {
+  const failedSteps = [];
+  const unknown = reason => ({ complete: false, reason, failedSteps });
+  if (!Array.isArray(steps) || !steps.length) return unknown('missing-step-metadata');
+  if (steps.length > 512) return unknown('step-metadata-limit');
+  const ranges = [];
+  let previousNumber = 0;
+  for (const step of steps) {
+    if (!step || !Number.isSafeInteger(step.number) || step.number <= previousNumber
+        || typeof step.name !== 'string' || !step.name.trim() || step.name.length > 4096
+        || step.status !== 'completed' || !['success', 'failure', 'neutral', 'skipped'].includes(step.conclusion)) {
+      return unknown('invalid-step-metadata');
+    }
+    previousNumber = step.number;
+    const identity = { number: step.number, name: step.name };
+    if (step.conclusion === 'failure') failedSteps.push(identity);
+    if (step.conclusion === 'skipped' && step.started_at == null && step.completed_at == null) continue;
+    const start = ciTimestamp(step.started_at), end = ciTimestamp(step.completed_at);
+    if (start === null || end === null || start > end) return unknown('invalid-step-boundaries');
+    if (ranges.length && start < ranges.at(-1).end) return unknown('overlapping-step-boundaries');
+    ranges.push({ step: identity, failed: step.conclusion === 'failure', start, end, lines: [] });
+  }
+  if (!failedSteps.length) return unknown('missing-failed-step');
+  if (typeof log !== 'string' || Buffer.byteLength(log) > 2 * 1024 * 1024) return unknown('job-log-limit');
+  const rawLines = log.split('\n');
+  if (rawLines.some(line => line.length > 16 * 1024)) return unknown('job-log-line-limit');
+  let first = null, last = null;
+  for (const raw of rawLines) {
+    const line = stripVTControlCharacters(raw).trimEnd();
+    if (!line.trim()) continue;
+    if (/\btruncated\b/i.test(line)) return unknown('truncated-job-log');
+    const match = /^(\S+)[ \t](.*)$/.exec(line);
+    const time = ciTimestamp(match?.[1]);
+    if (time === null) return unknown('missing-or-invalid-log-timestamp');
+    if (last !== null && time < last) return unknown('nonmonotonic-log-timestamps');
+    first ??= time;
+    last = time;
+    const owners = ranges.filter(range => time >= range.start && time <= range.end);
+    if (owners.length > 1) return unknown('ambiguous-step-boundary');
+    if (!owners.length) {
+      if ((time >= ranges[0].start && time <= ranges.at(-1).end)
+          || /^(?:FAIL\b|Error:|AssertionError:|Tests\s+\d+\s+failed\b|##\[error\])/.test(match[2].trim())) {
+        return unknown('unowned-log-output');
+      }
+      continue;
+    }
+    if (owners[0].failed) owners[0].lines.push(match[2]);
+  }
+  if (first === null || first > ranges[0].start || last < ranges.at(-1).end) return unknown('incomplete-job-log-boundaries');
+  return { complete: true, failedSteps, logs: ranges.filter(range => range.failed)
+    .map(({ step, lines }) => ({ step, log: lines.join('\n') })) };
+}
+
 /** The failing test lines a vitest / node log names, de-duplicated in log order.
  * includeErrors also retains diagnostics for context, without asserting step attribution. */
 export function extractFailedTests(log, max = 12, { includeErrors = false, maxBytes = Infinity } = {}) {
