@@ -17,8 +17,9 @@
  * Off-main refusal order: in-progress/unreadable git dir; unreadable HEAD; missing main; unreadable status;
  * tracked changes; invalid (non-40-hex) head/main/adopted SHA or main != adopted; unreadable reachability;
  * unreachable (foreign) commit. Reachability uses the concrete HEAD SHA and the local origin/main ref,
- * never a fetch. Re-read HEAD, main, tracked status and operation markers immediately before each write,
- * under prepare's clone write lock. Changed/unreadable HEAD or main refuses as detached-state-changed.
+ * never a fetch. Re-read detachment, HEAD, main, tracked status, operation markers and reachability
+ * immediately before each write, under prepare's clone write lock. Changed/unreadable detachment, HEAD,
+ * main or reachability refuses as detached-state-changed, with detail.field naming the failed proof.
  * Save create-only at refs/we/wrong-branch-heal/<ts>-<sha9> (zero old SHA); save failure stops before checkout.
  * Checkout is non-forced with --no-overwrite-ignore: even ignored untracked collisions refuse. A failed
  * switch retains the saved ref in detail.savedRef for operator recovery; no refusal tries another heal path.
@@ -137,21 +138,24 @@ export function healWrongBranch({ git, adoptedHead = null, settings = resolveWro
   const inProgress = readInProgress(git);
   const st = git(['status', '--porcelain=v1', '-z', '--untracked-files=no']);
   const changedPaths = st.status === 0 && typeof st.stdout === 'string' ? parseTrackedChanges(st.stdout) : null;
-  let headReachability = 'unreadable';
-  if (!branch && headSha !== mainSha && FULL_SHA_RE.test(headSha)) {
+  const readReachability = () => {
     try {
       const reachable = git(['merge-base', '--is-ancestor', headSha, 'refs/remotes/origin/main']);
-      headReachability = reachable?.status === 0 ? 'reachable' : reachable?.status === 1 ? 'unreachable' : 'unreadable';
-    } catch { headReachability = 'unreadable'; }
-  }
+      return reachable?.status === 0 ? 'reachable' : reachable?.status === 1 ? 'unreachable' : 'unreadable';
+    } catch { return 'unreadable'; }
+  };
+  const headReachability = !branch && headSha !== mainSha && FULL_SHA_RE.test(headSha) ? readReachability() : 'unreadable';
   const plan = planWrongBranchHeal({ branch, headSha, mainSha, adoptedHead, headReachability, changedPaths, hasMain, settings, inProgress });
   if (!plan.heal) return { healed: false, reason: plan.reason, ...(plan.detail ? { detail: plan.detail } : {}) };
 
   if (plan.savedRefNeeded) {
     // Only this path moves a detached tree. Re-check each proof before BOTH the save and the switch.
     const reverify = () => {
-      let field = 'headSha';
+      let field = 'detached';
       try {
+        const detached = git(['symbolic-ref', '-q', 'HEAD']);
+        if (detached?.status !== 1) return { healed: false, reason: 'detached-state-changed', detail: { field } };
+        field = 'headSha';
         const liveHead = git(['rev-parse', '--verify', '--quiet', 'HEAD']);
         if (liveHead?.status !== 0 || out(liveHead) !== headSha) return { healed: false, reason: 'detached-state-changed', detail: { field } };
         field = 'mainSha';
@@ -165,6 +169,8 @@ export function healWrongBranch({ git, adoptedHead = null, settings = resolveWro
         const operations = readInProgress(git);
         if (operations === null) return { healed: false, reason: 'git-dir-unreadable' };
         if (operations.length) return { healed: false, reason: 'operation-in-progress', detail: { operations } };
+        field = 'reachability';
+        if (readReachability() !== 'reachable') return { healed: false, reason: 'detached-state-changed', detail: { field } };
         return null;
       } catch {
         return { healed: false, reason: field === 'status' ? 'status-unreadable' : field === 'gitDir' ? 'git-dir-unreadable' : 'detached-state-changed', detail: { field } };

@@ -230,6 +230,96 @@ describe('DAEMON-CLONE-DETACHED-HEAL', () => {
     expect(f.refs()).toEqual([savedRef]);
     expect(f.ok(['rev-parse', result.detail.savedRef])).toBe(f.oldHead);
   });
+  it.each(['save', 'switch'])('reverify refuses HEAD attached at same sha before %s', before => {
+    const f = detachedFixture();
+    const branch = 'fixture-unallowlisted';
+    const calls = [];
+    let attached = false;
+    const git = args => {
+      calls.push(args);
+      const result = f.git(args);
+      if (!attached && args[0] === (before === 'save' ? 'merge-base' : 'update-ref')) {
+        expect(result.status).toBe(0);
+        f.ok(['checkout', '--quiet', '-b', branch]);
+        attached = true;
+      }
+      return result;
+    };
+    const result = f.heal({ git });
+    const savedRef = `refs/we/wrong-branch-heal/1234-${f.oldHead.slice(0, 9)}`;
+    expect(result).toEqual({ healed: false, reason: 'detached-state-changed',
+      detail: { field: 'detached', ...(before === 'switch' ? { savedRef } : {}) } });
+    expect(attached).toBe(true);
+    expect(calls.filter(args => args[0] === 'checkout')).toEqual([]);
+    expect(calls.filter(args => args[0] === 'update-ref')).toHaveLength(before === 'switch' ? 1 : 0);
+    expect(f.ok(['symbolic-ref', 'HEAD'])).toBe(`refs/heads/${branch}`);
+    expect(f.ok(['rev-parse', 'HEAD'])).toBe(f.oldHead);
+    expect(f.ok(['rev-parse', 'refs/heads/main'])).toBe(f.adoptedHead);
+    expect(f.refs()).toEqual(before === 'switch' ? [savedRef] : []);
+    if (before === 'switch') expect(f.ok(['rev-parse', result.detail.savedRef])).toBe(f.oldHead);
+  });
+  it.each(['save', 'switch'].flatMap(before => ['exit-128', 'timeout', 'missing-result', 'throw'].map(fault => [before, fault])))(
+    'reverify refuses unreadable detached state before %s: %s', (before, fault) => {
+      const f = detachedFixture();
+      const calls = [];
+      let saved = false;
+      const git = args => {
+        calls.push(args);
+        if (args.join(' ') === 'symbolic-ref -q HEAD' && (before === 'save' || saved)) {
+          if (fault === 'throw') throw new Error('injected detached-state read failure');
+          if (fault === 'missing-result') return undefined;
+          return { status: fault === 'timeout' ? null : 128, stdout: '' };
+        }
+        const result = f.git(args);
+        if (args[0] === 'update-ref') { expect(result.status).toBe(0); saved = true; }
+        return result;
+      };
+      const result = f.heal({ git });
+      const savedRef = `refs/we/wrong-branch-heal/1234-${f.oldHead.slice(0, 9)}`;
+      expect(result).toEqual({ healed: false, reason: 'detached-state-changed',
+        detail: { field: 'detached', ...(before === 'switch' ? { savedRef } : {}) } });
+      expect(calls.filter(args => args[0] === 'checkout')).toEqual([]);
+      expect(calls.filter(args => args[0] === 'update-ref')).toHaveLength(before === 'switch' ? 1 : 0);
+      expect(f.ok(['rev-parse', 'HEAD'])).toBe(f.oldHead);
+      expect(f.git(['symbolic-ref', '--quiet', 'HEAD']).status).toBe(1);
+      expect(f.refs()).toEqual(before === 'switch' ? [savedRef] : []);
+      if (before === 'switch') expect(f.ok(['rev-parse', result.detail.savedRef])).toBe(f.oldHead);
+    });
+  it.each(['save', 'switch'].flatMap(before => ['unreachable', 'missing-origin-main', 'exit-128', 'timeout', 'throw'].map(fault => [before, fault])))(
+    'reverify refuses origin/main no longer containing HEAD before %s: %s', (before, fault) => {
+      const f = detachedFixture();
+      const calls = [];
+      let changed = false;
+      const git = args => {
+        calls.push(args);
+        if (changed && args[0] === 'merge-base' && !['unreachable', 'missing-origin-main'].includes(fault)) {
+          if (fault === 'throw') throw new Error('injected reachability read failure');
+          return { status: fault === 'timeout' ? null : 128, stdout: '' };
+        }
+        const result = f.git(args);
+        if (!changed && args[0] === (before === 'save' ? 'merge-base' : 'update-ref')) {
+          expect(result.status).toBe(0);
+          if (fault === 'unreachable') f.ok(['update-ref', 'refs/remotes/origin/main', f.adoptedHead]);
+          if (fault === 'missing-origin-main') f.ok(['update-ref', '-d', 'refs/remotes/origin/main']);
+          changed = true;
+        }
+        return result;
+      };
+      const result = f.heal({ git });
+      const savedRef = `refs/we/wrong-branch-heal/1234-${f.oldHead.slice(0, 9)}`;
+      expect(result).toEqual({ healed: false, reason: 'detached-state-changed',
+        detail: { field: 'reachability', ...(before === 'switch' ? { savedRef } : {}) } });
+      expect(changed).toBe(true);
+      expect(calls.filter(args => args[0] === 'checkout')).toEqual([]);
+      expect(calls.filter(args => args[0] === 'update-ref')).toHaveLength(before === 'switch' ? 1 : 0);
+      expect(f.ok(['rev-parse', 'HEAD'])).toBe(f.oldHead);
+      expect(f.git(['symbolic-ref', '--quiet', 'HEAD']).status).toBe(1);
+      expect(f.ok(['rev-parse', 'refs/heads/main'])).toBe(f.adoptedHead);
+      expect(f.refs()).toEqual(before === 'switch' ? [savedRef] : []);
+      if (before === 'switch') expect(f.ok(['rev-parse', result.detail.savedRef])).toBe(f.oldHead);
+      if (fault === 'unreachable') expect(f.ok(['rev-parse', 'refs/remotes/origin/main'])).toBe(f.adoptedHead);
+      if (fault === 'missing-origin-main') expect(f.git(['rev-parse', '--verify', 'refs/remotes/origin/main']).status).toBe(128);
+    });
   it('saved-ref collision never replaces an existing audit ref', () => {
     const f = detachedFixture();
     const ref = `refs/we/wrong-branch-heal/1234-${f.oldHead.slice(0, 9)}`;
