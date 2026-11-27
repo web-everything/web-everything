@@ -55,6 +55,15 @@ ruling through we:scripts/conveyor/reconcile-fix-dispatch.mjs into fresh and res
 the work instructions. The original answer is retained byte-for-byte in the structured record and brief;
 HTML comment delimiters are escaped in the visible quote so quoted marker text stays inert.
 
+## Fix-agent stand-down head
+
+A fix agent's terminal stand-down (needs-judgment, conflict or gate-red) run from the fix brief passes
+`--head` with the PR head from `git ls-remote` when that lookup succeeds, meaning it exits 0 within a fixed
+20-second bound on the lookup alone and its first field is exactly 40 lower-case hex; otherwise, including
+on timeout, the stand-down is posted unheaded and the rest of the exit (completion report and fix-end)
+runs exactly as before. Stand-downs suggested by daemon-built resume or appended prompts are out of scope
+of this rule.
+
 ## PR description handoff: live case #3181
 
 After merge, from the WE checkout, the orchestrator should run this exact command on the operator's
