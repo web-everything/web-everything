@@ -5527,8 +5527,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       && cached.baseOid === baseSha && cached.headRef === headRef && cached.baseRef === baseRef && cached.complete === true
       && Array.isArray(cached.commits)) return { commits: cached.commits, degraded: false };
     try {
-      const result = await meteredPrCommitsAsync(shaCacheRepo(repo, localSlug), num, { headRefOid: headSha, baseRefOid: baseSha,
-        exec: async (args, opts) => (await execFileP('gh', args, opts)).stdout });
+      const result = await meteredPrCommitsAsync(shaCacheRepo(repo, localSlug), num, { headRefOid: headSha, baseRefOid: baseSha });
       if (!result.complete) {
         process.stderr.write(`head-chain: commits-read-refused #${num} ${result.reason}; retry next pass\n`);
         return { commits: [], degraded: true };

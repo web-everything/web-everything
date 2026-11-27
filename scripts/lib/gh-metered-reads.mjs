@@ -1,5 +1,6 @@
 /** Read queries include their own rateLimit cost; gh-throttle captures it before stdout projection. */
 import { runGhSync } from './gh-throttle.mjs';
+import { execDrainAsync } from './drain-gh-async.mjs';
 
 const OID = /^[a-f0-9]{40}$/;
 const incomplete = reason => ({ commits: [], headOid: null, baseOid: null, complete: false, reason });
@@ -62,7 +63,8 @@ export function meteredPrCommits(repo, number, { exec = runGhSync, ...expected }
 }
 
 /** Same request/parser contract for the drain's asynchronous, throttled executor. */
-export async function meteredPrCommitsAsync(repo, number, { exec, ...expected } = {}) {
+const readCommitsAsync = async (args, opts) => (await execDrainAsync('gh', args, opts)).stdout;
+export async function meteredPrCommitsAsync(repo, number, { exec = readCommitsAsync, ...expected } = {}) {
   const requests = commitRequests(repo, number, expected);
   let next = requests.next();
   while (!next.done) next = requests.next(await exec(next.value, commitsOptions()));
