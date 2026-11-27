@@ -637,6 +637,121 @@ function isoDeps({ parent, repo }, hook, dirs = []) {
 }
 const leftovers = parent => readdirSync(parent).filter(n => n.startsWith('.urgent-verify-'));
 
+describe('urgent missing-object acquisition', () => {
+  function acquisition(options = {}) {
+    const parent = mkdtempSync(pjoin(tmpdir(), 'uv-fetch-'));
+    tempParents.push(parent);
+    const repo = pjoin(parent, 'repo'), home = pjoin(parent, 'home'), bin = pjoin(parent, 'bin');
+    mkdirSync(repo); mkdirSync(bin);
+    for (const tool of ['git', 'node', 'npm', 'sh']) writeFileSync(pjoin(bin, tool), '', { mode: 0o755 });
+    const ledger = pjoin(parent, 'fix-ready.jsonl');
+    mkdirSync(pjoin(repo, 'scripts/settings'), { recursive: true });
+    writeFileSync(pjoin(repo, 'scripts/settings/prototype-load.json'), JSON.stringify({ readyRecordPath: ledger }));
+    writeFileSync(ledger, options.ledger ?? JSON.stringify({ sha, ref: options.ref ?? 'fix/urgent', tests: 'green', audit: 'NOT WEAKENED' }) + '\n');
+    let available = Boolean(options.available), tip = sha;
+    const calls = [], append = vi.fn();
+    const spawnSync = vi.fn((cmd, args, opts) => {
+      calls.push({ cmd, args, opts });
+      let stdout = '', status = 0, error;
+      if (args[0] === 'remote' && args[1] === 'get-url') stdout = options.origin ?? 'https://github.com/web-everything/web-everything.git';
+      if (args[0] === 'rev-parse') stdout = args.includes('--git-common-dir') ? pjoin(repo, '.git') : tip;
+      if (args[0] === 'init') mkdirSync(pjoin(args.at(-1), '.git/objects/info'), { recursive: true });
+      if (args[0] === 'cat-file' && !available) status = 1;
+      if (args.includes('fetch')) {
+        if (options.timeout) { status = null; error = Object.assign(new Error('deadline'), { code: 'ETIMEDOUT' }); }
+        else if (options.fail || (options.rawRefused && args.at(-1) === sha)) status = 1;
+        else { available = true; tip = options.tip ?? sha; }
+      }
+      if (args[0] === 'checkout' && !available) status = 1;
+      return { status, stdout, stderr: '', error };
+    });
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    const deps = createUrgentDeps({ cwd: repo, home, host: 'fixture', tempRoot: parent, isolated: true, spawnSync,
+      env: { HOME: home, TMPDIR: parent, PATH: bin, LANE_POOL_ROOT: pjoin(parent, 'pool'),
+        GIT_DIR: '/hostile', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'url.evil.insteadOf', GIT_CONFIG_VALUE_0: 'https://github.com/' },
+      decorate: scoped => ({ ...fixture(), clean: scoped.clean, head: scoped.head, append }) });
+    return { deps, parent, calls, append, clock };
+  }
+  async function run(options = {}, requested = sha) {
+    const t = acquisition(options);
+    try { return { ...t, result: await urgentVerify({ sha: requested }, t.deps) }; }
+    finally { t.clock.mockRestore(); }
+  }
+  it('an urgent SHA absent from alternates is fetched before checkout and verified exactly', async () => {
+    const t = await run();
+    expect(t.result).toMatchObject({ ok: true, marker: { sha, result: 'green' } });
+    const fetch = t.calls.findIndex(c => c.args.includes('fetch'));
+    const checkout = t.calls.findIndex(c => c.args[0] === 'checkout');
+    expect(fetch).toBeGreaterThan(-1); expect(checkout).toBeGreaterThan(fetch);
+    expect(t.calls[fetch].args.at(-1)).toBe(sha);
+    expect(leftovers(t.parent)).toEqual([]);
+  });
+  it('uses only the fix-ready branch after raw-SHA refusal and verifies FETCH_HEAD', async () => {
+    const t = await run({ rawRefused: true });
+    expect(t.result.ok).toBe(true);
+    expect(t.calls.filter(c => c.args.includes('fetch')).map(c => c.args.at(-1))).toEqual([sha, 'refs/heads/fix/urgent']);
+    expect(t.calls.some(c => c.args.includes('FETCH_HEAD^{commit}'))).toBe(true);
+  });
+  it.each([
+    ['torn historical line', '{"ref":"lane/old"\n', '\n'],
+    ['torn final line', '\n', '\n{"ref":"lane/torn"'],
+    ['malformed lines and CRLF blanks', 'not-json\r\n\r\n', '\r\n \r\n{oops\r\n'],
+  ])('uses the matching fix-ready record despite %s', async (_, before, after) => {
+    const ledger = before + JSON.stringify({ sha, ref: 'lane/urgent' }) + after;
+    const t = await run({ rawRefused: true, ledger });
+    expect(t.result).toMatchObject({ ok: true, marker: { sha, result: 'green' } });
+    expect(t.calls.filter(c => c.args.includes('fetch')).map(c => c.args.at(-1))).toEqual([sha, 'refs/heads/lane/urgent']);
+    expect(t.calls.some(c => c.args.includes('FETCH_HEAD^{commit}'))).toBe(true);
+    expect(t.calls.some(c => c.args[0] === 'checkout')).toBe(true);
+    expect(leftovers(t.parent)).toEqual([]);
+  });
+  it('keeps the latest matching record across malformed lines', async () => {
+    const ledger = [JSON.stringify({ sha, ref: 'lane/old' }), '{"ref":"lane/torn"',
+      JSON.stringify({ sha, ref: 'lane/urgent' }), '{oops'].join('\n');
+    const t = await run({ rawRefused: true, ledger });
+    expect(t.result.ok).toBe(true);
+    expect(t.calls.filter(c => c.args.includes('fetch')).map(c => c.args.at(-1))).toEqual([sha, 'refs/heads/lane/urgent']);
+  });
+  it('keeps available objects local and deterministic', async () => {
+    const t = await run({ available: true });
+    expect(t.result.ok).toBe(true);
+    expect(t.calls.some(c => c.args.includes('fetch'))).toBe(false);
+  });
+  it.each([
+    ['fetch failure', { fail: true }, 'fetch-failed'],
+    ['fetch timeout', { timeout: true }, 'fetch-timeout'],
+    ['wrong repo', { origin: 'https://evil.invalid/o/r.git' }, 'origin-not-allowed'],
+    ['wrong fetched SHA', { tip: 'b'.repeat(40) }, 'fetched-sha-mismatch'],
+    ['moved branch', { rawRefused: true, tip: 'b'.repeat(40) }, 'fetched-sha-mismatch'],
+    ['invalid ref', { rawRefused: true, ref: 'fix/../evil' }, 'fix-ready-ref-invalid'],
+    ['missing record', { rawRefused: true, ledger: '' }, 'fix-ready-record-missing'],
+    ['only malformed records', { rawRefused: true, ledger: '{"ref":"lane/old"\n{oops\n' }, 'fix-ready-record-missing'],
+    ['malformed and nonmatching records', { rawRefused: true, ledger: '{oops\n' + JSON.stringify({ sha: 'b'.repeat(40), ref: 'lane/other' }) }, 'fix-ready-record-missing'],
+    ['invalid latest ref after torn line', { rawRefused: true, ledger: [JSON.stringify({ sha, ref: 'lane/old' }), '{oops', JSON.stringify({ sha, ref: 'lane/../evil' })].join('\n') }, 'fix-ready-ref-invalid'],
+    ['oversized ledger', { rawRefused: true, ledger: 'x'.repeat(1024 * 1024 + 1) }, 'fix-ready-ledger-too-large'],
+  ])('fails closed for %s, cleans the isolate and writes no marker', async (_, options, reason) => {
+    const t = await run(options);
+    expect(t.result).toMatchObject({ ok: false, detail: expect.stringContaining(reason), fallback: expect.stringContaining('retry') });
+    expect(t.append).not.toHaveBeenCalled();
+    expect(t.calls.some(c => c.args[0] === 'checkout')).toBe(false);
+    expect(leftovers(t.parent)).toEqual([]);
+  });
+  it('refuses invalid SHA before subprocesses', async () => {
+    const t = await run({}, '--upload-pack=evil');
+    expect(t.result.ok).toBe(false); expect(t.calls).toEqual([]); expect(t.append).not.toHaveBeenCalled();
+  });
+  it('fetch ignores hostile Git environment and disables ambient config, helpers and replacement objects', async () => {
+    const t = await run();
+    const fetch = t.calls.find(c => c.args.includes('fetch'));
+    expect(fetch).toBeDefined();
+    expect(fetch.opts.env).toMatchObject({ GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_NO_REPLACE_OBJECTS: '1', GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' });
+    expect(fetch.opts.env).not.toHaveProperty('GIT_DIR'); expect(fetch.opts.env).not.toHaveProperty('GIT_CONFIG_COUNT');
+    expect(fetch.args).toContain('https://github.com/web-everything/web-everything');
+    expect(fetch.args).toContain('--no-recurse-submodules');
+    expect(fetch.opts.timeout).toBeLessThanOrEqual(60000);
+  });
+});
+
 describe('urgent-verify isolated worktree', () => {
   it.each([0, 1])('keeps the throwaway HOME present for wrapper children and removes it after exit %s', async exit => {
     const t = tempRepo(); let childHome;
