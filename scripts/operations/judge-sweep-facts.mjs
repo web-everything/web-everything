@@ -89,7 +89,8 @@ function deriveResponsibility(pr, thresholds) {
     return result('orchestrator', 'Inspect the hold and assign the next responsible worker.');
   }
   // Empty-owner fallback only, after every guard above. Only an explicit CONFLICTING on a known non-draft PR counts.
-  if (pr.mergeable === 'CONFLICTING' && pr.isDraft === false && !labels.includes(pr.fixHoldLabel ?? 'hold:fix')
+  if (pr.mergeable === 'CONFLICTING' && pr.isDraft === false && !labels.includes('hold:fix')
+    && !labels.includes(pr.fixHoldLabel ?? 'hold:fix')
     && !labels.includes(pr.workerFixHoldLabel ?? 'hold:fix')) {
     return { ...result('fixer', 'Resolve the conflict.'), conflictFallback: true };
   }
@@ -107,7 +108,8 @@ export function needsJudgment(pr, thresholds = STALL_DEFAULTS) {
     && ownerAge(pr) > (thresholds.unownedMinutes ?? STALL_DEFAULTS.unownedMinutes)) {
     const responsibility = deriveResponsibility(pr, thresholds);
     // Only the conflict fallback may name a fixer that was never dispatched.
-    if (['nobody', 'orchestrator'].includes(responsibility.nextOwner) || responsibility.conflictFallback) {
+    if (['nobody', 'orchestrator'].includes(responsibility.nextOwner) || responsibility.conflictFallback
+      || pr.conflictOwnershipError) {
       return { needsJudgment: true, reason: 'unowned: inspect PR and assign the next responsible worker' };
     }
   }

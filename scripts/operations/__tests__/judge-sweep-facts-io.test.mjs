@@ -2,6 +2,7 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { resolveHumanReviewSurfaces } from '../../lib/human-review-surfaces.mjs';
+import * as referralCards from '../../lib/referral-card-readable.mjs';
 import { runGhSync } from '../../lib/gh-throttle.mjs';
 import { createJudgeSweepFactsReader, createShapeCache, JUDGE_SWEEP_REPO, operatorGh, readCheckoutState, readFromFreshOrigin, resolveFixHoldLabel } from '../judge-sweep-facts-io.mjs';
 import { execFileSync } from 'node:child_process';
@@ -65,7 +66,7 @@ const pr = (extra = {}) => ({ number: 1, title: 'IO fixture', headRefOid: head,
 const options = (extra = {}) => {
   const opts = ({
   env: {}, readFile: () => '{}', log: () => {},
-  cardReadable: () => false, shape: () => ({ humanRequired: false }),
+  shape: () => ({ humanRequired: false }),
   findSuspendedRuns: () => [],
   readExitRulings: () => ({ prs: new Set(), errors: [] }),
   checkoutState: () => ({ behind: 0 }),
@@ -239,11 +240,11 @@ it('keeps a dropped finding with an existing block open', () => {
   expect(facts.openReferrals).toEqual([{ key: record.referrals[0].key, ruled: true, superseded: false }]);
 });
 
-it('remote card verification refuses additional GitHub reads and leaves the referral open', () => {
+it.each(['123-fixture.md', 'xabc123-fixture.md'])('remote card verification refuses additional reads and leaves %s open', file => {
   const record = referralRecord();
   record.rulings = [{ id: 'ruling-1', key: record.referrals[0].key, reviewerId: record.reviewer.id,
     lens: record.reviewer.lens, result: 'card', rationale: 'filed', evidence: ['diff'],
-    card: 'we:backlog/123-fixture.md@pr55' }];
+    card: `we:backlog/${file}@pr55` }];
   expect(validateReferralRecord(record)).toBe(true);
   const gh = vi.fn(() => JSON.stringify([pr()]));
   const facts = read({ gh, readComments: () => [comment(renderReferralRecord(record))] });
@@ -1120,8 +1121,8 @@ it.each([false, true])('validates unknown merge state on current/fresh paths (fr
       : { nextOwner: 'operator', nextStep: expect.stringMatching(/mergeability.*rerun/) });
   }
 });
-it.each([false, true])('custom hold label replaces the default on current/fresh paths (fresh=%s)', fresh => {
-  for (const [label, nextOwner] of [['custom:fix', 'nobody'], ['hold:fix', 'fixer']]) {
+it.each([false, true])('custom hold label preserves the default on current/fresh paths (fresh=%s)', fresh => {
+  for (const [label, nextOwner] of [['custom:fix', 'nobody'], ['hold:fix', 'nobody']]) {
     const env = { WE_FIX_HOLD_LABEL: 'custom:fix', WE_POLICY_CASCADE_LOG: '1' };
     const log = vi.fn();
     const local = hardenedRead({ env, log, gh: () => JSON.stringify([pr({ labels: [{ name: label }],
@@ -1202,4 +1203,30 @@ it.each([7, 'BOGUS', false, {}, []])('malformed merge evidence requires judgment
   expect(bundle.prs[0]).toMatchObject({ needsJudgment: true, nextOwner: 'judge',
     reason: 'evidence-unavailable: inspect PR evidence and rerun' });
   expect(bundle.counts).toEqual({ needsJudgment: 1, noAction: 0 });
+});
+
+
+it('shared IO fixtures exercise the production remote card verifier without additional reads', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'judge-card-verifier-'));
+  const original = referralCards.referralCardReadable;
+  const verifier = vi.spyOn(referralCards, 'referralCardReadable')
+    .mockImplementation((ref, _root, ports) => original(ref, dir, ports));
+  try {
+    const record = referralRecord();
+    record.rulings = [{ id: 'ruling-1', key: record.referrals[0].key, reviewerId: record.reviewer.id,
+      lens: record.reviewer.lens, result: 'card', rationale: 'filed', evidence: ['diff'],
+      card: 'we:backlog/123-fixture.md@pr55' }];
+    const gh = vi.fn(() => JSON.stringify([pr()]));
+    const facts = read({ gh, readStallThresholds: () => ({}),
+      readComments: () => [comment(renderReferralRecord(record))] });
+    expect(verifier).toHaveBeenCalledWith(record.rulings[0].card, expect.any(String),
+      expect.objectContaining({ readOnPr: expect.any(Function) }));
+    expect(gh).toHaveBeenCalledTimes(2);
+    expect(exec).not.toHaveBeenCalled();
+    expect(runGhSync).not.toHaveBeenCalled();
+    expect(facts.openReferrals).toEqual([{ key: record.referrals[0].key, ruled: true, superseded: false }]);
+  } finally {
+    verifier.mockRestore();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

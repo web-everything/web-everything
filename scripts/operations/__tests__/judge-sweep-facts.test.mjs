@@ -992,3 +992,20 @@ it.each(['ready-to-merge', 'operator-accepted'])('preserves %s ownership despite
     ? { needsJudgment: false, reason: 'awaiting-merge', nextOwner: 'drain' }
     : { needsJudgment: true, reason: 'awaiting-operator', nextOwner: 'judge' });
 });
+
+
+it('unknown mergeability preserves judgment for an ownerless 90-minute-old fix loop', () => {
+  const input = facts({ owner: null, fixerRunning: false, minutesSinceUpdate: 1,
+    minutesSinceFixLoop: 90, mergeable: 'UNKNOWN', isDraft: false,
+    conflictOwnershipError: 'Inspect PR mergeability and rerun; merge state is unknown or unreadable.' });
+  expect(buildJudgeSweepBundle({ prs: [input] }).prs[0]).toMatchObject({
+    needsJudgment: true, reason: expect.stringMatching(/^unowned:/), nextOwner: 'operator',
+    nextStep: input.conflictOwnershipError });
+});
+
+it.each(['hold:fix', 'custom:fix', 'worker:fix'])(
+  'conflict fallback respects %s alongside effective and worker hold overrides', label => {
+    expect(judgeSweepFacts.deriveNextOwner(facts({ mergeable: 'CONFLICTING', isDraft: false,
+      fixHoldLabel: 'custom:fix', workerFixHoldLabel: 'worker:fix', labels: [label] })))
+      .toMatchObject({ nextOwner: 'nobody' });
+  });

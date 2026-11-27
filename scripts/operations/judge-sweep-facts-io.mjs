@@ -243,6 +243,9 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
   cardReadable = ref => referralCardReadable(ref, rootDir(), { readOnPr: () => {
     // Remote card verification would break this operation's bounded evidence call budget.
     throw failure('remote referral card requires operator verification');
+  }, readMainByBornAs: () => {
+    // The shared verifier's published-card fallback must not spawn unbudgeted git reads either.
+    throw failure('published referral card requires operator verification');
   } }),
 } = {}) {
   return ({ repo = JUDGE_SWEEP_REPO, checkCoverage } = {}) => {
