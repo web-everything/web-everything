@@ -54,7 +54,7 @@ import {
  *  comments/body/files come from cached per-PR hydration. */
 export const SNAPSHOT_FIELDS = Object.freeze([
   'number', 'title', 'body', 'url', 'isDraft', 'createdAt', 'updatedAt',
-  'headRefName', 'headRefOid', 'baseRefName', 'isCrossRepository', 'mergeable', 'mergeStateStatus', 'reviewDecision',
+  'headRefName', 'headRefOid', 'baseRefOid', 'baseRefName', 'isCrossRepository', 'mergeable', 'mergeStateStatus', 'reviewDecision',
   'labels', 'files', 'comments', 'statusCheckRollup', 'rowsHead', 'rowsComplete',
 ]);
 

@@ -189,6 +189,7 @@ import { autoStrandedSweepPass } from './backlog-stranded-sweep.mjs'; // xvr2o8r
 import { parseEscalationReason } from './review-detail.mjs';
 import { deriveResolutionBasis, graduatedToFromBody, renderResolutionBasisBanner } from './lib/review-render.mjs'; // #2447 — the graduatedTo resolution-basis banner (presentation only; never gates)
 import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, nextLimit } from './lib/pr-snapshot.mjs';
+import { meteredPrCommitsAsync } from './lib/gh-metered-reads.mjs';
 import { listOpenPrsPagedHydratedCompleteAsync as listOpenPrsPagedHydrated, resolvePrListPaging, parseListOutput } from './lib/pr-list-paged.mjs'; // refuses a short inventory (rows < totalCount)
 import { withListRetryAsync as withListRetry } from './lib/gh-list-retry.mjs'; // 504 incident 2026-11-03 — retry a transient 5xx list with backoff; a persistent failure throws + raises gh-list-failed
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
@@ -3211,13 +3212,13 @@ export { OPEN_PR_LIST_LIMIT, isDegradedOpenPrListing };
  *  listing is the overlap-yield planner's ONLY source for a same-based/non-draft/changed-file read on an open PR
  *  that is NOT itself `ready-to-merge` (a label-scoped candidate listing never sees it at all — #4308 Data). The
  *  measured cost of widening it is exactly Task 5's "warm and cold caches" number (this PR's own body). */
-export const CONTEXT_LIST_FIELDS = 'number,title,body,labels,statusCheckRollup,headRefName,headRefOid,baseRefName,isDraft,files';
+export const CONTEXT_LIST_FIELDS = 'number,title,body,labels,statusCheckRollup,headRefName,headRefOid,baseRefName,baseRefOid,isDraft,files';
 
 /** #4108 (converge round 2) — the candidate listing's OWN fields, unwidened. Used verbatim when RECONCILE is
  *  off (a bare `/merge`/`/finish`/`/pr` sweep — no repo's context is ever collected that pass, #xc7p3q9 B3), so
  *  that path never pays {@link SWEEP_LIST_FIELDS}' extra connection fields (`files` prices a GraphQL page) for a
  *  widening it has no reuse to spend it on. */
-const CANDIDATE_ONLY_FIELDS = 'number,title,body,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision,labels';
+const CANDIDATE_ONLY_FIELDS = 'number,title,body,headRefName,headRefOid,baseRefName,baseRefOid,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision,labels';
 
 /** #4108 — {@link CANDIDATE_ONLY_FIELDS} (the certification inputs {@link CONTEXT_LIST_FIELDS} doesn't need)
  *  UNION'd with {@link CONTEXT_LIST_FIELDS}. `sweepOnce`'s per-repo candidate listing (`listOne`) requests this
@@ -4763,7 +4764,8 @@ const execFileP = execDrainAsync;
 
 /** Manifest bodies can change at the same head SHA; an unknown body/identity must remain retryable. */
 export function prReadCacheIdentity(p) {
-  return p.headRefOid && typeof p.body === 'string' ? JSON.stringify([p.headRefOid, p.body]) : null;
+  return p.headRefOid && p.baseRefOid && p.headRefName && p.baseRefName && typeof p.body === 'string'
+    ? JSON.stringify(['v2', p.headRefOid, p.baseRefOid, p.headRefName, p.baseRefName, p.body]) : null;
 }
 
 /**
@@ -5516,18 +5518,28 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // it and re-fetches next `--watch` pass rather than latching an empty read for the head-SHA lifetime. Behaviour
   // THIS pass is unchanged — the caller still sees `[]` (⇒ isAiGeneratedPr → false → skipped, never merged on
   // missing data); a genuinely-empty successful read returns `{ commits: [], degraded: false }` and DOES cache.
-  const fetchPrCommits = async (repo, num, headSha = null) => {
+  const fetchPrCommits = async (repo, num, headSha = null, baseSha = null, headRef = null, baseRef = null) => {
     // #gh-graphql-budget — a PR's commit list is fixed by its head SHA, and the resident daemon starts a FRESH
     // process every pass (so the in-process `ctxReadCache`/`sweepReadCache` below start empty each time and
     // re-read every open PR's commits every 60s). Persist a successful read on disk keyed by (repo, PR, head SHA).
     const cached = readShaCache({ repo: shaCacheRepo(repo, localSlug), num, sha: headSha, kind: 'commits' });
-    if (Array.isArray(cached)) return { commits: cached, degraded: false };
+    if (headSha && baseSha && headRef && baseRef && cached?.v === 2 && cached.headOid === headSha
+      && cached.baseOid === baseSha && cached.headRef === headRef && cached.baseRef === baseRef && cached.complete === true
+      && Array.isArray(cached.commits)) return { commits: cached.commits, degraded: false };
     try {
-      const { stdout } = await execFileP('gh', ['pr', 'view', String(num), ...repoFlag(repo), '--json', 'commits'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-      const commits = JSON.parse(stdout.trim() || '{}').commits || [];
-      writeShaCache({ repo: shaCacheRepo(repo, localSlug), num, sha: headSha, kind: 'commits', value: commits });
-      return { commits, degraded: false };
-    } catch { return { commits: [], degraded: true }; } // gh threw → degraded → re-fetch next pass
+      const result = await meteredPrCommitsAsync(shaCacheRepo(repo, localSlug), num, { headRefOid: headSha, baseRefOid: baseSha,
+        exec: async (args, opts) => (await execFileP('gh', args, opts)).stdout });
+      if (!result.complete) {
+        process.stderr.write(`head-chain: commits-read-refused #${num} ${result.reason}; retry next pass\n`);
+        return { commits: [], degraded: true };
+      }
+      if (!writeShaCache({ repo: shaCacheRepo(repo, localSlug), num, sha: headSha, kind: 'commits',
+        value: { ...result, v: 2, headRef, baseRef } })) process.stderr.write(`head-chain: commits-cache-write-miss #${num}; retry next pass\n`);
+      return { commits: result.commits, degraded: false };
+    } catch {
+      process.stderr.write(`head-chain: commits-read-failed #${num}; retry next pass\n`);
+      return { commits: [], degraded: true };
+    }
   };
 
   // #2683 — the per-PR IDEMPOTENCY probe for the merge-write critical section. Re-reads the PR's CURRENT state
@@ -5569,7 +5581,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       isDegraded: (v) => !!v?.degraded || !!v?.transient, // #2417 review — an error-path or non-head read is NOT cached
       fetchOne: async ({ repo, p }) => {
         const readCommits = shouldReadContextCommits({ onlyPr, scope: fastDrain.scope, isTarget: isFastDrainTarget(repo, p) });
-        const [manifestRes, commitsRes] = await Promise.all([readPrManifest(repo, p.headRefName, p.body, p.number, prHeadSha(p)), readCommits ? fetchPrCommits(repo, p.number, prHeadSha(p)) : { degraded: false }]);
+        const [manifestRes, commitsRes] = await Promise.all([readPrManifest(repo, p.headRefName, p.body, p.number, prHeadSha(p)), readCommits ? fetchPrCommits(repo, p.number, prHeadSha(p), p.baseRefOid, p.headRefName, p.baseRefName) : { degraded: false }]);
         return shapeOpenPrRead({ manifestRes, commitsRes, includeCommits: readCommits });
       },
     });
@@ -6228,7 +6240,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     shaOf: ({ p }) => prReadCacheIdentity(p),
     isDegraded: (v) => !!v?.degraded || !!v?.transient, // #2417 review — an error-path or non-head read is NOT cached
     fetchOne: async ({ repo, p }) => {
-      const [commitsRes, manifestRes] = await Promise.all([fetchPrCommits(repo, p.number, prHeadSha(p)), readPrManifest(repo, p.headRefName, p.body, p.number, prHeadSha(p))]);
+      const [commitsRes, manifestRes] = await Promise.all([fetchPrCommits(repo, p.number, prHeadSha(p), p.baseRefOid, p.headRefName, p.baseRefName), readPrManifest(repo, p.headRefName, p.body, p.number, prHeadSha(p))]);
       return shapeOpenPrRead({ manifestRes, commitsRes });
     },
   }));

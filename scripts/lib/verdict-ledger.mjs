@@ -568,6 +568,22 @@ export const STABLE_FINDING_ID_PATTERN = /^fi-[0-9a-f]{12}$/;
 
 const isStr = (v) => typeof v === 'string' && v.trim() !== '';
 const oneOf = (list) => (v) => list.includes(v);
+const HEAD_OID = /^[a-f0-9]{40}$/;
+const headRefValid = v => typeof v === 'string' && v.length > 0 && v.length <= 255
+  && /^[A-Za-z0-9_][A-Za-z0-9_./-]*$/.test(v) && !v.includes('..') && !v.includes('//')
+  && !v.endsWith('/') && !v.endsWith('.') && !v.endsWith('.lock') && !v.split('/').some(p => p.startsWith('.'));
+const HEAD_CHAIN_FIELDS = ['headSha', 'parentSha', 'headRef', 'baseRef', 'baseSha', 'commits', 'authorship'];
+function validHeadSummary(raw) {
+  if (!HEAD_OID.test(raw.headSha ?? '') || !(raw.parentSha === null || HEAD_OID.test(raw.parentSha ?? ''))
+    || !HEAD_OID.test(raw.baseSha ?? '') || !headRefValid(raw.headRef) || !headRefValid(raw.baseRef)) return false;
+  const c = raw.commits;
+  if (!c || !['count', 'substantive', 'ai'].every(k => Number.isSafeInteger(c[k]) && c[k] >= 0)
+    || c.count < c.substantive || !Array.isArray(c.nonAi) || c.nonAi.length > 20
+    || !c.nonAi.every(oid => HEAD_OID.test(oid)) || new Set(c.nonAi).size !== c.nonAi.length
+    || !/^sha256:[a-f0-9]{64}$/.test(c.digest ?? '')) return false;
+  if (c.nonAi.length < 20 ? c.substantive !== c.ai + c.nonAi.length : c.substantive < c.ai + 20) return false;
+  return raw.authorship === (c.substantive === 0 ? 'none' : c.substantive === c.ai ? 'ai' : 'human');
+}
 
 /** Per-type payload fields: `[name, check, normalize]`. A required field that fails its check invalidates the
  *  event; an optional one (`opt`) is dropped when absent and invalidates when present and wrong. */
@@ -615,6 +631,7 @@ const EVENT_PAYLOAD = Object.freeze({
   ],
   [EVENT_TYPES.AUTHOR]: [
     ['author', isStr, (v) => oneLine(v, 200)],
+    ...HEAD_CHAIN_FIELDS.map(name => [name, () => true, v => v]),
   ],
   [EVENT_TYPES.LABEL_INPUT]: [
     ['label', isStr, (v) => oneLine(v, 128)],
@@ -716,6 +733,8 @@ export function validateLedgerEvent(raw) {
   for (const [name, check] of spec) {
     if (!check(raw[name])) errors.push(`bad \`${name}\`: ${JSON.stringify(raw[name])}`);
   }
+  if (raw.type === EVENT_TYPES.AUTHOR && HEAD_CHAIN_FIELDS.some(k => raw[k] !== undefined)
+    && !validHeadSummary(raw)) errors.push('bad author head-chain payload: missing, malformed or contradictory facts');
   // A delegated approval's optional head witness must identify the full commit, never a prefix.
   if (raw.type === EVENT_TYPES.APPROVAL && raw.delegation && raw.headSha !== undefined
     && (typeof raw.headSha !== 'string' || shaOrNull(raw.headSha)?.length !== 40)) {

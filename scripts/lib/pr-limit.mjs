@@ -228,7 +228,7 @@ export function countBackpressurePrs(prs) {
 /** The open-PR fields this limit reads. `isCrossRepository` tells an upstream head from a fork's same-named one (a
  *  stacked PR's base is always an upstream branch); every field must also be in the shared snapshot's field list
  *  (we:scripts/lib/pr-snapshot.mjs#SNAPSHOT_FIELDS), or the snapshot never serves this reader. */
-const OPEN_PR_FIELDS = 'number,labels,headRefName,headRefOid,baseRefName,isCrossRepository,files';
+const OPEN_PR_FIELDS = 'number,labels,headRefName,headRefOid,baseRefName,baseRefOid,isCrossRepository,files';
 
 /** Fetch a repo's open PRs ({@link OPEN_PR_FIELDS} — deliberately NOT `commits`, see {@link fetchPrCommits})
  *  through the shared throttle. Fail-SOFT: any gh/auth/network hiccup returns `null` (never throws), so a
@@ -257,20 +257,19 @@ export function fetchOpenPrs(repoSlug, { exec = runGhSync, localOnly = false, re
  *  repo): `gh pr list --json commits` for even a handful of open PRs routinely blows GitHub's GraphQL
  *  node-limit ("requesting up to 1,000,000 possible nodes … exceeds the maximum limit of 500,000") — the
  *  `commits` connection has no per-PR cap in a bulk list query, so it multiplies out across every PR in the
- *  page. `scripts/merge-ai-prs.mjs`'s own drain already fetches commits this exact way (`gh pr view --json
- *  commits`, one call per PR) for the identical reason; this reuses that established shape rather than
- *  re-discovering the limit the hard way twice. Fail-SOFT: returns `null` (never `[]`, which would read as
+ *  page. The drain and cap instead use verified, paged per-PR reads, bound to the expected head and base.
+ *  Returns `null` (never a fabricated `[]`, which would read as
  *  "zero commits" / mechanical-only) on any failure, so the caller can tell "unknown" apart from "empty".
  *  @returns {Array|null} */
-export function fetchPrCommits(repoSlug, number, { exec = runGhSync, headRefName, headRefOid, baseRefName, cwd, git, localOnly = false, allowApi = true, onApi } = {}) {
-  const local = readGitPrCommits(repoSlug, headRefName, { cwd, git, headRefOid, baseRefName, localOnly });
-  if (local !== null) return local;
+export function fetchPrCommits(repoSlug, number, { exec = runGhSync, headRefName, headRefOid, baseRefOid, baseRefName, cwd, git, localOnly = false, allowApi = true, onApi } = {}) {
+  const local = readGitPrCommits(repoSlug, headRefName, { cwd, git, headRefOid, baseRefOid, baseRefName, localOnly });
+  if (local?.complete === true && local.headOid === headRefOid && local.baseOid === baseRefOid) return local;
   // `allowApi:false` is a caller's spent GitHub budget: git was still tried, the metered read is not.
   if (localOnly || !allowApi) return null;
   onApi?.();
   try {
-    const commits = meteredPrCommits(repoSlug, number, { exec });
-    return Array.isArray(commits) ? commits : null;
+    const result = meteredPrCommits(repoSlug, number, { exec, headRefOid, baseRefOid });
+    return result.complete && result.headOid === headRefOid && result.baseOid === baseRefOid ? result.commits : null;
   } catch {
     return null;
   }
@@ -280,10 +279,10 @@ export function fetchPrCommits(repoSlug, number, { exec = runGhSync, headRefName
  *  `{repoKey, slug, count, prNumbers, limit, unavailable}` — `unavailable:true` (count `null`) on any gh
  *  failure or an unknown repo key, never a thrown error. `env` feeds {@link resolvePrLimit}.
  *
- *  ONE `gh pr list` per repo, plus ONE `gh pr view --json commits` per open PR that is not ALREADY
+ *  ONE open-PR listing per repo, then exact-oid local git or verified paged commits per PR not ALREADY
  *  `review:accepted` (an already-accepted PR is excluded from the count regardless of authorship, so its
  *  commits are never worth fetching) — see {@link fetchPrCommits} for why a bulk commits fetch is unsafe. A
- *  PR whose commits lookup fails is DROPPED from the count (unknown authorship is never assumed AI). */
+ *  PR whose commits lookup fails is unresolved; dispatch counts unresolved PRs conservatively. */
 export function countOpenPrsForRepo(repoKey, { exec, env = process.env, reposTable = CONSTELLATION_REPOS, git, cwd, localOnly = false, readShared, authorshipCache = null, maxApiFetches = Infinity, now = Date.now(), scope } = {}) {
   const meta = reposTable[repoKey];
   const liveScope = scope && typeof scope.excludeCardOnly === 'boolean' ? scope : readPrLimitScope({ env });
@@ -328,7 +327,7 @@ export function countOpenPrsForRepo(repoKey, { exec, env = process.env, reposTab
     const coolingDown = Number.isFinite(hit?.failedAt) && now - hit.failedAt < AUTHORSHIP_FAILURE_COOLDOWN_MS;
     let spent = false;
     const commits = fetchPrCommits(meta.slug, pr.number, {
-      exec, headRefName: pr.headRefName, headRefOid: pr.headRefOid, baseRefName: pr.baseRefName, git, localOnly, cwd: repoCwd,
+      exec, headRefName: pr.headRefName, headRefOid: pr.headRefOid, baseRefOid: pr.baseRefOid, baseRefName: pr.baseRefName, git, localOnly, cwd: repoCwd,
       allowApi: !coolingDown && apiFetches < maxApiFetches, onApi: () => { apiFetches++; spent = true; },
     });
     if (!Array.isArray(commits)) {
