@@ -16,6 +16,7 @@ import { rebuildClone } from '../daemon-rebuild.mjs';
 import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs';
 import { readRebuildState } from '../daemon-rebuild/state.mjs';
 import { gitRun } from '../main-staleness.mjs';
+import { withOverlayAuditOff } from './helpers/overlay-audit-off.mjs';
 
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
@@ -58,13 +59,14 @@ function fixture() {
     gitOk(author, ['push', '-q', 'origin', `+HEAD:refs/heads/${ref}`]);
     return gitOk(author, ['rev-parse', 'HEAD']).trim();
   };
-  const env = {
+  const stateDir = mktemp('we-overlay-pin-state-');
+  // The prefs-file helper selects legacy tip-following; these tests cover conflict pins.
+  const env = withOverlayAuditOff({
     ...process.env,
-    WE_DAEMON_STATE_DIR: mktemp('we-overlay-pin-state-'),
+    WE_DAEMON_STATE_DIR: stateDir,
     WE_DAEMON_CLONE_LOCK_ROOT: mktemp('we-overlay-pin-lock-'),
     WE_DAEMON_OVERLAY_DIR: mktemp('we-overlay-pin-overlay-'),
-    WE_DAEMON_OVERLAY_FOLLOW_TIP: 'follow', // these tests cover conflict pins, not the audited-tip gate
-  };
+  }, { dir: stateDir });
   // Two live fixes in the review daemon, plus the moving PR (#5793) that starts on an unrelated file.
   const a = push('lane/fix-a', init, { [DAEMON]: lines({ 2: 'fix a' }) });
   const b = push('lane/fix-b', init, { [DAEMON]: lines({ 8: 'fix b' }) });

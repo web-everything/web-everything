@@ -2,6 +2,13 @@ import { describe, expect, it } from 'vitest';
 import { classify, directionFor, isLoosening } from '../settings-safe-direction.mjs';
 
 describe('settings safe direction', () => {
+  it('overlay.followTip is a safety enum: follow loosens, audited-only tightens, equal is not loosening', () => {
+    expect(classify('overlay', 'followTip')).toBe('safety');
+    const direction = directionFor('overlay', 'followTip');
+    expect(isLoosening(direction, 'audited-only', 'follow')).toBe(true);
+    expect(isLoosening(direction, 'follow', 'audited-only')).toBe(false);
+    expect(isLoosening(direction, 'follow', 'follow')).toBe(false);
+  });
   it('classifies the seeded gate keys as safety and the rest as unclassed', () => {
     expect(classify('review', 'unattendedAcceptRequiresCleanReferrals')).toBe('safety');
     expect(classify('review.careExemptPaths', '')).toBe('safety');

@@ -20,6 +20,8 @@ export const SAFE_DIRECTION = Object.freeze({
   'review.careExemptPaths': { kind: 'safety', safe: 'subset' },
   'redTeam.recheckReadsRepo': { kind: 'safety', safe: 'true' },
   'redTeam.skipCardOnly': { kind: 'safety', safe: 'false' },
+  // OVERLAY-SHA-PIN: env must never loosen the overlay audited-tip gate; only a preferences file may select follow.
+  'overlay.followTip': { kind: 'safety', safe: 'enum:audited-only,follow' },
 });
 
 const keyOf = (policy, leaf) => (leaf ? `${policy}.${leaf}` : String(policy));

@@ -15,6 +15,7 @@ import { addOverlay, appendOverlayEvent, overlayFilePath, readOverlays, removeOv
 import { removeRegistration, retireRegistration } from '../../../daemon-overlay.mjs';
 import { createPrototypeLoader } from '../../../operations/prototype-load-io.mjs';
 import { OPERATOR_LOGINS } from '../../marker-authorship.mjs';
+import { withOverlayAuditOff, withShippedPrefs } from '../../__tests__/helpers/overlay-audit-off.mjs';
 
 const AUTOMATIC_RETIREMENT_REASONS = Object.freeze([
   'in-main', 'pr-merged', 'pr-squash-merged', 'redundant-merge-sibling', 'superseded', 'urgent-failed', 'pr-closed',
@@ -288,8 +289,11 @@ describe('operator retirement of a live overlay', () => {
     'mainOnly benign removal', 'benign manual removal', 'removed during planning', 'auto-drop contract',
     'audited omission', 'explicitly pinned omission', 're-registered pinned during planning',
   ])('prepareRebuild adapter: %s', async (mode) => {
-    env = { ...env, WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_AUTO_REBASE: '0',
-      WE_DAEMON_OVERLAY_FOLLOW_TIP: mode === 'audited omission' ? 'audited-only' : 'follow' };
+    const base = { ...env, WE_DAEMON_STATE_DIR: join(root, 'state'), WE_DAEMON_AUTO_REBASE: '0' };
+    // The prefs-file helper selects legacy tip-following except for the audited omission case.
+    env = mode === 'audited omission'
+      ? { ...withShippedPrefs(base, { dir: root }), WE_DAEMON_OVERLAY_FOLLOW_TIP: 'audited-only' }
+      : withOverlayAuditOff(base, { dir: root });
     const liveHead = 'b'.repeat(40), mainSha = 'c'.repeat(40), candidate = 'd'.repeat(40);
     const carried = 'lane/carried';
     const mainOnly = mode === 'mainOnly benign removal';
