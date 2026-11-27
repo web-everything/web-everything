@@ -337,3 +337,78 @@ test('withdrawals and unreadable revocation ledgers revoke stored waivers', () =
     assert.deepEqual(loadLedgerEvidence({ env }).waivers, []);
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
+
+// RS-7369-1-F2: a revoked or unplaceable higher-priority waiver shadows, never unlocks, the lower store waiver.
+// Timestamps: higher-layer at <= WITHDRAWN at < store at, so the store entry itself is not revoked.
+const shadowAt = { tool: '2026-11-10T00:00:00Z', withdrawn: '2026-11-11T00:00:00Z', store: '2026-11-12T00:00:00Z' };
+const shadowFixture = ({ tool, platform, store = [], withdrawn = [], audit = true } = {}) => {
+  const env = { HOME: '/fixture', WE_PLATFORM_PREFERENCES_FILE: '/fixture/prefs.json' };
+  const weak = { ...valid, head: sha, base, verdict: 'WEAKENED', findings: ['accepted'] };
+  const lines = rows => rows.map(row => JSON.stringify(row)).join('\n') + '\n';
+  const fs = { readFileSync(path) {
+    if (String(path).endsWith('/scripts/settings/prototype-load.json')) {
+      if (tool === undefined) throw Object.assign(Error('absent'), { code: 'ENOENT' });
+      return JSON.stringify(typeof tool === 'string' ? tool : { ruledWeakened: tool });
+    }
+    if (path === env.WE_PLATFORM_PREFERENCES_FILE) return JSON.stringify(platform === undefined ? {} : { prototypeLoad: { ruledWeakened: platform } });
+    if (path.endsWith('/audits.jsonl') && audit) return JSON.stringify(weak) + '\n';
+    if (path.endsWith('/ruled-weakened.jsonl')) return lines(store);
+    if (path.endsWith('/waiver-requests.jsonl')) return lines(withdrawn);
+    throw Object.assign(Error('absent'), { code: 'ENOENT' });
+  } };
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  try {
+    const evidence = loadAuditEvidence({ env, fs });
+    return { evidence, verdict: auditEvidenceFor(sha, { ...evidence, ref, covers }) };
+  } finally { console.warn = originalWarn; }
+};
+const storeWaiver = (extra = {}) => ({ ...waiver, at: shadowAt.store, ...extra });
+const higher = (extra = {}) => ({ ref, sha, ruling: 'R12', findings: ['accepted'], at: shadowAt.tool, ...extra });
+const withdrawal = { ref, sha, ruling: 'WITHDRAWN', at: shadowAt.withdrawn };
+
+test('an invalid or revoked higher-priority waiver shadows, never unlocks, the lower store waiver', () => {
+  const a = shadowFixture({ tool: [higher()], store: [storeWaiver()], withdrawn: [withdrawal] });
+  assert.deepEqual(a.evidence.waivers, [], '(a) revoked tool waiver');
+  assert.equal(a.verdict.ok, false);
+  const b = shadowFixture({ platform: [higher()], store: [storeWaiver()], withdrawn: [withdrawal] });
+  assert.deepEqual(b.evidence.waivers, [], '(b) revoked platform waiver');
+  assert.equal(b.verdict.ok, false);
+  const c = shadowFixture({ tool: [higher()], store: [storeWaiver()] });
+  assert.deepEqual(c.evidence.waivers, [{ ...higher(), layer: 'tool' }], '(c) control: one tool waiver, store shadowed');
+  assert.equal(c.verdict.kind, 'waiver');
+});
+
+test('(d) a revoked tool waiver for R12 does not shadow a store waiver for a different ruling that is not revoked', () => {
+  const later = { ...withdrawal, at: shadowAt.tool };
+  const d = shadowFixture({ tool: [higher()], store: [storeWaiver({ ruling: 'R13' })], withdrawn: [later] });
+  assert.deepEqual(d.evidence.waivers, [storeWaiver({ ruling: 'R13' })]);
+  assert.equal(d.verdict.kind, 'waiver');
+});
+
+for (const [label, at] of [['(e) an invalid-timestamp', 'not-a-date'], ['(f) a future-timestamp', '2999-01-01T00:00:00Z']]) {
+  test(`${label} tool waiver stays loaded and shadows the store entry, and evaluation refuses`, () => {
+    const control = shadowFixture({ tool: [higher()], store: [storeWaiver()] });
+    assert.equal(control.verdict.ok, true);
+    assert.equal(control.verdict.kind, 'waiver');
+    const { evidence, verdict } = shadowFixture({ tool: [higher({ at })], store: [storeWaiver()] });
+    assert.deepEqual(evidence.waivers, [{ ...higher({ at }), layer: 'tool' }]);
+    assert.equal(verdict.ok, false);
+  });
+}
+
+test('(g) malformed platform or tool settings still yield no waivers', () => {
+  assert.deepEqual(shadowFixture({ tool: '{broken', store: [storeWaiver()] }).evidence.waivers, []);
+  assert.deepEqual(shadowFixture({ tool: { x: 1 }, store: [storeWaiver()] }).evidence.waivers, []);
+  assert.deepEqual(shadowFixture({ platform: {}, store: [storeWaiver()] }).evidence.waivers, []);
+});
+
+for (const layer of ['tool', 'platform']) {
+  for (const badSha of [7, null, {}, [], true]) {
+    test(`(h) ${layer} settings with sha ${JSON.stringify(badSha)} refuse every waiver without throwing`, () => {
+      const { evidence, verdict } = shadowFixture({ [layer]: [higher({ sha: badSha })], store: [storeWaiver()] });
+      assert.deepEqual(evidence.waivers, []);
+      assert.equal(verdict.ok, false);
+    });
+  }
+}

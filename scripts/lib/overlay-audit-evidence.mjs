@@ -122,11 +122,11 @@ export function loadAuditEvidence({ env = process.env, fs = { readFileSync }, cw
       }
     }
     if (!damaged) {
-      waivers = mergeRuledWeakened(platform.prefs.prototypeLoad?.ruledWeakened, tool, console.warn)
-        .filter(entry => !revoked(entry));
-      // Keep the loader's tool > platform > store precedence for the same ref/SHA/ruling.
+      const merged = mergeRuledWeakened(platform.prefs.prototypeLoad?.ruledWeakened, tool, console.warn);
+      // Waiver precedence (docs/agent/testing/overlay-audit-evidence.md): shadow from ALL higher-layer entries, revoked or not.
       const key = entry => JSON.stringify([entry.ref, entry.sha.toLowerCase(), entry.ruling]);
-      const seen = new Set(waivers.map(key));
+      const seen = new Set(merged.map(key));
+      waivers = merged.filter(entry => !revoked(entry));
       if (!store.error) waivers = [...waivers, ...store.entries.filter(entry => !revoked(entry) && !seen.has(key(entry)))];
     }
   } catch { /* Missing or unreadable waiver ledger: no waiver evidence. */ }
