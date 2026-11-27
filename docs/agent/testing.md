@@ -2529,6 +2529,9 @@ variables remain the operator settings layer. Scoped coverage lives in `memory-a
 `resource-sampler`, `resource-admission`, `resource-gate`, and `heavy-admission` tests.
 Keep the shared pressure/floor decisions in the import-free `memory-warn-corroboration.mjs`:
 read-only operations reach them via `resource-policy` and must never inherit the measurement module's IO imports.
+Run admission CLI unit fixtures in Vitest's Node environment: happy-dom's global `URL` can break
+`fileURLToPath(new URL(..., import.meta.url))`. Resolve subprocess entry points from the test module,
+not cwd, and supply both test load and memory readings so queue fixtures never sample host memory.
 
 The `heavy-enforce` guard requires admission even for one-file Vitest runs, `related`,
 and direct `check-standards.mjs` execution. Use `node scripts/readiness/heavy-admission.mjs run -- npx vitest run <file>`

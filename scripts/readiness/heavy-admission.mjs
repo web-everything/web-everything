@@ -322,7 +322,7 @@ const ADMISSION_ENV = {
   warnMinFreePct: 'WE_LOAD_ADMISSION_WARN_MIN_FREE_PCT', warnSwapGrowthMb: 'WE_LOAD_ADMISSION_WARN_SWAP_GROWTH_MB',
   'priority.mode': 'WE_HEAVY_ADMISSION_PRIORITY', 'priority.repairPatterns': 'WE_HEAVY_ADMISSION_REPAIR_PATTERNS',
 };
-/** Leaves that shape this caller's execution policy; warn thresholds may only tighten shared settings. */
+/** Leaves that shape this caller's execution policy; tool warn thresholds may only tighten operator settings. */
 const PER_CALLER_LEAVES = new Set(['onTimeout', 'runWaitMs', 'wholeSuite', 'warnMinFreePct', 'warnSwapGrowthMb']);
 const tightensWarn = (leaf, value, setting) => leaf === 'warnMinFreePct' ? value >= setting
   : leaf === 'warnSwapGrowthMb' ? value <= setting : true;
@@ -434,9 +434,7 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
         ignored.push(`env ${name}=${oneLine(raw)} (a per-process value would diverge from the shared host pool; set heavyAdmission.${leaf} in platform-preferences)`);
       } else {
         const v = parseAdmissionEnv(leaf, raw);
-        if (valid(v) && !tightensWarn(leaf, v, value)) {
-          ignored.push(`env ${name}=${v} (may only tighten shared setting ${value})`);
-        } else if (valid(v)) { value = v; sources[leaf] = `env ${name}`; }
+        if (valid(v)) { value = v; sources[leaf] = `env ${name}`; }
         else invalid.push(`env ${name}=${oneLine(JSON.stringify(raw))}`);
       }
     }

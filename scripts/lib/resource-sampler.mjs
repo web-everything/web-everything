@@ -68,18 +68,18 @@ export function memoryPressureLevel(text) {
   const value = String(text).trim();
   return /^(1|2|3|4)$/.test(value) ? Number(value) : null;
 }
-export function swapUsedMb(text) {
-  const match = /used\s*=\s*([\d.]+)M/.exec(String(text));
-  const used = match ? Number(match[1]) : NaN;
-  return Number.isFinite(used) && used >= 0 ? used : null;
+function swapFieldMb(text, field) {
+  const fields = [...String(text).matchAll(new RegExp(`(?:^|\\s)${field}\\s*=\\s*(\\S*)`, 'g'))];
+  if (fields.length !== 1 || !/^\d+(?:\.\d+)?M$/.test(fields[0][1])) return null;
+  const value = Number(fields[0][1].slice(0, -1));
+  return Number.isFinite(value) && value <= Number.MAX_SAFE_INTEGER ? value : null;
 }
+export function swapUsedMb(text) { return swapFieldMb(text, 'used'); }
 /** Swap use in percent from `sysctl -n vm.swapusage` ("total = 27648.00M  used = 26500.00M  free = …"); null when
  *  unparseable, 0 with no swap configured. A fix-cap signal (operator 2026-10-10: swap, not CPU, hurt throughput). */
 export function swapUsedPct(text) {
-  const m = /total\s*=\s*([\d.]+)M\s+used\s*=\s*([\d.]+)M/.exec(String(text));
-  if (!m) return null;
-  const total = Number(m[1]); const used = Number(m[2]);
-  if (!Number.isFinite(total) || !Number.isFinite(used)) return null;
+  const total = swapFieldMb(text, 'total'); const used = swapUsedMb(text);
+  if (total === null || used === null) return null;
   return total > 0 ? round(used / total * 100) : 0;
 }
 export function buildSnapshot({ sampledAtMs, intervalMs, maxFreshMs = DEFAULT_SNAPSHOT_MAX_FRESH_MS, cpuIdlePct, cores, loadAvg, memPressureLevel, memFreePct, memAvailableMb, memFloorMb, memFloorSource, memMetric, swapUsedPct: swapPct, swapUsedMb, swapGrowthMb, disk, fseventsdCpuPct, heavySlots, agentSessions, laneCount, errors = [] }) {

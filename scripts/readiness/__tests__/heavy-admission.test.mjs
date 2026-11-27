@@ -1,3 +1,4 @@
+// @vitest-environment node
 /**
  * @file scripts/readiness/__tests__/heavy-admission.test.mjs
  * @description Unit proof of the #3461 heavy-command admission-queue semaphore: slot acquisition/release built
@@ -9,8 +10,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, mkdirSync, realpathSync, symlinkSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
 import { execFileSync, execSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir, userInfo } from 'node:os';
-import { join, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { join } from 'node:path';
+import { pathToFileURL, fileURLToPath } from 'node:url';
 import {
   classifyCommandKind, DEFAULT_FAST_MAX_FILES,
   DEFAULT_ADMISSION_CAP, DEFAULT_TIMEOUT_MS, DEFAULT_ADMISSION_CEILING_MS, ADMISSION_SWITCH_ENV,
@@ -43,7 +44,7 @@ import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 vi.mock('../../lib/resource-admission.mjs', () => ({ shadowAdmission: vi.fn(), admit: vi.fn(), decideAdmission: vi.fn(), readSnapshot: vi.fn() }));
 // x6nuodj — the legacy telemetry rule's tests run with the shared decision observing only (`shadow`); the cut-over
 // (admit() deciding) has its own describe below with an explicit `mode`.
-beforeEach(() => { vi.stubEnv('WE_RESOURCE_SHADOW', 'off'); vi.stubEnv('WE_RESOURCE_CUTOVER', 'shadow'); vi.stubEnv('WE_TEST_HOST_LOAD1', '0'); });
+beforeEach(() => { vi.stubEnv('WE_RESOURCE_SHADOW', 'off'); vi.stubEnv('WE_RESOURCE_CUTOVER', 'shadow'); vi.stubEnv('WE_TEST_HOST_LOAD1', '0'); vi.stubEnv('WE_TEST_HOST_MEMORY_MB', '100000'); });
 // admission-no-fail-open — hermetic: the admission policy's platform layer never reads the operator's real file.
 beforeEach(() => { vi.stubEnv('WE_PLATFORM_PREFERENCES', join(tmpdir(), 'heavy-admission-test-no-such-platform-preferences.json')); });
 afterEach(() => vi.unstubAllEnvs());
@@ -165,7 +166,7 @@ describe('CLI relative --repo', () => {
     const env = { ...process.env };
     delete env.LANE_POOL_ROOT;
     execFileSync(process.execPath, [
-      resolve('scripts/readiness/heavy-admission.mjs'),
+      HEAVY_ADMISSION_CLI,
       'acquire', '--repo=.', '--cap=1', '--json',
     ], { cwd: repo, env, encoding: 'utf8' });
     const held = heldSlots({ lockRoot: join(lockRoot, '.lanes', '.admission', 'heavy'), cap: 1 });
@@ -718,7 +719,7 @@ function cliEnv(poolRoot, extra = {}) {
   delete env.CI; delete env.WE_HEAVY_ADMISSION; delete env[ADMISSION_HELD_ENV];
   return env;
 }
-const CLI = resolve('scripts/readiness/heavy-admission.mjs');
+const CLI = fileURLToPath(new URL('../heavy-admission.mjs', import.meta.url));
 
 describe('admissionBypassReason — when the wrapper is a pass-through', () => {
   it('queues by default', () => expect(admissionBypassReason({ env: {}, poolExists: true })).toBeNull());
@@ -1183,6 +1184,30 @@ function metricLine(name, value, timestamp) {
 function busyLine(idlePct, timestamp, busyValue = 100 - idlePct) {
   return JSON.stringify({ event: 'metric', name: 'host.cpu.busy_pct', value: busyValue, timestamp, attributes: { idle_pct: idlePct } }) + '\n';
 }
+
+describe('MEM-ADMIT-HARDEN window evidence', () => {
+  const now = new Date('2026-09-25T13:00:00Z');
+  const record = (name, value, age = 0) => ({ name: `host.mem.${name}`, value,
+    timestamp: new Date(now.getTime() - age).toISOString() });
+  it('a throwing reader refuses instead of synthesizing one interval', () => {
+    expect(() => readLatestLoad({ root: lockRoot, now, readRecords: () => { throw Error('reader unavailable'); } }))
+      .toThrow('reader unavailable');
+  });
+  it('stale free-memory evidence cannot corroborate warn', () => {
+    const samples = readLatestLoad({ root: lockRoot, now, readRecords: () => ({ records: [
+      record('pressure_level', 2), record('available_bytes', 45, 300000), record('total_bytes', 100),
+      record('swap_used_bytes', 0, 1000), record('swap_used_bytes', 0),
+    ] }) });
+    expect(samples).toMatchObject({ freePct: null, swapGrowthMb: 0 });
+    expect(loadAdmissionDecision(samples)).toMatchObject({ held: true });
+  });
+  it('uses the requested window instead of a single swap interval', () => {
+    const readRecords = () => ({ records: [record('swap_used_bytes', 0, 3000),
+      record('swap_used_bytes', 512 * 1048576, 2000), record('swap_used_bytes', 512 * 1048576, 1000)] });
+    expect(readLatestLoad({ root: lockRoot, now, window: 3, readRecords }).swapGrowthMb).toBe(512);
+    expect(readLatestLoad({ root: lockRoot, now, window: 2, readRecords }).swapGrowthMb).toBe(0);
+  });
+});
 
 describe('readLatestLoad + resolveLoadAdmission (real fixture fs, injectable root — #4343)', () => {
   let telemetryRoot;
