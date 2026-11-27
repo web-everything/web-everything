@@ -3,12 +3,14 @@
  *   rate limits, and the hard rule that shadow mode makes ZERO GitHub writes.
  */
 import { AUTOMATION_LOGINS } from '../../lib/marker-authorship.mjs';
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import * as redTeamGate from '../../lib/red-team-gate.mjs';
+import * as roundJudge from '../round-judge-shadow.mjs';
 import fs from 'node:fs';
 import { mkdtempSync, rmSync, readFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { resolveStallSweepSettings, runStallSweep, planStallActions, stallSweepDir, strictGh, strictDrainText, STALL_SWEEP_DEFAULTS } from '../pr-stall-sweep.mjs';
+import { resolveStallSweepSettings, runStallSweep, readAuditHistory, planStallActions, stallSweepDir, strictGh, strictDrainText, STALL_SWEEP_DEFAULTS } from '../pr-stall-sweep.mjs';
 import { resetCascadeLogForTest } from '../../lib/policy-cascade.mjs';
 import { judgeRound } from '../../lib/round-judge.mjs';
 import { createPrSweepReader } from '../../operations/pr-sweep-io.mjs';
@@ -1328,5 +1330,196 @@ describe('R804 restart-only live acceptance', () => {
     const { dispatchRestart } = await run({ dir });
     expect(dispatchRestart).toHaveBeenCalledTimes(1);
     expect(lines(dir).filter(r => r.phase === 'did' && r.ts === new Date(NOW).toISOString())).toMatchObject([{ key, prHead }]);
+  });
+});
+
+
+describe('audit history repair digest (BLD-8039)', () => {
+  const prHead = `${REPO}#11@${HEAD}`;
+  const receipt = (n) => ({ ts: old, phase: 'intent', action: n === 1 ? 'restart-red-team' : 'tooling-card', prHead,
+    key: `${prHead}:historical-${n}` });
+  beforeEach(() => {
+    vi.useFakeTimers(); vi.setSystemTime(NOW);
+    // These resolvers otherwise read the live checkout/platform policy, even with sweep settings injected.
+    vi.spyOn(redTeamGate, 'readConfirmedBreaks').mockReturnValue({ value: {}, source: 'fixture' });
+    vi.spyOn(roundJudge, 'resolveRoundJudgeMode').mockReturnValue({ maxGrants: 1, line: 'fixture' });
+  });
+  afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
+  const fixture = () => {
+    const dir = auditDir(); mkdirSync(dir, { recursive: true });
+    const file = join(dir, '2026-09.jsonl');
+    const valid = [receipt(1), receipt(2)];
+    const write = middle => writeFileSync(file, `${JSON.stringify(valid[0])}\n${middle}\n${JSON.stringify(valid[1])}\n`);
+    const dispatchRestart = vi.fn(async () => ({ status: 'dispatched', jobPid: 24680 }));
+    const run = () => runStallSweep({ now: NOW, env: {}, dir, force: true, log: () => {},
+      settings: shadow({ actionModes: { 'restart-red-team': 'on' }, maxActionsPerPrHead: 2, maxRedTeamRestartsPerHead: 2 }),
+      gh: () => { throw Error('unexpected gh'); }, readFiles: () => ['fixture.mjs'],
+      read: () => ({ now: NOW, stalledAfterSource: 'fixture', unreadable: [], liveJobs: [], drainSkips: [],
+        prs: [{ ...PRS[0], repo: REPO, labels: [{ name: 'red-team:pending' }], comments: [], labelEvents: [], headCommittedAt: old }] }),
+      readRedTeamStatus: () => ({ repo: REPO, pr: 11, head: HEAD, status: 'running', startedAt: old,
+        host: 'fixture-host', pidNamespace: 'fixture-ns', pid: 12345, pidStart: 'fixture-start' }),
+      readStatusAt: () => NOW,
+      probe: { host: 'fixture-host', namespace: 'fixture-ns', isAlive: () => false, readPidStart: () => 'fixture-start' },
+      readPrHead: () => HEAD, abandonStaleRun: () => ({ ok: true }), planRestartRecovery: () => ({ abandon: false, mode: 'fresh' }),
+      dispatchRestart });
+    const digest = out => publishStalledDigest(out, { now: NOW, env: {}, stateDir: join(dir, 'digest'),
+      feedPath: join(dir, '..', 'needs-you-events.jsonl'), traceStateDir: null,
+      notify: () => ({ ok: true }), enqueue: () => {}, drain: () => {} });
+    const held = out => {
+      expect(out.incomplete).toBe(true); expect(out.act).toEqual([]);
+      expect(dispatchRestart).not.toHaveBeenCalled();
+      expect(out.records.some(r => ['intent', 'did', 'would-do'].includes(r.phase))).toBe(false);
+      const emitted = digest(out);
+      expect(emitted.errors).toEqual([]);
+      expect(emitted.lines.join(' ')).toMatch(/audit history incomplete.*operator must.*repair.*rerun/i);
+      return emitted.lines.join(' ');
+    };
+    return { dir, file, valid, write, run, held, dispatchRestart };
+  };
+  it('torn audit line preserves valid history and emits actionable incomplete digest', async () => {
+    const f = fixture(); f.write('{"phase":');
+    const history = readAuditHistory(f.dir);
+    expect(history.records).toEqual(f.valid); expect(history.complete).toBe(false);
+    const emitted = f.held(await f.run());
+    expect(emitted).toContain('2026-09.jsonl:2');
+    expect(emitted).toContain('invalid JSON');
+  });
+  it('malformed interior row keeps history incomplete', async () => {
+    const f = fixture(); f.write(JSON.stringify({ ts: old, phase: 'intent' }));
+    expect(readAuditHistory(f.dir).records).toEqual(f.valid);
+    expect(f.held(await f.run())).toContain('2026-09.jsonl:2');
+  });
+  it('routine pass growth beyond the old lifetime byte ceiling preserves all action evidence', async () => {
+    const f = fixture();
+    const pass = JSON.stringify({ ts: old, phase: 'pass', settings: { padding: 'x'.repeat(2048) } }) + '\n';
+    writeFileSync(join(f.dir, '2026-08.jsonl'), pass.repeat(4096));
+    f.write(JSON.stringify({ ts: old, phase: 'pass' }));
+    const history = readAuditHistory(f.dir);
+    expect(history.complete).toBe(true);
+    expect(history.records).toEqual(f.valid);
+    const out = await f.run();
+    expect(out.incomplete).toBe(false);
+    expect(out.held).toEqual([expect.objectContaining({ held: 'per-PR-head cap' })]);
+    expect(f.dispatchRestart).not.toHaveBeenCalled();
+  });
+  it('streaming still rejects corrupt pass records after the old lifetime byte ceiling', async () => {
+    const f = fixture();
+    const pass = JSON.stringify({ ts: old, phase: 'pass', padding: 'x'.repeat(2048) }) + '\n';
+    writeFileSync(join(f.dir, '2026-08.jsonl'), pass.repeat(4096));
+    f.write(JSON.stringify({ phase: 'pass', ts: 'invalid' }));
+    expect(f.held(await f.run())).toContain('2026-09.jsonl:2: invalid audit record');
+  });
+  it('streaming preserves UTF-8 records split across read chunks and a final row without newline', () => {
+    const f = fixture();
+    const prefix = Buffer.from(JSON.stringify({ ...f.valid[0], reason: '' }).replace(/""\}$/, '"'));
+    const padding = 'x'.repeat(64 * 1024 - prefix.length - 1);
+    const first = { ...f.valid[0], reason: `${padding}é漢字` };
+    writeFileSync(f.file, `${JSON.stringify(first)}\n${JSON.stringify(f.valid[1])}`);
+    expect(readAuditHistory(f.dir)).toEqual({ complete: true, issues: [], records: [first, f.valid[1]] });
+  });
+  it('retained evidence byte ceiling holds and emits a capacity warning before exhaustion', async () => {
+    const f = fixture();
+    const row = { ...f.valid[0], reason: 'x'.repeat(1024 * 1024) };
+    writeFileSync(f.file, (JSON.stringify(row) + '\n').repeat(5));
+    const log = vi.fn();
+    const out = await runStallSweep({ now: NOW, env: {}, dir: f.dir, force: true, log, settings: shadow(),
+      read: () => ({ now: NOW, unreadable: [], liveJobs: [], drainSkips: [], prs: [] }) });
+    expect(out.incomplete).toBe(false);
+    expect(log.mock.calls.flat().join(' ')).toMatch(/audit.*50%.*compact.*preserv.*lifetime/i);
+    writeFileSync(f.file, (JSON.stringify(row) + '\n').repeat(9));
+    expect(f.held(await f.run())).toMatch(/oversized.*retained.*evidence/i);
+  });
+  it('audit shrinkage after fstat fails closed instead of accepting a truncated snapshot', async () => {
+    const f = fixture(); f.write(JSON.stringify({ ts: old, phase: 'pass' }));
+    const initial = fs.statSync(f.file), fstat = fs.fstatSync;
+    vi.spyOn(fs, 'fstatSync').mockImplementation(fd => {
+      const stat = fstat(fd);
+      if (stat.ino === initial.ino && stat.dev === initial.dev) fs.truncateSync(f.file, 0);
+      return stat;
+    });
+    expect(f.held(await f.run())).toMatch(/audit shrank.*rerun/i);
+  });
+  it('more than 20 corrupt rows report an omitted count and persist the operator repair record', async () => {
+    const f = fixture(); f.write(Array.from({ length: 25 }, () => '{torn').join('\n'));
+    const history = readAuditHistory(f.dir);
+    expect(history.issues).toHaveLength(21);
+    expect(history.issues.slice(0, 20)).toEqual(Array.from({ length: 20 }, (_, i) => `2026-09.jsonl:${i + 2}: invalid JSON`));
+    expect(history.issues[20]).toBe('5 additional corrupt rows; inspect full audit');
+    const out = await f.run(); f.held(out);
+    expect(out.errors.join(' ')).toContain('5 additional corrupt rows');
+    expect(out.errors.join(' ')).not.toContain('2026-09.jsonl:22:');
+    expect(lines(f.dir)).toContainEqual(expect.objectContaining({ phase: 'operator', action: 'repair-audit-history', prHead }));
+  });
+  it('location strips control characters from repair guidance', async () => {
+    const f = fixture();
+    const dirty = join(f.dir, 'control\n\r\t\x1b\x7f\x85path');
+    mkdirSync(dirty);
+    writeFileSync(join(dirty, '2026-09.jsonl'), '{torn\n');
+    const out = await runStallSweep({ now: NOW, env: {}, dir: dirty, force: true, log: () => {}, settings: shadow(),
+      read: () => ({ now: NOW, unreadable: [], liveJobs: [], drainSkips: [], prs: [] }) });
+    expect(out.incomplete).toBe(true);
+    const reason = out.errors.find(e => e.includes('audit history incomplete'));
+    expect(reason).toContain(dirty.replace(/[\x00-\x1f\x7f-\x9f]/g, ''));
+    expect(reason).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
+    expect(reason).not.toContain(dirty);
+  });
+  it('blank audit rows preserve physical diagnostic line numbers', async () => {
+    const f = fixture();
+    writeFileSync(f.file, `\n\n${JSON.stringify(f.valid[0])}\n\n \t\n{torn\n${JSON.stringify(f.valid[1])}\n`);
+    expect(readAuditHistory(f.dir)).toEqual({ records: f.valid, complete: false, issues: ['2026-09.jsonl:6: invalid JSON'] });
+    expect(f.held(await f.run())).toContain('2026-09.jsonl:6');
+  });
+  it('audit read failure emits repair guidance', async () => {
+    const f = fixture();
+    // A directory with a monthly audit filename deterministically fails the regular-file check.
+    mkdirSync(f.file);
+    expect(f.held(await f.run())).toContain('2026-09.jsonl');
+  });
+  it('repaired history retains lifetime cap', async () => {
+    const f = fixture(); f.write('{torn'); f.held(await f.run());
+    // Repair only the torn row, retaining both older-month lifetime spends.
+    f.write(JSON.stringify({ ts: old, phase: 'pass' }));
+    const out = await f.run();
+    expect(out.incomplete).toBe(false);
+    expect(readAuditHistory(f.dir).records.filter(r => r.phase === 'intent')).toEqual(f.valid);
+    expect(out.held).toEqual([expect.objectContaining({ held: 'per-PR-head cap' })]);
+    expect(f.dispatchRestart).not.toHaveBeenCalled();
+  });
+  it('oversized audit input holds with operator guidance', async () => {
+    const f = fixture(); writeFileSync(f.file, ''); fs.truncateSync(f.file, 8 * 1024 * 1024 + 1);
+    expect(f.held(await f.run())).toMatch(/oversized.*full.*audit/i);
+  });
+  it('audit growth after fstat stops reads at the snapshot byte budget plus one and blocks actions', async () => {
+    const f = fixture();
+    const remaining = 4096;
+    writeFileSync(f.file, ' '.repeat(remaining));
+    const initial = fs.statSync(f.file);
+    const fstat = fs.fstatSync, read = fs.readSync;
+    let growingFd; const snapshots = [], reads = [];
+    const statSpy = vi.spyOn(fs, 'fstatSync').mockImplementation(fd => {
+      const stat = fstat(fd);
+      if (stat.ino === initial.ino && stat.dev === initial.dev) {
+        growingFd = fd; snapshots.push(stat.size);
+        // The returned snapshot passes the size check, but the file has already grown.
+        fs.truncateSync(f.file, remaining * 2);
+      }
+      return stat;
+    });
+    const readSpy = vi.spyOn(fs, 'readSync').mockImplementation((fd, buffer, offset, length, position) => {
+      if (fd !== growingFd) return read(fd, buffer, offset, length, position);
+      // Short reads force the production loop to spend its remaining budget incrementally.
+      const got = read(fd, buffer, offset, Math.min(length, 1024), position);
+      reads.push({ offset, length, position, got });
+      return got;
+    });
+    const out = await f.run();
+    statSpy.mockRestore(); readSpy.mockRestore();
+    expect(snapshots).toEqual([remaining]);
+    expect(fs.statSync(f.file).size).toBe(remaining * 2);
+    expect(reads).toEqual([0, 1024, 2048, 3072, 4096].map(offset => ({
+      offset: 0, length: remaining + 1 - offset, position: null, got: Math.min(1024, remaining + 1 - offset),
+    })));
+    expect(reads.reduce((total, r) => total + r.got, 0)).toBe(remaining + 1);
+    expect(f.held(out)).toMatch(/audit.*grew.*rerun/i);
   });
 });
