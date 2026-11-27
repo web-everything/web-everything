@@ -311,6 +311,26 @@ describe('open-pr sibling base: landed-sibling evidence', () => {
       expect(f.run()).toMatchObject({ outcome: 'opened' });
     });
 
+    it('admits a three-deep stack where every level landed as its own squash', () => {
+      const { f, squash } = stack();
+      f.git(['checkout', '-qb', 'lane/7359', 'lane/7358']);
+      f.commit('grandchild', 'grandchild sibling change');
+      f.git(['branch', '-f', 'lane/own', 'lane/7359']);
+      f.git(['checkout', 'lane/own']);
+      f.commit('own3', 'own change on the deeper stack');
+      expect(f.run()).toMatchObject({ outcome: 'refused', reason: 'sibling-base' });
+      for (const lane of ['lane/7357', 'lane/7358', 'lane/7359']) squash(lane);
+      f.git(['checkout', 'lane/own']);
+      expect(f.run()).toMatchObject({ outcome: 'opened' });
+    });
+
+    it('admits a stack whose child landed as one squash carrying the parent commits too', () => {
+      const { f, squash } = stack();
+      squash('lane/7358');
+      f.git(['checkout', 'lane/own']);
+      expect(f.run()).toMatchObject({ outcome: 'opened' });
+    });
+
     it('still names the child when only the parent landed', () => {
       const { f, squash } = stack();
       squash('lane/7357');

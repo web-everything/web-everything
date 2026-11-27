@@ -178,16 +178,22 @@ export function checkSiblingBase({ git, ref, sha, base = 'main', now = () => per
         return id && landedPatches.has(id);
       });
     };
+    // Exit status 1 is the answer "no"; any other failure (bad object, timeout) is unreadable evidence.
+    const isAncestor = (ancestor, descendant) => {
+      try { read(['merge-base', '--is-ancestor', ancestor, descendant]); return true; }
+      catch (error) { if (error?.status === 1) return false; throw error; }
+    };
     const siblings = [];
     const unique = [...new Map(candidates.map(candidate => [`${candidate.lane}\0${candidate.tip}`, candidate])).values()];
     for (const { lane, tip } of unique) {
       // The sibling's whole history first: a lane whose PR carried its parent's commits lands them together.
       if (rangeLanded(commits(tip, `^${main}`), commitSha(read(['merge-base', tip, main])), tip)) continue;
-      // Otherwise judge only the lane's own commits, with every other carried sibling's history set aside:
+      // Otherwise judge only the lane's own commits, with its carried PARENTS' history set aside:
       // a stack of PRs that each landed separately must not be refused for the parent's unmatched commits.
-      // The parents are judged in their own turn, so excluding them here never clears them.
-      const own = commits('--topo-order', tip, `^${main}`,
-        ...unique.filter(other => other.tip !== tip).map(other => `^${other.tip}`));
+      // The parents are judged in their own turn, so excluding them here never clears them. Only ancestors
+      // are set aside: a descendant or an unrelated sibling contains commits this lane owns.
+      const parents = unique.filter(other => other.tip !== tip && isAncestor(other.tip, tip));
+      const own = commits('--topo-order', tip, `^${main}`, ...parents.map(other => `^${other.tip}`));
       if (rangeLanded(own, `${own.at(-1)}^`, tip)) continue;
       siblings.push(lane);
     }
