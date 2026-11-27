@@ -12,12 +12,13 @@
  * Usage as a one-off: `node supersede-watch.mjs
  * [--repo=<owner/name>] [--apply]` (dry run without `--apply`).
  */
-import { execFileSync } from 'node:child_process';
+import { execFileSyncThrottled as execFileSync } from '../lib/gh-throttle.mjs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { isTrustedSupersedeAuthor, parseSupersedes, planSupersedeHolds, resolveSupersedeSettings, supersedeCandidates } from './supersede-rule.mjs';
+import { supersedeHoldsOn } from './stand-down.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -31,46 +32,67 @@ const ghJson = (args, exec) => JSON.parse(String(exec('gh', args, {
   stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', maxBuffer: 64 * 1024 * 1024,
 }) || 'null'));
 
-/** Bounded REST pagination: exhausting the cap is unreadable evidence, never a truncated success. */
-function readPullPages({ repo, state, exec, since }) {
+/** Count brackets and unique identities prove completeness despite mutable REST update ordering.
+ * No short/old page alone establishes coverage. Any discrepancy requires an operator retry.
+ */
+function readPullPages({ repo, state, exec, since, requireComplete = false }) {
+  const incomplete = (why) => new Error(`incomplete ${state} PR list in ${slugOf(repo)}: ${why}; operator must inspect the full list and retry next tick`);
+  const [owner, name] = slugOf(repo).split('/');
+  const readCount = () => {
+    const out = ghJson(['api', 'graphql', '-f',
+      'query=query($o:String!,$n:String!,$s:[PullRequestState!]!){repository(owner:$o,name:$n){pullRequests(states:$s){totalCount}}}',
+      '-f', `o=${owner}`, '-f', `n=${name}`, '-f', `s[]=${state === 'open' ? 'OPEN' : 'CLOSED'}`,
+      ...(state === 'closed' ? ['-f', 's[]=MERGED'] : [])], exec);
+    const count = out?.data?.repository?.pullRequests?.totalCount;
+    if (out?.errors?.length || !Number.isSafeInteger(count) || count < 0) throw incomplete('unreadable count proof');
+    return count;
+  };
+  const expected = requireComplete ? readCount() : null;
+  if (expected >= MAX_LIST_PAGES * PAGE_SIZE) throw new Error(`PR list page cap reached in ${slugOf(repo)}; operator must narrow the inventory or inspect the full list before dispatch; retry next tick`);
   const rows = [];
+  const ids = new Set();
   for (let page = 1; page <= MAX_LIST_PAGES; page += 1) {
     const batch = ghJson(['api', `repos/${slugOf(repo)}/pulls?state=${state}&sort=updated&direction=desc&per_page=${PAGE_SIZE}&page=${page}`], exec);
-    if (!Array.isArray(batch) || batch.some(p => !Number.isInteger(p?.number) || (since !== undefined
-      && (!Number.isFinite(Date.parse(p.updated_at)) || (p.merged_at !== null && (
+    if (!Array.isArray(batch) || batch.length > PAGE_SIZE || batch.some(p => !Number.isSafeInteger(p?.number) || p.number < 1
+      || (state === 'closed' && (!Number.isFinite(Date.parse(p.updated_at)) || (p.merged_at !== null && (
         !Number.isFinite(Date.parse(p.merged_at)) || (p.body !== null && typeof p.body !== 'string')
         || typeof p.user?.login !== 'string' || !p.user.login.trim())))))) {
-      throw new Error(`unreadable ${state} PR list in ${slugOf(repo)}`);
+      throw new Error(`unreadable ${state} PR list in ${slugOf(repo)}; operator must inspect evidence and retry next tick`);
     }
-    rows.push(...batch);
-    // REST has no merged-time ordering. An old merge updated recently cannot end the scan:
-    // updated_at >= merged_at, so only an old *update* proves all subsequent merges are old.
-    if (batch.length < PAGE_SIZE || (since !== undefined && batch.every(p => Date.parse(p.updated_at) < since))) return rows;
+    for (const row of batch) {
+      if (requireComplete && ids.has(row.number)) throw incomplete(`duplicate #${row.number}; ${ids.size} unique of claimed ${expected}`);
+      ids.add(row.number);
+      rows.push(row);
+    }
+    if (batch.length < PAGE_SIZE || (!requireComplete && since !== undefined && batch.every(p => Date.parse(p.updated_at) < since))) {
+      if (requireComplete && (ids.size !== expected || readCount() !== expected)) throw incomplete(`${ids.size} unique of claimed ${expected}, or count changed`);
+      return rows;
+    }
   }
-  throw new Error(`PR list page cap reached in ${slugOf(repo)}; operator must narrow the lookback or inspect the full list before dispatch; retry next tick`);
+  throw new Error(`PR list page cap reached in ${slugOf(repo)}; operator must narrow the inventory or inspect the full list before dispatch; retry next tick`);
 }
 
-/** Merged PRs within the window, normalized from REST to the planner's gh PR shape. */
-export function defaultReadMergedPrs({ repo, lookbackDays, now = Date.now(), exec = execFileSync }) {
+/** Low-level merged list, normalized to the planner shape. The daemon requires count proof via requireComplete. */
+export function defaultReadMergedPrs({ repo, lookbackDays, now = Date.now(), exec = execFileSync, requireComplete = false }) {
   const since = now - lookbackDays * 86_400_000;
-  return readPullPages({ repo, state: 'closed', exec, since })
+  return readPullPages({ repo, state: 'closed', exec, since, requireComplete })
     .filter(p => Date.parse(p.merged_at) >= since)
     .map(p => ({ number: p.number, body: p.body, state: 'MERGED', mergedAt: p.merged_at, author: p.user }));
 }
 
 /**
- * When a merged PR's body was last edited and by whom (GraphQL: `gh pr list` has no such field). Read only for the few
- * merged PRs that carry a marker. `{ lastEditedAt: null, editor: null }` = never edited.
+ * One GraphQL response binds body, stable identity, merged state, head and edit version.
+ * Read only for merged PRs carrying relevant markers. The caller validates the complete snapshot.
  */
 export function defaultReadBodyEdit({ repo, pr, exec = execFileSync }) {
   const [owner, name] = slugOf(repo).split('/');
-  const out = ghJson(['api', 'graphql', '-f', 'query=query($o:String!,$n:String!,$p:Int!){repository(owner:$o,name:$n){pullRequest(number:$p){lastEditedAt editor{login}}}}',
+  const out = ghJson(['api', 'graphql', '-f', 'query=query($o:String!,$n:String!,$p:Int!){repository(owner:$o,name:$n){pullRequest(number:$p){id number body state author{login} mergedAt updatedAt headRefOid lastEditedAt editor{login}}}}',
     '-f', `o=${owner}`, '-f', `n=${name}`, '-F', `p=${Number(pr)}`], exec);
   if (out?.errors?.length) throw new Error(`GraphQL body-edit read failed for #${pr}`);
   const node = out?.data?.repository?.pullRequest;
   if (!node) throw new Error(`no pull request #${pr} in ${slugOf(repo)}`);
   if (node.lastEditedAt === undefined || node.editor === undefined) throw new Error(`incomplete body-edit fields for #${pr}`);
-  return { lastEditedAt: node.lastEditedAt, editor: node.editor ? { login: node.editor.login } : null };
+  return node;
 }
 
 /**
@@ -80,25 +102,47 @@ export function defaultReadBodyEdit({ repo, pr, exec = execFileSync }) {
  * it never throws and never blocks the others. Returns `{ rows, failures }` so a persistent failure (no GraphQL access,
  * a rate limit) is reported instead of silently switching every hold off.
  */
-export function withBodyEdits({ repo, mergedPrs, openNumbers, readBodyEdit = defaultReadBodyEdit }) {
+const timestamp = (value, now) => {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(value)) return false;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) && ms <= now && new Date(ms).toISOString() === value.replace(/Z$/, value.includes('.') ? 'Z' : '.000Z');
+};
+const authorLogin = p => p?.author?.login?.replace(/^app\//, '');
+const snapshotVersion = (p) => JSON.stringify([p.id, p.number, p.body, p.state, p.author?.login,
+  p.mergedAt, p.updatedAt, p.headRefOid, p.lastEditedAt, p.editor?.login ?? null]);
+function validateSnapshot(p, listed, now) {
+  if (!p || p.number !== listed.number || typeof p.id !== 'string' || !p.id
+    || p.state !== 'MERGED' || (p.body !== null && typeof p.body !== 'string')
+    || !isTrustedSupersedeAuthor(p) || authorLogin(p) !== authorLogin(listed) || !/^[a-f0-9]{40}$/i.test(p.headRefOid ?? '')
+    || !timestamp(p.mergedAt, now) || !timestamp(p.updatedAt, now) || Date.parse(p.updatedAt) < Date.parse(p.mergedAt)
+    || !(p.lastEditedAt === null ? p.editor === null : timestamp(p.lastEditedAt, now)
+      && Date.parse(p.lastEditedAt) <= Date.parse(p.updatedAt) && typeof p.editor?.login === 'string' && !!p.editor.login.trim())
+    || ['body', 'state', 'mergedAt', 'id', 'updatedAt', 'headRefOid'].some(k => listed[k] !== undefined && p[k] !== listed[k])) {
+    throw new Error(`unreadable or changed merged PR #${listed.number} snapshot; operator must inspect evidence and retry next tick`);
+  }
+  return p;
+}
+
+export function withBodyEdits({ repo, mergedPrs, openNumbers, readBodyEdit = defaultReadBodyEdit, now = Date.now() }) {
   const open = new Set(openNumbers.map(Number));
   let failures = 0;
   const rows = mergedPrs.map((m) => {
     if (!isTrustedSupersedeAuthor(m) || !parseSupersedes(m.body).some((t) => open.has(t))) return m;
-    try { return { ...m, ...readBodyEdit({ repo, pr: m.number }) }; } catch { failures += 1; return { ...m, bodyEditUnknown: true }; }
+    try { return validateSnapshot(readBodyEdit({ repo, pr: m.number }), m, now); }
+    catch { failures += 1; return { ...m, bodyEditUnknown: true }; }
   });
   return { rows, failures };
 }
 
-/** Open PR numbers only (cheap); comments are read just for the candidates. */
-export function defaultReadOpenNumbers({ repo, exec = execFileSync }) {
-  return readPullPages({ repo, state: 'open', exec }).map(p => p.number);
+/** Low-level open numbers; the daemon requires count proof via requireComplete before authorizing effects. */
+export function defaultReadOpenNumbers({ repo, exec = execFileSync, requireComplete = false }) {
+  return readPullPages({ repo, state: 'open', exec, requireComplete }).map(p => p.number);
 }
 
 /** One candidate's state, read fresh, with its COMPLETE comment thread (paginated — a hold past comment 100 still counts). */
 export function defaultReadPr({ repo, pr, exec = execFileSync, readComments = readCompletePrComments }) {
-  const view = ghJson(['pr', 'view', String(pr), '--repo', slugOf(repo), '--json', 'number,state,labels'], exec);
-  return { ...view, comments: readComments(pr, { repo: slugOf(repo) }) };
+  const view = ghJson(['pr', 'view', String(pr), '--repo', slugOf(repo), '--json', 'id,number,state,headRefOid,labels'], exec);
+  return { ...view, comments: readComments(pr, { repo: slugOf(repo), exec }) };
 }
 
 /** Post the hold through the stand-down CLI (comment + `review-status:stood-down` + `superseded` labels). */
@@ -106,7 +150,7 @@ export function defaultPostHold({ repo, hold, exec = execFileSync }) {
   try {
     const out = exec(process.execPath, [STAND_DOWN_CLI, String(hold.pr), `--repo=${slugOf(repo)}`, '--reason=superseded',
       `--superseded-by=${hold.by}`, ...(hold.mergedAt ? [`--merged-at=${hold.mergedAt}`] : []), `--actor=${SUPERSEDE_WATCH_ACTOR}`], {
-      stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+      stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
     });
     const last = String(out || '').trim().split('\n').at(-1) || '{}';
     const parsed = JSON.parse(last);
@@ -116,33 +160,71 @@ export function defaultPostHold({ repo, hold, exec = execFileSync }) {
   }
 }
 
+function validateCandidate(p, pr) {
+  if (p?.number !== pr || !['OPEN', 'CLOSED', 'MERGED'].includes(p?.state)
+    || typeof p.id !== 'string' || !p.id || !/^[a-f0-9]{40}$/i.test(p.headRefOid ?? '')
+    || !Array.isArray(p.comments)) throw new Error(`unreadable candidate PR #${pr} identity/state; operator must inspect evidence and retry next tick`);
+}
+
 /**
  * One repo's pass. Never throws.
  * @returns {{repo:string, holds:Array<object>, applied:Array<object>, skipped?:string, error?:string}}
  */
 export function runSupersedeWatch({
   repo, apply = true, settings = resolveSupersedeSettings(), now = Date.now(),
-  readMergedPrs = defaultReadMergedPrs, readOpenNumbers = defaultReadOpenNumbers, readPr = defaultReadPr, postHold = defaultPostHold,
-  readBodyEdit = defaultReadBodyEdit,
+  readMergedPrs, readOpenNumbers, readPr, postHold, readBodyEdit, exec = execFileSync,
 } = {}) {
   if (!settings?.hold) return { repo, holds: [], applied: [], skipped: 'supersede hold is off' };
   try {
+    let calls = 0;
+    const boundedExec = (...args) => {
+      if (++calls > 256) throw new Error('supersede evidence call cap reached; operator must inspect the inventory and retry next tick');
+      return exec(...args);
+    };
+    readMergedPrs ??= args => defaultReadMergedPrs({ ...args, exec: boundedExec, requireComplete: true });
+    readOpenNumbers ??= args => defaultReadOpenNumbers({ ...args, exec: boundedExec, requireComplete: true });
+    readBodyEdit ??= args => defaultReadBodyEdit({ ...args, exec: boundedExec });
+    readPr ??= args => defaultReadPr({ ...args, exec: boundedExec });
+    postHold ??= args => defaultPostHold({ ...args, exec: boundedExec });
+    const evidence = [];
     const openNumbers = readOpenNumbers({ repo });
     const { rows: mergedPrs, failures: bodyEditFailures } = withBodyEdits({
-      repo, mergedPrs: readMergedPrs({ repo, lookbackDays: settings.lookbackDays, now }), openNumbers, readBodyEdit });
+      repo, mergedPrs: readMergedPrs({ repo, lookbackDays: settings.lookbackDays, now }), openNumbers, readBodyEdit, now });
     const candidates = supersedeCandidates({ mergedPrs, openNumbers });
     // Re-read each candidate: it must still be OPEN, and its own thread decides idempotency.
     const openPrs = candidates.map((pr) => {
       const p = readPr({ repo, pr });
-      if (typeof p?.state !== 'string') throw new Error(`unreadable candidate PR #${pr} state in ${slugOf(repo)}`);
+      validateCandidate(p, pr);
       return p;
     }).filter((p) => p.state.toUpperCase() === 'OPEN');
     const holds = planSupersedeHolds({ mergedPrs, openPrs, settings });
     const applied = apply ? holds.map((hold) => {
-      try { return { ...hold, ...postHold({ repo, hold }) }; }
+      try {
+        const source = mergedPrs.find(p => p.number === hold.by);
+        const fresh = validateSnapshot(readBodyEdit({ repo, pr: hold.by }), source, now);
+        if (snapshotVersion(fresh) !== snapshotVersion(source)) throw new Error('source version changed; retry next tick');
+        const candidate = openPrs.find(p => p.number === hold.pr);
+        const current = readPr({ repo, pr: hold.pr });
+        validateCandidate(current, hold.pr);
+        if (current.state !== 'OPEN' || current.id !== candidate.id || current.headRefOid !== candidate.headRefOid)
+          throw new Error('candidate moved before write; retry next tick');
+        if (!planSupersedeHolds({ mergedPrs: [fresh], openPrs: [current], settings }).length)
+          throw new Error('hold authority changed before write; retry next tick');
+        const bound = { candidateId: current.id, candidateHead: current.headRefOid,
+          sourceId: fresh.id, version: fresh.updatedAt, snapshot: snapshotVersion(fresh) };
+        evidence.push({ pr: hold.pr, ...bound });
+        const posted = postHold({ repo, hold });
+        if (!posted?.ok) return { ...hold, ...posted, ok: false };
+        const observed = readPr({ repo, pr: hold.pr });
+        validateCandidate(observed, hold.pr);
+        if (observed.state !== 'OPEN' || observed.id !== current.id || observed.headRefOid !== current.headRefOid
+          || !supersedeHoldsOn(observed.comments).includes(hold.by))
+          throw new Error('effect read-back incomplete; inspect the PR and retry next tick');
+        return { ...hold, ...posted };
+      }
       catch (e) { return { ...hold, ok: false, error: String(e?.message || e).split('\n')[0] }; }
     }) : [];
-    return { repo, holds, applied, ...(bodyEditFailures ? { bodyEditFailures } : {}) };
+    return { repo, holds, applied, ...(evidence.length ? { evidence } : {}), ...(bodyEditFailures ? { bodyEditFailures } : {}) };
   } catch (e) {
     return { repo, holds: [], applied: [], blocked: true, error: String(e?.message || e).split('\n')[0] };
   }
