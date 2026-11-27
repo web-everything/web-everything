@@ -413,6 +413,29 @@ describe('shared registry scope holds', () => {
     expect(filterFixesByInFlightScope([candidate(2)], [build], [], { now: NOW, maxWaitMinutes: null, rebaseExempt: null,
       policy: { value: { ...policyApi.FIX_SCOPE_DEFAULTS }, sources: {} } }).planned).toHaveLength(1);
   });
+  it.each([{ scope: [F] }, { scope: [X, F] }])('expired build claim retains ordinary-file protection for scope %j', ({ scope }) => {
+    const build = { heartbeatAt: new Date(NOW - 61 * 60000).toISOString(), ttlMinutes: 60,
+      meta: { num: '300', scope: [X, F] } };
+    const out = filterFixesByInFlightScope([candidate(2, scope)], [build], [], {
+      now: NOW, maxWaitMinutes: null, rebaseExempt: null,
+      policy: { value: { ...policyApi.FIX_SCOPE_DEFAULTS, overlapGranularity: 'file' }, sources: {} },
+    });
+    expect(out.planned).toEqual([]);
+    expect(out.refusals).toHaveLength(1);
+    expect(out.refusals[0]).toMatchObject({ pr: 2, kind: 'scope-overlap', queuePosition: 2,
+      why: expect.stringContaining('behind build #300') });
+    expect(out.refusals[0]).not.toHaveProperty('registry');
+    expect(out.agedAdmits).toEqual([]);
+  });
+  it.each(['pr-lifetime', null])('refused registry candidate retains ordinary-file reservations under %s', holdMode => {
+    const out = run([candidate(2, [X, F, 'we:other.mjs'], 3), candidate(3, [F], 2), candidate(4, [X], 1)],
+      [live(99, ['we:other.mjs'])], holdMode ? { holdMode } : {}, holdMode ? {} : { policy: null });
+    expect(out.planned.map(e => e.pr)).toEqual([4]);
+    expect(out.refusals.map(r => r.pr)).toEqual([2, 3]);
+    expect(out.refusals[1]).toMatchObject({ pr: 3, kind: 'scope-overlap', queuePosition: 2,
+      why: expect.stringContaining('waiting 2nd behind #2') });
+    expect(out.refusals[1]).not.toHaveProperty('registry');
+  });
   it('P5 registry: new holder head retains the session hold; release then admission', () => {
     const entries = [candidate(2)];
     expect(run(entries, [live(1, [X], { headSha: 'a'.repeat(40) })], {}, { holderEntries: new Map([[1, { headRefOid: 'b'.repeat(40) }]]) }).refusals[0].waitingOn)
