@@ -1389,6 +1389,86 @@ describe('audit history repair digest (BLD-8039)', () => {
     expect(readAuditHistory(f.dir).records).toEqual(f.valid);
     expect(f.held(await f.run())).toContain('2026-09.jsonl:2');
   });
+  it('routine pass growth beyond the old lifetime byte ceiling preserves all action evidence', async () => {
+    const f = fixture();
+    const pass = JSON.stringify({ ts: old, phase: 'pass', settings: { padding: 'x'.repeat(2048) } }) + '\n';
+    writeFileSync(join(f.dir, '2026-08.jsonl'), pass.repeat(4096));
+    f.write(JSON.stringify({ ts: old, phase: 'pass' }));
+    const history = readAuditHistory(f.dir);
+    expect(history.complete).toBe(true);
+    expect(history.records).toEqual(f.valid);
+    const out = await f.run();
+    expect(out.incomplete).toBe(false);
+    expect(out.held).toEqual([expect.objectContaining({ held: 'per-PR-head cap' })]);
+    expect(f.dispatchRestart).not.toHaveBeenCalled();
+  });
+  it('streaming still rejects corrupt pass records after the old lifetime byte ceiling', async () => {
+    const f = fixture();
+    const pass = JSON.stringify({ ts: old, phase: 'pass', padding: 'x'.repeat(2048) }) + '\n';
+    writeFileSync(join(f.dir, '2026-08.jsonl'), pass.repeat(4096));
+    f.write(JSON.stringify({ phase: 'pass', ts: 'invalid' }));
+    expect(f.held(await f.run())).toContain('2026-09.jsonl:2: invalid audit record');
+  });
+  it('streaming preserves UTF-8 records split across read chunks and a final row without newline', () => {
+    const f = fixture();
+    const prefix = Buffer.from(JSON.stringify({ ...f.valid[0], reason: '' }).replace(/""\}$/, '"'));
+    const padding = 'x'.repeat(64 * 1024 - prefix.length - 1);
+    const first = { ...f.valid[0], reason: `${padding}é漢字` };
+    writeFileSync(f.file, `${JSON.stringify(first)}\n${JSON.stringify(f.valid[1])}`);
+    expect(readAuditHistory(f.dir)).toEqual({ complete: true, issues: [], records: [first, f.valid[1]] });
+  });
+  it('retained evidence byte ceiling holds and emits a capacity warning before exhaustion', async () => {
+    const f = fixture();
+    const row = { ...f.valid[0], reason: 'x'.repeat(1024 * 1024) };
+    writeFileSync(f.file, (JSON.stringify(row) + '\n').repeat(5));
+    const log = vi.fn();
+    const out = await runStallSweep({ now: NOW, env: {}, dir: f.dir, force: true, log, settings: shadow(),
+      read: () => ({ now: NOW, unreadable: [], liveJobs: [], drainSkips: [], prs: [] }) });
+    expect(out.incomplete).toBe(false);
+    expect(log.mock.calls.flat().join(' ')).toMatch(/audit.*50%.*compact.*preserv.*lifetime/i);
+    writeFileSync(f.file, (JSON.stringify(row) + '\n').repeat(9));
+    expect(f.held(await f.run())).toMatch(/oversized.*retained.*evidence/i);
+  });
+  it('audit shrinkage after fstat fails closed instead of accepting a truncated snapshot', async () => {
+    const f = fixture(); f.write(JSON.stringify({ ts: old, phase: 'pass' }));
+    const initial = fs.statSync(f.file), fstat = fs.fstatSync;
+    vi.spyOn(fs, 'fstatSync').mockImplementation(fd => {
+      const stat = fstat(fd);
+      if (stat.ino === initial.ino && stat.dev === initial.dev) fs.truncateSync(f.file, 0);
+      return stat;
+    });
+    expect(f.held(await f.run())).toMatch(/audit shrank.*rerun/i);
+  });
+  it('more than 20 corrupt rows report an omitted count and persist the operator repair record', async () => {
+    const f = fixture(); f.write(Array.from({ length: 25 }, () => '{torn').join('\n'));
+    const history = readAuditHistory(f.dir);
+    expect(history.issues).toHaveLength(21);
+    expect(history.issues.slice(0, 20)).toEqual(Array.from({ length: 20 }, (_, i) => `2026-09.jsonl:${i + 2}: invalid JSON`));
+    expect(history.issues[20]).toBe('5 additional corrupt rows; inspect full audit');
+    const out = await f.run(); f.held(out);
+    expect(out.errors.join(' ')).toContain('5 additional corrupt rows');
+    expect(out.errors.join(' ')).not.toContain('2026-09.jsonl:22:');
+    expect(lines(f.dir)).toContainEqual(expect.objectContaining({ phase: 'operator', action: 'repair-audit-history', prHead }));
+  });
+  it('location strips control characters from repair guidance', async () => {
+    const f = fixture();
+    const dirty = join(f.dir, 'control\n\r\t\x1b\x7f\x85path');
+    mkdirSync(dirty);
+    writeFileSync(join(dirty, '2026-09.jsonl'), '{torn\n');
+    const out = await runStallSweep({ now: NOW, env: {}, dir: dirty, force: true, log: () => {}, settings: shadow(),
+      read: () => ({ now: NOW, unreadable: [], liveJobs: [], drainSkips: [], prs: [] }) });
+    expect(out.incomplete).toBe(true);
+    const reason = out.errors.find(e => e.includes('audit history incomplete'));
+    expect(reason).toContain(dirty.replace(/[\x00-\x1f\x7f-\x9f]/g, ''));
+    expect(reason).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
+    expect(reason).not.toContain(dirty);
+  });
+  it('blank audit rows preserve physical diagnostic line numbers', async () => {
+    const f = fixture();
+    writeFileSync(f.file, `\n\n${JSON.stringify(f.valid[0])}\n\n \t\n{torn\n${JSON.stringify(f.valid[1])}\n`);
+    expect(readAuditHistory(f.dir)).toEqual({ records: f.valid, complete: false, issues: ['2026-09.jsonl:6: invalid JSON'] });
+    expect(f.held(await f.run())).toContain('2026-09.jsonl:6');
+  });
   it('audit read failure emits repair guidance', async () => {
     const f = fixture();
     // A directory with a monthly audit filename deterministically fails the regular-file check.
@@ -1409,11 +1489,10 @@ describe('audit history repair digest (BLD-8039)', () => {
     const f = fixture(); writeFileSync(f.file, ''); fs.truncateSync(f.file, 8 * 1024 * 1024 + 1);
     expect(f.held(await f.run())).toMatch(/oversized.*full.*audit/i);
   });
-  it('audit growth after fstat stops reads at the remaining byte budget plus one and blocks actions', async () => {
+  it('audit growth after fstat stops reads at the snapshot byte budget plus one and blocks actions', async () => {
     const f = fixture();
-    const limit = 8 * 1024 * 1024, remaining = 4096;
-    writeFileSync(join(f.dir, '2026-08.jsonl'), ' '.repeat(limit - remaining));
-    writeFileSync(f.file, '');
+    const remaining = 4096;
+    writeFileSync(f.file, ' '.repeat(remaining));
     const initial = fs.statSync(f.file);
     const fstat = fs.fstatSync, read = fs.readSync;
     let growingFd; const snapshots = [], reads = [];
@@ -1435,12 +1514,12 @@ describe('audit history repair digest (BLD-8039)', () => {
     });
     const out = await f.run();
     statSpy.mockRestore(); readSpy.mockRestore();
-    expect(snapshots).toEqual([0]);
+    expect(snapshots).toEqual([remaining]);
     expect(fs.statSync(f.file).size).toBe(remaining * 2);
     expect(reads).toEqual([0, 1024, 2048, 3072, 4096].map(offset => ({
-      offset, length: remaining + 1 - offset, position: null, got: Math.min(1024, remaining + 1 - offset),
+      offset: 0, length: remaining + 1 - offset, position: null, got: Math.min(1024, remaining + 1 - offset),
     })));
     expect(reads.reduce((total, r) => total + r.got, 0)).toBe(remaining + 1);
-    expect(f.held(out)).toMatch(/oversized.*full.*audit/i);
+    expect(f.held(out)).toMatch(/audit.*grew.*rerun/i);
   });
 });
