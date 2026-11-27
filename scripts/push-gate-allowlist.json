@@ -184,6 +184,7 @@
     "scripts/lib/daemon-rebuild/plan.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":36},
     "scripts/lib/daemon-rebuild/prepare.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":12},
     "scripts/lib/daemon-rebuild/preview.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":2},
+    "scripts/lib/daemon-rebuild/shared-smoke.mjs": {"status":"pending-migration","reason":"Reviewed six unresolved read-only smoke identity sites: gitRead invokes the injected git port; rev, checkoutState and candidateRead forward read arguments; candidate status and runtime version call gitRead. Commands are rev-parse, ls-files, ls-tree, diff, status and --version; no push path.","sites":6},
     "scripts/lib/daemon-rebuild/shared.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":2},
     "scripts/lib/daemon-rebuild/smoke.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":7},
     "scripts/lib/daemon-rebuild/state.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":3},
