@@ -1,5 +1,9 @@
 // Card 272 part 2 (live #5045, 2026-10-13): refresh once before paying for a fixer.
 import { describe, it, expect, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import * as lanePoolHealth from '../lane-pool-health-watch.mjs';
 import { extractFailingTestFiles, decideStaleBaseRefresh, staleBaseBudgetSpent, buildStaleBaseComment,
   resolveStaleBaseSetting, createStaleBaseGate, readStaleBaseFacts } from '../stale-base-refresh.mjs';
 import { resolveLanePoolRepoPath } from '../lane-pool-health-watch.mjs';
@@ -133,8 +137,8 @@ describe('stale base fact reader', () => {
     const exec = vi.fn((cmd, args) => {
       if (cmd === 'git') return '';
       if (args[0] === 'pr') return JSON.stringify(view);
-      if (args[1].endsWith('/jobs/10/logs')) return log;
-      if (args[1].endsWith('/jobs/11/logs')) return f.failingChecks[1].log;
+      if (args.at(-1).endsWith('/jobs/10/logs')) return log;
+      if (args.at(-1).endsWith('/jobs/11/logs')) return f.failingChecks[1].log;
       if (args[1].includes('/compare/main...')) return JSON.stringify({ behind_by: 576, merge_base: sha });
       if (args[1].includes('/compare/')) return '576';
       if (args[1].endsWith('/files')) return 'backlog/272.md\n';
@@ -146,6 +150,30 @@ describe('stale base fact reader', () => {
       exec, readMainRuns, readMainLatestCheckRuns };
     return { input, exec, readMainRuns, readMainLatestCheckRuns };
   };
+  it('reads job logs with --allow-escape-sequences so an ANSI-coloured log (gh 2.104) still yields failing test files', () => {
+    const root = mkdtempSync(join(tmpdir(), 'stale-base-ansi-'));
+    const resolveRoot = vi.spyOn(lanePoolHealth, 'resolveLanePoolRepoPath').mockReturnValue(root);
+    const cwd = vi.spyOn(process, 'cwd').mockReturnValue(root);
+    try {
+      const d = fixture({ headRefName: 'lane/ansi-fixture' });
+      const original = d.exec.getMockImplementation();
+      d.exec.mockImplementation((cmd, args, opts) => {
+        if (cmd === 'gh' && args.at(-1)?.endsWith('/logs')) {
+          if (!args.includes('--allow-escape-sequences')) {
+            throw new Error('the response contains terminal escape sequences; pass --allow-escape-sequences');
+          }
+          return args.at(-1).endsWith('/jobs/10/logs') ? log : facts().failingChecks[1].log;
+        }
+        return original(cmd, args, opts);
+      });
+      const result = readStaleBaseFacts({ ...d.input, root });
+      expect(result.decision).toMatchObject({ owed: true, via: 'main-green', failingTestFiles: [file] });
+    } finally {
+      cwd.mockRestore();
+      resolveRoot.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
   it('ignores non-CI workflows (review-gate) and cancelled CI jobs', () => {
     const f = facts();
     const d = fixture({ statusCheckRollup: [
@@ -168,9 +196,9 @@ describe('stale base fact reader', () => {
     const d = fixture();
     const result = readStaleBaseFacts(d.input);
     expect(result.decision).toMatchObject({ owed: true, via: 'main-green' });
-    expect(d.exec.mock.calls.map(([cmd, args]) => [cmd, ...args.slice(0, 2)])).toEqual([
-      ['gh', 'pr', 'view'], ['gh', 'api', 'repos/web-everything/web-everything/actions/jobs/10/logs'],
-      ['gh', 'api', 'repos/web-everything/web-everything/actions/jobs/11/logs'],
+    expect(d.exec.mock.calls.map(([cmd, args]) => [cmd, ...args.slice(0, args[1] === '--allow-escape-sequences' ? 3 : 2)])).toEqual([
+      ['gh', 'pr', 'view'], ['gh', 'api', '--allow-escape-sequences', 'repos/web-everything/web-everything/actions/jobs/10/logs'],
+      ['gh', 'api', '--allow-escape-sequences', 'repos/web-everything/web-everything/actions/jobs/11/logs'],
       ['gh', 'api', `repos/web-everything/web-everything/compare/main...${facts().headRefOid}`],
       ['gh', 'api', `repos/web-everything/web-everything/compare/${'c'.repeat(40)}...${facts().headRefOid}`],
       ['gh', 'api', 'repos/web-everything/web-everything/pulls/5045/files'], ['git', '--literal-pathspecs', '-C'],
@@ -201,7 +229,7 @@ describe('stale base fact reader', () => {
   it('stops before compare on unreadable logs', () => {
     const d = fixture(); const original = d.exec.getMockImplementation();
     d.exec.mockImplementation((cmd, args, opts) => {
-      if (args[1]?.endsWith('/logs')) throw new Error('404');
+      if (args.at(-1)?.endsWith('/logs')) throw new Error('404');
       return original(cmd, args, opts);
     });
     expect(readStaleBaseFacts(d.input).decision.why).toMatch(/unreadable/);
