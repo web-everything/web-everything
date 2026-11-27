@@ -47,7 +47,7 @@ runReviewLabelCli({ argv: process.argv.slice(3), fixedTo: 'rearm', defaultActor:
 });
 `);
   return spawnSync(process.execPath, [childFile, stateFile, String(args.prNumber),
-    '--repo=web-everything/web-everything', `--expect-head=${args.expectHead}`, '--actor=conveyor'],
+    '--repo=no-code-rearm-fixture/example', `--expect-head=${args.expectHead}`, '--actor=conveyor'],
   { encoding: 'utf8', timeout: 20000, maxBuffer: 1024 * 1024, env: { ...process.env, TMPDIR: temp } });
 }
 
@@ -99,7 +99,11 @@ function runCase(name, dispatch) {
       readThread: () => name === 'missing-thread' ? undefined : read().comments,
       readPrLabels: args => defaultReadPrLabels({ ...args, runGh: () => JSON.stringify(read()) }),
       acquireRearmLock: args => {
-        const release = acquireNoCodeRearmLock({ ...args, root: temp });
+        const release = acquireNoCodeRearmLock({ ...args, root: temp }, {
+          pid: 42, host: 'fixture-host', namespace: 'fixture-namespace',
+          stamp: () => ({ runnerStart: 'fixture-start' }),
+          identity: () => ({ alive: true }),
+        });
         if (name.startsWith('concurrent')) putClaim();
         return () => { release(); lockReleased = true; };
       },
