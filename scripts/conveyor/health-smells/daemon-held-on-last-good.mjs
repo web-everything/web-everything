@@ -56,9 +56,10 @@ export default {
         // Old persisted episodes may lack heldSinceIso: require adoption after first observation then.
         const recordedSince = Date.parse(prior.measure?.heldSinceIso ?? '');
         const after = Number.isFinite(recordedSince) ? recordedSince : prior.firstBreachAt;
+        // Confirm recovery from current adoption evidence even if the original hold lacked a SHA.
         const resolved = c.rebuild?.held === null && Number.isFinite(adopted?.at)
           && adopted.at > after && adopted.at <= now && typeof adopted.head === 'string'
-          && adopted.head.length > 0 && typeof prior.measure?.lastGood === 'string';
+          && adopted.head.length > 0;
         return { subject, breach: !resolved,
           measure: { ...prior.measure, daemon: c.cloneKey,
             episodeId: prior.measure?.episodeId ?? prior.id,

@@ -124,6 +124,43 @@ describe('last-good hold alarm contract', () => {
   });
 
   it.each([
+    { lastGood: undefined, since: NOW - 31 * MINUTE },
+    { lastGood: null, since: null },
+    { lastGood: 123, since: null },
+  ])('confirmed adoption closes incomplete hold evidence and a later hold notifies again (%j)', (incomplete) => {
+    const first = tick([clone('incomplete-daemon', held(31, incomplete))]);
+    const [firstRecord] = sink(first);
+    expect(firstRecord.episodeId).toEqual(expect.any(String));
+    const recovered = tick([{ cloneKey: 'incomplete-daemon', rebuild: { held: null,
+      adopted: { at: NOW + MINUTE, head: 'recovered-head' } } }], first.state, NOW + MINUTE);
+    expect(recovered.transitions.filter(t => t.type === 'closed').map(t => t.episode.subject))
+      .toEqual(['clone:incomplete-daemon']);
+    expect(recovered.state.episodes['daemon-held-on-last-good::clone:incomplete-daemon']).toBeUndefined();
+    const next = tick([clone('incomplete-daemon', held(31, { since: NOW + 2 * MINUTE }))],
+      recovered.state, NOW + 33 * MINUTE);
+    expect(sink(next)).toEqual([expect.objectContaining({ daemon: 'incomplete-daemon', heldMs: 31 * MINUTE })]);
+    expect(sink(next)[0].episodeId).not.toBe(firstRecord.episodeId);
+  });
+
+  it.each([
+    { held: null },
+    { held: null, adopted: { at: NOW, head: 'recovered-head' } },
+    { held: null, adopted: { at: NOW - MINUTE, head: 'recovered-head' } },
+    { held: null, adopted: { at: NOW + 2 * MINUTE, head: 'recovered-head' } },
+    { held: null, adopted: { at: NOW + MINUTE, head: '' } },
+    { held: null, adopted: { at: NOW + MINUTE } },
+    { held: null, adopted: { at: 'invalid', head: 'recovered-head' } },
+    { adopted: { at: NOW + MINUTE, head: 'recovered-head' } },
+  ])('incomplete hold evidence stays open without confirmed adoption (%j)', (rebuild) => {
+    const first = tick([clone('incomplete-daemon', held(31, { since: null, lastGood: null }))]);
+    const result = tick([{ cloneKey: 'incomplete-daemon', rebuild }], first.state, NOW + MINUTE);
+    expect(result.transitions.some(t => t.type === 'closed')).toBe(false);
+    expect(result.state.episodes['daemon-held-on-last-good::clone:incomplete-daemon'].measure.uncertainty)
+      .toContain('unconfirmed-adoption');
+    expect(result.evaluations[0].results[0].recommendation).toMatch(/inspect.*rebuild/i);
+  });
+
+  it.each([
     { rows: [] },
     { rows: [{ cloneKey: 'one', rebuild: null }] },
     { rows: [{ cloneKey: 'one', rebuild: { held: null } }] },
