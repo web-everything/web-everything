@@ -1626,8 +1626,8 @@ function writeGhWriteBudgetState(lockRoot, state) {
  * decision is a spend decision regardless of which ledger it is checked against), over its OWN state file and
  * lock key so exhausting the write budget never blocks a read and vice versa. A caller QUEUES here (spins,
  * bounded, injectable `sleep`/`now` for tests) rather than firing — the #gh-write-burst fix's whole point:
- * a write past budget waits for the window instead of hammering GitHub. FAILS OPEN on timeout, identically to
- * the points-budget gate. Cost is always 1 per call (write calls are not weighted by REST points —
+ * a write past budget waits for the window instead of hammering GitHub. A timed-out write is throttled
+ * by default (card 308), unless the caller explicitly opts into ungated execution. Cost is always 1 per call (write calls are not weighted by REST points —
  * unlike the points budget, this ledger counts MUTATIONS, not spend).
  */
 export function acquireGhWriteBudgetSync({
@@ -2363,7 +2363,11 @@ function runGhSyncUnmemoized(args, opts = {}) {
     // reasoning as releasing the slot before a backoff sleep, below).
     const waitStartedMs = Date.now();
     const acq = gated ? failOpenGate('acquire', () => {
-      if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
+      const writeGate = isWrite && acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
+      if (writeGate?.timedOut) {
+        if (slotWait.onSlotTimeout !== 'ungated') return { ok: false, timedOut: true, waitedMs: writeGate.waitedMs };
+        noteSlotTimeout(logPath, writeGate, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv }, throttle.warn);
+      }
       const pointsGate = acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: reserved ? Math.min(acquireTimeoutMs, reservedCapMs) : acquireTimeoutMs, windowMs: pointsWindowMs, pointClass: pointsClass, reserved, env, pointsAlgorithm: throttle.pointsAlgorithm, toolFile: throttle.pointsToolFile, jitter: throttle.jitter });
       // A reserved read FAILS CLOSED if the points budget did not clear inside its own call bound (the freeze then holds).
       if (pointsGate?.closed || (pointsClosed && pointsGate?.ok === false)) return { ok: false, timedOut: true, waitedMs: pointsGate.waitedMs };
@@ -2671,7 +2675,11 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
     // The fix daemon's tick ran 25+ min with its log silent, the drain's live smoke took 25 min and was rejected.
     // A nested call rides the outer's slot (and its already-charged points/write budget) — one call, one slot.
     const acq = gated && !outer ? failOpenGate('acquire', () => {
-      if (isWrite) acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
+      const writeGate = isWrite && acquireGhWriteBudgetSync({ lockRoot, budgetPerMin: writeBudgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: acquireTimeoutMs, windowMs: pointsWindowMs });
+      if (writeGate?.timedOut) {
+        if (slotWait.onSlotTimeout !== 'ungated') return { ok: false, timedOut: true, waitedMs: writeGate.waitedMs };
+        noteSlotTimeout(logPath, writeGate, { op: opLabel, attempt, caller, w: isWrite, resource, id: identity, inv }, throttle.warn);
+      }
       const pointsGate = acquireGhPointsSync({ lockRoot, points, budgetPerMin, owner, pid, now, sleep, pollMs, timeoutMs: reserved ? Math.min(acquireTimeoutMs, reservedCapMs) : acquireTimeoutMs, windowMs: pointsWindowMs, pointClass: pointsClass, reserved, env, pointsAlgorithm: throttle.pointsAlgorithm, toolFile: throttle.pointsToolFile, jitter: throttle.jitter });
       // A reserved read FAILS CLOSED if the points budget did not clear inside its own call bound (the freeze then holds).
       if (pointsGate?.closed || (pointsClosed && pointsGate?.ok === false)) return { ok: false, timedOut: true, waitedMs: pointsGate.waitedMs };

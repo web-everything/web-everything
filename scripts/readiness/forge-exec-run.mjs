@@ -922,7 +922,7 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
           String.raw`oifname "lo" accept`,
           String.raw`ip daddr @registry4 tcp dport 443 accept`,
           String.raw`ip6 daddr @registry6 tcp dport 443 accept`,
-          String.raw`(?:reject with icmpx type admin-prohibited|drop)`,
+          String.raw`(?:reject with icmpx (?:type )?(?:admin-prohibited|3)|drop)`,
           String.raw`\}`,
           String.raw`chain output \{`,
           String.raw`type filter hook output priority (?:0|filter); policy accept;`,
@@ -931,12 +931,13 @@ export function createRunner({testRoot, testDrainStat, testDeployStatePath, test
           String.raw`\}`,
         ].join('\\s*')+'\\s*$(?![\\s\\S])');
         const output=shape.exec(result.stdout??'')?.[1];
+        if(!output)throw Object.assign(new Error('Egress table inet forge_exec_egress has an unrecognised ruleset; use local fallback'),{code:'egress-table-unrecognized'});
         const covered=output&&[...output.matchAll(new RegExp(`meta skuid (${uidList}) jump slot_egress`,'g'))]
           .flatMap(match=>match[1].replace(/[{}]/g,'').split(',').map(v=>Number(v.trim())));
         if(covered?.includes(uid))return;
         throw Object.assign(new Error(`Egress rules do not cover slot UID ${uid}; rerun forge-setup or use local fallback`),{code:'egress-uid-uncovered'});
       }
-    } catch(error) { if(error.code==='egress-uid-uncovered')throw error; /* all probe failures require local fallback */ }
+    } catch(error) { if(['egress-uid-uncovered','egress-table-unrecognized'].includes(error.code))throw error; /* all probe failures require local fallback */ }
     throw Object.assign(new Error('Egress table inet forge_exec_egress absent; use local fallback'),{code:'egress-table-absent'});
   }
   async function identity(user) {

@@ -33,7 +33,7 @@ function sentBackPr(number = 6001, overrides = {}) {
 }
 const gateFor = (p, kind, local = locals()) => eligibility(p, buildEligibilityFacts({ pr: p, comments: p.comments,
   commentsComplete: p.commentsComplete === true, population: kind, locals: local }));
-const run = options => runEligibilityShadow({ mode: 'shadow', now, readLocals: locals, ...options });
+const run = options => runEligibilityShadow({ mode: 'shadow', now, readLocals: locals, appendLine: vi.fn(), ...options });
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -340,5 +340,174 @@ describe('shadow mode line never pollutes machine-readable stdout', () => {
     expect(r.status).toBe(0);
     expect(JSON.parse(r.stdout)).toEqual({ ok: true });
     expect(r.stderr).toContain('dispatch.eligibility.mode=');
+  });
+});
+
+
+describe('explicit shadow evaluation coverage', () => {
+  it('isolates reader assignments to accessors without invoking source setters', () => {
+    const p = sentBackPr();
+    let sourceEvidence = 'source';
+    const getter = vi.fn(() => sourceEvidence);
+    const setter = vi.fn(value => { sourceEvidence = value; });
+    Object.defineProperty(p, 'readerEvidence', { enumerable: true, get: getter, set: setter });
+    const readLocals = vi.fn((_entry, snapshot) => {
+      expect(getter).not.toHaveBeenCalled();
+      snapshot.readerEvidence = 'local';
+      expect(snapshot.readerEvidence).toBe('local');
+      expect(getter).not.toHaveBeenCalled();
+      return locals();
+    });
+    const coverage = {};
+    const onError = vi.fn();
+    run({ dispatch: [entry()], prs: [p], readLocals, coverage, onError });
+    expect(readLocals).toHaveBeenCalledTimes(1);
+    expect(onError).not.toHaveBeenCalled();
+    expect(setter).not.toHaveBeenCalled();
+    expect(p.readerEvidence).toBe('source');
+    expect(coverage).toEqual({ attempted: 1, evaluated: 1, failed: 0, disagreements: 0, complete: true });
+  });
+
+  it('keeps reader-only getters lazy on a separate local-reader snapshot', () => {
+    const p = sentBackPr();
+    const getter = vi.fn(() => 'reader evidence');
+    Object.defineProperty(p, 'readerEvidence', { enumerable: true, get: getter });
+    const readLocals = vi.fn((_entry, snapshot) => {
+      // Compare identity without Vitest's object diff probing the lazy getters.
+      expect(Object.is(snapshot, p)).toBe(false);
+      expect(getter).not.toHaveBeenCalled();
+      expect(snapshot.readerEvidence).toBe('reader evidence');
+      snapshot.isDraft = true;
+      return locals();
+    });
+    const coverage = {};
+    const onError = vi.fn();
+    run({ dispatch: [entry()], prs: [p], readLocals, coverage, onError });
+    expect(onError).not.toHaveBeenCalled();
+    expect(getter).toHaveBeenCalledTimes(1);
+    expect(p.isDraft).toBe(false);
+    expect(coverage).toEqual({ attempted: 1, evaluated: 1, failed: 0, disagreements: 0, complete: true });
+  });
+
+  it('requires a ledger writer when omitted and completes only after a recorded replay', () => {
+    const coverage = {};
+    const diagnostics = [];
+    const input = { dispatch: [entry()], prs: [sentBackPr(6001, { isDraft: true })], now,
+      readLocals: locals, coverage, onError: vi.fn(), appendDiagnostic: line => diagnostics.push(JSON.parse(line)) };
+    runEligibilityShadow(input);
+    expect(coverage).toEqual({ attempted: 1, evaluated: 0, failed: 1, disagreements: 1, complete: false });
+    expect(diagnostics).toEqual([expect.objectContaining({ action: expect.stringMatching(/repair.*replay/i) })]);
+    const appendLine = vi.fn();
+    runEligibilityShadow({ ...input, appendLine });
+    expect(appendLine).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(appendLine.mock.calls[0][0])).toMatchObject({ pr: 6001, gate: 'hold', reasons: ['draft'] });
+    expect(coverage).toEqual({ attempted: 1, evaluated: 1, failed: 0, disagreements: 1, complete: true });
+  });
+
+  const replay = options => {
+    const coverage = {};
+    const diagnostics = [];
+    const result = run({ coverage, appendDiagnostic: line => diagnostics.push(JSON.parse(line)), ...options });
+    return { result, coverage, diagnostics };
+  };
+
+  it('isolates top-level PR mutations by the local reader without reading unrelated getters', () => {
+    const p = sentBackPr(6001, { readerEvidence: 'fixture' });
+    const unused = vi.fn(() => { throw new Error('unused PR field'); });
+    Object.defineProperty(p, 'unrelated', { enumerable: true, get: unused });
+    const appendLine = vi.fn();
+    const readLocals = vi.fn((_entry, snapshot) => {
+      // Compare identity without Vitest's object diff probing the lazy getters.
+      expect(Object.is(snapshot, p)).toBe(false);
+      expect(snapshot.readerEvidence).toBe('fixture');
+      snapshot.state = 'CLOSED';
+      snapshot.readerEvidence = 'changed';
+      return locals();
+    });
+    const onError = vi.fn();
+    const out = replay({ dispatch: [entry()], prs: [p], readLocals, appendLine, onError });
+    expect(readLocals).toHaveBeenCalledTimes(1);
+    expect(onError).not.toHaveBeenCalled();
+    expect(p.state).toBe('OPEN');
+    expect(p.readerEvidence).toBe('fixture');
+    expect(unused).not.toHaveBeenCalled();
+    expect(appendLine).not.toHaveBeenCalled();
+    expect(out.coverage).toEqual({ attempted: 1, evaluated: 1, failed: 0, disagreements: 0, complete: true });
+  });
+
+  it('refuses complete coverage for a disagreement without a ledger writer and requires repair and replay', () => {
+    const onError = vi.fn();
+    const out = replay({ dispatch: [entry()], prs: [sentBackPr(6001, { isDraft: true })],
+      appendLine: undefined, onError });
+    expect(out.result).toEqual({ checked: 1, disagreements: 1 });
+    expect(out.coverage).toEqual({ attempted: 1, evaluated: 0, failed: 1, disagreements: 1, complete: false });
+    expect(out.diagnostics).toEqual([expect.objectContaining({ gate: 'error',
+      reasons: ['evaluation-failed'], action: expect.stringMatching(/repair.*replay/i) })]);
+    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringMatching(/ledger.*writer/i) }));
+  });
+
+  it('an unrelated throwing PR getter cannot suppress a real eligibility disagreement', () => {
+    const p = sentBackPr(6001, { isDraft: true });
+    const unused = vi.fn(() => { throw new Error('unused PR field'); });
+    Object.defineProperty(p, 'unrelated', { enumerable: true, get: unused });
+    const appendLine = vi.fn();
+    const out = replay({ dispatch: [entry()], prs: [p], appendLine });
+    expect(unused).not.toHaveBeenCalled();
+    expect(out.result).toEqual({ checked: 1, disagreements: 1 });
+    expect(out.coverage).toEqual({ attempted: 1, evaluated: 1, failed: 0, disagreements: 1, complete: true });
+    expect(JSON.parse(appendLine.mock.calls[0][0])).toMatchObject({ gate: 'hold', reasons: ['draft'] });
+    expect(out.diagnostics).toEqual([]);
+  });
+
+  it.each(['state', 'comments', 'headRefOid'])('a required %s getter failure is a durable non-evaluation even with silent onError', field => {
+    const broken = sentBackPr();
+    Object.defineProperty(broken, field, { get() { throw new Error('required read failed'); } });
+    const appendLine = vi.fn();
+    const out = replay({ dispatch: [entry()], prs: [broken], appendLine, onError: () => {} });
+    expect(out.coverage).toEqual({ attempted: 1, evaluated: 0, failed: 1, disagreements: 0, complete: false });
+    expect(appendLine).not.toHaveBeenCalled();
+    expect(out.diagnostics).toEqual([expect.objectContaining({ pathId: 'reconcile-core', pr: 6001,
+      gate: 'error', reasons: ['evaluation-failed'], action: expect.stringMatching(/repair.*replay/i) })]);
+  });
+
+  it('a gate-read local getter failure cannot count as evaluated', () => {
+    const local = locals();
+    Object.defineProperty(local.claim, 'claimed', { get() { throw new Error('gate evidence failed'); } });
+    const out = replay({ dispatch: [entry()], prs: [sentBackPr()], readLocals: () => local, onError: () => {} });
+    expect(out.coverage).toMatchObject({ attempted: 1, evaluated: 0, failed: 1, complete: false });
+    expect(out.diagnostics).toHaveLength(1);
+  });
+
+  it('append failure blocks coverage and remains visible when diagnostic and error reporters throw', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const out = replay({ dispatch: [entry()], prs: [pr()],
+      appendLine: () => { throw new Error('ledger unavailable'); },
+      appendDiagnostic: () => { throw new Error('diagnostic unavailable'); },
+      onError: () => { throw new Error('reporter unavailable'); } });
+    expect(out.coverage).toEqual({ attempted: 1, evaluated: 0, failed: 1, disagreements: 1, complete: false });
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/repair.*replay/i));
+  });
+
+  it('replays one disagreement and one failure; only a complete repaired replay proves coverage', () => {
+    const broken = pr(6002);
+    Object.defineProperty(broken, 'state', { get() { throw new Error('read failed'); } });
+    const dispatch = [entry(), entry('ci-heal', 6002)];
+    const out = replay({ dispatch, prs: [sentBackPr(6001, { isDraft: true }), broken], onError: () => {} });
+    expect(out.coverage).toEqual({ attempted: 2, evaluated: 1, failed: 1, disagreements: 1, complete: false });
+    expect(out.diagnostics).toHaveLength(1);
+    const repaired = replay({ dispatch, prs: [sentBackPr(6001, { isDraft: true }), sentBackPr(6002)] });
+    expect(repaired.coverage).toEqual({ attempted: 2, evaluated: 2, failed: 0, disagreements: 1, complete: true });
+  });
+
+  it.each(['true', 'false', 1, 0, null])('explicit commentsComplete=%s stays incomplete on a short thread', commentsComplete => {
+    const appendLine = vi.fn();
+    const out = replay({ dispatch: [entry()], prs: [sentBackPr(6001, { commentsComplete })], appendLine });
+    expect(out.coverage).toMatchObject({ evaluated: 1, failed: 0, disagreements: 1 });
+    expect(JSON.parse(appendLine.mock.calls[0][0])).toMatchObject({ gate: 'unknown', reasons: ['thread'] });
+  });
+
+  it('off mode has no promotion evidence', () => {
+    const out = replay({ mode: 'off', dispatch: [entry()] });
+    expect(out.coverage).toEqual({ attempted: 0, evaluated: 0, failed: 0, disagreements: 0, complete: false });
   });
 });

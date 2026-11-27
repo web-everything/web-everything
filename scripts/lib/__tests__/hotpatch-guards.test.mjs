@@ -31,7 +31,8 @@ describe('hotpatch admission', () => {
     const controls = ciControlFiles();
     for (const path of ['scripts/lib/write-all-sync.mjs', 'scripts/lib/test-result-cache.mjs',
       'scripts/lib/trust-chain-tier.mjs', 'scripts/test-cache/trace-setup.mjs',
-      'scripts/readiness/forge-exec-siblings.mjs', 'eleventy/filters.cjs', '.nvmrc', '.eleventy.js']) {
+      'scripts/readiness/forge-exec-siblings.mjs', 'tests/build/site-asset-size.test.mjs',
+      'eleventy/filters.cjs', '.nvmrc', '.eleventy.js']) {
       expect(controls.has(path), `CI graph must include ${path}`).toBe(true);
     }
     const admitted = [];
@@ -84,7 +85,8 @@ describe('hotpatch admission', () => {
   it.each(['.github/workflows/ci.yml', '.github/workflows/other.yml', '.github/actions/test/action.yml',
     'scripts/ci/shards.mjs', 'scripts/lib/hermetic-env.mjs', 'scripts/lib/red-main-quarantine-io.mjs',
     'scripts/check-standards.mjs', 'scripts/merge-coverage.mjs', 'scripts/lint-host-paths.mjs',
-    'scripts/conveyor/soak/soak-scope.mjs', 'playwright.config.ts',
+    'scripts/conveyor/soak/soak-scope.mjs', 'tests/build/site-asset-size.test.mjs',
+    'tests/build/future-build-check.test.mjs', 'playwright.config.ts',
     'vitest.unit.config.ts', 'package.json', 'package-lock.json'])('a PR editing %s is refused even with a green test check', async path => {
     const { data, readers } = hotpatchFixture(); data.paths = [path];
     expect(await ciDefinitionGuard(SHA, readers)).toMatchObject({ outcome: 'fail' });

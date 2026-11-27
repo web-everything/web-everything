@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync, readdirSync, symlinkSync, realpathSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync, readdirSync, symlinkSync, realpathSync, unlinkSync, rmSync } from 'node:fs';
 
 const mod = await import('../lib/agent-launch.mjs');
 const { launchAgent, buildAgentInvocation, buildAgentArgs } = mod;
@@ -32,7 +32,8 @@ function fixture() {
 const codex = (extra = {}) => ({ agent: 'codex', githubRole: 'worker', cwd: process.cwd(), sandbox: 'workspace-write', model: 'gpt-5.6-sol', env: { PATH: binDir }, ...extra });
 const claude = (extra = {}) => ({ agent: 'claude', githubRole: 'worker', cwd: process.cwd(), print: true, sessionId: SID, prompt: 'hello', env: { PATH: binDir }, ...extra });
 const refuses = (d, io, re) => expect(() => buildAgentInvocation(d, io)).toThrow(re);
-beforeEach(fixture);
+const LOCALE_CASE = 'keeps only the explicit LC_ category names and drops any other LC_ key';
+beforeEach(({ task }) => { if (task.name !== LOCALE_CASE) fixture(); });
 afterEach(() => vi.restoreAllMocks());
 
 describe('prompt text stays separate from flag values', () => {
@@ -122,6 +123,35 @@ describe('4 caller PATH tail cannot shadow guards', () => {
 });
 
 describe('5/6 launcher-owned env, no git pins', () => {
+  it(LOCALE_CASE, () => {
+    // Independent synthetic guards: no host account, checkout fixtures or ambient cwd.
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), 'agent-launch-locale-')));
+    const guards = join(dir, 'guards'), gh = join(dir, 'gh'), bin = join(dir, 'bin');
+    for (const path of [guards, gh, bin]) mkdirSync(path, { mode: 0o755 });
+    const body = '#!/bin/sh\n';
+    for (const name of ['npm', 'npx', 'playwright', 'vitest', '_guard.sh']) put(guards, name, body);
+    for (const name of ['node', 'codex', 'claude']) put(bin, name, body);
+    put(gh, 'gh', GH_BODY);
+    const shellsFile = join(dir, 'shells'); writeFileSync(shellsFile, '/bin/sh\n');
+    const manifest = {
+      codex: { pinned: Object.fromEntries(['npm', 'npx', 'playwright', 'vitest'].map(name => [name, sha(body)])), sourced: { '_guard.sh': sha(body) }, generated: ['gh'] },
+      claude: { pinned: {}, sourced: {}, generated: ['gh'] },
+    };
+    vi.stubEnv('XPC_SERVICE_NAME', undefined);
+    try {
+      for (const make of [codex, claude]) {
+        const io = { manifest, codexShimDir: guards, ghShimDir: gh, shellsFile, execPath: join(bin, 'node'),
+          user: { homedir: dir, username: 'fixture', shell: '/bin/sh' }, accountMap: {},
+          readKeychain: vi.fn(() => { throw new Error('unexpected keychain read'); }), resolveBinary: agent => join(bin, agent) };
+        const env = { PATH: bin, LC_ALL: 'C', LC_CTYPE: 'UTF-8', LC_S1E_CANARY: 'x', LC_TERMINAL: 'iTerm2', lc_all: 'C', LC_: 'x' };
+        const descriptor = make({ cwd: dir, tempRoot: dir, env });
+        const child = buildAgentInvocation(descriptor, io).options.env;
+        expect(child).toMatchObject({ LC_ALL: 'C', LC_CTYPE: 'UTF-8' });
+        for (const key of ['LC_S1E_CANARY', 'LC_TERMINAL', 'lc_all', 'LC_']) expect(child).not.toHaveProperty(key);
+        expect(buildAgentInvocation({ ...descriptor, env: { ...env, LC_ALL: undefined } }, io).options.env).not.toHaveProperty('LC_ALL');
+      }
+    } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
+  });
   const hostile = { SHELL: '/tmp/evil', HOME: '/tmp/evil', CODEX_HOME: '/tmp/evil', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.hooksPath',
     GIT_CONFIG_VALUE_0: '/dev/null', GIT_CONFIG_PARAMETERS: "'core.hooksPath=/dev/null'", SSH_AUTH_SOCK: '/tmp/s', GH_TOKEN: 't', NODE_OPTIONS: '-r x',
     WE_CODEX_SHIM_DIR: '/tmp/evil', WE_GH_AUTH_PERSONAL_FALLBACK: 'allow', USER: 'evil', TMPDIR: '/tmp/evil' };

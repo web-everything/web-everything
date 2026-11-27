@@ -1,12 +1,14 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { BUILT_IN_VERIFY_SETTINGS, defaultVerifySettingsPath, validateVerifySettings,
   loadVerifySettingsFile, resolveVerifySettings } from '../verify-settings.mjs';
+import { resetCascadeLogForTest } from '../policy-cascade.mjs';
 import { verifyRelatedMode, verifyTestTimeoutFactor, verifyStandardsPolicy, verifyPhaseAdmissionEnabled,
-  verifyFastTargets, resolveDefaultGate, phaseAdmissionKind, buildVerifyPhases, formatVerifyPhases } from '../verify-lane-gate.mjs';
+  verifyFastTargets, resolveDefaultGate, phaseAdmissionKind, buildVerifyPhases, formatVerifyPhases,
+  alwaysRunPlan, verifySetting, verifySettingSource } from '../verify-lane-gate.mjs';
 
 const allSources = source => Object.fromEntries(Object.keys(BUILT_IN_VERIFY_SETTINGS).map(key => [key, source]));
 const custom = { sharedGreenReuse: false, shardMinTests: 24, shardSize: 12, shardParallel: 3, relatedMode: 'import-only', testTimeoutFactor: 4, standards: 'ci-only', phaseAdmission: false, fastTargets: 2,
@@ -202,7 +204,95 @@ describe('#5128 — related selection settings', () => {
 });
 
 describe('alwaysRunTests setting (#99)', () => {
-  it('rejects unsafe entries per key and an empty-but-set env switches the set off', () => {
+  it.each(['', ' ', '\t\r\n '])('loading a blank guard env logs tool provenance (%j)', value => {
+    const path = file(JSON.stringify({ alwaysRunTests: ['guard.test.mjs'] }));
+    const preferences = file('{}');
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    resetCascadeLogForTest();
+    try {
+      const loaded = loadVerifySettingsFile(path, { env: {
+        WE_PLATFORM_PREFERENCES_FILE: preferences, WE_POLICY_CASCADE_LOG: '1',
+        WE_VERIFY_ALWAYS_RUN_TESTS: value,
+      } });
+      expect(loaded.alwaysRunTests).toEqual(['guard.test.mjs']);
+      const line = log.mock.calls.map(([line]) => line).find(line => line.startsWith('policy-cascade · verify:'));
+      expect(line).toContain('alwaysRunTests=["guard.test.mjs"] (tool)');
+      expect(line).not.toContain('alwaysRunTests=' + JSON.stringify(value) + ' (env)');
+    } finally {
+      log.mockRestore();
+      resetCascadeLogForTest();
+    }
+  });
+
+  it('empty always-run override inherits configured guards', () => {
+    const fileConfig = { alwaysRunTests: ['guard.test.mjs'] };
+    const absent = resolveVerifySettings({ fileConfig, env: {} });
+    const empty = resolveVerifySettings({ fileConfig, env: { WE_VERIFY_ALWAYS_RUN_TESTS: '' } });
+    expect(empty.values.alwaysRunTests).toEqual(['guard.test.mjs']);
+    expect(empty.sources.alwaysRunTests).toBe('file');
+    expect(empty).toEqual(absent);
+  });
+
+  it.each([
+    ['file', { alwaysRunTests: ['guard.test.mjs'] }, ['guard.test.mjs']],
+    ['default', {}, []],
+  ])('empty and whitespace overrides inherit both guards and provenance (%s)', (source, fileConfig, guards) => {
+    const absent = resolveVerifySettings({ fileConfig, env: {} });
+    for (const value of [undefined, '', ' ', '\t\r\n ']) {
+      const env = value === undefined ? {} : { WE_VERIFY_ALWAYS_RUN_TESTS: value };
+      const resolved = resolveVerifySettings({ fileConfig, env });
+      expect(resolved).toEqual(absent);
+      expect(resolved.values.alwaysRunTests).toEqual(guards);
+      expect(resolved.sources.alwaysRunTests).toBe(source);
+    }
+  });
+
+  it('empty overrides keep configured guards in the lane always-run selection', () => {
+    const path = file(JSON.stringify({ alwaysRunTests: ['guard.test.mjs'] }));
+    const root = dirname(path);
+    writeFileSync(join(root, 'guard.test.mjs'), '');
+    const preferences = join(root, 'platform-preferences.json');
+    writeFileSync(preferences, '{}');
+    const fileConfig = loadVerifySettingsFile(path, { env: { WE_PLATFORM_PREFERENCES_FILE: preferences } });
+    for (const env of [{}, { WE_VERIFY_ALWAYS_RUN_TESTS: '' }, { WE_VERIFY_ALWAYS_RUN_TESTS: ' \t ' }]) {
+      const plan = alwaysRunPlan({ declared: verifySetting('alwaysRunTests', env, fileConfig),
+        fileExists: name => existsSync(join(root, name)), scanCommands: [], testTimeoutFactor: 1 });
+      expect(plan.files).toEqual(['guard.test.mjs']);
+      expect(plan.skipped).toEqual([]);
+      expect(plan.command).toBe("npx vitest run 'guard.test.mjs'");
+      expect(verifySettingSource('alwaysRunTests', env, fileConfig)).toBe('file');
+    }
+  });
+
+  it('valid nonblank env paths override guards', () => {
+    expect(resolveVerifySettings({ fileConfig: { alwaysRunTests: ['guard.test.mjs'] },
+      env: { WE_VERIFY_ALWAYS_RUN_TESTS: ' ./a/b.test.ts, c/d.test.cjs ' } }))
+      .toMatchObject({ values: { alwaysRunTests: ['./a/b.test.ts', 'c/d.test.cjs'] }, sources: { alwaysRunTests: 'env' } });
+  });
+
+  it('documented tool-file alwaysRunTests: [] disables named guards even over platform guards', () => {
+    const path = file(JSON.stringify({ alwaysRunTests: [] }));
+    const preferences = join(dirname(path), 'platform-preferences.json');
+    writeFileSync(preferences, JSON.stringify({ verify: { alwaysRunTests: ['platform-guard.test.mjs'] } }));
+    const fileConfig = loadVerifySettingsFile(path, { env: { WE_PLATFORM_PREFERENCES_FILE: preferences } });
+    for (const env of [{}, { WE_VERIFY_ALWAYS_RUN_TESTS: '' }, { WE_VERIFY_ALWAYS_RUN_TESTS: ' \t ' }]) {
+      expect(resolveVerifySettings({ fileConfig, env }))
+        .toMatchObject({ values: { alwaysRunTests: [] }, sources: { alwaysRunTests: 'file' } });
+      expect(alwaysRunPlan({ declared: verifySetting('alwaysRunTests', env, fileConfig) }))
+        .toEqual({ command: null, declared: [], files: [], skipped: [] });
+    }
+  });
+
+  it.each([',', ', ,', 'guard.test.mjs,', ',guard.test.mjs', 'guard.test.mjs,,other.test.mjs',
+    '--bail', 'guard.test.mjs,--bail', '../guard.test.mjs', 'off', '[]',
+    Array.from({ length: 51 }, (_, i) => `guard${i}.test.mjs`).join(',')])(
+    'malformed or oversized overrides retain configured guards and provenance (%s)', value => {
+      expect(resolveVerifySettings({ fileConfig: { alwaysRunTests: ['configured.test.mjs'] },
+        env: { WE_VERIFY_ALWAYS_RUN_TESTS: value } }))
+        .toMatchObject({ values: { alwaysRunTests: ['configured.test.mjs'] }, sources: { alwaysRunTests: 'file' } });
+    });
+
+  it('rejects unsafe entries per key and an empty-but-set env inherits the explicit policy', () => {
     for (const bad of ['a.test.mjs', ['/abs.test.mjs'], ['../x.test.mjs'], [1], ['a b.test.mjs'],
       // a leading dash is a vitest option, not a path; a non-test file would not be a guard at all
       ['-u'], ['--bail'], ['--passWithNoTests'], ['-u.test.mjs'], ['--config=x.test.mjs'], ['ok.test.mjs', '--bail'], ['package.json'], ['scripts/x.mjs']]) {
@@ -212,7 +302,13 @@ describe('alwaysRunTests setting (#99)', () => {
       expect(resolveVerifySettings({ fileConfig: { alwaysRunTests: ['k.test.mjs'] }, env: { WE_VERIFY_ALWAYS_RUN_TESTS: bad } }).values.alwaysRunTests, bad).toEqual(['k.test.mjs']);
     }
     expect(resolveVerifySettings({ fileConfig: {}, env: { WE_VERIFY_ALWAYS_RUN_TESTS: './a/b.test.ts,c/d.test.cjs' } }).values.alwaysRunTests).toEqual(['./a/b.test.ts', 'c/d.test.cjs']);
-    expect(resolveVerifySettings({ fileConfig: { alwaysRunTests: ['a.test.mjs'] }, env: { WE_VERIFY_ALWAYS_RUN_TESTS: '' } }).values.alwaysRunTests).toEqual([]);
+    const env = { WE_VERIFY_ALWAYS_RUN_TESTS: '' };
+    const inherited = resolveVerifySettings({ fileConfig: { alwaysRunTests: ['a.test.mjs'] }, env });
+    expect(inherited.values.alwaysRunTests).toEqual(['a.test.mjs']);
+    expect(inherited.sources.alwaysRunTests).toBe('file');
+    const disabled = resolveVerifySettings({ fileConfig: { alwaysRunTests: [] }, env });
+    expect(disabled.values.alwaysRunTests).toEqual([]);
+    expect(disabled.sources.alwaysRunTests).toBe('file');
   });
 });
 

@@ -1,0 +1,11 @@
+---
+pagination:
+    data: backlogTileChunks.resolved.chunks
+    size: 1
+    alias: chunk
+permalink: "{{ chunk.url }}"
+layout: false
+eleventyExcludeFromCollections: true
+---
+{% set tileItems = chunk.items %}
+{% include "backlog-tiles.njk" %}

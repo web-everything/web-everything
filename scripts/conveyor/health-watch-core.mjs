@@ -540,7 +540,7 @@ function matchSilence(silences, smell, subject) {
 /**
  * PURE: step every episode by one tick's smell results.
  * @param {ReturnType<typeof emptyHealthState>} state
- * @param {Array<{ smell: object, results: Array<{subject:string, breach:boolean, severity?:string, escalation?:object, measure?:object, summary?:string}>|null }>} evaluations
+ * @param {Array<{ smell: object, results: Array<{subject:string, breach:boolean, resolvedEpisodeId?:string, severity?:string, escalation?:object, measure?:object, summary?:string}>|null }>} evaluations
  *   `results: null` means the smell had no sample this tick (probe not due / errored) — its episodes do not move.
  * @param {number} now
  * @param {{ config?: object, activeCards?: Set<string> }} [opts]
@@ -567,6 +567,12 @@ export function stepEpisodes(state, evaluations, now, { config = DEFAULT_HEALTH_
       const key = episodeKey(smell.id, r.subject);
       seen.add(key);
       let ep = next.episodes[key];
+      // Confirmed recovery can precede another breach between samples. Retire only the
+      // named episode (including a flapping one), then evaluate the current observation.
+      if (ep && typeof r.resolvedEpisodeId === 'string' && r.resolvedEpisodeId === ep.id) {
+        applyClean(ep, key, true);
+        ep = next.episodes[key];
+      }
       if (r.breach) {
         const wasOpen = ep && ep.status !== 'pending';
         const priorSeverity = ep?.severity;
@@ -623,11 +629,11 @@ export function stepEpisodes(state, evaluations, now, { config = DEFAULT_HEALTH_
       if (ep.smell === smell.id && !seen.has(key) && !smell.missingSubjectsUnknown) applyClean(ep, key);
     }
 
-    function applyClean(ep, key) {
+    function applyClean(ep, key, confirmedRecovery = false) {
       ep.cleanStreak += 1; ep.breachStreak = 0; ep.samples += 1;
       if (ep.status === 'pending') { delete next.episodes[key]; return; }
       const need = ep.status === 'flapping' ? cfg.flapCloseAfter : closeAfter;
-      if (ep.cleanStreak >= need) {
+      if (confirmedRecovery || ep.cleanStreak >= need) {
         ep.status = 'closed'; ep.closedAt = now;
         delete next.episodes[key];
         next.history.push(ep);
@@ -949,10 +955,13 @@ export function runHealthTick(prevState, probes, smells, now, { config = {}, act
   const evaluations = smells.map((smell) => {
     const needs = smell.probes ?? [];
     const missing = needs.filter((p) => probes[p] === undefined);
-    if (missing.length) return { smell, results: null, skipped: missing };
+    // Opt-in evaluators can surface uncertainty on existing episodes when their evidence is unavailable.
+    if (missing.length && !smell.evaluateMissingProbes) return { smell, results: null, skipped: missing };
     try {
       const results = smell.evaluate(probes, ctx);
-      delete errs[`smell:${smell.id}`];
+      // Missing-probe evaluations annotate uncertainty; only a complete successful sample
+      // confirms recovery from an evaluator failure. Preserve the streak until then.
+      if (!missing.length) delete errs[`smell:${smell.id}`];
       return { smell, results };
     } catch (e) {
       errs[`smell:${smell.id}`] = { count: (errs[`smell:${smell.id}`]?.count ?? 0) + 1, last: String(e?.message || e).slice(0, 200) };

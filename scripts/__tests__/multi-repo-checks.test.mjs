@@ -143,6 +143,13 @@ it('the no-code-owed soak uses a repository-neutral fixture and still refuses ex
   expect(scenario.judge(await scenario.run())).toEqual([]);
 }, 30_000);
 
+it('the active-claim soak uses a repository-neutral writer and preserves repair-claim exclusion', async () => {
+  const file = 'scripts/conveyor/soak/breaks/no-code-rearm-active-claim.mjs';
+  expect(scanMultiRepo(read(file))).toEqual([]);
+  const { default: scenario } = await import('../conveyor/soak/breaks/no-code-rearm-active-claim.mjs');
+  expect(scenario.judge(await scenario.run())).toEqual([]);
+}, 30_000);
+
 it('the no-code rearm recovery soak uses a repository-neutral fixture and preserves replacement recovery', async () => {
   const file = 'scripts/conveyor/soak/breaks/no-code-rearm-recovery.mjs';
   expect(scanMultiRepo(read(file))).toEqual([]);
