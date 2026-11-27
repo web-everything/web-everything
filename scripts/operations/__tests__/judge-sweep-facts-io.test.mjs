@@ -1,12 +1,14 @@
 /** Bounded observations must expose grants that need evidence beyond list + comments. */
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { resolveHumanReviewSurfaces } from '../../lib/human-review-surfaces.mjs';
+import * as referralCards from '../../lib/referral-card-readable.mjs';
 import { runGhSync } from '../../lib/gh-throttle.mjs';
-import { createJudgeSweepFactsReader, createShapeCache, JUDGE_SWEEP_REPO, operatorGh, readCheckoutState, readFromFreshOrigin } from '../judge-sweep-facts-io.mjs';
+import { createJudgeSweepFactsReader, createShapeCache, JUDGE_SWEEP_REPO, operatorGh, readCheckoutState, readFromFreshOrigin, resolveFixHoldLabel, resolveStallThresholds } from '../judge-sweep-facts-io.mjs';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import fs, { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { homedir, tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { buildJudgeSweepBundle } from '../judge-sweep-facts.mjs';
 import { buildShapePlan } from '../../review-core-cli.mjs';
@@ -17,8 +19,38 @@ import { mandatoryReferralReviewer, normalizeFinding, referralFindingKey, render
   REFERRAL_DROP_REASON, REFERRAL_SUPERSEDE_REASON, validateReferralRecord } from '../../lib/jury-core.mjs';
 
 vi.mock('../../lib/gh-throttle.mjs', async original => ({ ...await original(), runGhSync: vi.fn() }));
+const settingsIO = { reads: [], violations: [] };
+let restoreSettingsRead;
+// The shared Vitest setup supplies a private HOME and account homedir. Pin preferences there for this file.
+// Record host settings access even when production catches an IO error, so it still fails the test.
+beforeEach(() => {
+  vi.stubEnv('WE_PLATFORM_PREFERENCES_FILE', join(homedir(), 'sentinel-platform-preferences.json'));
+  const original = fs.readFileSync;
+  fs.readFileSync = (path, ...args) => {
+    const name = String(path);
+    if (/(?:platform-preferences|delivery-priority-settings|operator-overrides)\.json$/.test(name)) {
+      settingsIO.reads.push(name);
+      const privateRoots = [homedir(), userInfo().homedir];
+      const versioned = /\/scripts\/lib\/delivery-(?:platform-preferences|priority-settings)\.json$/.test(name);
+      if (!versioned && !privateRoots.some(root => name.startsWith(`${root}/`))) {
+        settingsIO.violations.push(name);
+        throw new Error('settings read outside the private sentinel home');
+      }
+    }
+    return original(path, ...args);
+  };
+  // Native .mjs imports retain builtin bindings; a Vitest module mock alone does not cover those callers.
+  syncBuiltinESMExports();
+  restoreSettingsRead = () => { fs.readFileSync = original; syncBuiltinESMExports(); };
+});
 
-afterEach(() => { vi.resetAllMocks(); vi.unstubAllEnvs(); });
+afterEach(() => {
+  restoreSettingsRead();
+  const violations = settingsIO.violations.splice(0);
+  settingsIO.reads.length = 0;
+  vi.resetAllMocks(); vi.unstubAllEnvs();
+  expect(violations, 'host settings reads outside private homes').toEqual([]);
+});
 
 const repo = 'o/r', head = 'a'.repeat(40), at = '2026-10-22T13:00:00Z';
 // Keep the production cap; detail fixtures explicitly use round three (cap - 2).
@@ -64,6 +96,8 @@ const pr = (extra = {}) => ({ number: 1, title: 'IO fixture', headRefOid: head,
   body: '<!-- authored-by-actor: author -->', createdAt: at, statusCheckRollup: [], commits: [], mergeable: 'MERGEABLE', ...extra });
 const options = (extra = {}) => {
   const opts = ({
+  env: {}, readFile: () => '{}', log: () => {},
+  shape: () => ({ humanRequired: false }),
   findSuspendedRuns: () => [],
   readExitRulings: () => ({ prs: new Set(), errors: [] }),
   checkoutState: () => ({ behind: 0 }),
@@ -237,11 +271,11 @@ it('keeps a dropped finding with an existing block open', () => {
   expect(facts.openReferrals).toEqual([{ key: record.referrals[0].key, ruled: true, superseded: false }]);
 });
 
-it('remote card verification refuses additional GitHub reads and leaves the referral open', () => {
+it.each(['123-fixture.md', 'xabc123-fixture.md'])('remote card verification refuses additional reads and leaves %s open', file => {
   const record = referralRecord();
   record.rulings = [{ id: 'ruling-1', key: record.referrals[0].key, reviewerId: record.reviewer.id,
     lens: record.reviewer.lens, result: 'card', rationale: 'filed', evidence: ['diff'],
-    card: 'we:backlog/123-fixture.md@pr55' }];
+    card: `we:backlog/${file}@pr55` }];
   expect(validateReferralRecord(record)).toBe(true);
   const gh = vi.fn(() => JSON.stringify([pr()]));
   const facts = read({ gh, readComments: () => [comment(renderReferralRecord(record))] });
@@ -509,7 +543,8 @@ it('shape child receives filenames unchanged as JSON stdin with bounded output a
     'with\u2028separator.md', '`backtick`.md', "quote'\".md", '$(shell).md', '--leading.md',
     '../parent.md', 'invisible\u200b.md', 'ｆullwidth.md', 'back\\slash.md'];
   exec.mockReturnValue('{"humanRequired":true}');
-  const facts = read({ gh: () => JSON.stringify([humanPr({ files: files.map(path => ({ path })), changedFiles: files.length })]) });
+  const facts = read({ shape: undefined,
+    gh: () => JSON.stringify([humanPr({ files: files.map(path => ({ path })), changedFiles: files.length })]) });
   expect(facts.humanRequired).toBe(true);
   expect(exec).toHaveBeenCalledTimes(1);
   const [bin, args, opts] = exec.mock.calls[0];
@@ -560,7 +595,7 @@ it('flags a ledger row that names the PR head but is malformed as unreadable evi
 
 // Evidence must never depend on how stale the caller's checkout is (R372).
 
-const goodPr = { number: 7, headSha: head, labels: [], evidenceErrors: [], minutesSinceUpdate: 5 };
+const goodPr = { mergeable: 'MERGEABLE', fixHoldLabel: 'hold:fix', number: 7, headSha: head, labels: [], evidenceErrors: [], minutesSinceUpdate: 5 };
 const freshFacts = { generatedAt: at, prs: [goodPr] };
 const staleOptions = extra => options({ gh: vi.fn(() => { throw new Error('stale checkout must not read locally'); }), ...extra });
 
@@ -611,6 +646,9 @@ it.each([
   ['a malformed head', [{ ...goodPr, headSha: 'abc' }], false],
   ['missing evidenceErrors', [{ ...goodPr, evidenceErrors: undefined }], false],
   ['non-array labels', [{ ...goodPr, labels: 'x' }], false],
+  ['object-shaped hold label', [{ ...goodPr, mergeable: 'CONFLICTING', isDraft: false,
+    labels: [{ name: 'hold:fix' }] }], false],
+  ['non-string label among strings', [{ ...goodPr, labels: ['hold:fix', null] }], false],
   ['a non-finite age', [{ ...goodPr, minutesSinceUpdate: null }], false],
   ['a valid PR', [goodPr], true],
 ])('validates the fresh PR shape: %s', (_name, prs, ok) => {
@@ -1086,14 +1124,189 @@ it.each([[undefined], [null], ['UNKNOWN']])('an unknown or missing merge state i
   const row = read({ gh: () => JSON.stringify([pr({ mergeable, isDraft: false })]) });
   expect(row.mergeable).toBeNull();
   expect(row.evidenceErrors).toEqual([]);
-  expect(buildJudgeSweepBundle({ prs: [row] }).prs[0]).toMatchObject({ needsJudgment: false, nextOwner: 'nobody' });
+  expect(buildJudgeSweepBundle({ prs: [row] }).prs[0]).toMatchObject({ needsJudgment: false, nextOwner: 'operator' });
   expect(buildJudgeSweepBundle({ prs: [{ ...row, labels: ['review:human'],
     latestVerdict: { accepted: true }, redTeam: { state: 'clear' }, openReferrals: [], openSendBacks: [] }] }).prs[0])
     .toMatchObject({ needsJudgment: true, reason: 'clean-and-owed-approval' });
 });
-it.each([[7], ['BOGUS'], ['unknown'], [''], [false], [{}], [[]]])('records an evidence error for an invalid merge state (%s)', mergeable => {
-  const gh = vi.fn(() => JSON.stringify([pr({ mergeable })]));
-  const row = createJudgeSweepFactsReader(options({ gh }))({ repo }).prs[0];
+it.each([[7], ['BOGUS'], ['unknown'], [''], [false], [{}], [[]]])('requires judgment for an invalid merge state (%s)', mergeable => {
+  const row = hardenedRead({ gh: () => JSON.stringify([pr({ mergeable, isDraft: false })]) }).prs[0];
   expect(row.mergeable).toBeNull();
-  expect(row.evidenceErrors).toContain('merge state unavailable; inspect PR mergeability');
+  expect(row.conflictOwnershipError).toBe('Inspect PR mergeability and rerun; merge state is unknown or unreadable.');
+  expect(row.evidenceErrors).toEqual(['merge state unavailable; inspect PR mergeability']);
+  expect(buildJudgeSweepBundle({ prs: [row] }).prs[0]).toMatchObject({
+    needsJudgment: true, nextOwner: 'judge', reason: 'evidence-unavailable: inspect PR evidence and rerun',
+  });
+});
+
+
+// All observations and settings IO are private ports; no host files or commands are used.
+const hardenedOptions = extra => options({ env: {}, log: () => {},
+  readFile: () => '{}', readStallThresholds: () => ({}),
+  cardReadable: () => false, shape: () => ({ humanRequired: false }), ...extra });
+const hardenedRead = extra => createJudgeSweepFactsReader(hardenedOptions(extra))({ repo });
+const ioOwnershipCases = [false, true].flatMap(fresh => ['UNKNOWN', null].flatMap(mergeable =>
+  ['fixer', 'drain', 'review', 'red-team'].map(nextOwner => ({ fresh, mergeable, nextOwner }))));
+it.each(ioOwnershipCases)(
+  'unknown mergeability preserves IO owner $nextOwner (fresh=$fresh, mergeable=$mergeable)',
+  ({ fresh, mergeable, nextOwner }) => {
+    const labels = { fixer: [], drain: ['ready-to-merge'], review: ['review:pending'], 'red-team': ['red-team:pending'] }[nextOwner];
+    const local = hardenedRead({ gh: () => JSON.stringify([pr({ mergeable, isDraft: false,
+      labels: labels.map(name => ({ name })) })]),
+      readJobs: () => nextOwner === 'fixer' ? [{ repo, pr: 1, kind: 'fix-run' }] : [] });
+    // An old fix loop used to widen pending-review judgment even though review still owns the PR.
+    local.prs[0].minutesSinceFixLoop = 90;
+    const result = fresh ? hardenedRead({ checkoutState: () => ({ behind: 1 }), readFresh: () => local }) : local;
+    expect(buildJudgeSweepBundle(result).prs[0]).toMatchObject({ nextOwner, needsJudgment: false });
+  });
+
+it.each([false, true])('validates unknown merge state on current/fresh paths (fresh=%s)', fresh => {
+  for (const mergeable of [undefined, null, 'UNKNOWN', 'BOGUS']) {
+    const local = hardenedRead({ gh: () => JSON.stringify([pr({ mergeable, isDraft: false })]) });
+    const result = fresh ? hardenedRead({ checkoutState: () => ({ behind: 1 }),
+      readFresh: () => ({ ...local, prs: local.prs.map(({ conflictOwnershipError, ...row }) => row) }) }) : local;
+    expect(buildJudgeSweepBundle(result).prs[0]).toMatchObject(mergeable === 'BOGUS'
+      ? { nextOwner: 'judge', needsJudgment: true, reason: 'evidence-unavailable: inspect PR evidence and rerun' }
+      : { nextOwner: 'operator', nextStep: expect.stringMatching(/mergeability.*rerun/) });
+  }
+});
+it.each([false, true])('custom environment hold label replaces the default on current/fresh paths (fresh=%s)', fresh => {
+  for (const [label, nextOwner] of [['custom:fix', 'nobody'], ['hold:fix', 'fixer']]) {
+    const env = { WE_FIX_HOLD_LABEL: 'custom:fix', WE_POLICY_CASCADE_LOG: '1' };
+    const log = vi.fn();
+    const local = hardenedRead({ env, log, gh: () => JSON.stringify([pr({ labels: [{ name: label }],
+      mergeable: 'CONFLICTING', isDraft: false })]) });
+    const result = fresh ? hardenedRead({ env, log, checkoutState: () => ({ behind: 1 }), readFresh: () => local }) : local;
+    expect(buildJudgeSweepBundle(result).prs[0]).toMatchObject({ nextOwner });
+    expect(log.mock.calls.flat().join(' ')).toMatch(/custom:fix.*env/);
+  }
+});
+it.each(['', '   ', 'bad\nlabel', 42])('invalid explicit hold environment refuses automatic conflict ownership (%j)', value => {
+  const result = hardenedRead({ env: { WE_FIX_HOLD_LABEL: value },
+    gh: () => JSON.stringify([pr({ mergeable: 'CONFLICTING', isDraft: false })]) });
+  expect(buildJudgeSweepBundle(result).prs[0]).toMatchObject({ nextOwner: 'operator',
+    nextStep: expect.stringMatching(/hold label.*rerun/) });
+});
+it('unreadable hold settings refuse automatic conflict ownership', () => {
+  const result = hardenedRead({ readFile: () => { throw new Error('unreadable'); },
+    gh: () => JSON.stringify([pr({ mergeable: 'CONFLICTING', isDraft: false })]) });
+  expect(buildJudgeSweepBundle(result).prs[0].nextOwner).toBe('operator');
+});
+it('head-changed detail refuses conflict routing without dispatch', () => {
+  const gh = vi.fn(args => JSON.stringify(args[1] === 'list'
+    ? [pr({ mergeable: 'CONFLICTING', isDraft: false })] : pr({ headRefOid: 'f'.repeat(40) })));
+  const row = buildJudgeSweepBundle(hardenedRead({ gh })).prs[0];
+  expect(row).toMatchObject({ nextOwner: 'judge', needsJudgment: true });
+  expect(row.evidenceErrors.join(' ')).toMatch(/head changed/);
+  expect(gh.mock.calls.every(([args]) => args[0] === 'pr' && ['list', 'view'].includes(args[1]))).toBe(true);
+});
+
+// Audit regressions: every settings/observation source is injected.
+it.each(['platform', 'tool'])('rejects an object-shaped scalar hold at the %s layer', layer => {
+  const dir = mkdtempSync(join(tmpdir(), 'hold-scalar-'));
+  try {
+    const platformPath = join(dir, 'platform.json');
+    const env = { WE_PLATFORM_PREFERENCES_FILE: platformPath };
+    const readFile = path => JSON.stringify(String(path) === platformPath
+      ? (layer === 'platform' ? { fixHoldLabel: { nested: 'custom:fix' } } : {})
+      : (layer === 'tool' ? { fix: { holdLabel: { nested: 'custom:fix' } } } : {}));
+    const resolved = resolveFixHoldLabel({ env, readFile, log: () => {} });
+    expect(resolved.error).toMatch(/hold label.*rerun/);
+    expect(typeof resolved.value).toBe('string');
+    const row = buildJudgeSweepBundle(hardenedRead({ env, readFile,
+      gh: () => JSON.stringify([pr({ mergeable: 'CONFLICTING', isDraft: false,
+        labels: [{ name: 'hold:fix' }] })]) })).prs[0];
+    expect(row.nextOwner).toBe('operator');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it('preserves fresh-origin effective hold settings despite different stale-checkout settings', () => {
+  const local = hardenedRead({ env: { WE_FIX_HOLD_LABEL: 'custom:fix' },
+    gh: () => JSON.stringify([pr({ mergeable: 'CONFLICTING', isDraft: false,
+      labels: [{ name: 'custom:fix' }] })]) });
+  const result = hardenedRead({ checkoutState: () => ({ behind: 2 }), readFresh: () => local,
+    readFile: () => { throw new Error('stale settings unreadable'); } });
+  expect(result.prs[0]).toEqual(local.prs[0]);
+  expect(buildJudgeSweepBundle(result).prs[0].nextOwner).toBe('nobody');
+});
+
+it('resolves hold and stall settings only through injected reads, including empty platform preferences', () => {
+  const readFile = vi.fn(() => '{}');
+  const before = settingsIO.reads.length;
+  const resolved = resolveFixHoldLabel({ env: {}, readFile, log: () => {} });
+  expect(resolved).toMatchObject({ value: 'hold:fix', error: null, sources: { '': 'standard' } });
+  expect(resolveStallThresholds({ env: {}, readFile, log: () => {} })).toMatchObject({ unownedMinutes: 45 });
+  expect(settingsIO.reads.slice(before)).toEqual([]);
+  expect(readFile).toHaveBeenCalled();
+});
+
+it('the settings sentinel rejects an outside-home read even if the caller catches it', async () => {
+  const { readFileSync } = await import('node:fs');
+  const outside = join(tmpdir(), 'outside-settings-sentinel', '.claude', 'platform-preferences.json');
+  expect(() => readFileSync(outside, 'utf8')).toThrow(/outside the private sentinel home/);
+  expect(settingsIO.violations.splice(0)).toEqual([outside]);
+});
+
+it.each([
+  ['unowned conflict', { mergeable: 'CONFLICTING', isDraft: false }, 'operator'],
+  ['active fixer', { mergeable: 'CONFLICTING', isDraft: false, fixerRunning: true }, 'fixer'],
+  ['merge admission', { mergeable: 'MERGEABLE', labels: ['ready-to-merge'] }, 'drain'],
+  ['pending review', { mergeable: 'UNKNOWN', labels: ['review:pending'] }, 'review'],
+])('fresh-origin rows without fixHoldLabel refuse only conflict fallback: %s', (_name, patch, nextOwner) => {
+  const { fixHoldLabel, ...legacyPr } = { ...goodPr, ...patch };
+  const result = hardenedRead({ checkoutState: () => ({ behind: 2 }),
+    readFresh: () => ({ prs: [legacyPr] }),
+    readFile: () => { throw new Error('stale settings must not be read'); } });
+  expect(result.prs[0].conflictOwnershipError).toMatch(/hold label.*rerun/);
+  expect(buildJudgeSweepBundle(result).prs[0].nextOwner).toBe(nextOwner);
+});
+
+it.each(['platform', 'tool'])('a %s hold override preserves the worker default hold', layer => {
+  const dir = mkdtempSync(join(tmpdir(), 'hold-worker-'));
+  try {
+    const platformPath = join(dir, 'platform.json');
+    const env = { WE_PLATFORM_PREFERENCES_FILE: platformPath };
+    const readFile = path => JSON.stringify(String(path) === platformPath
+      ? (layer === 'platform' ? { fixHoldLabel: 'custom:fix' } : {})
+      : (layer === 'tool' ? { fix: { holdLabel: 'custom:fix' } } : {}));
+    const result = hardenedRead({ env, readFile, gh: () => JSON.stringify([pr({
+      mergeable: 'CONFLICTING', isDraft: false, labels: [{ name: 'hold:fix' }] })]) });
+    expect(result.prs[0].fixHoldLabel).toBe('custom:fix');
+    expect(buildJudgeSweepBundle(result).prs[0].nextOwner).toBe('nobody');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it.each([7, 'BOGUS', false, {}, []])('malformed merge evidence requires judgment and never counts as noAction (%j)', mergeable => {
+  const result = hardenedRead({ gh: () => JSON.stringify([pr({ mergeable, isDraft: false })]) });
+  const bundle = buildJudgeSweepBundle(result);
+  expect(bundle.prs[0].evidenceErrors).toContain('merge state unavailable; inspect PR mergeability');
+  expect(bundle.prs[0]).toMatchObject({ needsJudgment: true, nextOwner: 'judge',
+    reason: 'evidence-unavailable: inspect PR evidence and rerun' });
+  expect(bundle.counts).toEqual({ needsJudgment: 1, noAction: 0 });
+});
+
+
+it('shared IO fixtures exercise the production remote card verifier without additional reads', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'judge-card-verifier-'));
+  const original = referralCards.referralCardReadable;
+  const verifier = vi.spyOn(referralCards, 'referralCardReadable')
+    .mockImplementation((ref, _root, ports) => original(ref, dir, ports));
+  try {
+    const record = referralRecord();
+    record.rulings = [{ id: 'ruling-1', key: record.referrals[0].key, reviewerId: record.reviewer.id,
+      lens: record.reviewer.lens, result: 'card', rationale: 'filed', evidence: ['diff'],
+      card: 'we:backlog/123-fixture.md@pr55' }];
+    const gh = vi.fn(() => JSON.stringify([pr()]));
+    const facts = read({ gh, readStallThresholds: () => ({}),
+      readComments: () => [comment(renderReferralRecord(record))] });
+    expect(verifier).toHaveBeenCalledWith(record.rulings[0].card, expect.any(String),
+      expect.objectContaining({ readOnPr: expect.any(Function) }));
+    expect(gh).toHaveBeenCalledTimes(2);
+    expect(exec).not.toHaveBeenCalled();
+    expect(runGhSync).not.toHaveBeenCalled();
+    expect(facts.openReferrals).toEqual([{ key: record.referrals[0].key, ruled: true, superseded: false }]);
+  } finally {
+    verifier.mockRestore();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
