@@ -108,14 +108,35 @@ const lanes = () => {
 
 async function loop({ parallel, judge, seatLanes = null, runId, store = createMemoryRunStore(), argv = ARGV, opts = {} }) {
   const { declaration, registry } = build(opts);
+  // Capture the private diagnostic port: raw refusal details no longer belong in public CLI output.
+  const diagnosticLog = vi.fn(() => ({ ok: true }));
   const out = await runReviewLoopOnce({
     declaration, registry, argv, store, sinks: recordingSinks(), makeJudge: judge.make, mintRunId: () => runId,
     appendLearning: () => ({ path: '/dev/null' }), fileItem: async () => ({ code: 0, lines: ['{}'] }),
     // Keep the production acceptance gate enabled against this fixture's pinned head.
     readAcceptancePr: () => ({ headRefOid: HEAD, body: 'the PR description', comments: [] }),
-    parallelJudges: parallel, seatLanes,
+    parallelJudges: parallel, seatLanes, diagnostics: { log: diagnosticLog },
   });
-  return { out, run: store.read(out.run?.id ?? runId), store, declaration, registry };
+  return { out, run: store.read(out.run?.id ?? runId), store, declaration, registry, diagnosticLog };
+}
+
+function expectReadRefusal({ out, run, diagnosticLog }, reason) {
+  expect(out.code).toBe(1);
+  expect(out.stopped).toBe('step-refused');
+  const payload = JSON.parse(out.lines[0]);
+  expect(payload).toEqual({ runId: run.id, op: 'review-pr', stopped: 'step-refused',
+    error: 'drive-run:unknown', correlationId: expect.any(String), debugLog: 'written' });
+  expect(payload.correlationId).toMatch(/^[0-9a-f-]{36}$/);
+  expect(diagnosticLog).toHaveBeenCalledTimes(1);
+  expect(diagnosticLog).toHaveBeenCalledWith(
+    `drive-run correlation-id=${payload.correlationId}`, expect.any(Error));
+  const error = diagnosticLog.mock.calls[0][1];
+  expect(error.message).toMatch(reason);
+  expect(JSON.stringify(out)).not.toContain(error.message);
+  expect(JSON.stringify(out)).not.toMatch(reason);
+  expect(run.cursor).toBe(0);
+  expect(run.findings).not.toHaveProperty('read');
+  expect(run.effects).toEqual([]);
 }
 
 /** Everything a verdict is made of — the record minus the wall-clock step timings. */
@@ -482,8 +503,7 @@ describe('review.seatsByTouchSet — the seat list comes from the touch-set, bef
   it('a prose roster refuses when the net diff the run reads now holds code (the author pushed after the touch-set read)', async () => {
     const judge = scriptedJudge();
     const refused = await loop({ parallel: false, judge, runId: 'r-toctou', opts: { securitySeat: false, netPaths: ['backlog/x-a-card.md', 'scripts/operations/review-pr.mjs'] } });
-    expect(refused.out.code).toBe(1);
-    expect(JSON.stringify(refused.out)).toMatch(/roster leaves the security juror out/);
+    expectReadRefusal(refused, /roster leaves the security juror out/);
     expect(judge.calls).toHaveLength(0); // refused before any juror was paid for
     // The same run on a PR that is still all prose proceeds.
     const ok = await loop({ parallel: false, judge: scriptedJudge(), runId: 'r-toctou-ok', opts: { securitySeat: false } });
@@ -607,8 +627,7 @@ describe('review.seatsByTouchSet — a rename carries its source path (code move
   it('a prose roster refuses at `read` when the diff text did not read (rename sources cannot be ruled out)', async () => {
     const judge = scriptedJudge();
     const refused = await loop({ parallel: false, judge, runId: 'r-unscored', opts: { securitySeat: false, diffText: '', diffScored: false } });
-    expect(refused.out.code).toBe(1);
-    expect(JSON.stringify(refused.out)).toMatch(/did not read/);
+    expectReadRefusal(refused, /did not read/);
     expect(judge.calls).toHaveLength(0);
     // The full roster has nothing to prove, so an unscored diff does not refuse it.
     const full = await loop({ parallel: false, judge: scriptedJudge(), runId: 'r-unscored-full', opts: { diffText: '', diffScored: false } });
@@ -629,8 +648,7 @@ describe('review.seatsByTouchSet — a rename carries its source path (code move
   it('a prose roster refuses at `read` when the net diff renames code into a prose path (the net list is path-only)', async () => {
     const judge = scriptedJudge();
     const refused = await loop({ parallel: false, judge, runId: 'r-rename', opts: { securitySeat: false, netPaths: PROSE_PATHS, diffText: RENAME_DIFF } });
-    expect(refused.out.code).toBe(1);
-    expect(JSON.stringify(refused.out)).toMatch(/roster leaves the security juror out/);
+    expectReadRefusal(refused, /roster leaves the security juror out/);
     expect(judge.calls).toHaveLength(0);
     // The same prose PR with no rename in its diff proceeds, so the refusal is the rename and nothing else.
     const ok = await loop({ parallel: false, judge: scriptedJudge(), runId: 'r-rename-ok', opts: { securitySeat: false, netPaths: PROSE_PATHS } });
