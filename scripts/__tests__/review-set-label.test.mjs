@@ -86,6 +86,114 @@ const pending = [{ name: REVIEW_LABELS.pending }, { name: 'ready-to-merge' }];
 const accepted = [{ name: REVIEW_LABELS.accepted }, { name: 'ready-to-merge' }];
 const neither = [{ name: 'ready-to-merge' }];
 
+describe('REARM-KEEP-ACCEPT shared writer', () => {
+  const headSha = 'a'.repeat(40);
+  const accept = (sha = headSha, extra = {}) => ({ id: 'IC_accept', author: { login: 'web-everything' },
+    body: buildVerdictComment({ to: 'accepted', actor: 'reviewer', headSha: sha }), ...extra });
+  let dir;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'keep-accept-')); vi.useFakeTimers(); vi.setSystemTime(new Date('2026-11-26T12:00:00Z')); });
+  afterEach(() => { vi.useRealTimers(); rmSync(dir, { recursive: true, force: true }); });
+
+  function replay({ comments = [accept()], head = headSha, labels = [REVIEW_LABELS.accepted, READY_TO_MERGE_LABEL], fresh = {}, onlyIf = false, onWrite = () => {} } = {}) {
+    const writes = [];
+    const initial = { state: 'OPEN', headRefOid: head, labels, comments, body: '', headRefName: 'lane/fixture', isDraft: false };
+    const provider = { readPrState: vi.fn().mockReturnValueOnce(initial).mockImplementation(() => {
+      if (fresh instanceof Error) throw fresh;
+      return { ...initial, ...fresh };
+    }), readComments: vi.fn(() => comments), readLabels: () => labels,
+    postComment: () => { writes.push('comment'); onWrite('comment', initial); },
+    setLabels: () => { writes.push('labels'); onWrite('labels', initial); } };
+    const chunks = [];
+    const exit = vi.spyOn(process, 'exit').mockImplementation(code => { throw Object.assign(new Error('exit'), { exitCode: code }); });
+    let code;
+    try {
+      runReviewLabelCliRaw({ argv: ['7472', '--repo=fixture/repo', ...(onlyIf ? ['--only-if=accepted'] : [])], fixedTo: 'rearm',
+        provider, defaultActor: 'fixture', usage: 'fixture', emit: line => chunks.push(line),
+        buildComment: () => REARM_COMMENT_MARKER, successResult: value => ({ ok: true, ...value }),
+        refusalResult: ({ decision }) => ({ ok: false, reason: decision.reason }),
+        appendLedgerVerdict: () => { writes.push('ledger'); onWrite('ledger', initial); return { ok: true }; },
+        signalFix: () => writes.push('dispatch'),
+        withRearmWriteLock: (_repo, _pr, fn) => fn(),
+      });
+    } catch (error) { if (error.exitCode === undefined) throw error; code = error.exitCode; }
+    finally { exit.mockRestore(); }
+    return { code, writes, result: JSON.parse(chunks.join('')), provider };
+  }
+
+  it.each([false, true])('unchanged accepted head is a successful explicit no-op, accepted-only=%s', onlyIf => {
+    for (let tick = 0; tick < 2; tick++) {
+      const result = replay({ onlyIf });
+      expect(result.code).toBe(0);
+      expect(result.result).toMatchObject({ ok: true, alreadyAccepted: true, rearmed: false, reason: expect.stringContaining('already-accepted') });
+      expect(result.writes).toEqual([]);
+    }
+  });
+
+  it('historical records use thread order even with tied, absent or invalid timestamps', () => {
+    const comments = [accept('b'.repeat(40), { createdAt: 'invalid' }), accept(headSha, { id: 'IC_latest' })];
+    expect(replay({ comments }).writes).toEqual([]);
+    expect(replay({ comments }).result.alreadyAccepted).toBe(true);
+    const moved = replay({ comments: [...comments, accept('c'.repeat(40), { id: 'IC_newer', createdAt: 'invalid' })] });
+    expect(moved.result.alreadyAccepted).not.toBe(true);
+    expect(moved.writes).toContain('labels');
+  });
+
+  it.each([
+    ['forged producer', [accept(headSha, { author: { login: 'mallory', name: 'web-everything' }, viewerDidAuthor: true })]],
+    ['missing provenance', [accept(headSha, { author: undefined, viewerDidAuthor: true })]],
+    ['label alone', []],
+    ['marker on a bounce', [{ ...accept(), body: `🔁 review — changes requested\n<!-- reviewed-sha: ${headSha} -->` }]],
+    ['abbreviated accepted head', [accept(headSha.slice(0, 9))]],
+    ['newer send-back', [accept(), { id: 'IC_bounce', author: { login: 'web-everything' }, body: '🔁 review — changes requested' }]],
+    ['active repair claim', [accept(), { author: { login: 'web-everything' }, body: '🔒 conveyor fix-begin — fix claim held' }]],
+  ])('%s cannot skip review', (_name, comments) => {
+    const result = replay({ comments });
+    expect(result.result.alreadyAccepted).not.toBe(true);
+    expect(result.code === 1 || result.writes.includes('labels')).toBe(true);
+  });
+
+  it.each([
+    ['head moved', { headRefOid: 'b'.repeat(40) }],
+    ['human hold', { labels: [REVIEW_LABELS.accepted, REVIEW_LABELS.human] }],
+    ['security hold', { labels: [REVIEW_LABELS.accepted, 'red-team:changes'] }],
+    ['comments unavailable', { comments: null }],
+    ['read timeout', new Error('timed out')],
+  ])('live %s refuses the no-op without any durable write', (_name, fresh) => {
+    const result = replay({ fresh });
+    expect(result.code).toBe(1);
+    expect(result.result.alreadyAccepted).not.toBe(true);
+    expect(result.writes).toEqual([]);
+  });
+
+  it.each(['', 'a'.repeat(9), null])('absent or abbreviated live head %j refuses without writes', head => {
+    expect(replay({ head }).code).toBe(1);
+    expect(replay({ head }).writes).toEqual([]);
+  });
+
+  it('malformed and oversized comment evidence holds visibly with an operator recovery path', () => {
+    for (const comments of [[null], [accept(headSha, { body: 'x'.repeat(65537) })]]) {
+      const result = replay({ comments });
+      expect(result.code).toBe(1);
+      expect(result.result.reason ?? result.result.error).toMatch(/unreadable|limit|operator/i);
+      expect(result.writes).toEqual([]);
+    }
+  });
+
+  it('a moved-head rearm rechecks before its ledger and refuses a concurrent hold without writes', () => {
+    const result = replay({ head: 'b'.repeat(40), fresh: { labels: [REVIEW_LABELS.accepted, REVIEW_LABELS.human] } });
+    expect(result.code).toBe(1);
+    expect(result.writes).toEqual([]);
+  });
+
+  it.each(['ledger', 'labels'])('a hold arriving during %s stops all following writes', during => {
+    const result = replay({ head: 'b'.repeat(40), onWrite: (step, state) => {
+      if (step === during) state.labels = [REVIEW_LABELS.accepted, REVIEW_LABELS.human];
+    } });
+    expect(result.code).toBe(1);
+    expect(result.writes).toEqual(during === 'ledger' ? ['ledger'] : ['ledger', 'labels']);
+  });
+});
+
 describe('decideSetLabel — INVARIANT 2 (review:human is human-ceremony-only)', () => {
   it('REFUSES accepted on a review:human PR (gate-self reason, no swap)', () => {
     const d = decideSetLabel({ to: 'accepted', currentLabels: human });

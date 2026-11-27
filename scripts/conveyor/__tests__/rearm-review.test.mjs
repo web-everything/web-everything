@@ -12,7 +12,7 @@ import { mkdtempSync, writeFileSync, readFileSync, existsSync, chmodSync, rmSync
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { decideRearm, buildRearmComment, presentRemoveLabels, countRearmComments, REARM_COMMENT_MARKER, buildSameHeadWakeComment, SAME_HEAD_WAKE_TRAILER, decideEmptyFixRound, rearmWindow, hasUnexpectedPositionals, hasInvalidArgs, buildNoChangeComment, NO_CHANGE_COMMENT_MARKER } from '../rearm-review.mjs';
+import { decideRearm, buildRearmComment, presentRemoveLabels, countRearmComments, REARM_COMMENT_MARKER, buildSameHeadWakeComment, SAME_HEAD_WAKE_TRAILER, decideEmptyFixRound, rearmWindow, hasUnexpectedPositionals, hasInvalidArgs, buildNoChangeComment, NO_CHANGE_COMMENT_MARKER, runRearmPreflight } from '../rearm-review.mjs';
 import { REVIEW_LABELS, READY_TO_MERGE_LABEL } from '../../lib/review-escalation.mjs';
 import { RED_TEAM_STATUS_LABELS } from '../../lib/red-team-status-label-meta.mjs';
 
@@ -22,6 +22,35 @@ import { buildOperatorAnswer } from '../stand-down-answer-core.mjs';
 import { buildStandDownComment } from '../stand-down.mjs';
 
 const lbl = (...names) => names.map((name) => ({ name }));
+
+describe('REARM-KEEP-ACCEPT', () => {
+  const headSha = 'a'.repeat(40);
+  const accept = { id: 'IC_7472', author: { login: 'web-everything' },
+    body: `✅ review — accepted\n\n<!-- reviewed-sha: ${headSha} -->` };
+
+  it('accepted exact head rearm is a zero-write no-op', () => {
+    const input = { currentLabels: lbl(REVIEW_LABELS.accepted, READY_TO_MERGE_LABEL), headSha, comments: [accept] };
+    const before = JSON.stringify(input);
+    for (let replay = 0; replay < 2; replay++) {
+      expect(decideRearm(input)).toMatchObject({ allowed: false, alreadyAccepted: true,
+        addLabel: '', removeLabels: [], reason: expect.stringContaining('already-accepted') });
+    }
+    expect(JSON.stringify(input)).toBe(before);
+    expect(countRearmComments(input.comments)).toBe(0);
+    expect(decideRearm({ ...input, headSha: 'b'.repeat(40) })).toMatchObject({ allowed: true, addLabel: REVIEW_LABELS.pending });
+  });
+
+  it('accepted head bypasses the empty-round note and delegates live label validation to the shared writer', () => {
+    const comments = [{ author: accept.author, body: '🔁 review — changes requested' },
+      { author: accept.author, body: `🔒 conveyor fix-begin — fix claim held\n**Branch:** \`lane/fixture\` at \`${headSha}\`` }, accept];
+    const io = vi.fn(args => args[0] === 'pr' ? JSON.stringify({ headRefOid: headSha }) : JSON.stringify([comments]));
+    const result = runRearmPreflight({ pr: '7472', repo: 'fixture/repo', read: io, timeoutMs: 1000 });
+    expect(result).toMatchObject({ empty: false, liveHead: headSha });
+    expect(io.mock.calls).toHaveLength(2);
+    expect(io.mock.calls.every(([args]) => args[0] === 'api' || args[1] === 'view')).toBe(true);
+    expect(countRearmComments(comments)).toBe(0);
+  });
+});
 
 describe('decideRearm — the pure re-arm swap (#2630)', () => {
   it('re-arms a plain review:changes bounce → review:pending, dropping review:changes', () => {

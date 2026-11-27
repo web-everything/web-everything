@@ -96,8 +96,21 @@ export function countRearmComments(comments) {
  * @param {{currentLabels?:Array}} o - `currentLabels` is the observed label array (string or `{name}` shape).
  * @returns {{allowed:boolean, addLabel:string, removeLabels:string[], keepsHuman:boolean, reason:string}}
  */
-export function decideRearm({ currentLabels = [] } = {}) {
-  return decideSetLabel({ to: 'rearm', currentLabels });
+export function decideRearm({ currentLabels = [], headSha, comments } = {}) {
+  return decideSetLabel({ to: 'rearm', currentLabels, headSha, comments });
+}
+
+/** Read-only preflight. An accepted-head candidate delegates to the shared writer,
+ * which reads the actual live labels before deciding; preflight grants no acceptance.
+ * read and timeoutMs are injectable so replay never consults the host. */
+export function runRearmPreflight({ pr, repo, read = readGh, timeoutMs = resolveChildTimeoutMs() } = {}) {
+  const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: timeoutMs, killSignal: 'SIGKILL' };
+  const liveHead = JSON.parse(read(['pr', 'view', pr, ...(repo ? [`--repo=${repo}`] : []), '--json', 'headRefOid'], opts)).headRefOid;
+  const pages = JSON.parse(read(['api', `repos/${repo || ':owner/:repo'}/issues/${pr}/comments`, '--paginate', '--slurp'], opts));
+  if (!Array.isArray(pages) || !pages.every(Array.isArray)) throw new Error('re-arm preflight comments unreadable');
+  const comments = pages.flat();
+  const candidate = decideSetLabel({ to: 'rearm', currentLabels: ['review:accepted'], headSha: liveHead, comments });
+  return { ...(candidate.alreadyAccepted ? { empty: false } : decideEmptyFixRound({ comments, liveHead })), liveHead };
 }
 
 /**
@@ -392,16 +405,11 @@ if (IS_CLI) {
   const repoVal = argOf('repo');
   let labelArgv = process.argv.slice(2);
   if (prArg && !isConflictRound && !argOf('only-if')) {
-    const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' };
     let verdict = { empty: false };
     let liveHead;
     try {
-      const repoFlag = repoVal ? [`--repo=${repoVal}`] : [];
-      liveHead = JSON.parse(readGh(['pr', 'view', prArg, ...repoFlag, '--json', 'headRefOid'], opts)).headRefOid;
-      // The FULL paginated thread (a latest fix-begin beyond the first page must not be missed).
-      const apiRepo = repoVal || ':owner/:repo';
-      const pages = JSON.parse(readGh(['api', `repos/${apiRepo}/issues/${prArg}/comments`, '--paginate', '--slurp'], opts));
-      verdict = decideEmptyFixRound({ comments: pages.flat(), liveHead });
+      verdict = runRearmPreflight({ pr: prArg, repo: repoVal });
+      liveHead = verdict.liveHead;
     } catch { /* fail open: never block a real push on a read error */ }
     // Outside the read-error catch: a conflicting pin must refuse before even the no-change note.
     if (liveHead !== undefined || verdict.noCodeResume) {

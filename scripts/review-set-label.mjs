@@ -87,6 +87,7 @@ import {
   // `parseReviewedSha`'s answer whenever it is non-null; a second independent parse would only ever agree.
   parseReviewedSha, parseReviewedDiff, parseReviewedContribution, parseOperatorClearance,
   parseLatestHumanClearedSha, headEverHumanCleared, acceptanceCoversHead,
+  blankQuotedRegions,
   // #x9krtkc (mutual-exclusivity fix, #2766/#2767) — the automated-escalation park decision and its detector,
   // re-exported below for the same reason `REASONLESS_BOUNCE_REFUSAL` is: this file is the SINGLE label home
   // (#2644), so a reader looks HERE for what governs a label swap even though the pure decision itself lives
@@ -104,6 +105,54 @@ import { isTrustedMarkerAuthor, AUTOMATION_LOGINS } from './lib/marker-authorshi
 import { GATE_OUTCOMES, readRedTeamDisposition } from './lib/red-team-gate.mjs';
 import { REARM_COMMENT_MARKER } from './conveyor/rearm-review.mjs';
 import { sleepSyncMs } from './readiness/drain-lock.mjs';
+import { withLedgerAppendLock } from './lib/ledger-append-lock.mjs';
+
+/** Re-arm effects share a host-wide repo/PR lock. Contention holds for an operator retry. */
+function withRearmWriteLock(repo, pr, effect) {
+  return withLedgerAppendLock(`review-rearm:${repo}#${pr}`, effect, { waitMs: 0 });
+}
+
+/** Exact-head preservation only: unknown evidence still owes review, never a new acceptance.
+ * The provider's complete thread order is authoritative; timestamps never select a winner.
+ * Bounds refuse with an operator recovery path instead of accepting a truncated thread. */
+function acceptedHeadRearm({ currentLabels, headSha, comments }) {
+  const stopped = reason => ({ allowed: false, addLabel: '', removeLabels: [],
+    keepsHuman: hasReviewLabel(currentLabels, REVIEW_LABELS.human), reason });
+  if (!Array.isArray(currentLabels) || !currentLabels.every(l => typeof (typeof l === 'string' ? l : l?.name) === 'string'
+    && (typeof l === 'string' ? l : l.name).trim().length)) return stopped('re-arm labels unreadable — retry the read or ask the operator');
+  if (!hasReviewLabel(currentLabels, REVIEW_LABELS.accepted)) return null;
+  if (typeof headSha !== 'string' || !/^[0-9a-f]{40}$/i.test(headSha)) return stopped('accepted re-arm head unreadable — a full 40-hex head is required; retry or ask the operator');
+  if (!Array.isArray(comments) || comments.length > 10000 || comments.some(c => !c || typeof c !== 'object'
+    || typeof c.body !== 'string' || c.body.length > 65536)) return stopped('acceptance comments unreadable or over the evidence limit — retry the complete read or ask the operator to review the full thread');
+  // Only the producer's acceptance envelope may supply a reviewed-sha. A stamp in
+  // a bounce, quote or free-text note cannot turn that record into an acceptance.
+  const acceptanceHeading = /^(?:✅ review — (?:accepted|`review:human` cleared via the sanctioned path)|📌 review — acceptance re-stamped after a rebase \(no new review\))\s*$/;
+  const records = comments.map(c => {
+    const body = blankQuotedRegions(c.body);
+    const record = { ...c, viewerDidAuthor: false, body: body.replace(/reviewed-sha/g, 'unbound-sha') };
+    if (!isTrustedMarkerAuthor(record)) return record;
+    return { ...record, body: acceptanceHeading.test(body.trimStart().split('\n')[0]) ? body : record.body };
+  });
+  const record = latestAcceptRecord(records);
+  if (!record) return null; // no acceptance to preserve: the ordinary path restores the review hold
+  const source = records[record.index];
+  const id = source.node_id ?? source.id;
+  const stamps = [...source.body.matchAll(/^<!-- reviewed-sha: ([0-9a-f]{40}) -->$/gim)];
+  if (stamps.length !== 1 || !(typeof id === 'string' && id.trim().length > 0 && id.length <= 200
+    || Number.isSafeInteger(id) && id > 0)
+    || record.laterVerdict || record.laterBodyDerivedHold
+    || records.slice(record.index + 1).some(c => /^🔒 conveyor fix-begin —/.test(c.body.trimStart()))) {
+    return stopped('acceptance provenance or finality unproven — independent review is owed; ask the operator if the thread cannot be read');
+  }
+  if (currentLabels.some(l => {
+    const name = typeof l === 'string' ? l : l.name;
+    return (name.startsWith('review:') && name !== REVIEW_LABELS.accepted)
+      || (/^(?:red-team:|redteam:|security:|advisory:)/.test(name)
+        && !['red-team:clear', REVIEW_LABELS.redteamAccepted, ADVISORY_LABELS.ACCEPTED].includes(name));
+  })) return stopped('concurrent human/security/review hold — independent review is owed; hold retained');
+  if (record.sha !== headSha.toLowerCase()) return null;
+  return { ...stopped('already-accepted — trusted accepted verdict covers the exact unchanged head; nothing was changed'), alreadyAccepted: true };
+}
 
 export const CHANGES_VERDICT_PREFIX = '🔁 review — changes requested';
 
@@ -420,7 +469,7 @@ export { decideParkToHuman, findContradictoryReviewVerdicts, decideContradictory
  *   its CLI also binds OPEN state and the pushed head before writing and verifies the result afterward.
  * @returns {{allowed:boolean, addLabel:string, removeLabels:string[], keepsHuman:boolean, reason:string}}
  */
-export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null, humanOnlyHold = false, redTeamRulingHold = false, sentBackSameHead = false, acceptanceStillCoversHead = false, humanClearedHead = false, operatorRestamp = false } = {}) {
+export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null, humanOnlyHold = false, redTeamRulingHold = false, sentBackSameHead = false, acceptanceStillCoversHead = false, humanClearedHead = false, operatorRestamp = false, headSha, comments } = {}) {
   // we:scripts/review-set-label.mjs#decideSetLabel — only the targets in the closed set are valid.
   if (!REVIEW_LABEL_TARGETS.includes(to)) {
     throw new Error(
@@ -526,6 +575,11 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
   // acceptance and a bad merge — that gate already held.
   if (to === 'rearm') {
     if (humanClearedHead) return { allowed: false, addLabel: '', removeLabels: [], keepsHuman: isHuman, reason: 'head carries a human clearance — a rearm never undoes it' };
+    // Label-only callers plan a review hold; only complete live evidence can preserve an acceptance.
+    if (headSha !== undefined || comments !== undefined) {
+      const preserved = acceptedHeadRearm({ currentLabels, headSha, comments });
+      if (preserved) return preserved;
+    }
     const missing = requireLive === 'missing';
     if (missing && (!Array.isArray(currentLabels) || !currentLabels.every(l => typeof (typeof l === 'string' ? l : l?.name) === 'string' && (typeof l === 'string' ? l : l.name).length > 0)
       || currentLabels.some(l => (typeof l === 'string' ? l : l.name).startsWith('review:')))) {
@@ -1212,6 +1266,7 @@ export function runReviewLabelCli({
   // PR #5758 — the read-time verified standing-ruling scope, so the red-team ruling check credits an automatic round
   // grant exactly as the gate does. Unreadable = no automatic grant credit (the operator grants still count).
   readGrantScope = standingRulingScope,
+  withRearmWriteLock: lockRearmWrite = withRearmWriteLock,
 } = {}) {
   // Shadows the module-level `fail` so EVERY refusal inside this function goes to the
   // injected emitter too. Without this the guards print past an in-process caller's collector (#3061); the
@@ -1649,7 +1704,26 @@ export function runReviewLabelCli({
     acceptanceStillCoversHead: parseReviewedSha(prComments.filter(isTrustedMarkerAuthor)) === headSha,
     humanClearedHead: to === 'rearm' && headEverHumanCleared(rearmThread, headSha.trim()),
     operatorRestamp: to === 'restamp' && actorArg.trim().toLowerCase() === 'operator',
+    ...(to === 'rearm' ? { headSha, comments: rearmThread } : {}),
   });
+  if (decision.alreadyAccepted) {
+    // Even a no-op reports live evidence: a concurrent push/hold cannot inherit this result.
+    let fresh, liveDecision;
+    try {
+      ({ fresh } = lockRearmWrite(repo, pr, () => {
+        const fresh = provider.readPrState(repo, pr);
+        if (fresh.state !== 'OPEN' || fresh.headRefOid !== headSha) throw new Error('accepted re-arm live head or state changed — retry; nothing was changed');
+        const comments = fullThread(fresh.comments, fresh.headRefOid, reason => { throw new Error(reason); });
+        liveDecision = decideSetLabel({ to: 'rearm', currentLabels: fresh.labels, headSha: fresh.headRefOid, comments });
+        if (!liveDecision.alreadyAccepted) throw new Error(liveDecision.reason);
+        return { fresh };
+      }));
+    } catch (error) { refuseRearm(ghErr(error, 'accepted re-arm evidence unreadable — retry or ask the operator')); }
+    emit(`${JSON.stringify({ ...successResult({ pr: Number(pr), to, decision: liveDecision,
+      labels: fresh.labels.map(l => typeof l === 'string' ? l : l.name) }),
+    alreadyAccepted: true, rearmed: false, reason: liveDecision.reason })}\n`);
+    process.exit(0);
+  }
   if (resumePinnedRearm) {
     decision = { ...decision, allowed: true, addLabel: REVIEW_LABELS.pending, removeLabels: [],
       rearmFrom: REVIEW_LABELS.pending, reason: 'resuming the marker for a pinned pending re-arm' };
@@ -2124,11 +2198,39 @@ export function runReviewLabelCli({
   };
   try { assertClearHumanHead(); } catch (e) { fail(ghErr(e, 'gh pr view failed'), 2); }
 
+  const protectAcceptedRearm = to === 'rearm' && hasReviewLabel(currentLabels, REVIEW_LABELS.accepted);
+  let acceptedRearmSwapped = false;
+  const writeRearmEffect = effect => {
+    if (!protectAcceptedRearm) return effect();
+    try {
+      return lockRearmWrite(repo, pr, () => {
+        const fresh = provider.readPrState(repo, pr);
+        if (fresh.state !== 'OPEN' || fresh.headRefOid !== headSha) throw new Error('accepted re-arm head or state changed — retry; hold retained');
+        const comments = fullThread(fresh.comments, fresh.headRefOid, reason => { throw new Error(reason); });
+        const liveDecision = decideSetLabel({ to: 'rearm', currentLabels: fresh.labels, headSha: fresh.headRefOid, comments });
+        // Our pending label cannot hide a new acceptance arriving before the marker.
+        const acceptance = acceptedHeadRearm({ currentLabels: [REVIEW_LABELS.accepted], headSha: fresh.headRefOid, comments });
+        if (acceptance || (!liveDecision.allowed && !acceptedRearmSwapped)) throw new Error((acceptance ?? liveDecision).reason);
+        const hold = fresh.labels.some(l => {
+          const name = typeof l === 'string' ? l : l.name;
+          return (name.startsWith('review:') && name !== REVIEW_LABELS.accepted
+            && !(acceptedRearmSwapped && name === REVIEW_LABELS.pending))
+            || (/^(?:red-team:|redteam:|security:|advisory:)/.test(name)
+              && !['red-team:clear', REVIEW_LABELS.redteamAccepted, ADVISORY_LABELS.ACCEPTED].includes(name));
+        });
+        if (hold) throw new Error('concurrent human/security/review hold — accepted re-arm stopped; hold retained');
+        return effect();
+      });
+    } catch (error) {
+      throw Object.assign(new Error(ghErr(error, 'accepted re-arm evidence or effect unreadable — retry or ask the operator')), { rearmRefusal: true });
+    }
+  };
+
   const ledgerVerdict = verdictForLabelTarget(to);
   let clearingLedgerMiss = false;
   let clearingLedgerError;
   try {
-    const appended = appendLedgerVerdict(buildVerdictRecord({
+    const appended = writeRearmEffect(() => appendLedgerVerdict(buildVerdictRecord({
       repo,
       pr: Number(pr),
       verdict: ledgerVerdict,
@@ -2147,7 +2249,7 @@ export function runReviewLabelCli({
       channel: normalizeChannel(channelArg),
       independence: independence ? independence.status : null,
       source: 'review-set-label',
-    }));
+    })));
     if (!appended.ok) {
       process.stderr.write(`review-set-label: verdict-ledger append REFUSED (#3007 shadow) — ${appended.errors.join('; ')}\n`);
       // F4 (`#verdict-ledger-pr-state-store` rule 4): a CLEARING verdict whose git write missed does NOT clear.
@@ -2184,6 +2286,7 @@ export function runReviewLabelCli({
       }
     }
   } catch (e) {
+    if (e.rearmRefusal) refuseRearm(ghErr(e, 'accepted re-arm refused — retry or ask the operator'));
     if (to === 'clear-human') {
       clearingLedgerMiss = true;
       clearingLedgerError = String((e && e.message) || e).split('\n')[0];
@@ -2234,7 +2337,8 @@ export function runReviewLabelCli({
       }
     }
     try {
-      provider.setLabels(repo, pr, { add: decision.addLabel, remove: removals });
+      writeRearmEffect(() => provider.setLabels(repo, pr, { add: decision.addLabel, remove: removals }));
+      if (protectAcceptedRearm) acceptedRearmSwapped = true;
     } catch (e) {
       fail(ghErr(e, 'gh pr edit failed'), 1);
     }
@@ -2263,9 +2367,12 @@ export function runReviewLabelCli({
       }
       try {
         restampedAt = Date.now();
-        provider.postComment(repo, pr, commentBody);
+        writeRearmEffect(() => provider.postComment(repo, pr, commentBody));
         return;
-      } catch (e) { commentFailure = ghErr(e, 'gh pr comment failed'); }
+      } catch (e) {
+        if (e.rearmRefusal) refuseRearm(ghErr(e, 'accepted re-arm refused — retry or ask the operator'));
+        commentFailure = ghErr(e, 'gh pr comment failed');
+      }
       if (pinnedPlainRearm && attempt < 2) rearmRetrySleep(1000);
     }
     if (!pinnedPlainRearm) fail(commentFailure, 1);
