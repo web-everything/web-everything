@@ -6,6 +6,43 @@ import { join } from 'node:path';
 import { contributionPatchId, findCarriableVerdict, decideRebaseVerdictCarry, buildVerdictCarriedMarker, parseVerdictCarriedMarker, resolveCarryAcrossRebase } from '../rebase-verdict-carry.mjs';
 const a = 'a'.repeat(40), b = 'b'.repeat(40), p = 'c'.repeat(40);
 const comment = body => ({ author: { login: 'chalbert' }, body });
+
+describe('multi-hop carry chain', () => {
+  const c = 'c'.repeat(40), d = 'd'.repeat(40);
+  const adv = rev => [`<!-- we:red-team-advisory pr=1 rev=${rev} -->`, '### Post-accept red team — no break found', '',
+    'Advisory only: this comment changes no label itself; the red-team gate (setting `redTeam.confirmedBreaks`) sends a confirmed broken break back to the fixer. '
+      + `Head \`${a.slice(0, 12)}\` · red team codex/test · re-check ok · recorded verdict \`accept\`.`, '',
+    'The red team tried to break this change and reported nothing.'].join('\n');
+  const cs = () => [
+    { ...comment(`✅ review — accepted\n<!-- reviewed-sha: ${a} -->`), createdAt: '2026-11-01T00:00:00Z' },
+    comment(adv(a)), comment(`📌 review — acceptance re-stamped\n<!-- reviewed-sha: ${b} -->`),
+    comment(`${buildVerdictCarriedMarker({ fromSha: a, toSha: b, patchId: p })}\nReview verdict carried across an identical contribution.\n${adv(b)}`),
+    { ...comment(`📌 review — acceptance re-stamped\n<!-- reviewed-sha: ${c} -->`), createdAt: '2026-11-03T00:00:00Z' },
+    comment(`${buildVerdictCarriedMarker({ fromSha: b, toSha: c, patchId: p })}\nReview verdict carried across an identical contribution.\n${adv(c)}`),
+  ];
+  it('carries the plain chain with reviews []', () => expect(findCarriableVerdict({ comments: cs(), headSha: d, pr: 1, reviews: [] })?.sha).toBe(c));
+  it.each([undefined, null, {}, [{ state: 'CHANGES_REQUESTED', submitted_at: '2026-11-02T00:00:00Z' }],
+    [{ state: 'COMMENTED', submitted_at: '2026-11-02T00:00:00Z', user: { login: 'operator' } },
+      { state: 'APPROVED', submitted_at: '2026-11-02T01:00:00Z', user: { login: 'operator' } }]].map(reviews => [reviews]))(
+    'refuses missing, unreadable or objecting formal-review evidence %j', reviews =>
+      expect(findCarriableVerdict({ comments: cs(), headSha: d, pr: 1, reviews })).toBeNull());
+  it('preserves a later changes-requested verdict', () => expect(findCarriableVerdict({
+    comments: [...cs(), comment('🔁 review — changes requested')], headSha: d, pr: 1, reviews: [],
+  })).toBeNull());
+  it.each(['missing sentence', 'quoted', 'wrong gate label'])('refuses a filtered non-canonical multi-hop candidate: %s', mode => {
+    const comments = cs();
+    if (mode === 'missing sentence') comments.at(-1).body = comments.at(-1).body.replace('Review verdict carried across an identical contribution.\n', '');
+    if (mode === 'quoted') comments.at(-1).body = `> ${comments.at(-1).body}`;
+    if (mode === 'wrong gate label') comments.at(-1).body = `<!-- we:red-team-gate pr=2 rev=${c} outcome=card-queued -->\n${comments.at(-1).body}`;
+    expect(findCarriableVerdict({ comments, headSha: d, pr: 1, reviews: [] })).toBeNull();
+  });
+  it('carries the gate-prefixed chain with reviews []', async () => {
+    const { redTeamResultId, parseRedTeamComment, redTeamGateMarker } = await import('../red-team-gate.mjs');
+    const comments = cs(), result = redTeamResultId(parseRedTeamComment(adv(a)));
+    for (const [index, sha] of [[3, b], [5, c]]) comments[index].body = `${redTeamGateMarker(1, sha, 'card-queued', result)}\n${comments[index].body}`;
+    expect(findCarriableVerdict({ comments, headSha: d, pr: 1, reviews: [] })?.sha).toBe(c);
+  });
+});
 describe('verdict carry', () => {
   it('validates markers and decisions', () => {
     expect(parseVerdictCarriedMarker(buildVerdictCarriedMarker({ fromSha: a, toSha: b, patchId: p }))).toEqual({ fromSha: a, toSha: b, patchId: p });
@@ -17,20 +54,20 @@ describe('verdict carry', () => {
   });
   it('trusts authors and refuses superseding holds', () => {
     const accept = comment(`<!-- reviewed-sha: ${a} -->`);
-    expect(findCarriableVerdict({ comments: [accept], headSha: b })).toBeNull();
-    expect(findCarriableVerdict({ comments: [accept], headSha: a })).toBeNull();
-    expect(findCarriableVerdict({ comments: [{ ...accept, author: { login: 'stranger' } }], headSha: b })).toBeNull();
-    for (const body of ['🔁 review — changes requested', '<!-- drain-park-reason -->\nnew policy park', 'review paused: revoke']) expect(findCarriableVerdict({ comments: [accept, comment(body)], headSha: b })).toBeNull();
+    expect(findCarriableVerdict({ reviews: [], comments: [accept], headSha: b })).toBeNull();
+    expect(findCarriableVerdict({ reviews: [], comments: [accept], headSha: a })).toBeNull();
+    expect(findCarriableVerdict({ reviews: [], comments: [{ ...accept, author: { login: 'stranger' } }], headSha: b })).toBeNull();
+    for (const body of ['🔁 review — changes requested', '<!-- drain-park-reason -->\nnew policy park', 'review paused: revoke']) expect(findCarriableVerdict({ reviews: [], comments: [accept, comment(body)], headSha: b })).toBeNull();
     const gate = comment(`<!-- we:red-team-gate pr=1 rev=${a} outcome=card-queued -->`);
-    expect(findCarriableVerdict({ comments: [accept, gate], headSha: b, pr: 1 }).gateOutcomes).toEqual(['card-queued']);
+    expect(findCarriableVerdict({ reviews: [], comments: [accept, gate], headSha: b, pr: 1 }).gateOutcomes).toEqual(['card-queued']);
     for (const outcome of ['sent-back', 'round-cap']) {
-      expect(findCarriableVerdict({ comments: [accept, comment(`<!-- we:red-team-gate pr=1 rev=${a} outcome=${outcome} -->`)], headSha: b, pr: 1 })).toBeNull();
+      expect(findCarriableVerdict({ reviews: [], comments: [accept, comment(`<!-- we:red-team-gate pr=1 rev=${a} outcome=${outcome} -->`)], headSha: b, pr: 1 })).toBeNull();
     }
     const carried = comment(buildVerdictCarriedMarker({ fromSha: b, toSha: a, patchId: p }));
-    expect(findCarriableVerdict({ comments: [accept, gate, carried], headSha: b })?.sha).toBe(a);
+    expect(findCarriableVerdict({ reviews: [], comments: [accept, gate, carried], headSha: b })?.sha).toBe(a);
     const advisoryBody = `<!-- we:red-team-advisory pr=1 rev=${a} -->\nNo confirmed breaks.`;
     const combined = comment(`${buildVerdictCarriedMarker({ fromSha: b, toSha: a, patchId: p })}\n${advisoryBody}`);
-    expect(findCarriableVerdict({ comments: [accept, combined], headSha: b })?.advisoryBody).toBe(advisoryBody);
+    expect(findCarriableVerdict({ reviews: [], comments: [accept, combined], headSha: b })?.advisoryBody).toBe(advisoryBody);
   });
   it('requires a trusted completed red-team record for the accepted PR and head', () => {
     const accept = comment(`<!-- reviewed-sha: ${a} -->`);
@@ -41,11 +78,11 @@ describe('verdict carry', () => {
       comment(`<!-- we:red-team-advisory pr=1 rev=${b} -->`),
       { author: { login: 'stranger' }, body: `<!-- we:red-team-advisory pr=1 rev=${a} -->` },
     ]) {
-      expect(findCarriableVerdict({ comments: [record, accept].filter(Boolean), headSha: b, pr: 1 }), record?.body).toBeNull();
+      expect(findCarriableVerdict({ reviews: [], comments: [record, accept].filter(Boolean), headSha: b, pr: 1 }), record?.body).toBeNull();
     }
     for (const body of [`<!-- we:red-team-gate pr=1 rev=${a} outcome=card-queued -->`,
       `<!-- we:red-team-advisory pr=1 rev=${a} -->\nNo confirmed breaks.`]) {
-      expect(findCarriableVerdict({ comments: [accept, comment(body)], headSha: b, pr: 1 })?.sha).toBe(a);
+      expect(findCarriableVerdict({ reviews: [], comments: [accept, comment(body)], headSha: b, pr: 1 })?.sha).toBe(a);
     }
   });
   it('drops only trusted same-sha provenance and preserves later holds', () => {
@@ -54,7 +91,7 @@ describe('verdict carry', () => {
     const gate = (sha, outcome) => `<!-- we:red-team-gate pr=1 rev=${sha} outcome=${outcome} -->`;
     const advisory = (sha, finding = '') => `<!-- we:red-team-advisory pr=1 rev=${sha} -->\n${finding}`;
     const broken = '1. [**confirmed**] (correctness, broken) — Breaks approval';
-    const find = c => findCarriableVerdict({ comments: [accept, comment(gate(a, 'card-queued')), c], headSha: b, pr: 1 });
+    const find = c => findCarriableVerdict({ reviews: [], comments: [accept, comment(gate(a, 'card-queued')), c], headSha: b, pr: 1 });
     for (const body of [carry, `${gate(a, 'card-queued')}\n${carry}\nReview verdict carried across an identical contribution.\n${advisory(a)}`, gate(a, 'card-queued'), advisory(a), advisory(a, '1. [**confirmed**] (quality, degraded) — Cosmetic'), advisory(a, '1. [not confirmed] (correctness, broken) — Unproven')]) {
       expect(find(comment(body))?.sha, body).toBe(a);
       expect(find({ ...comment(body), author: { login: 'stranger' } }), body).toBeNull();
@@ -80,7 +117,7 @@ describe('verdict carry', () => {
       plan: { sendBack: [], card: [{ index: 1 }], advisory: [{ index: 2 }] }, cardResult: { ok: true, session: 'red-team-card' } });
     const advisory = findings => renderRedTeamComment({ pr: 1, rev: a, provider: 'claude', model: 'test',
       findings, recheckStatus: 'complete', foldedVerdict: 'accept' });
-    const find = body => findCarriableVerdict({ comments: [accept, comment(body)], headSha: b, pr: 1 });
+    const find = body => findCarriableVerdict({ reviews: [], comments: [accept, comment(body)], headSha: b, pr: 1 });
     for (const body of [gate, advisory([]), advisory([{ confirmedByRecheck: true, category: 'quality',
       impactIfUnfixed: 'degraded', summary: 'Cosmetic', failure_scenario: 'Visible text', recheckReason: 'Confirmed' }])]) {
       expect(find(body)?.sha, body).toBe(a);

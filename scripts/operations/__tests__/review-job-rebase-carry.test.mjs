@@ -1,6 +1,10 @@
 // @vitest-environment node
 // (node: the carried-check writer reads its App id setting through a file: URL, as the daemon does.)
-import { describe, it, expect, vi } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import * as dispatch from '../review-dispatch.mjs';
 import { runReviewJob } from '../review-job.mjs';
 import { parseVerdictCarriedMarker } from '../../lib/rebase-verdict-carry.mjs';
 import { gateOutcomesForHead, parseRedTeamComment, redTeamGateMarker, redTeamResultId } from '../../lib/red-team-gate.mjs';
@@ -15,13 +19,70 @@ function fixture() {
     redTeamStatus: () => {},
     readPrevCompletion: () => null, newActorId: () => 'actor', prepareLane: () => ({ head: 'a'.repeat(40) }), acquireLane: () => ({ lanePath: 'fake-lane' }), updateRecord: vi.fn(), releaseLane: vi.fn(),
     carryAcrossRebaseSetting: () => ({ value: 'on', source: 'test' }),
-    readCarryEvidence: () => ({ headSha: b, comments: [trusted(`<!-- reviewed-sha: ${a} -->`), trusted(clearA), trusted(gateA)] }),
+    readCarryEvidence: () => ({ reviews: [], headSha: b, comments: [trusted(`<!-- reviewed-sha: ${a} -->`), trusted(clearA), trusted(gateA)] }),
     contributionPatchId: () => p, restampVerdict: vi.fn(() => ({ ok: true })), postCarryComment: vi.fn(),
     publishCarriedCheck: vi.fn(() => ({ ok: true })), markCarriedCheckOwed: vi.fn(),
     runLoop: vi.fn(() => ({ status: 0, stdout: JSON.stringify({ stopped: 'complete', verdict: { verdict: 'accept', loop: { outcome: 'converged' } } }) })),
     runExtraSeats: vi.fn(), runRedTeam: vi.fn(), startSpeculativeRedTeam: vi.fn(), speculativeRedTeamSetting: () => ({ enabled: true }),
   };
 }
+
+describe('multi-hop carry integration', () => {
+  let root;
+  const c = 'c'.repeat(40), d = 'd'.repeat(40);
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'carry-job-'));
+    vi.spyOn(dispatch, 'planReviewDispatch').mockImplementation(({ pr, repo }) => ({ pr, repo, repoKey: 'we', laneRepo: root, sessionSlug: 'fixture-job' }));
+  });
+  afterEach(() => { vi.restoreAllMocks(); rmSync(root, { recursive: true, force: true }); });
+  const advisory = rev => [`<!-- we:red-team-advisory pr=1 rev=${rev} -->`, '### Post-accept red team — no break found', '',
+    'Advisory only: this comment changes no label itself; the red-team gate (setting `redTeam.confirmedBreaks`) sends a confirmed broken break back to the fixer. '
+      + `Head \`${a.slice(0, 12)}\` · red team codex/test · re-check ok · recorded verdict \`accept\`.`, '',
+    'The red team tried to break this change and reported nothing.'].join('\n');
+  function evidence(reviews = []) {
+    const hop = (from, to) => trusted(`<!-- review-verdict-carried from=${from} to=${to} patch-id=${p} -->\nReview verdict carried across an identical contribution.\n${advisory(to)}`);
+    return { headSha: d, reviews, comments: [
+      { ...trusted(`✅ review — accepted\n<!-- reviewed-sha: ${a} -->`), createdAt: '2026-11-01T00:00:00Z' },
+      trusted(advisory(a)), trusted(`📌 review — acceptance re-stamped\n<!-- reviewed-sha: ${b} -->`), hop(a, b),
+      { ...trusted(`📌 review — acceptance re-stamped\n<!-- reviewed-sha: ${c} -->`), createdAt: '2026-11-03T00:00:00Z' }, hop(b, c),
+    ] };
+  }
+  function ioFor(data) {
+    const io = fixture(); io.root = root; io.readCarryEvidence = () => data;
+    io.acquireLane = () => ({ lanePath: root }); io.prepareLane = () => ({ head: d });
+    return io;
+  }
+  it.each([
+    ['standing objection', [{ state: 'CHANGES_REQUESTED', submitted_at: '2026-11-02T00:00:00Z' }]],
+    ['COMMENTED then APPROVED', [{ state: 'COMMENTED', submitted_at: '2026-11-02T00:00:00Z', user: { login: 'operator' } },
+      { state: 'APPROVED', submitted_at: '2026-11-02T01:00:00Z', user: { login: 'operator' } }]],
+    ['unreadable', null],
+  ])('carry refuses without formal-review evidence: %s', (_name, reviews) => {
+    const io = ioFor(evidence(reviews));
+    expect(runReviewJob({ pr: 1, repo: 'web-everything/web-everything' }, io).outcome).not.toBe('carried');
+    for (const key of ['restampVerdict', 'postCarryComment', 'publishCarriedCheck']) expect(io[key]).not.toHaveBeenCalled();
+    expect(io.runLoop).toHaveBeenCalledTimes(1);
+  });
+  it('a malformed filtered envelope never reaches a carry write', () => {
+    const data = evidence(); data.comments.at(-1).body = data.comments.at(-1).body.replace('Review verdict carried across an identical contribution.\n', '');
+    const io = ioFor(data);
+    runReviewJob({ pr: 1, repo: 'web-everything/web-everything' }, io);
+    for (const key of ['restampVerdict', 'postCarryComment', 'publishCarriedCheck']) expect(io[key]).not.toHaveBeenCalled();
+    expect(io.runLoop).toHaveBeenCalledTimes(1);
+  });
+  it('refused restamp is attempted once and writes no carry comment or check', () => {
+    const io = ioFor(evidence()); io.restampVerdict.mockReturnValue({ ok: false, reason: 'fresh thread has a hold' });
+    runReviewJob({ pr: 1, repo: 'web-everything/web-everything' }, io);
+    expect(io.restampVerdict).toHaveBeenCalledTimes(1);
+    expect(io.postCarryComment).not.toHaveBeenCalled(); expect(io.publishCarriedCheck).not.toHaveBeenCalled();
+    expect(io.runLoop).toHaveBeenCalledTimes(1);
+  });
+  it('formal reviews [] permits the same chain to carry', () => {
+    const io = ioFor(evidence());
+    expect(runReviewJob({ pr: 1, repo: 'web-everything/web-everything' }, io).outcome).toBe('carried');
+    expect(io.restampVerdict).toHaveBeenCalledTimes(1); expect(io.postCarryComment).toHaveBeenCalledTimes(1);
+  });
+});
 describe('review job rebase carry', () => {
   it('restamps before one carry comment and starts no round or seats', () => {
     const io = fixture(); const out = runReviewJob({ pr: 1, repo: 'web-everything/web-everything' }, io);
@@ -69,8 +130,8 @@ describe('review job rebase carry', () => {
     if (mode === 'unequal') io.contributionPatchId = ({ sha }) => sha === a ? p : a;
     if (mode === 'unreadable') io.readCarryEvidence = () => { throw Error('read failed'); };
     if (mode === 'restamp-failed') io.restampVerdict.mockReturnValue({ ok: false, reason: 'own proof refused' });
-    if (mode === 'red-team-pending') io.readCarryEvidence = () => ({ headSha: b, comments: [trusted(`<!-- reviewed-sha: ${a} -->`)] });
-    if (mode === 'gate-with-hold') io.readCarryEvidence = () => ({ headSha: b, comments: [trusted(`<!-- reviewed-sha: ${a} -->`),
+    if (mode === 'red-team-pending') io.readCarryEvidence = () => ({ reviews: [], headSha: b, comments: [trusted(`<!-- reviewed-sha: ${a} -->`)] });
+    if (mode === 'gate-with-hold') io.readCarryEvidence = () => ({ reviews: [], headSha: b, comments: [trusted(`<!-- reviewed-sha: ${a} -->`),
       trusted(`<!-- we:red-team-gate pr=1 rev=${a} outcome=card-queued -->\nunknown hold`)] });
     const out = runReviewJob({ pr: 1, repo: 'web-everything/web-everything' }, io);
     expect(out.outcome).not.toBe('carried'); expect(io.runLoop).toHaveBeenCalledTimes(1); expect(io.postCarryComment).not.toHaveBeenCalled();
@@ -81,7 +142,7 @@ describe('review job rebase carry', () => {
   // #6606 red team: a carry must never post a result the live publisher refuses, or the carried head waits forever
   // for a check no retry can publish. The carry decision reads the re-keyed result with the publisher's own rule.
   const clear = (reason, rev = a) => trusted(`<!-- we:red-team-advisory pr=1 rev=${rev} -->\n\nRed team not required on this head: ${reason}`);
-  const withAdvisory = advisory => () => ({ headSha: b, comments: [trusted(`<!-- reviewed-sha: ${a} -->`),
+  const withAdvisory = advisory => () => ({ reviews: [], headSha: b, comments: [trusted(`<!-- reviewed-sha: ${a} -->`),
     trusted(`<!-- we:red-team-gate pr=1 rev=${a} outcome=card-queued -->`), advisory] });
   it('a canonical policy-clear result carries, re-keyed to the new head', () => {
     const io = fixture();
@@ -102,7 +163,7 @@ describe('review job rebase carry', () => {
     ['a finding-shaped line', trusted(`<!-- we:red-team-advisory pr=1 rev=${a} -->\n 1. [confirmed] x`), false],
   ])('a result the publisher would refuse (%s) is not carried: no restamp, owed marker or comment', (_, advisory, gated) => {
     const io = fixture();
-    io.readCarryEvidence = advisory ? withAdvisory(advisory) : () => ({ headSha: b, comments: [trusted(`<!-- reviewed-sha: ${a} -->`),
+    io.readCarryEvidence = advisory ? withAdvisory(advisory) : () => ({ reviews: [], headSha: b, comments: [trusted(`<!-- reviewed-sha: ${a} -->`),
       trusted(`<!-- we:red-team-gate pr=1 rev=${a} outcome=card-queued -->`)] });
     const out = runReviewJob({ pr: 1, repo: 'web-everything/web-everything' }, io);
     expect(out.outcome).not.toBe('carried');
@@ -200,7 +261,7 @@ describe('human clearance remains owned by restamp', () => {
     const oldDiff = 'diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n';
     const comments = [trusted(buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: a, reviewedDiff: oldDiff })),
       trusted(clearA), trusted(gateA)];
-    const io = fixture(); io.readCarryEvidence = () => ({ headSha: b, comments });
+    const io = fixture(); io.readCarryEvidence = () => ({ reviews: [], headSha: b, comments });
     io.restampVerdict = vi.fn(() => {
       const humanClearance = decideRestampHumanClearance({ comments, headSha: b, headDiff: agrees ? oldDiff : oldDiff.replace('+new', '+changed') });
       comments.push(trusted(buildVerdictComment({ to: 'restamp', actor: 'review-carry', headSha: b, reviewedDiff: oldDiff, humanClearance })));

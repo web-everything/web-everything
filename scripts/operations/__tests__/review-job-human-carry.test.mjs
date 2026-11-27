@@ -50,7 +50,7 @@ function fixture() {
     prepareLane: () => ({ head: toSha }), acquireLane: () => ({ lanePath: 'fake-lane' }),
     updateRecord: vi.fn(), releaseLane: vi.fn(),
     carryAcrossRebaseSetting: vi.fn(() => ({ value: 'off', source: 'test' })),
-    readCarryEvidence: vi.fn(() => ({ headSha: toSha, comments: [
+    readCarryEvidence: vi.fn(() => ({ reviews: [], headSha: toSha, comments: [
       trusted(`<!-- reviewed-sha: ${fromSha} -->`),
       trusted(clearFrom), trusted(gateFrom),
     ] })),

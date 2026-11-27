@@ -2388,6 +2388,21 @@ describe('unprovable accepted head move — fresh full review', () => {
       log: vi.fn(), settle: vi.fn(), ...over,
     });
   }
+  it('a second-generation carried advisory keeps the original Head label and does not supersede the acceptance', () => {
+    const o = moved();
+    const origin = 'c'.repeat(40), middle = 'd'.repeat(40);
+    const advisory = rev => [redTeamMarker(pr, rev), '### Post-accept red team — no break found', '',
+      'Advisory only: this comment changes no label itself; the red-team gate (setting `redTeam.confirmedBreaks`) sends a confirmed broken break back to the fixer. '
+        + `Head \`${origin.slice(0, 12)}\` · red team codex/test · re-check ok · recorded verdict \`accept\`.`, '',
+      'The red team tried to break this change and reported nothing.'].join('\n');
+    const c = body => ({ author: { login: 'web-everything' }, createdAt: '2026-11-01T00:00:00Z', body });
+    const hop = (from, to) => c(`<!-- review-verdict-carried from=${from} to=${to} patch-id=${'e'.repeat(40)} -->\nReview verdict carried across an identical contribution.\n${advisory(to)}`);
+    o.rawPrs[0].comments = [c(`✅ review — accepted\n<!-- reviewed-sha: ${origin} -->`), c(advisory(origin)),
+      c(`📌 review — acceptance re-stamped\n<!-- reviewed-sha: ${middle} -->`), hop(origin, middle),
+      c(`📌 review — acceptance re-stamped\n<!-- reviewed-sha: ${old} -->`), hop(middle, old)];
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review', why: 'unprovable head move needs a full review' });
+    expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, expectedHead: head });
+  });
   it('CI-recovery head move with older acceptance and a later hold stays blocked by the acceptance guard', () => {
     const o = moved();
     o.rawPrs[0].labels.push('mq-failure-recovery', 'ready-to-merge');
