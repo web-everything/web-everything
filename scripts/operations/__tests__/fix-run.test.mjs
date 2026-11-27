@@ -597,7 +597,7 @@ describe('runFixCli', () => {
     expect(comments[0]).toContain(diagnosis);
   });
   // card 5947 (live #5045, 2026-10-13): CI context and durable outcomes precede lane acquisition.
-  it.each(['aaa', 'a'.repeat(40)])('launches a ci-heal without a finding and records no-change as real repair evidence (%s)', async head => {
+  async function assertCiHealNoChange(head) {
     const m = mk([head, head]);
     const readComments = vi.fn(async () => []), appendLoopRow = vi.fn();
     const readNoCodeSnapshot = vi.fn(() => { throw Error('CI-heal must not read review authorization'); });
@@ -611,6 +611,12 @@ describe('runFixCli', () => {
     const prompt = m.spawn.mock.calls[0][0].prompt;
     for (const text of ['## CI FAILURE CONTEXT (fetched by the launcher)', 'scripts/conveyor/soak/__tests__/shard-files.test.mjs', 'AssertionError: expected 0.796875 to be greater than 0.8']) expect(prompt).toContain(text);
     expect(appendLoopRow).toHaveBeenCalledWith(expect.objectContaining({ kind: 'outcome', head, outcome: 'no-change', infra: false }));
+  }
+  it('launches a ci-heal without a finding and records no-change as real repair evidence', async () => {
+    await assertCiHealNoChange('aaa');
+  });
+  it('keeps ci-heal no-change evidence separate from review authorization with a full commit head', async () => {
+    await assertCiHealNoChange('a'.repeat(40));
   });
   it.each(['ci-heal', 'fix'])('records a pre-lane %s refusal against the PR head', async repairKind => {
     const m = mk([]), recordRouted = vi.fn(() => ({})), appendLoopRow = vi.fn(), writeErr = vi.fn();
