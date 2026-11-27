@@ -40,10 +40,15 @@ export default {
     const violations = [], cases = [];
     const variants = ['persisted', 'interrupted', 'invalid-cause', 'new-failure', 'new-failure-with-park',
       'new-park', 'untrusted', 'unreadable', 'wrong-head', 'missing-time', 'same-time', 'future-answer', 'new-question',
-      'lifecycle-routed', 'lifecycle-claude'];
+      'lifecycle-routed', 'lifecycle-claude', 'unrelated-budget-park', 'unrelated-raw-ceiling-park'];
     const scenarios = ['fix', 'ci-heal'].flatMap(mode => variants.map(variant => ({ mode, variant })));
     for (const { mode, variant } of scenarios) {
       const thread = comments.map(c => ({ ...c }));
+      const unrelatedParkReason = variant === 'unrelated-budget-park' ? 'fix-loop-exhausted'
+        : variant === 'unrelated-raw-ceiling-park' ? 'raw per-head repair session ceiling reached' : null;
+      // The operator answered an earlier budget stand-down. A later unknown failure could
+      // not publish its own stand-down, so the old park must not authorize admission.
+      if (unrelatedParkReason) thread[1].body = buildStandDownComment({ reason: 'fix-loop-exhausted', head });
       const lifecycle = variant.startsWith('lifecycle-'), episodeRows = [];
       if (lifecycle) {
         if (!recordUnknownCausePark) { violations.push(`${mode}/${variant}: missing renewed park publication`); continue; }
@@ -76,11 +81,12 @@ export default {
         readPrComments: () => { if (variant === 'unreadable') throw Error('disk'); return thread; },
         fixConfig: { hold: true, maxSessions: 3, windowHours: 6 },
         fixLoop: { readRows: () => lifecycle ? episodeRows : variant === 'interrupted' || variant === 'new-failure' ? []
-          : [{ ...park, ...(variant === 'new-park' ? { at: new Date(now - 500).toISOString() }
+          : [{ ...park, ...(unrelatedParkReason ? { reason: unrelatedParkReason } : {}),
+            ...(variant === 'new-park' ? { at: new Date(now - 500).toISOString() }
             : variant === 'same-time' ? { at: thread[2].createdAt } : {}) }],
         append: () => {}, killed: () => false, currentBuild: () => 'b'.repeat(40),
         readRouted: () => variant === 'lifecycle-claude' ? {} : ({ 'we#1764': [{ head,
-          at: lifecycle || variant.startsWith('new-failure') ? now - 500 : variant === 'same-time' ? now - 1000 : now - 3000,
+          at: lifecycle || unrelatedParkReason || variant.startsWith('new-failure') ? now - 500 : variant === 'same-time' ? now - 1000 : now - 3000,
           outcome: 'failed', cause: variant === 'invalid-cause' ? 'invalid' : 'unknown' }] }) },
         findItemFn: () => null, loadItems: () => [],
         fetchItemlessDiffPaths: () => ['scripts/conveyor/reconcile-fix-dispatch.mjs'],
@@ -95,6 +101,8 @@ export default {
       cases.push({ mode, variant, dispatched: result.dispatched.length, expected,
         refusals: [...result.reconcileRefusalDetails, ...result.refusals].map(r => r.kind) });
       if (result.dispatched.length !== expected) violations.push(`${mode}/${variant}: expected ${expected} dispatch, got ${result.dispatched.length}`);
+      if (unrelatedParkReason && !cases.at(-1).refusals.includes(mode === 'fix' ? 'fix-loop-parked' : 'fix-cause-unknown'))
+        violations.push(`${mode}/${variant}: missing unknown-cause admission refusal`);
       if (lifecycle) {
         thread.push({ author: { login: 'chalbert' }, createdAt: new Date(now - 100).toISOString(),
           body: buildOperatorAnswer({ standDownId: thread.at(-1).id, actor: 'chalbert', channel: 'chat', reason: 'Retry the new failure' }) });
