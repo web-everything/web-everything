@@ -142,8 +142,9 @@ export function parseGithubEvent(eventName, payload, { deliveryId = null, receiv
   if (typeof repo !== 'string' || !repo) return null;
   const base = { id: deliveryId, at: new Date(receivedAt).toISOString(), type: eventName, action, repo };
   // Preserve the legacy parser shape for level observations. Their delivery-based shadow annotation is
-  // added by the log; edge identity must be captured here before the payload is discarded.
-  if (!isLevel(eventName, action)) {
+  // added by the log; valid edge identity must be captured here before the payload is discarded.
+  // Without a native id, keep the legacy parser shape; the log reports the missing identity as unknown.
+  if (!isLevel(eventName, action) && nativeId(payload[nativeType[eventName]]?.id) !== null) {
     base.occ = occurrenceId(eventName, payload);
     base.native = { id: nativeId(payload[nativeType[eventName]]?.id), type: nativeType[eventName] };
   }

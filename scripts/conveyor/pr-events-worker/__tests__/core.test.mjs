@@ -813,6 +813,25 @@ describe('advisory and operator-ruling PR comments', () => {
   const payload = (body, overrides = {}) => ({ action: 'created', repository: REPO,
     issue: { number: 4624, pull_request: { url: 'https://example.invalid/pr/4624' } }, comment: { body }, ...overrides });
 
+  it.each([
+    ['advisory', advisory], ['ruling', '<!-- mandatory-referral-operator-ruling-v1 -->\nPRIVATE comment text'],
+  ])('preserves the legacy %s parser shape for missing native ids while shadow storage reports unknown', (kind, body) => {
+    for (const id of [undefined, null, 0, -1, '8', Number.MAX_SAFE_INTEGER + 1]) {
+      const event = parseGithubEvent('issue_comment', payload(body, { comment: { body, id } }),
+        { deliveryId: 'comment-1', receivedAt: 0 });
+      expect(event).toEqual({ id: 'comment-1', at: '1970-01-01T00:00:00.000Z', type: 'issue_comment',
+        action: 'created', repo: REPO.full_name, prs: [4624], sha: null, kind });
+      const log = createEventLog(createMemoryStorage());
+      log.append(event, 0);
+      expect(log.read(0).events[0]).toEqual({ ...event, seq: 1, occ: null, level: false,
+        occMissing: true, occDuplicate: false });
+    }
+    const event = parseGithubEvent('issue_comment', payload(body, { comment: { body, id: 8 } }),
+      { deliveryId: 'comment-native', receivedAt: 0 });
+    expect(event).toMatchObject({ occ: 'gh/comment/8/created', native: { id: 8, type: 'comment' } });
+    expect(JSON.stringify(event)).not.toContain('PRIVATE');
+  });
+
   it('classifies only the advisory shape or ruling marker', async () => {
     const { classifyPrComment, OPERATOR_RULING_COMMENT_MARKER } = await import('../core.mjs');
     expect(OPERATOR_RULING_COMMENT_MARKER).toBe('mandatory-referral-operator-ruling-v1');
