@@ -267,6 +267,12 @@ const firstLine = (e) => String((e && e.message) || e).split('\n')[0];
 // loader:1227`) — the live 08:14 ET smoke-rejected alert carried nothing else, hiding that the gh shim's baked
 // throttle path was missing. Keep the first line, and append the first real `…Error:` line when it differs.
 const failureLine = (e) => {
+  // The child runner may summarize stderr in its message while stdout carries
+  // the actual code failure. Preserve that negative evidence before considering
+  // a rate-limit summary; otherwise the rebuild can exempt a broken candidate.
+  const stdoutError = String(e?.stdout ?? '').split('\n')
+    .find((line) => /\b[A-Za-z]*Error\b[:\s]|Cannot find module/.test(line));
+  if (stdoutError) return stdoutError.trim();
   const lines = String((e && e.message) || e).split('\n');
   const err = lines.find((l) => /\b[A-Za-z]*Error\b[:\s]|Cannot find module/.test(l));
   return err && err !== lines[0] ? `${lines[0]} — ${err.trim()}` : lines[0];

@@ -565,6 +565,76 @@ describe('BLD-5539 — rate-limited overlay recovery', () => {
     expect(result.alerts.some(a => a.kind === 'smoke-rate-limited')).toBe(false);
   });
 
+  it('stdout code failure beside stderr throttling cannot bypass rejection or plain-main fallback', async () => {
+    let produced;
+    f.smoke.mockImplementationOnce(async ({ root, env }) => {
+      const smoke = await runLiveSmoke({ root, env, repos: [], clock: f.now, now: f.now(), load: () => 0, cores: () => 1,
+        shadow: () => null, admit: () => null, hostBusy: () => false,
+        makeReadMemoDir: () => mkdtempSync(join(f.env.TMPDIR, 'memo-')),
+        runChild: async (cmd, args, options) => {
+          if (cmd === 'gh') throw Object.assign(new Error(`exited 1: ${throttle}`), {
+            status: 1, signal: null, stdout: 'TypeError: invalid dispatch', stderr: throttle,
+          });
+          if (args[1] === 'list') return '[]';
+          if (args[1] === 'acquire') return JSON.stringify({ lane: 39 });
+          if (options.env.GH_CALLER === 'rebuild-smoke:dispatch-dry-run') {
+            return JSON.stringify([{ kind: options.env.WE_SMOKE_DRYRUN_ONLY, ok: true, ms: 1 }]);
+          }
+          return cmd === 'node' ? JSON.stringify({ ok: true }) : '';
+        } });
+      produced = { verdict: classifySmokeFailure(smoke.results), smoke };
+      return produced;
+    }).mockResolvedValue(passed());
+
+    const result = await f.rebuild();
+    expect(produced.verdict).toBe('code');
+    expect(rateLimitOnly(produced)).toBe(false);
+    expect(result.alerts.some(a => a.kind === 'smoke-rate-limited')).toBe(false);
+    expect(result.alerts).toContainEqual(expect.objectContaining({ kind: 'smoke-rejected' }));
+    expect(result.reason).toBe('fallback-plain-main');
+    expect(result.adopted).toBe(true);
+    expect(f.git(['rev-parse', 'HEAD'])).toBe(f.lastGood);
+    expect(f.refs()).toEqual([]);
+    expect(f.smoke).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ['malformed', 'detail'], ['malformed', 'stderrTail'],
+    ['oversized', 'detail'], ['oversized', 'stderrTail'],
+  ])('%s optional %s on a passing row cannot suppress independent code rejection and fallback', async (kind, field) => {
+    const evidence = passed();
+    evidence.verdict = 'code'; evidence.smoke.pass = false;
+    Object.assign(evidence.smoke.results.find(row => row.name === 'dispatch-dry-run'), {
+      ok: false, detail: 'TypeError: invalid dispatch',
+    });
+    evidence.smoke.results.find(row => row.name === 'gh-pr-list')[field] = kind === 'oversized' ? 'x'.repeat(4001) : {};
+    f.smoke.mockResolvedValueOnce(evidence).mockResolvedValue(passed());
+
+    const result = await f.rebuild();
+    expect(result.alerts).toContainEqual(expect.objectContaining({ kind: 'smoke-rejected' }));
+    expect(result.alerts.some(a => a.kind === 'smoke-rate-limited')).toBe(false);
+    expect(result.reason).toBe('fallback-plain-main');
+    expect(result.adopted).toBe(true);
+    expect(f.git(['rev-parse', 'HEAD'])).toBe(f.lastGood);
+    expect(f.refs()).toEqual([]);
+    expect(f.smoke).toHaveBeenCalledTimes(2);
+  });
+
+  it('malformed optional diagnostics cannot suppress definite external failure rejection and retry backoff', async () => {
+    const evidence = limited();
+    evidence.smoke.results.find(row => row.name === 'gh-api-repo').detail = 'TypeError: invalid dispatch';
+    evidence.smoke.results.find(row => row.name === 'gh-pr-list').stderrTail = {};
+    f.smoke.mockResolvedValueOnce(evidence).mockResolvedValue(passed());
+
+    const result = await f.rebuild();
+    const rejected = result.alerts.find(a => a.kind === 'smoke-rejected');
+    expect(rejected).toBeDefined();
+    expect(rejected.detail).toMatchObject({ failed: 'gh-api-repo', attempts: 1 });
+    expect(Date.parse(rejected.detail.retryAt)).toBeGreaterThan(f.now());
+    expect(result.reason).toBe('fallback-plain-main');
+    expect(f.refs()).toEqual([]);
+  });
+
   it('a null row in last-good control cannot authorize no-worse adoption', async () => {
     f.env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE = '1';
     const candidate = passed();
