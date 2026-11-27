@@ -49,6 +49,8 @@ export default {
         if (['wrong head', 'unreadable job', 'other failed step'].includes(scenario)) {
           if (kinds.includes('ci-heal') || kinds.includes('review'))
             violations.push(`${elapsed}: ${scenario} unreadable evidence must be refused, got ${kinds.join(',')}`);
+          if (!(plan.refusals ?? []).some(r => r.prNumber === 7106 && r.kind === 'x-merge-gate-unreadable'))
+            violations.push(`${elapsed}: ${scenario} unreadable evidence must be recorded as x-merge-gate-unreadable`);
           continue;
         }
         const expected = scenario === 'workflow hold' ? 'review' : 'ci-heal';

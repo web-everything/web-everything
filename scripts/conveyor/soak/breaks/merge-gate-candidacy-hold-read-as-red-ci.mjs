@@ -94,6 +94,8 @@ export default {
     // Policy (ci-heal admission): a job-level merge-gate failure (#5023 workflow self-check, fail closed) is
     // UNREADABLE evidence, so it is refused (x-merge-gate-unreadable) for a person to inspect: never ci-heal,
     // never excused into review or promotion.
+    if (!(plan.refusals ?? []).some(r => r.prNumber === 5023 && r.kind === 'x-merge-gate-unreadable'))
+      violations.push('PR #5023 unreadable merge-gate failure was not refused as x-merge-gate-unreadable');
     for (const kind of ['ci-heal', 'review', 'promote-draft']) {
       if (dispatched(5023, kind)) violations.push(`PR #5023 unreadable merge-gate failure was admitted as ${kind}`);
     }
@@ -101,6 +103,8 @@ export default {
       if (!dispatched(number, 'ci-heal')) violations.push(`PR #${number} real merge-gate failure was incorrectly excused`);
       if (dispatched(number, 'review') || dispatched(number, 'promote-draft')) violations.push(`PR #${number} real merge-gate failure allowed review or promotion`);
     }
+    if (!(plan.refusals ?? []).some(r => r.prNumber === 5025 && r.kind === 'main-red'))
+      violations.push('PR #5025 main-only hold with unknown main state was not refused as main-red');
     for (const kind of ['ci-heal', 'review', 'promote-draft']) {
       if (dispatched(5025, kind)) violations.push(`PR #5025 main-only hold with unknown main state was admitted as ${kind}`);
     }
