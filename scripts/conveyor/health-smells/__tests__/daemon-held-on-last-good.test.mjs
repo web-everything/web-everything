@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import daemonHeldOnLastGood, { MAX_HELD_AGE_MS } from '../daemon-held-on-last-good.mjs';
 import {
-  MINUTE, HOUR, emptyHealthState, stepEpisodes, planActions,
+  MINUTE, HOUR, emptyHealthState, stepEpisodes, planActions, runHealthTick,
 } from '../../health-watch-core.mjs';
 import { probeSelfSync } from '../../health-watch.mjs';
 import { NOTIFY_EVEN_IN_SHADOW } from '../../health-smells-notify-list.mjs';
@@ -21,6 +21,93 @@ import { NOTIFY_EVEN_IN_SHADOW } from '../../health-smells-notify-list.mjs';
 const NOW = Date.parse('2026-09-26T20:00:00Z');
 
 const clone = (cloneKey, held) => ({ cloneKey, alerts: [], rebuild: { held } });
+
+describe('last-good hold alarm contract', () => {
+  const held = (minutes, extra = {}) => ({ since: NOW - minutes * MINUTE,
+    reason: 'smoke-rejected', failed: 'live-smoke', lastGood: 'abc123', target: 'def456', ...extra });
+  const tick = (rows, state = emptyHealthState(), now = NOW) => runHealthTick(state,
+    { selfSync: rows }, [daemonHeldOnLastGood], now);
+  // The same action plan consumed by the health-watch alert sink, with all IO replaced by this collector.
+  const sink = (result) => result.plan.filter(p => p.kind === 'notify' && p.suppressed === null)
+    .map(p => result.state.episodes[p.key].measure);
+
+  it('ten-hour last-good hold remains actionable and reaches the alert sink', () => {
+    const result = tick([clone('incident-7472', held(600))]);
+    expect(sink(result)).toEqual([expect.objectContaining({ daemon: 'incident-7472', lastGood: 'abc123',
+      target: 'def456', heldMs: 10 * HOUR, heldReason: 'smoke-rejected', failedChecks: 'live-smoke',
+      episodeId: expect.any(String), uncertainty: [] })]);
+  });
+
+  it.each([29, 30, 31])('keeps the earlier sign actionable at %i minutes', (minutes) => {
+    const result = tick([clone('boundary', held(minutes))]);
+    expect(sink(result)).toEqual([expect.objectContaining({ heldMs: minutes * MINUTE })]);
+  });
+
+  it('ancient state emits uncertainty alongside the actionable hold', () => {
+    const result = tick([clone('ancient', held(25 * 60))]);
+    expect(sink(result)).toEqual([expect.objectContaining({ overMaxAge: true, uncertainty: ['ancient-hold'] })]);
+    expect(result.evaluations[0].results[0].recommendation).toMatch(/inspect.*rebuild/i);
+  });
+
+  it.each([null, 'not-a-date', NaN, NOW + MINUTE, 1e30])('reports uncertain since %s without throwing or going healthy', (since) => {
+    const result = tick([clone('unknown', held(31, { since }))]);
+    expect(result.evaluations[0].error).toBeUndefined();
+    expect(sink(result)).toEqual([expect.objectContaining({ heldMs: null, heldSinceIso: null,
+      uncertainty: expect.arrayContaining(['invalid-since']), episodeId: expect.any(String) })]);
+  });
+
+  it('oversized evidence stays actionable with a bounded diagnostic and inspect/rebuild fallback', () => {
+    const result = tick([clone('large', held(31, { failed: 'x'.repeat(100_000) }))]);
+    const [record] = sink(result);
+    expect(record.uncertainty).toContain('oversized-failed');
+    expect(record.failedChecks.length).toBeLessThanOrEqual(4096);
+    expect(result.evaluations[0].results[0].recommendation).toMatch(/inspect.*rebuild/i);
+  });
+
+  it('adoption closes exactly the matching hold; repeated ticks dedupe and a new hold has a new identity', () => {
+    const rows = [clone('one', held(31)), clone('two', held(31))];
+    const first = tick(rows);
+    const repeated = tick([clone('one', held(31, { target: 'new-target' })), rows[1]], first.state, NOW + MINUTE);
+    expect(sink(repeated)).toEqual([]);
+    const firstId = first.state.episodes['daemon-held-on-last-good::clone:one'].measure.episodeId;
+    expect(repeated.state.episodes['daemon-held-on-last-good::clone:one'].measure.episodeId).toBe(firstId);
+    const adopted = { cloneKey: 'one', rebuild: { held: null, adopted: { at: NOW + 2 * MINUTE, head: 'new-target' } } };
+    const closed = tick([adopted, rows[1]], repeated.state, NOW + 2 * MINUTE);
+    expect(closed.transitions.filter(t => t.type === 'closed').map(t => t.episode.subject)).toEqual(['clone:one']);
+    expect(closed.state.episodes['daemon-held-on-last-good::clone:two']).toBeDefined();
+    const next = tick([clone('one', held(0)), rows[1]], closed.state, NOW + 31 * MINUTE);
+    expect(sink(next)[0].episodeId).not.toBe(firstId);
+  });
+
+  it.each([
+    [],
+    [{ cloneKey: 'one', rebuild: null }],
+    [{ cloneKey: 'one', rebuild: { held: null } }],
+    [{ cloneKey: 'one', rebuild: { held: null, adopted: { at: NOW - HOUR, head: 'def456' } } }],
+    [{ cloneKey: 'one', rebuild: { held: null, adopted: { at: NOW + MINUTE, head: 'abc123' } } }],
+  ])('missing or stale adoption evidence does not close an owed hold (%j)', (rows) => {
+    const first = tick([clone('one', held(31))]);
+    const result = tick(rows, first.state, NOW + MINUTE);
+    expect(result.transitions.some(t => t.type === 'closed')).toBe(false);
+    expect(result.state.episodes['daemon-held-on-last-good::clone:one'].measure.uncertainty.length).toBeGreaterThan(0);
+  });
+
+  it('replays the ten-hour incident and synthetic 31-minute hold from isolated state files into the health feed', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'last-good-replay-'));
+    try {
+      for (const [name, minutes] of [['incident-7472', 600], ['synthetic-31m', 31]]) {
+        const state = held(minutes);
+        writeFileSync(join(dir, `${name}.rebuild.json`), JSON.stringify({ held: { ...state,
+          since: new Date(state.since).toISOString() } }));
+      }
+      const records = sink(tick(probeSelfSync(dir)));
+      expect(records.map(r => [r.daemon, r.heldMs])).toEqual([
+        ['incident-7472', 10 * HOUR], ['synthetic-31m', 31 * MINUTE],
+      ]);
+      console.info('last-good health-feed replay:', JSON.stringify(records));
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
 
 describe('daemon-held-on-last-good — evaluate', () => {
   it('breaches once held past heldForMs (16 min) and names the failing check(s) + reason in the summary', () => {

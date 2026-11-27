@@ -949,7 +949,8 @@ export function runHealthTick(prevState, probes, smells, now, { config = {}, act
   const evaluations = smells.map((smell) => {
     const needs = smell.probes ?? [];
     const missing = needs.filter((p) => probes[p] === undefined);
-    if (missing.length) return { smell, results: null, skipped: missing };
+    // Opt-in evaluators can surface uncertainty on existing episodes when their evidence is unavailable.
+    if (missing.length && !smell.evaluateMissingProbes) return { smell, results: null, skipped: missing };
     try {
       const results = smell.evaluate(probes, ctx);
       delete errs[`smell:${smell.id}`];

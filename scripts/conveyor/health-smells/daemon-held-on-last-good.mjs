@@ -11,8 +11,8 @@
  * Reads `~/.claude/daemon-self-sync-state/<cloneKey>.rebuild.json`'s `held` field, passed through by
  * `health-watch.mjs#probeSelfSync` (see `daemon-rebuild.mjs`'s own doc for the exact shape:
  * `{since, reason: 'smoke-rejected'|'smoke-harness-broken'|'smoke-transient'|'smoke-threw'|'github-auth-broken'|'smoke-env-timeout'|'smoke-env-unavailable', failed, details,
- * lastGood, target, mainSha, updatedAt}`). Any later adoption clears `held` back to `null`, closing this
- * episode the very next tick.
+ * lastGood, target, mainSha, updatedAt}`). A cleared hold closes an existing episode only with a newer
+ * adoption of a different build. Missing or invalid evidence retains the alert with uncertainty.
  *
  * Notify scope: still notifies even in shadow mode — a PREVIOUSLY approved sign, carried forward unchanged by
  * the Sun 2026-09-27 ~7:40 AM ET operator decision (`we:scripts/conveyor/health-smells-notify-list.mjs`),
@@ -28,28 +28,68 @@ export default {
   scope: 'host',
   cadence: 'every-tick',
   probes: ['selfSync'],
+  // Even a failed/missing probe must annotate owed alerts rather than silently retaining stale certainty.
+  evaluateMissingProbes: true,
   openAfter: 1,
   closeAfter: 1,
+  missingSubjectsUnknown: true,
   severity: 'high',
   action: 'alert',
   heldForMs: 15 * MINUTE,
   recommendationHint: 'A daemon clone is held on its last-good build after a failed live smoke — its alerts file names the failing check(s); fix the tree (or, if the harness itself is broken, the tool the check exercises) — never the clone by hand.',
-  evaluate({ selfSync }, { now }) {
-    return (selfSync || []).map((c) => {
+  evaluate({ selfSync }, { now, episodes = {} }) {
+    const previous = Object.values(episodes).filter(ep => ep.smell === this.id);
+    const rows = Array.isArray(selfSync) ? [...selfSync] : [];
+    const seen = new Set(rows.map(c => `clone:${c.cloneKey}`));
+    for (const ep of previous) {
+      if (!seen.has(ep.subject)) rows.push({ cloneKey: ep.subject.slice('clone:'.length) });
+    }
+    return rows.map((c) => {
+      const subject = `clone:${c.cloneKey}`;
+      const prior = previous.find(ep => ep.subject === subject);
       const held = c.rebuild?.held ?? null;
-      const since = held?.since ?? null;
+      if (!held && prior) {
+        const adopted = c.rebuild?.adopted;
+        // Old persisted episodes may lack heldSinceIso: require adoption after first observation then.
+        const recordedSince = Date.parse(prior.measure?.heldSinceIso ?? '');
+        const after = Number.isFinite(recordedSince) ? recordedSince : prior.firstBreachAt;
+        const resolved = c.rebuild?.held === null && Number.isFinite(adopted?.at)
+          && adopted.at > after && adopted.at <= now && typeof adopted.head === 'string'
+          && adopted.head.length > 0 && typeof prior.measure?.lastGood === 'string'
+          && adopted.head !== prior.measure.lastGood;
+        return { subject, breach: !resolved,
+          measure: { ...prior.measure, daemon: c.cloneKey,
+            episodeId: prior.measure?.episodeId ?? prior.id,
+            uncertainty: resolved ? [] : ['unconfirmed-adoption'] },
+          summary: resolved ? `clone ${c.cloneKey}: newer build adopted.` : prior.summary,
+          recommendation: resolved ? `clone ${c.cloneKey} adopted a newer build.`
+            : 'Inspect the daemon rebuild state and adoption history; rebuild through the normal smoke gate. The hold cannot yet be confirmed cleared.',
+        };
+      }
+      const uncertainty = [];
+      const validSince = typeof held?.since === 'number' && Number.isFinite(held.since)
+        && Math.abs(held.since) <= 8.64e15 && held.since <= now;
+      const since = validSince ? held.since : null;
+      if (held && !validSince) uncertainty.push('invalid-since');
       const heldMs = since != null ? now - since : null;
       const heldMin = heldMs != null ? Math.round(heldMs / MINUTE) : null;
-      const breach = !!held && since != null && heldMs > this.heldForMs;
-      const failedChecks = held?.failed || null;
+      const breach = !!held && (since == null || heldMs > this.heldForMs || !!prior);
+      const failed = held?.failed == null ? null : String(held.failed);
+      if (failed?.length > 4096) uncertainty.push('oversized-failed');
+      const failedChecks = failed ? failed.slice(0, 4096).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ') : null;
       const lastGood12 = held?.lastGood ? String(held.lastGood).slice(0, 12) : null;
       const overMaxAge = heldMs != null && heldMs > MAX_HELD_AGE_MS;
+      if (overMaxAge) uncertainty.push('ancient-hold');
       const reasonPart = held ? `${held.reason}${failedChecks ? `: ${failedChecks}` : ''}` : null;
 
       return {
-        subject: `clone:${c.cloneKey}`,
+        subject,
         breach,
         measure: {
+          daemon: c.cloneKey,
+          episodeId: prior?.measure?.episodeId ?? prior?.id ?? `${this.id}:${c.cloneKey}:${since ?? now}`,
+          heldMs,
+          uncertainty,
           heldReason: held?.reason ?? null,
           heldSinceIso: since != null ? new Date(since).toISOString() : null,
           heldMin,
@@ -63,6 +103,8 @@ export default {
           : `clone ${c.cloneKey}: not held.`,
         recommendation: !held
           ? `clone ${c.cloneKey} is not currently held on its last-good build.`
+          : uncertainty.length
+            ? 'Inspect the daemon rebuild state and full alerts history; rebuild through the normal smoke gate. Hold evidence is uncertain or older than 24 hours; escalate to the operator if it cannot be verified.'
           : held.reason === 'github-auth-broken'
             ? `GitHub rejects the daemon's App token even after a forced re-mint — an ENVIRONMENT fault, not the tree. Check the App installation / private key (\`node scripts/conveyor/github-app-status.mjs\`); the clone keeps dispatching from its last-good build (${lastGood12 ?? '?'}) and re-checks every tick. Full history: ~/.claude/daemon-self-sync-state/${c.cloneKey}.alerts.jsonl.`
           : held.reason === 'smoke-env-timeout'
