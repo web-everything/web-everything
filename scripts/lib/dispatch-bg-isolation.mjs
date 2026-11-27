@@ -110,8 +110,25 @@ export function dispatchBroadcastHooks({ repo, repoRoot } = {}) {
     return hooks.length ? [groupWith(g, hooks)] : [];
   })]));
 }
-const canonical = v => Array.isArray(v) ? v.map(canonical) : plain(v)
-  ? Object.fromEntries(Object.keys(v).sort().map(k => [k, canonical(v[k])])) : v;
+// Local hook fields are arbitrary JSON. Sort their keys without consuming a call frame per
+// level: unrelated deeply nested metadata must not prevent installation of the deny guards.
+const canonical = v => {
+  const container = value => Array.isArray(value) || plain(value);
+  const copy = value => Array.isArray(value) ? value.slice()
+    : Object.fromEntries(Object.keys(value).sort().map(key => [key, value[key]]));
+  if (!container(v)) return v;
+  const result = copy(v);
+  const pending = [result];
+  while (pending.length) {
+    const node = pending.pop();
+    for (const key of Object.keys(node)) {
+      if (!container(node[key])) continue;
+      node[key] = copy(node[key]);
+      pending.push(node[key]);
+    }
+  }
+  return result;
+};
 const hookIdentity = (g, h) => JSON.stringify([g.matcher ?? '', canonical(h)]);
 
 /**

@@ -9,7 +9,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, mkdirSync, readdirSync, copyFileSync, symlinkSync, realpathSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import {
   DISPATCH_WORKTREE_SETTINGS, ensureWorktreeIsolationOff, hasWorktreeIsolationOff,
@@ -320,6 +320,39 @@ describe('xl5reby dispatched worker effective settings include the repo guard ho
     const parsed = JSON.parse(once);
     expect(parsed.env).toEqual({ A: '1' });
     expect(parsed.hooks.PreToolUse.flatMap((g) => g.hooks.map((h) => h.command))).toContain('echo mine');
+  });
+
+  it('installs both deny guards despite a 2,200-level local PostToolUse field, preserving it idempotently', () => {
+    // Native Node reproduces the dispatcher's stack limit, independent of Vitest's larger worker stack.
+    const out = spawnSync(process.execPath, ['--input-type=module', '--eval', `
+      import assert from 'node:assert/strict';
+      import { ensureDispatchGuardHooks } from ${JSON.stringify(pathToFileURL(join(REPO, 'scripts/lib/dispatch-bg-isolation.mjs')).href)};
+      ${memoryFs.toString()}
+      let nested = 'keep';
+      for (let i = 0; i < 2200; i++) nested = { child: nested };
+      const path = '/w/.claude/settings.local.json';
+      const fs = memoryFs({ [path]: JSON.stringify({ env: { KEEP: 'yes' }, hooks: {
+        PostToolUse: [{ hooks: [{ type: 'command', command: 'echo local', nested }] }],
+      } }) });
+      const options = { cwd: '/w', repoRoot: '/nope', ...fs };
+      assert.equal(ensureDispatchGuardHooks(options).ok, true);
+      const once = fs.files[path];
+      const parsed = JSON.parse(once);
+      assert.deepEqual(parsed.hooks.PreToolUse, [
+        { matcher: 'Edit|Write', hooks: [{ type: 'command', command: 'node "/nope/scripts/guard-lane.mjs"' }] },
+        { matcher: 'Bash', hooks: [{ type: 'command', command: 'node "/nope/scripts/guard-bash.mjs"' }] },
+      ]);
+      assert.deepEqual(parsed.env, { KEEP: 'yes' });
+      assert.equal(parsed.hooks.PostToolUse[0].hooks[0].command, 'echo local');
+      let preserved = parsed.hooks.PostToolUse[0].hooks[0].nested;
+      for (let i = 0; i < 2200; i++) preserved = preserved.child;
+      assert.equal(preserved, 'keep');
+      assert.deepEqual(parsed.hooks.PostToolUse[1], { hooks: [{ type: 'command', command: 'node "/nope/scripts/broadcast-inject.mjs"' }] });
+      assert.equal(ensureDispatchGuardHooks(options).ok, true);
+      assert.equal(fs.files[path], once);
+    `], { encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024 });
+    expect(out.error).toBeUndefined();
+    expect(out.status, out.stderr).toBe(0);
   });
 
   it('never throws on a write failure', () => {
