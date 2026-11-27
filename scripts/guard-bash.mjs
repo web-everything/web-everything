@@ -4505,7 +4505,13 @@ function prePrReviewBypass(head) {
 function rawPrCreation(head) {
   // Unlike ordinary argv scanning, shellWords keeps whitespace INSIDE command substitutions
   // in the same raw word (`$(printf gh)` / `\`printf gh\``), without executing it.
-  const tokens = shellWords(head).map(argvWordShape);
+  const tokens = shellWords(head).flatMap(raw => {
+    const shape = argvWordShape(raw);
+    // Split attached redirects without losing quote/expansion provenance. Substitutions
+    // stay opaque: a redirect inside $(...) belongs to that nested command.
+    if (shape.dynamicAt >= 0 || shape.split) return [shape];
+    return headWords(raw, true).map(word => argvWordShape(raw.slice(word.start, word.end)));
+  });
   const start = wrapperPrefixLength(tokens.map(word => word.value));
   const shapes = tokens.slice(start);
   const words = shapes.map(shape => shape.value);
@@ -4807,7 +4813,8 @@ export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLi
   }
 
   // Reuse command-position normalization so paths/env wrappers match, but quoted prose does not.
-  const creation = rawPrCreation(s);
+  const creation = rawPrCreation(s)
+    ?? (/^gh(?:\s|$)/.test(canon) ? rawPrCreation(canon) : null);
   if (!hasLeadingEnvEscape(s, 'RAW_PR_CREATE_OK') && creation === 'dynamic')
     return 'raw PR creation carries a shell expansion the guard cannot read and may omit the `authored-by-actor` stamp. Write the gh command and subcommand literally and use the open-pr operation. Operator fallback: prefix `RAW_PR_CREATE_OK=1`.';
   if (!hasLeadingEnvEscape(s, 'RAW_PR_CREATE_OK') && creation === 'literal')

@@ -1413,6 +1413,29 @@ describe('guard-bash — differential write-shape table (#2108 review r5)', () =
 });
 
 describe('guard-bash — raw PR creation loses the author stamp', () => {
+  it('denies creation with attached redirects and preserves the explicit escape', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'raw-pr-redirect-'));
+    try {
+      for (const redirect of [`>"${join(cwd, 'pr-output')}"`, '</dev/null']) {
+        const command = `gh pr create${redirect}`;
+        expect.soft(decide(command, { cwd }), command).toMatch(/authored-by-actor/);
+        expect.soft(decide(`RAW_PR_CREATE_OK=1 ${command}`, { cwd }), command).toBeNull();
+      }
+      expect(decide('gh pr "create>/dev/null"', { cwd })).toBeNull();
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+  it('denies creation in command-string wrappers and preserves the explicit escape', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'raw-pr-wrapper-'));
+    try {
+      for (const wrapper of ['npx -c', `flock "${join(cwd, 'pr-lock')}" -c`, 'watch']) {
+        const command = `${wrapper} "gh pr create --fill"`;
+        expect.soft(decide(command, { cwd }), command).toMatch(/authored-by-actor/);
+        expect.soft(decide(`RAW_PR_CREATE_OK=1 ${command}`, { cwd }), command).toBeNull();
+        expect.soft(decide(`${wrapper} "gh pr list"`, { cwd }), wrapper).toBeNull();
+      }
+      expect(decide('git commit -m "gh pr create --fill"', { cwd })).toBeNull();
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
   it('denies global-flag, alias, REST, graphql and variable-word creation', () => {
     for (const command of [
       'gh -R a/b pr create --fill', 'gh --repo a/b pr create --fill',
