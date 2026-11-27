@@ -27,6 +27,7 @@ import { gateLaunch } from './resource-gate.mjs';
 import { isBorrowedRunnerDead, isPidAlive, resolveFixBorrowSettings } from './dispatch-throttle.mjs';
 
 import { pickChainRung, resolveFixExecutionMode } from './fix-executor-chain.mjs';
+import { FIX_RUN_INFRA_PATTERNS } from './fix-run-infra-patterns.mjs';
 import { readSettings } from './settings-files.mjs';
 import { readLockEntry, heartbeat } from '../readiness/file-locks.mjs';
 // Keep fix-run's static graph independent of the dispatch wrappers: use the light claim store.
@@ -171,7 +172,7 @@ export const ROUTED_CODEX_MAX_UNPRODUCTIVE = 2;
  *  one entry, which only delays the Claude fallback by one run. Content keeps the `{ "<repo>#<pr>": [...] }` shape. */
 export const routedOutcomePath = ({ repo = 'we', pr }) =>
   join(resolveCoordinationRoot(), 'fix-routed-outcomes', `${String(repo).replace(/[^A-Za-z0-9._-]/g, '_')}_${String(pr).replace(/[^0-9]/g, '')}.json`);
-export const readRoutedOutcomes = ({ repo = 'we', pr } = {}) => fileLedger(routedOutcomePath({ repo, pr })).read();
+export const readRoutedOutcomes = ({ repo = 'we', pr, strict = false } = {}) => fileLedger(routedOutcomePath({ repo, pr }), { strict }).read();
 
 /** Sentinel merge target: fix-run resolves it to the PR's live `baseRefName` from `gh pr view` (never guesses `main`). */
 export const PR_BASE_MERGE_TARGET = '@pr-base';
@@ -179,20 +180,46 @@ export const PR_BASE_MERGE_TARGET = '@pr-base';
  *  {@link PR_BASE_MERGE_TARGET} so fix-run reads it — a guessed `main` could merge main into a stacked PR. null = no merge. */
 export const mergeOntoFor = (planned) => planned.restack?.onto ?? (planned.isConflict ? planned.baseRefName || PR_BASE_MERGE_TARGET : null);
 
+const ROUTED_CAUSES = new Set(['model', 'input', 'launcher', 'infra', 'unknown']);
+const LEGACY_LAUNCHER_PATTERNS = [/conflict not resolvable/i, /lane git config/i, /rearm-review/i, /non-fast-forward|fast-forward hint|fetch first/i];
+
+/** PURE. Explicit invalid causes fail closed; only absent causes use the legacy table. */
+export function routedOutcomeCause(entry) {
+  if (Object.hasOwn(entry, 'cause')) return ROUTED_CAUSES.has(entry.cause) ? entry.cause : 'unknown';
+  if (entry.outcome === 'lease-lost') return 'infra';
+  if (['no-change', 'no-change-unproven'].includes(entry.outcome)) return 'model';
+  if (entry.outcome === 'failed' && [...FIX_RUN_INFRA_PATTERNS, ...LEGACY_LAUNCHER_PATTERNS]
+    .some(pattern => pattern.test(String(entry.reason ?? '')))) return 'launcher';
+  return 'unknown';
+}
+
 export function consecutiveUnproductiveOnHead(table, { repo = 'we', pr, head }) {
   if (!head) return 0;
   let count = 0;
   for (const entry of [...(table?.[`${repo}#${pr}`] ?? [])].reverse()) {
-    if (entry.head !== head || entry.outcome === 'pushed') break;
+    if (entry.outcome === 'pushed') break;
+    if (routedOutcomeCause(entry) !== 'model') continue;
+    if (entry.head !== head) break;
     count++;
   }
   return count;
 }
 
+/** New unknown/invalid causes cannot silently authorize another launch if parking was interrupted.
+ * Legacy rows without cause are deliberately excluded from this recovery rule. */
+export function unparkedUnknownOnHead(table, { repo = 'we', pr, head }, rows) {
+  if (rows.some(row => row.kind === 'park' && row.repo === repo && row.pr === pr && row.head === head)) return false;
+  for (const row of [...(table?.[`${repo}#${pr}`] ?? [])].reverse()) {
+    if (row.outcome === 'pushed') break;
+    if (row.head === head && Object.hasOwn(row, 'cause') && routedOutcomeCause(row) === 'unknown') return true;
+  }
+  return false;
+}
+
 const oneLine = (t) => String(t ?? '').replace(/\s+/g, ' ').trim().slice(0, 300);
 
 /** `reason` is the local diagnosis (may hold command errors); `note` is the agent's final message, the only text a PR comment shows. */
-export function recordRoutedOutcome({ repo = 'we', pr, head, outcome, reason = '', note = '', now = Date.now(), store = fileLedger(routedOutcomePath({ repo, pr })),
+export function recordRoutedOutcome({ repo = 'we', pr, head, outcome, cause, reason = '', note = '', now = Date.now(), store = fileLedger(routedOutcomePath({ repo, pr }), { strict: true }),
   readClaim = (kind) => readLockEntry(fixDispatchClaimRoot(), fixDispatchResource({ repo, pr, kind })),
 }) {
   // Borrowed launches keep their existing ledger and retry policy.
@@ -200,7 +227,15 @@ export function recordRoutedOutcome({ repo = 'we', pr, head, outcome, reason = '
   const table = store.read() ?? {};
   const key = `${repo}#${pr}`;
   if (outcome === 'pushed') delete table[key];
-  else table[key] = [...(table[key] ?? []), { at: now, head, outcome, reason: oneLine(reason), note: oneLine(note) }].slice(-10);
+  else {
+    // Preserve legacy API callers while normalizing every newly persisted row.
+    const row = { at: now, head, outcome, reason: oneLine(reason), note: oneLine(note) };
+    row.cause = routedOutcomeCause(cause === undefined ? row : { ...row, cause });
+    if (row.cause === 'unknown') row.handling = 'unhandled';
+    let model = 0, other = 0;
+    table[key] = [...(table[key] ?? []), row].reverse().filter(entry =>
+      routedOutcomeCause(entry) === 'model' ? ++model <= 10 : ++other <= 10).reverse();
+  }
   store.write(table);
   return table;
 }
@@ -233,14 +268,23 @@ export function recentBorrowFailures(table, { repo, pr, now = Date.now(), window
 
 export const defaultBorrowLedgerPath = () => join(resolveCoordinationRoot(), 'fix-cap-waits.json');
 
-function fileLedger(path) {
+function fileLedger(path, { strict = false } = {}) {
   return {
-    read() { try { const v = JSON.parse(readFileSync(path, 'utf8')); return v && typeof v === 'object' ? v : {}; } catch { return {}; } },
+    read() {
+      try {
+        const v = JSON.parse(readFileSync(path, 'utf8'));
+        if (strict && (!v || typeof v !== 'object' || Array.isArray(v)
+            || Object.values(v).some(rows => !Array.isArray(rows) || rows.some(row => !row || typeof row !== 'object')))) {
+          throw new Error('Invalid routed outcome ledger');
+        }
+        return v && typeof v === 'object' ? v : {};
+      } catch (error) { if (strict && error.code !== 'ENOENT') throw error; return {}; }
+    },
     write(v) {
       // temp + rename: a reader never sees a half-written file.
       const tmp = `${path}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
       try { mkdirSync(dirname(path), { recursive: true }); writeFileSync(tmp, JSON.stringify(v), { mode: 0o600 }); renameSync(tmp, path); }
-      catch { try { rmSync(tmp, { force: true }); } catch { /* best-effort */ } /* best-effort: a lost ledger only restarts the wait */ }
+      catch (error) { try { rmSync(tmp, { force: true }); } catch { /* best-effort */ } if (strict) throw error; }
     },
   };
 }

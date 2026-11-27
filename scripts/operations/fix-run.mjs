@@ -43,8 +43,8 @@ import { REPO_ROOT } from './detached-dispatch.mjs';
 // Imported FROM the leaf, never the other way round (see `fix.mjs#FIX_RUN_EXECUTORS`): this file's top-level `await`
 // below deadlocks if `dispatch-providers/fix.mjs` imports it back.
 import { FIX_RUN_EXECUTORS } from './dispatch-providers/fix.mjs';
-import { PR_BASE_MERGE_TARGET, recordBorrowOutcome, recordRoutedOutcome, consecutiveUnproductiveOnHead, ROUTED_CODEX_MAX_UNPRODUCTIVE } from '../lib/fix-slot-borrow.mjs';
-import { appendFixLoopRow, isInfraFixRunOutcome, FIX_RUN_OUTCOME } from '../conveyor/fix-loop-ledger.mjs';
+import { PR_BASE_MERGE_TARGET, recordBorrowOutcome, recordRoutedOutcome, routedOutcomeCause, consecutiveUnproductiveOnHead, ROUTED_CODEX_MAX_UNPRODUCTIVE } from '../lib/fix-slot-borrow.mjs';
+import { appendFixLoopRow, readFixLoopRows, isInfraFixRunOutcome, FIX_RUN_OUTCOME } from '../conveyor/fix-loop-ledger.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { riskyLaneConfig, LANE_CONFIG_LIST_ARGS, laneGitConfigArgs, laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
 import { LEASE_FILENAME, renewedLease } from '../lib/lane-lease.mjs';
@@ -183,7 +183,9 @@ export function unmergedPaths(porcelain) {
 }
 
 /** A refusal the launcher itself wrote: the only kind of error whose message may be posted to the public PR. */
-export class LauncherError extends Error {}
+export class LauncherError extends Error {
+  constructor(message, { cause = 'launcher' } = {}) { super(message); this.cause = cause; }
+}
 
 export class LeaseLostError extends LauncherError {}
 
@@ -384,7 +386,7 @@ export function escalationComment(head, entries) {
   // Notes contain the agent's final message or the launcher's own error, never raw child-process errors.
   // Both use the same sanitising and 200-character cap.
   const lines = entries.map(o => `- ${clean(o.outcome)}: ${clean(o.note || o.outcome).slice(0, 200)}`).join('\n');
-  return `**fix-run: codex repair unproductive on ${String(head).slice(0, 9)}**\n\n\`\`\`text\n${lines}\n\`\`\`\n\nThe next repair falls back to Claude.`;
+  return `**fix-run: codex repair unproductive on ${String(head).slice(0, 9)}**\n\n\`\`\`text\n${lines}\n\`\`\`\n\nThe next repair moves up the fixer chain.`;
 }
 
 function withMessageFile(message, action) {
@@ -430,29 +432,35 @@ export async function readCiHealInputs({ repo, pr, run = sh, readLog = readCiJob
     ...(repo ? ['--repo', repo] : [])]) || '{}');
   const checks = collapseRollupToLatestPerName(data.statusCheckRollup)
     .filter(check => ['FAILURE', 'TIMED_OUT', 'STARTUP_FAILURE'].includes(String(check?.conclusion ?? '').toUpperCase()));
-  const jobs = [];
+  const jobs = [], gaps = [];
+  const linked = checks.filter(check => /\/job\/(\d+)/.test(check.detailsUrl ?? ''));
+  if (linked.length > 4) gaps.push('jobs-omitted');
+  if (linked.length < checks.length) gaps.push('job-url-missing');
   let slug = repo;
-  for (const check of checks.filter(check => /\/job\/(\d+)/.test(check.detailsUrl ?? '')).slice(0, 4)) {
+  for (const check of linked.slice(0, 4)) {
     const id = /\/job\/(\d+)/.exec(check.detailsUrl)[1];
     let log = '';
     let filtered = false;
     try {
       if (!slug) slug = String(await run('gh', ['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'])).trim();
       const result = await readLog({ repo: slug, jobId: id, exec: run, opts: { maxBuffer: BLOB_MAX_BYTES } });
-      if (result.ok) {
+      if (result?.ok && typeof result.text === 'string') {
         // Extract diagnostics from the whole log before staging drops older cleanup context.
         // The renderer reapplies the same helper at its smaller prompt budget.
-        log = boundedCiLogTail(cleanCiLog(result.text));
+        const clean = cleanCiLog(result.text);
+        log = boundedCiLogTail(clean);
+        if (log !== clean || result.truncated === true) gaps.push('log-truncated');
         filtered = result.filtered === true;
-      }
-    } catch { /* one inaccessible job must not refuse the repair */ }
+      } else gaps.push('log-unreadable');
+    } catch { gaps.push('log-unreadable'); }
     jobs.push({ name: check.name, detailsUrl: check.detailsUrl, log, filtered });
   }
-  return { title: data.title, body: data.body, checks, jobs };
+  const inputs = { title: data.title, body: data.body, checks, jobs };
+  return { ...inputs, gaps: [...new Set([...gaps, ...ciHealContextGaps(inputs)])] };
 }
 
 /** PURE. Render bounded CI evidence, without a review finding, for card 5947 (live #5045, 2026-10-13). */
-export function renderCiHealContext(inputs) {
+function ciHealContext(inputs) {
   const files = new Set(), errors = new Set();
   const jobs = (inputs.jobs ?? []).map(job => {
     const lines = cleanCiLog(job.log).split('\n');
@@ -464,15 +472,28 @@ export function renderCiHealContext(inputs) {
     }
     return { ...job, lines, hasTests: sawTest };
   }).sort((a, b) => Number(b.hasTests) - Number(a.hasTests));
-  return cap([
+  return [
     '## CI FAILURE CONTEXT (fetched by the launcher)',
     'Diagnose the failing checks using attributable evidence. Unfiltered logs may contain passing-step fixtures; their rows are context only. The sandbox has no network: do not run gh; the launcher pushes after you exit.',
     `Title: ${String(inputs.title ?? '')}`, '', 'PR body:', cap(inputs.body, 4000),
     '', '### Failing checks', ...(inputs.checks ?? []).map(check => `- ${check.name}: ${check.detailsUrl ?? ''}`),
     '', '### Failing tests', ...(jobs.some(job => job.filtered !== true) ? ['unknown (unfiltered log)'] : []), ...[...files].map(file => `- ${file}`), ...errors,
     '', '### Failed log', FENCED_DATA_RULE, ...jobs.map(job => `${job.name} (${job.filtered === true ? 'failed-step evidence' : 'unfiltered context only'})\n${fenceUntrusted('material', boundedCiLogTail(job.lines.join('\n'), { maxLines: 120, maxBytes: 2000 }))}`), '', '---', '',
-  ].join('\n'), 16000);
+  ].join('\n');
 }
+
+/** PURE. Launcher-owned loss signals use the same transformations as the renderer. */
+export function ciHealContextGaps(inputs) {
+  const gaps = [];
+  for (const job of inputs.jobs ?? []) {
+    const clean = cleanCiLog(job.log);
+    if (boundedCiLogTail(clean, { maxLines: 120, maxBytes: 2000 }) !== clean) gaps.push('log-truncated');
+  }
+  if (ciHealContext(inputs).length > 16000 || String(inputs.body ?? '').length > 4000) gaps.push('context-truncated');
+  return [...new Set(gaps)];
+}
+
+export function renderCiHealContext(inputs) { return cap(ciHealContext(inputs), 16000); }
 
 /** Lane path = last non-empty stdout line of `lane-pool acquire` (it prints the path last). */
 export function parseAcquiredLanePath(stdout) {
@@ -660,6 +681,7 @@ export async function runFixCli(argv = [], {
   sleep = delay,
   clock = Date.now,
   appendLoopRow = appendFixLoopRow,
+  readLoopRows = readFixLoopRows,
   releaseClaim = releaseBorrowedClaim,
   recordOutcome = recordBorrowOutcome,
   recordRouted = recordRoutedOutcome,
@@ -691,30 +713,47 @@ export async function runFixCli(argv = [], {
   let abortMerge = null;
   let outcome = FIX_RUN_OUTCOME.FAILED;
   let reason = 'launch did not complete';
+  let agentPhase = 'before', inputGaps = [], cause = 'launcher';
+  let recoveringPending = false, failureStage = null;
   const settle = async () => {
     if (!launch?.pr) return;
     const repo = launch.claimRepo ?? 'we';
     reason = singleLine(reason);
     try { recordOutcome({ repo, pr: Number(launch.pr), outcome, reason }); } catch (e) { writeErr(`fix-run: could not record the outcome: ${String(e?.message ?? e)}\n`); }
     const head = before ?? prHeadSha;
+    if (!['model', 'input', 'launcher', 'infra', 'unknown'].includes(cause)) cause = 'unknown';
     if (launch.provider !== 'claude' && head) {
       try {
         const id = { repo, pr: Number(launch.pr), head };
         // `reason` (may carry raw command errors) stays in the local ledger; only `note` (the agent's final message
         // or the launcher's own error) is ever posted to the PR.
-        const table = recordRouted({ ...id, outcome, reason, note: finalMessage });
-        if (consecutiveUnproductiveOnHead(table, id) === ROUTED_CODEX_MAX_UNPRODUCTIVE) {
-          withMessageFile(escalationComment(head, table[`${repo}#${launch.pr}`].slice(-ROUTED_CODEX_MAX_UNPRODUCTIVE)), file =>
+        const table = recordRouted({ ...id, outcome, cause, reason, note: finalMessage });
+        const entries = table[`${repo}#${launch.pr}`] ?? [];
+        if (cause === 'model' && consecutiveUnproductiveOnHead(table, id) === ROUTED_CODEX_MAX_UNPRODUCTIVE
+            && consecutiveUnproductiveOnHead({ [`${repo}#${launch.pr}`]: entries.slice(0, -1) }, id) === ROUTED_CODEX_MAX_UNPRODUCTIVE - 1) {
+          withMessageFile(escalationComment(head, entries.filter(row => row.head === head && routedOutcomeCause(row) === 'model').slice(-ROUTED_CODEX_MAX_UNPRODUCTIVE)), file =>
             run('gh', ['pr', 'comment', launch.pr, ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot }));
         }
       } catch (e) { writeErr(`fix-run: could not record routed outcome / post escalation: ${String(e?.message ?? e)}\n`); }
     }
+    if (head && cause === 'unknown') {
+      try {
+        const parked = readLoopRows().some(row => row.kind === 'park' && row.repo === repo
+          && row.pr === Number(launch.pr) && row.head === head);
+        if (!parked) {
+          const body = buildStandDownComment({ reason: 'fix-cause-unknown', head });
+          withMessageFile(body, file => run('gh', ['pr', 'comment', launch.pr,
+            ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot }));
+          await appendLoopRow({ kind: 'park', repo, pr: Number(launch.pr), head, reason: 'fix-cause-unknown' });
+        }
+      } catch (e) { writeErr(`fix-run: unknown-cause park incomplete; operator intervention required: ${singleLine(e?.message ?? e)}\n`); }
+    }
     if (head) {
       try {
         await appendLoopRow({ kind: 'outcome', repo, pr: Number(launch.pr), head, session: launch.sessionSlug,
-          // The fix-loop ledger only accepts pushed|no-change|failed rows; a lease loss is a failed, non-infra row.
+          // The fix-loop ledger represents a lease loss as a failed infrastructure row.
           outcome: outcome === FIX_RUN_OUTCOME.LEASE_LOST ? FIX_RUN_OUTCOME.FAILED : outcome,
-          infra: isInfraFixRunOutcome(outcome, reason), reason });
+          infra: cause === 'infra' || isInfraFixRunOutcome(outcome, reason), reason });
       } catch (e) { writeErr(`fix-run: could not record fix-loop outcome: ${String(e?.message ?? e)}\n`); }
     }
     try {
@@ -756,6 +795,7 @@ export async function runFixCli(argv = [], {
     let repeatPlan = { action: 'patch' };
     if (launch.repairKind === 'ci-heal') {
       const inputs = await readCiHeal({ repo: launch.repo, pr, run: (cmd, args, opts) => run(cmd, args, { cwd: weRoot, ...opts }) });
+      inputGaps = [...(inputs.gaps ?? []), ...ciHealContextGaps(inputs)];
       if (!inputs.checks?.length) throw new LauncherError(`no-ci-failure: PR #${pr} has no failing check to heal`);
       prContext = renderCiHealContext(inputs);
     } else {
@@ -769,6 +809,9 @@ export async function runFixCli(argv = [], {
         withMessageFile(body, file => run('gh', ['pr', 'comment', pr, ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot }));
         throw new LauncherError('repeated finding: operator scope-baseline required');
       }
+      const latestFinding = comments.filter(c => CHANGES_COMMENT_RE.test(String(c?.body ?? '')))
+        .sort((a, b) => String(a.createdAt ?? '').localeCompare(String(b.createdAt ?? ''))).at(-1);
+      if (String(latestFinding?.body ?? '').length > 12000) inputGaps.push('findings-truncated');
       prContext = target && !comments.some(c => CHANGES_COMMENT_RE.test(c.body ?? ''))
         ? `## PR CONTEXT (fetched by the launcher)\nTitle: ${prHead.title ?? ''}\n${prHead.body ?? ''}\n\n`
         : renderPrContext({ ...prHead, comments });
@@ -843,10 +886,14 @@ export async function runFixCli(argv = [], {
     before = checkLane(prHeadSha).laneHead;
     const rearmReview = () => {
       try {
-        return run('node', [resolve(weRoot, 'scripts', 'conveyor', 'rearm-review.mjs'), pr, ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot });
+        failureStage = 'rearm';
+        const result = run('node', [resolve(weRoot, 'scripts', 'conveyor', 'rearm-review.mjs'), pr, ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot });
+        failureStage = null;
+        return result;
       } catch (e) {
         const policy = resolveRearmRefusalPolicy();
         if (policy.mode === 'noop' && isNothingToRearmRefusal(e)) {
+          failureStage = null;
           write(`fix-run: PR #${pr} re-arm skipped — nothing to re-arm (review label not changes/accepted); policy fixRearmNothingToRearm=noop (source ${policy.source})\n`);
           return;
         }
@@ -867,6 +914,8 @@ export async function runFixCli(argv = [], {
       comments: await readComments(pr, { repo: launch.repo }), headRefOid: prHeadSha,
     }).length);
     if (recoverPending) {
+      recoveringPending = true;
+      cause = 'launcher';
       if (pendingEvidence) rearmReview();
       else rearm(before);
       pendingRearm.clear(launch.repo, pr);
@@ -905,16 +954,16 @@ export async function runFixCli(argv = [], {
           else if (e.missing) removed.push(path);
           // Capped as each file is read, never after: sparse files (`truncate -s 64M f{1..1000}`) cost the agent no disk but
           // would each cost us a zero-filled buffer, so at most STAGE_MAX_BYTES plus the one file just read is ever held.
-          else if ((total += e.data.length) > STAGE_MAX_BYTES) throw new LauncherError(`refusing to stage over ${STAGE_MAX_BYTES} bytes of agent-written files`);
+          else if ((total += e.data.length) > STAGE_MAX_BYTES) throw new LauncherError(`refusing to stage over ${STAGE_MAX_BYTES} bytes of agent-written files`, { cause: 'model' });
           else (e.mode === '120000' ? links : files).push([path, dest, e]);
         }
-        if (refused.length) throw new LauncherError(`refusing to stage ${refused.slice(0, 5).join(', ')}: a hardlinked, non-regular, out-of-lane or over-${BLOB_MAX_BYTES}-byte file`);
+        if (refused.length) throw new LauncherError(`refusing to stage ${refused.slice(0, 5).join(', ')}: a hardlinked, non-regular, out-of-lane or over-${BLOB_MAX_BYTES}-byte file`, { cause: 'model' });
         // Regular files first, symlinks last, and every parent checked by realpath: a copy written through a symlink it
         // created itself (`X -> /elsewhere` then `x/y`, one entry on a case-insensitive filesystem) would write outside it.
         for (const [path, dest, e] of [...files, ...links]) {
           mkdirSync(dirname(dest), { recursive: true });
           const parent = realpathSync(dirname(dest));
-          if (parent !== copy && !parent.startsWith(copy + sep)) throw new LauncherError(`refusing to stage ${path}: its staging copy leaves the copy directory`);
+          if (parent !== copy && !parent.startsWith(copy + sep)) throw new LauncherError(`refusing to stage ${path}: its staging copy leaves the copy directory`, { cause: 'model' });
           if (e.mode === '120000') symlinkSync(e.data, dest);
           else writeFileSync(dest, e.data, { mode: e.mode === '100755' ? 0o755 : 0o644, flag: 'wx' });
         }
@@ -1104,6 +1153,7 @@ export async function runFixCli(argv = [], {
           try { item = launch.item ? await loadFixItem(launch.item) : {}; } catch { item = null; }
           admission = item && deriveAgyFixAdmission(item, { ...launch, repo: launch.claimRepo ?? 'we' });
         }
+        agentPhase = 'started';
         spawned = await provider.spawn({
           ...admission,
           taskKind: launch.taskKind, usageTaskKind: launch.repairKind === 'ci-heal' ? 'ci-heal' : launch.taskKind, repo: launch.repo, pr, caller: 'fix-run.mjs',
@@ -1122,6 +1172,7 @@ export async function runFixCli(argv = [], {
             } catch (e) { finalMessage = agentFinalMessage(e); throw e; }
           },
         } : {}) });
+        agentPhase = 'returned';
       } finally {
         clearInterval(heartbeat);
       }
@@ -1129,10 +1180,11 @@ export async function runFixCli(argv = [], {
       finalMessage = agentFinalMessage(e) || finalMessage;
       throw e;
     }
+    cause = inputGaps.length ? 'input' : agentPhase === 'returned' ? 'model' : 'launcher';
     finalMessage = agentFinalMessage(spawned) || finalMessage;
     assertLaneLease({ lanePath, holder, readLease, phase: 'push or stage files' });
     const configAfterAgent = laneConfig();
-    if (configAfterAgent !== configBefore || riskyLaneConfig(configAfterAgent).length) throw new LauncherError('lane git config changed while the agent ran; refusing to push');
+    if (configAfterAgent !== configBefore || riskyLaneConfig(configAfterAgent).length) throw new LauncherError('lane git config changed while the agent ran; refusing to push', { cause: 'model' });
     const statusAfterAgent = git('status', '--porcelain=v1', '-z', '--untracked-files=all');
     const paths = changedPaths(statusAfterAgent);
     if (inMerge()) {
@@ -1148,7 +1200,7 @@ export async function runFixCli(argv = [], {
       });
       const refuse = (paths) => {
         abortMerge();
-        throw new LauncherError(`conflict unresolved in ${paths.join(', ')}: ${finalMessage || 'agent committed nothing'}`);
+        throw new LauncherError(`conflict unresolved in ${paths.join(', ')}: ${finalMessage || 'agent committed nothing'}`, { cause: 'model' });
       };
       if (unresolved.length) refuse(unresolved);
       const stage = [...new Set([...unmerged.filter(path => isStageable(path)), ...unstagedPaths(statusAfterAgent)])]
@@ -1242,12 +1294,14 @@ export async function runFixCli(argv = [], {
       // risky, and run the push with the code-running keys pinned inert (env, so no gap after the check) and no hooks.
       const configAfter = laneConfig();
       if (configAfter !== configBefore || riskyLaneConfig(configAfter).length) {
-        throw new LauncherError('lane git config changed while the agent ran; refusing to push');
+        throw new LauncherError('lane git config changed while the agent ran; refusing to push', { cause: 'model' });
       }
       // Record the owed re-arm BEFORE the push (best effort): a crash anywhere after the push must not lose it.
       try { pendingRearm.write(launch.repo, pr, after); } catch (e) { writeErr(`fix-run: could not record the pending re-arm: ${String(e?.message ?? e)}\n`); }
       assertLaneLease({ lanePath, holder, readLease, phase: 'push' });
+      failureStage = 'push';
       run('git', [...HARDENED_GIT_ARGS, 'push', '--no-verify', 'origin', `HEAD:refs/heads/${ref}`], { cwd: lanePath, env: gitEnv }); // never --force
+      failureStage = null;
       await postEvidence(after);
       rearm(after);
       pendingRearm.clear(launch.repo, pr);
@@ -1259,6 +1313,12 @@ export async function runFixCli(argv = [], {
   } catch (e) {
     writeErr(`fix-run: PR #${pr} FAILED: ${String(e?.message ?? e)}\n`);
     outcome = e instanceof LeaseLostError ? FIX_RUN_OUTCOME.LEASE_LOST : FIX_RUN_OUTCOME.FAILED;
+    // Orchestrator ruling: input faults outrank throw-site causes and model results.
+    cause = recoveringPending ? 'launcher' : e instanceof LeaseLostError ? 'infra'
+      : inputGaps.length ? 'input' : e instanceof LauncherError ? e.cause
+      : agentPhase === 'before' ? 'infra'
+      : agentPhase === 'started' ? (finalMessage ? 'model' : isInfraFixRunOutcome('failed', childFailureReason(e)) ? 'infra' : 'unknown')
+      : ['push', 'rearm'].includes(failureStage) ? 'infra' : 'unknown';
     reason = `${childFailureReason(e)}${finalMessage && !String(e?.message).includes(finalMessage) ? `: ${finalMessage}` : ''}`;
     if (e instanceof LeaseLostError) reason = `lease-lost: ${reason.replace(/^fix-run:\s*/, '')}`;
     if (!finalMessage && e instanceof LauncherError) {

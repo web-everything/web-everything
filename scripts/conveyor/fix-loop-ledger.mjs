@@ -6,6 +6,7 @@ import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { execRead } from '../lib/proc-read.mjs';
 import { computeMainRedWindows, isWithinRedWindow, isMainCurrentlyRed } from './main-red-recovery.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
+import { FIX_RUN_INFRA_PATTERNS } from '../lib/fix-run-infra-patterns.mjs';
 
 export const FIX_HOLD_LABEL = 'hold:fix';
 export const fixLoopLedgerPath = (env = process.env) => env.WE_FIX_LOOP_LEDGER || join(homedir(), '.claude', 'conveyor', 'fix-loop-ledger.jsonl');
@@ -114,13 +115,7 @@ export function fixLoopState({ rows, repo, pr, head, now = Date.now(), config = 
     since: matches[0]?.at ?? null, sessions: matches.map(row => row.session).filter(session => typeof session === 'string') };
 }
 
-/** PRs #4992/#4993/#4965, 2026-10-12: failures before an agent runs are infrastructure, never repair evidence.
- * Card 5947 (live #5045, 2026-10-13) also classifies an absent CI failure. */
-export const FIX_RUN_INFRA_PATTERNS = Object.freeze([
-  /^no-finding:/i, /^no-ci-failure:/i, /^fix-run:/i, /^error:/i, /missing required flag/i, /has no fix launcher/i,
-  /launch did not complete/i, /lane-pool/i, /Operation not permitted/i, /EPERM/i, /EACCES/i,
-  /read-only file system/i, /index\.lock/i, /\.git\b/i, /sandbox/i, /could not (commit|push|stage)/i,
-]);
+export { FIX_RUN_INFRA_PATTERNS };
 /** Shared with the launcher: every emitted terminal must participate in session-log alignment. */
 export const FIX_RUN_OUTCOME = Object.freeze({
   FAILED: 'failed', NO_CHANGE: 'no-change', NO_CHANGE_UNPROVEN: 'no-change-unproven', PUSHED: 'pushed', LEASE_LOST: 'lease-lost',
@@ -143,7 +138,7 @@ export function infraFailureCount({ logText, pr, sessions }) {
 }
 /** Control rows persist across the counting window: each head gets only one Claude re-arm.
  * Card 5947 (live #5045, 2026-10-13): ledger outcomes join caller evidence; aggregate-only callers discount the newest rows. */
-export function fixLoopDisposition({ rows, repo, pr, head, now = Date.now(), config = fixLoopConfig(), infraFailures = 0, build, infraRows = null }) {
+export function fixLoopDisposition({ rows, repo, pr, head, now = Date.now(), config = fixLoopConfig(), infraFailures = 0, build, infraRows = null, modelCount = 0 }) {
   if (!config.hold) return { action: 'dispatch' };
   const identity = row => row.repo === repo && row.pr === pr && row.head === head;
   const observed = (rows ?? []).filter(row => validRow(row) && identity(row) && Date.parse(row.at) <= new Date(now).getTime());
@@ -176,7 +171,7 @@ export function fixLoopDisposition({ rows, repo, pr, head, now = Date.now(), con
     return { action: 'hold', until };
   }
   if (!state.held) {
-    if (rawCount >= config.maxSessions + 1) return { action: 'rearm', reason: 'final attempt before raw per-head session ceiling' };
+    if (rawCount >= config.maxSessions + 1) return { action: 'rearm', reason: 'final attempt before raw per-head session ceiling', strongerModel: modelCount >= 2 };
     return { action: 'dispatch' };
   }
   if (build && counted.some(row => row.build !== build)) return { action: 'rearm', reason: 'fixer build-change' };

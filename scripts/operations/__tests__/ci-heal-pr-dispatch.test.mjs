@@ -1328,12 +1328,31 @@ describe('CI-heal salvage before agent dispatch', () => {
     } else expect(ledger.append).not.toHaveBeenCalled();
   });
 
-  it('discounts three infrastructure refusals and dispatches on Claude', async () => {
-    const ledger = loop({ readRows: rows, readSessionLog: () =>
-      Array(3).fill('fix-run: PR #3895 failed (no-finding: none); claim released').join('\n') });
+  it('two infra failures alone do not set strongerModel', async () => {
+    const ledger = loop({ readRows: () => rows().slice(0, 2), readSessionLog: () =>
+      Array(2).fill('fix-run: PR #3895 failed (no-finding: none); claim released').join('\n') });
     const { result, dispatch } = await exercise(() => null, { fixLoop: ledger });
     expect(result.dispatched).toHaveLength(1);
-    expect(dispatch.mock.calls[0][0].strongerModel).toBe(true);
+    expect(dispatch.mock.calls[0][0].strongerModel).toBeUndefined();
+  });
+  it.each(['unknown', 'invalid', 'ledger-unreadable', 'outcomes-unreadable'])('CI-heal refuses %s evidence instead of silently launching', async variant => {
+    const ledger = loop({ readRows: () => { if (variant === 'ledger-unreadable') throw Error('disk'); return []; },
+      readRouted: () => { if (variant === 'outcomes-unreadable') throw Error('disk');
+        return { 'we#3895': [{ head: entry.headRefOid, outcome: 'failed', cause: variant }] }; } });
+    const { result, dispatch } = await exercise(() => null, { fixLoop: ledger });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: variant.endsWith('unreadable') ? 'fix-loop-unreadable' : 'fix-cause-unknown' }));
+  });
+  it('raw ceiling does not promote the current or persisted launcher-only rearm', async () => {
+    const evidence = [...rows(), rows()[0]];
+    const ledger = loop({ readRows: () => evidence, readSessionLog: () =>
+      Array(4).fill('fix-run: PR #3895 failed (no-finding: none); claim released').join('\n') });
+    const { dispatch } = await exercise(() => null, { fixLoop: ledger });
+    expect(dispatch.mock.calls[0][0].strongerModel).toBeUndefined();
+    const rearm = ledger.append.mock.calls.find(([r]) => r.kind === 'rearm')[0];
+    evidence.push({ ...rearm, v: 1, at: new Date(Date.now() - 3 * 3600000).toISOString() });
+    const next = await exercise(() => null, { fixLoop: ledger });
+    expect(next.dispatch.mock.calls[0][0].strongerModel).toBeUndefined();
   });
   it.each(['truncated', 'older-head', 'older-window', 'extra-terminal'])('leaves %s terminal evidence unassigned', async variant => {
     const evidence = rows();

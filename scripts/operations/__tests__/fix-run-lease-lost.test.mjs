@@ -238,7 +238,7 @@ describe('fix-run lease loss after the agent', () => {
       outcome: 'lease-lost', reason: expect.stringMatching(/lease/i),
     }));
     expect.soft(f.appendLoopRow).toHaveBeenCalledWith(expect.objectContaining({
-      outcome: 'failed', infra: false, reason: expect.stringMatching(/^lease-lost:/),
+      outcome: 'failed', infra: true, reason: expect.stringMatching(/^lease-lost:/),
     }));
     expect.soft(output.map(classifyFixRunOutcome).filter(Boolean)).toEqual([
       expect.objectContaining({ pr: 5759, outcome: 'lease-lost', infra: false }),

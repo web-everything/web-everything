@@ -654,7 +654,7 @@ describe('routed codex wiring: repo and merge target reach the router and the la
     const now = Date.now();
     const stacks = detectStacks([bottom, top], { isAncestor: (x, y) => x === bottom.headRefOid && y === top.headRefOid, now: () => now });
     const readRouted = vi.fn(({ repo, pr }) => (repo === 'frontierui' && pr === top.pr
-      ? { 'frontierui#12': [{ head: top.headRefOid, outcome: 'no-change' }, { head: top.headRefOid, outcome: 'failed' }] } : {}));
+      ? { 'frontierui#12': [{ head: top.headRefOid, outcome: 'no-change' }, { head: top.headRefOid, outcome: 'failed', cause: 'model' }] } : {}));
     const fixExecutorRoute = vi.fn((planned) => routeFixExecutor(planned,
       { setting, fixSettings: { strongerModelFromRound: 3 }, loadLadder: () => null, launcherAvailable: true, readRouted }));
     runReconcileFixDispatch({ root: '/repo', repo: 'frontierui', checkStaleness: () => ({ stale: false }),
@@ -729,7 +729,7 @@ describe('fallback chain routing', () => {
     const decision = routeFixExecutor({ repo: 'we', pr: 42, itemNum: '7', headRefOid: head, scope: item.scope }, {
       setting, chain, criticalFor: () => false, launcherAvailable: fixLauncherAvailable,
       loadFixItems: () => [{ num: '7', ...item }],
-      readRouted: () => ({ 'we#42': Array.from({ length: 3 }, () => ({ head, outcome: 'failed' })) }),
+      readRouted: () => ({ 'we#42': Array.from({ length: 3 }, () => ({ head, outcome: 'failed', cause: 'model' })) }),
     });
     expect(decision.executor).toBe(executor);
     expect(decision).not.toHaveProperty('agyAdmission');
@@ -741,14 +741,14 @@ describe('fallback chain routing', () => {
       expect(routeFixExecutor({ repo: 'we', pr: 42, itemNum: '7', headRefOid: head, scope }, {
         setting, chain, criticalFor: () => false, launcherAvailable: fixLauncherAvailable,
         loadFixItems: () => [{ num: '7', taskKind: 'fix', size: 1, scope: [`we:${path}`] }],
-        readRouted: () => ({ 'we#42': Array.from({ length: 3 }, () => ({ head, outcome: 'failed' })) }),
+        readRouted: () => ({ 'we#42': Array.from({ length: 3 }, () => ({ head, outcome: 'failed', cause: 'model' })) }),
       }).executor).toBe('claude');
     }
   });
   it('skips Argon when the item read fails', () => {
     expect(routeFixExecutor({ pr: 42, itemNum: '7', headRefOid: 'aaa' }, { setting, chain,
       criticalFor: () => false, launcherAvailable: fixLauncherAvailable,
-      readRouted: () => ({ 'we#42': Array.from({ length: 3 }, () => ({ head: 'aaa', outcome: 'failed' })) }),
+      readRouted: () => ({ 'we#42': Array.from({ length: 3 }, () => ({ head: 'aaa', outcome: 'failed', cause: 'model' })) }),
       loadFixItems: () => { throw Error('unreadable'); } }).executor).toBe('claude');
   });
   it.each(['fix', 'ci-heal'])('round 3 %s with two unproductive runs still tries codex-alt', kind => {

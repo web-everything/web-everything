@@ -15,7 +15,7 @@ import { buildFixEndComment } from '../../conveyor/fix-procedure.mjs';
 import { resolveFixBorrowSettings } from '../../lib/dispatch-throttle.mjs';
 import { fixDetachedProvider, fixLauncherAvailable, FIX_RUN_SCRIPT, FIX_RUN_EXECUTORS, FIX_RUN_CONFINEMENT } from '../dispatch-providers/fix.mjs';
 import { resolveDeliveryAgentProvider } from '../deliver-item-wrapper.mjs';
-import { childFailureReason, resolveAcquireWaitPolicy, parseFixRunArgv, readCiHealInputs, renderCiHealContext, renderPrContext, runFixCli, SANDBOX_PREAMBLE, HARDENED_GIT_ARGS, defaultPendingRearm, removePromptFile, riskyLaneConfig, changedPaths, unstagedPaths, escalationComment, readLaneFileSafe, laneStageEntry, unmergedPaths, MAX_CONFLICTED_PATHS, BLOB_MAX_BYTES, STAGE_MAX_BYTES } from '../fix-run.mjs';
+import { LauncherError, LeaseLostError, childFailureReason, resolveAcquireWaitPolicy, parseFixRunArgv, readCiHealInputs, ciHealContextGaps, renderCiHealContext, renderPrContext, runFixCli, SANDBOX_PREAMBLE, HARDENED_GIT_ARGS, defaultPendingRearm, removePromptFile, riskyLaneConfig, changedPaths, unstagedPaths, escalationComment, readLaneFileSafe, laneStageEntry, unmergedPaths, MAX_CONFLICTED_PATHS, BLOB_MAX_BYTES, STAGE_MAX_BYTES } from '../fix-run.mjs';
 
 // x6nuodj — these tests pin the LEGACY gate's verdicts, so the shared decision only observes here (`shadow`); the
 // cut-over itself (admit() deciding) is covered in we:scripts/lib/__tests__/resource-gate.test.mjs.
@@ -114,8 +114,167 @@ describe('runFixCli', () => {
       write: vi.fn((_r, _p, sha) => { owed.sha = sha; }),
       clear: vi.fn(() => { owed.sha = null; }),
     };
-    return { calls, envs, run, spawn, owed, pendingRearm, io: { persistEvidence: () => {}, readLease: () => ({ holder: 'test-holder' }), recordPush: () => {}, run, pendingRearm, readComments: async () => [{ createdAt: '2026-01-01', body: '🔁 review — changes requested\nFIX THE THING' }], releaseClaim: async () => ({ released: [] }), recordOutcome: () => {}, recordRouted: () => ({}), appendLoopRow: () => {}, removePrompt: () => {}, readPrompt: () => 'BRIEF', resolveProvider: () => ({ spawn }), weRoot: '/we', write: () => {}, writeErr: () => {} } };
+    return { calls, envs, run, spawn, owed, pendingRearm, io: { readLoopRows: () => [], persistEvidence: () => {}, readLease: () => ({ holder: 'test-holder' }), recordPush: () => {}, run, pendingRearm, readComments: async () => [{ createdAt: '2026-01-01', body: '🔁 review — changes requested\nFIX THE THING' }], releaseClaim: async () => ({ released: [] }), recordOutcome: () => {}, recordRouted: () => ({}), appendLoopRow: () => {}, removePrompt: () => {}, readPrompt: () => 'BRIEF', resolveProvider: () => ({ spawn }), weRoot: '/we', write: () => {}, writeErr: () => {} } };
   };
+  const capture = (m, extra = {}) => {
+    const recordRouted = vi.fn(() => ({}));
+    return { ...m.io, recordRouted, ...extra };
+  };
+  it('a provider rejection with no final message and an infra error records infra', async () => {
+    const m = mk(['aaa']); m.spawn.mockRejectedValue(new Error('EPERM: spawn refused'));
+    const io = capture(m); await runFixCli(argv, io);
+    expect(io.recordRouted).toHaveBeenCalledWith(expect.objectContaining({ cause: 'infra' }));
+  });
+  it('a provider that returns nothing still counts as returned', async () => {
+    const m = mk(['aaa', 'aaa']), io = capture(m);
+    await runFixCli(argv, io);
+    expect(m.spawn).toHaveReturned();
+    expect(io.recordRouted).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'no-change', cause: 'model' }));
+  });
+  it('a post-agent config change records model', async () => {
+    const m = mk(['aaa', 'aaa']);
+    const io = capture(m, { run: (cmd, args, opts) => args.includes('--show-scope')
+      ? (m.spawn.mock.calls.length ? 'local\0user.name\nchanged\0' : '') : m.run(cmd, args, opts) });
+    expect((await runFixCli(argv, io)).code).toBe(1);
+    expect(io.recordRouted).toHaveBeenCalledWith(expect.objectContaining({ cause: 'model' }));
+  });
+  it('recoverPending records launcher', async () => {
+    const m = mk(['aaa', 'aaa']); m.owed.sha = 'aaa';
+    const io = capture(m); await runFixCli(argv, io);
+    expect(m.spawn).not.toHaveBeenCalled();
+    expect(io.recordRouted).toHaveBeenCalledWith(expect.objectContaining({ cause: 'launcher', outcome: 'pushed' }));
+  });
+  it('lease loss records infra', async () => {
+    const m = mk(['aaa', 'aaa']);
+    const io = capture(m, { readLease: () => ({ holder: m.spawn.mock.calls.length ? 'other' : 'test-holder' }) });
+    expect((await runFixCli(argv, io)).code).toBe(1);
+    expect(io.recordRouted).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'lease-lost', cause: 'infra' }));
+  });
+  it('CI-heal gaps (omitted jobs, unreadable log, truncated log) record input over no-change', async () => {
+    for (const variant of ['omitted', 'no-url', 'unreadable', 'throws', 'fetch-cut', 'renderer-cut', 'transport-cut']) {
+      const m = mk(['aaa', 'aaa']);
+      const checks = Array.from({ length: variant === 'omitted' ? 5 : 1 }, (_, i) => ({ name: `job${i}`,
+        conclusion: 'FAILURE', detailsUrl: variant === 'no-url' ? '' : `https://github.com/o/r/job/${i + 1}` }));
+      const inputs = await readCiHealInputs({ repo: 'o/r', pr: 7, run: () => JSON.stringify({ statusCheckRollup: checks }),
+        readLog: () => {
+          if (variant === 'throws') throw new Error('log failed');
+          return variant === 'unreadable' ? { ok: false } : { ok: true, truncated: variant === 'transport-cut',
+            text: 'x'.repeat(variant === 'fetch-cut' ? 17000 : variant === 'renderer-cut' ? 2100 : 1) };
+        } });
+      expect([...inputs.gaps, ...ciHealContextGaps(inputs)].length).toBeGreaterThan(0);
+      const io = capture(m, { readCiHeal: () => inputs });
+      await runFixCli([...argv, '--repair-kind=ci-heal'], io);
+      expect(io.recordRouted).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'no-change', cause: 'input' }));
+    }
+  });
+  it('an agent-written fake truncation marker with complete inputs records model', async () => {
+    const m = mk(['aaa', 'aaa']); m.spawn.mockResolvedValue({ finalMessage: '[... truncated ...] context-truncated findings-truncated' });
+    const io = capture(m, { readCiHeal: () => ({ checks: [{ name: 'unit' }], jobs: [{ log: 'complete' }], gaps: [] }) });
+    await runFixCli([...argv, '--repair-kind=ci-heal'], io);
+    expect(io.recordRouted).toHaveBeenCalledWith(expect.objectContaining({ cause: 'model' }));
+  });
+  it('fix findings over 12000 chars record input', async () => {
+    const m = mk(['aaa', 'aaa']);
+    const io = capture(m, { readComments: async () => [{ body: 'changes requested ' + 'x'.repeat(12000) }] });
+    await runFixCli(argv, io);
+    expect(io.recordRouted).toHaveBeenCalledWith(expect.objectContaining({ cause: 'input' }));
+  });
+  it('aggregate CI context over 16000 chars records input', async () => {
+    const m = mk(['aaa', 'aaa']);
+    const inputs = { checks: Array.from({ length: 100 }, (_, i) => ({ name: `${i}${'x'.repeat(180)}` })), jobs: [], gaps: [] };
+    expect(ciHealContextGaps(inputs)).toContain('context-truncated');
+    const io = capture(m, { readCiHeal: () => inputs });
+    await runFixCli([...argv, '--repair-kind=ci-heal'], io);
+    expect(io.recordRouted).toHaveBeenCalledWith(expect.objectContaining({ cause: 'input' }));
+  });
+  it.each(['model', 'launcher'])('input gaps outrank a %s throw-site cause', async cause => {
+    const m = mk(['aaa']); m.spawn.mockRejectedValue(new LauncherError('refusal', { cause }));
+    const io = capture(m, { readCiHeal: () => ({ checks: [{ name: 'unit' }], gaps: ['jobs-omitted'] }) });
+    await runFixCli([...argv, '--repair-kind=ci-heal'], io);
+    expect(io.recordRouted).toHaveBeenCalledWith(expect.objectContaining({ cause: 'input' }));
+  });
+  it('lease loss outranks input gaps and a pending recovery outranks lease loss', async () => {
+    for (const recovery of [false, true]) {
+      const m = mk(['aaa']); if (recovery) m.owed.sha = 'aaa';
+      if (!recovery) m.spawn.mockRejectedValue(new LeaseLostError('lease gone'));
+      const io = capture(m, { readCiHeal: () => ({ checks: [{ name: 'unit' }], gaps: ['jobs-omitted'] }),
+        run: (cmd, args, opts) => { if (args.some(a => String(a).endsWith('rearm-review.mjs'))) throw new LeaseLostError('lease gone');
+          return m.run(cmd, args, opts); } });
+      expect((await runFixCli([...argv, '--repair-kind=ci-heal'], io)).code).toBe(1);
+      expect(io.recordRouted).toHaveBeenCalledWith(expect.objectContaining({ cause: recovery ? 'launcher' : 'infra' }));
+    }
+  });
+  it.each(['push', 'rearm'])('a post-agent %s error records infra', async failure => {
+    const m = mk(['aaa', 'bbb']);
+    const io = capture(m, { run: (cmd, args, opts) => {
+      if ((failure === 'push' && args.includes('push')) || (failure === 'rearm' && args.some(a => String(a).endsWith('rearm-review.mjs')))) throw new Error('transport failed');
+      return m.run(cmd, args, opts);
+    } });
+    expect((await runFixCli(argv, io)).code).toBe(1);
+    expect(io.recordRouted).toHaveBeenCalledWith(expect.objectContaining({ cause: 'infra' }));
+  });
+  it('an error after successful push and rearm remains unknown rather than inheriting infra', async () => {
+    const m = mk(['aaa', 'bbb']);
+    m.pendingRearm.clear.mockImplementation(() => { throw new Error('unclassified cleanup failure'); });
+    const io = capture(m);
+    expect((await runFixCli(argv, io)).code).toBe(1);
+    expect(m.calls.some(args => args.includes('push'))).toBe(true);
+    expect(m.calls.some(args => args.some(arg => String(arg).endsWith('rearm-review.mjs')))).toBe(true);
+    expect(io.recordRouted).toHaveBeenCalledWith(expect.objectContaining({ cause: 'unknown' }));
+  });
+  it.each(['comment', 'park', 'read'])('unknown %s failure remains visible and records unhandled cause', async failure => {
+    const m = mk(['a'.repeat(40)]), recordRouted = vi.fn(() => ({})), writeErr = vi.fn(), rows = [], order = [];
+    m.spawn.mockRejectedValue(new Error('unclassified worker error'));
+    const io = { ...m.io, recordRouted, writeErr,
+      readLoopRows: () => { if (failure === 'read') throw Error('disk'); return []; },
+      appendLoopRow: row => { if (row.kind === 'park') { order.push('park'); if (failure === 'park') throw Error('disk'); } rows.push(row); },
+      run: (cmd, args, opts) => { if (args.includes('comment')) { order.push('comment'); if (failure === 'comment') throw Error('posting failed'); return ''; }
+        return m.run(cmd, args, opts); } };
+    expect((await runFixCli(argv, io)).code).toBe(1);
+    expect(recordRouted).toHaveBeenCalledWith(expect.objectContaining({ cause: 'unknown' }));
+    expect(writeErr.mock.calls.flat().join('')).toContain('unknown-cause park incomplete; operator intervention required');
+    expect(rows.some(row => row.kind === 'park')).toBe(false);
+    expect(order).toEqual(failure === 'read' ? [] : failure === 'comment' ? ['comment'] : ['comment', 'park']);
+  });
+  it('unknown parks once per head and survives restart without re-posting', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'unknown-park-'));
+    const env = { WE_FIX_LOOP_LEDGER: join(dir, 'ledger.jsonl') }, head = 'a'.repeat(40), store = ledger();
+    const { readFixLoopRows, appendFixLoopRow } = await import('../../conveyor/fix-loop-ledger.mjs');
+    let comments = 0;
+    try {
+      for (let i = 0; i < 2; i++) {
+        const m = mk([head]); m.spawn.mockRejectedValue(new Error('unclassified worker error'));
+        const io = capture(m, { readLoopRows: () => readFixLoopRows({ env }),
+          appendLoopRow: row => appendFixLoopRow(row, { env }),
+          recordRouted: row => recordRoutedOutcome({ ...row, store, readClaim: () => null }),
+          run: (cmd, args, opts) => { if (args.includes('comment')) {
+            comments++; expect(readFileSync(args.at(-1), 'utf8')).toContain('reason=fix-cause-unknown'); return '';
+          } return m.run(cmd, args, opts); } });
+        expect((await runFixCli(argv, io)).code).toBe(1);
+      }
+      expect(comments).toBe(1);
+      expect(readFixLoopRows({ env }).filter(row => row.kind === 'park')).toHaveLength(1);
+      expect(store.read()['we#7'].every(row => row.cause === 'unknown' && row.handling === 'unhandled')).toBe(true);
+      expect(consecutiveUnproductiveOnHead(store.read(), { repo: 'we', pr: 7, head })).toBe(0);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('the comment posts only on the transition to 2, using model evidence', async () => {
+    const store = ledger(), comments = [];
+    for (const cause of ['model', 'input', 'model', 'infra', 'launcher', 'model']) {
+      const m = mk(['aaa', 'aaa']);
+      if (cause === 'infra') m.spawn.mockRejectedValue(new Error('EPERM'));
+      if (cause === 'launcher') m.io.readComments = async () => [];
+      if (cause === 'model') m.spawn.mockResolvedValue({ finalMessage: 'MODEL EVIDENCE' });
+      await runFixCli(argv, { ...m.io,
+        ...(cause === 'input' ? { readComments: async () => [{ body: 'changes requested ' + 'x'.repeat(12000) }] } : {}),
+        recordRouted: entry => recordRoutedOutcome({ ...entry, store, readClaim: () => null }),
+        run: (cmd, args, opts) => { if (args.includes('comment')) { comments.push(readFileSync(args.at(-1), 'utf8')); return ''; }
+          return m.run(cmd, args, opts); } });
+    }
+    expect(comments).toHaveLength(1);
+    expect(comments[0].match(/MODEL EVIDENCE/g)).toHaveLength(2);
+    expect(comments[0]).toContain('The next repair moves up the fixer chain.');
+  });
   it.each([false, true])('pushAfterCi=%s waits with injected time and folds failures before the agent', async enabled => {
     const m = mk(['a'.repeat(40), 'b'.repeat(40)]);
     let now = 1000;
@@ -558,7 +717,7 @@ describe('runFixCli', () => {
       policyRoute: { provider: 'antigravity' } }, { spawnDetached, logPathFor: () => '/unused', readDeliveryAgentMarker: () => null });
     const store = ledger();
     // Argon follows three unproductive runs on this head.
-    for (let i = 0; i < 3; i++) recordRoutedOutcome({ pr: 7, head: 'aaa', outcome: 'failed', store, readClaim: () => null });
+    for (let i = 0; i < 3; i++) recordRoutedOutcome({ pr: 7, head: 'aaa', outcome: 'failed', cause: 'model', store, readClaim: () => null });
     const out = await runFixCli(spawnDetached.mock.calls[0][0].slice(1), { ...m.io,
       loadFixItem: async () => ({ taskKind, size, scope }),
       resolveProvider: () => ({ spawn: (request, io) => provider.spawn(request, { ...io, runTask }) }),
@@ -568,7 +727,7 @@ describe('runFixCli', () => {
     if (admitted) expect(runTask).toHaveBeenCalledWith(expect.objectContaining({ kind: taskKind, size: 1, scope: ['docs'] }));
     else {
       expect(runTask).not.toHaveBeenCalled();
-      expect(consecutiveUnproductiveOnHead(store.read(), { repo: 'we', pr: 7, head: 'aaa' })).toBe(4);
+      expect(consecutiveUnproductiveOnHead(store.read(), { repo: 'we', pr: 7, head: 'aaa' })).toBe(3);
       expect(chooseFixExecutor({ setting: { value: 'codex-first' }, chain: { value: ['codex', 'codex-alt', 'argon', 'claude'] },
         codexUnproductive: 4, launcherAvailable: () => true }).executor).toBe('claude');
     }
@@ -620,7 +779,7 @@ describe('runFixCli', () => {
     expect(m.calls.some(c => c.includes('acquire'))).toBe(false);
     expect(writeErr.mock.calls.flat().join('')).toContain(reason);
   });
-  it('two pre-lane CI refusals make the next routed repair choose Claude', async () => {
+  it('two pre-lane CI refusals leave the next routed repair on codex', async () => {
     const m = mk([]), head = 'a'.repeat(40), store = ledger(), rows = [];
     const run = (cmd, args, opts) => cmd === 'gh' ? JSON.stringify({ headRefOid: head }) : m.run(cmd, args, opts);
     const io = { recordPush: () => {}, ...m.io, run, readCiHeal: () => ({ checks: [] }), appendLoopRow: row => rows.push(row),
@@ -631,7 +790,7 @@ describe('runFixCli', () => {
     await runFixCli([...argv, '--repair-kind=ci-heal'], io);
     expect(routed().executor).toBe('codex');
     await runFixCli([...argv, '--repair-kind=ci-heal'], io);
-    expect(routed().executor).toBe('claude');
+    expect(routed().executor).toBe('codex');
     expect(rows).toHaveLength(2);
     expect(rows.every(row => row.infra && row.head === head)).toBe(true);
     expect(m.spawn).not.toHaveBeenCalled();
@@ -1850,7 +2009,7 @@ describe('runFixCli', () => {
     expect((await runFixCli([...argv, '--merge-onto=main'], { ...m.io, run, fileExists: p => (p.endsWith('MERGE_HEAD') ? merging : true), readFile: () => '<<<<<<< HEAD\n' })).code).toBe(1);
     expect(m.calls.some(c => c.includes('--abort'))).toBe(true);
   });
-  it('does not post an fs or parse error message to the PR (only launcher-authored refusals)', async () => {
+  it('does not escalate or post an fs or parse error before the agent', async () => {
     const m = mk(['aaa']);
     const comments = [];
     const fsError = Object.assign(new Error("ENOENT: no such file, mkdtemp '/Users/someone/private/we-fix-x'"), { code: 'ENOENT', errno: -2, syscall: 'mkdtemp' });
@@ -1861,9 +2020,7 @@ describe('runFixCli', () => {
     };
     const recordRouted = entry => ({ 'we#7': [entry, entry] });
     expect((await runFixCli(argv, { ...m.io, run, recordRouted })).code).toBe(1);
-    expect(comments).toHaveLength(1);
-    expect(comments[0]).not.toContain('/Users/someone');
-    expect(comments[0]).not.toContain('ENOENT');
+    expect(comments).toEqual([]);
   });
   it('unmergedPaths keeps only unmerged rows and skips rename sources', () => {
     expect(unmergedPaths('R  new\0old\0UU a b\0 M c\0DD d\0AA e\0')).toEqual([
@@ -2072,7 +2229,8 @@ describe('runFixCli', () => {
     expect(m.run).not.toHaveBeenCalled();
     const f = mk(['aaa']); f.spawn.mockRejectedValue(new Error('boom'));
     expect((await runFixCli(argv, f.io)).code).toBe(1);
-    expect(f.calls.at(-1).join(' ')).toContain('release');
+    expect(f.calls.filter(c => c[0] === 'node').at(-1).join(' ')).toContain('release');
+    expect(f.calls.at(-1).slice(0, 3)).toEqual(['gh', 'pr', 'comment']);
   });
   it('a push with hooks off: the argv carries the hardening flags and --no-verify', async () => {
     const m = mk(['aaa', 'bbb']);
@@ -2092,7 +2250,7 @@ describe('runFixCli', () => {
     expect(m.spawn).not.toHaveBeenCalled();
     expect(m.calls.some(c => c.includes('merge') || c.includes('commit') || c.includes('push'))).toBe(false);
   });
-  it('posts the launcher refusal reason when risky lane config prevents the agent from running', async () => {
+  it('does not escalate when risky lane config prevents the agent from running', async () => {
     const m = mk(['aaa']);
     const comments = [];
     const run = (cmd, args, opts) => {
@@ -2103,9 +2261,7 @@ describe('runFixCli', () => {
     const recordRouted = entry => ({ 'we#7': [entry, entry] });
     expect((await runFixCli(argv, { ...m.io, run, recordRouted })).code).toBe(1);
     expect(m.spawn).not.toHaveBeenCalled();
-    expect(comments).toHaveLength(1);
-    expect(comments[0]).toContain('lane git config defines command/credential/remote-rewrite keys (remote.primary.url); refusing to run in it');
-    expect(comments[0]).not.toContain('secret-command');
+    expect(comments).toEqual([]);
   });
   it.each(['status', 'signal', 'stderr', 'stdout', 'pid', 'status/stderr', 'non-Error'])(
     'does not post raw command errors (%s)', async marker => {
@@ -2121,10 +2277,7 @@ describe('runFixCli', () => {
       };
       const recordRouted = entry => ({ 'we#7': [entry, entry] });
       expect((await runFixCli(argv, { ...m.io, run, recordRouted })).code).toBe(1);
-      expect(comments).toHaveLength(1);
-      expect(comments[0]).toContain('- failed: failed');
-      expect(comments[0]).not.toContain(message);
-      expect(comments[0]).not.toContain('secret');
+      expect(comments).toEqual([]);
     });
   it('a failed pending-marker write is not fatal: the repair is still pushed and re-armed', async () => {
     const m = mk(['aaa', 'bbb']);

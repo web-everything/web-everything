@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createDispatchThrottle, resolveFixBorrowSettings } from '../dispatch-throttle.mjs';
@@ -179,6 +179,72 @@ describe('a borrowed fix is a normal claim that the build daemon counts', () => 
 
 
 describe('routed Codex outcomes', () => {
+  it('counts only model rows: two model misses then ten excluded rows still count 2', async () => {
+    const { recordRoutedOutcome, consecutiveUnproductiveOnHead } = await import('../fix-slot-borrow.mjs');
+    let table = {};
+    const store = { read: () => table, write: value => { table = value; } };
+    const id = { repo: 'we', pr: 7, head: 'abc', store, readClaim: () => null };
+    for (let i = 0; i < 2; i++) recordRoutedOutcome({ ...id, outcome: 'no-change', cause: 'model', now: i });
+    for (let i = 2; i < 22; i++) recordRoutedOutcome({ ...id, outcome: 'failed', cause: ['launcher', 'infra', 'input', 'unknown'][i % 4], now: i });
+    expect(consecutiveUnproductiveOnHead(table, id)).toBe(2);
+    expect(table['we#7']).toHaveLength(12);
+    expect(table['we#7'].map(row => row.at)).toEqual([0, 1, ...Array.from({ length: 10 }, (_, i) => i + 12)]);
+    for (let i = 22; i < 34; i++) recordRoutedOutcome({ ...id, outcome: 'no-change', cause: 'model', now: i });
+    expect(table['we#7']).toHaveLength(20);
+    expect(consecutiveUnproductiveOnHead(table, id)).toBe(10);
+    expect(table['we#7'].map(row => row.at)).toEqual([...Array.from({ length: 10 }, (_, i) => i + 12), ...Array.from({ length: 10 }, (_, i) => i + 24)]);
+  });
+  it('the legacy table maps every FIX_RUN_OUTCOME', async () => {
+    const { routedOutcomeCause, consecutiveUnproductiveOnHead } = await import('../fix-slot-borrow.mjs');
+    const { FIX_RUN_OUTCOME, FIX_RUN_INFRA_PATTERNS } = await import('../../conveyor/fix-loop-ledger.mjs');
+    const expected = { failed: 'unknown', 'no-change': 'model', 'no-change-unproven': 'model', pushed: 'unknown', 'lease-lost': 'infra' };
+    expect(Object.keys(expected).sort()).toEqual(Object.values(FIX_RUN_OUTCOME).sort());
+    for (const outcome of Object.values(FIX_RUN_OUTCOME)) expect(routedOutcomeCause({ outcome })).toBe(expected[outcome]);
+    const reasons = ['no-finding: none', 'no-ci-failure: none', 'fix-run: refused', 'error: refused', 'missing required flag',
+      'has no fix launcher', 'launch did not complete', 'lane-pool', 'Operation not permitted', 'EPERM', 'EACCES',
+      'read-only file system', 'index.lock', '.git', 'sandbox', 'could not commit', 'could not push', 'could not stage',
+      'conflict not resolvable', 'lane git config', 'rearm-review', 'non-fast-forward', 'fast-forward hint', 'fetch first'];
+    for (const pattern of FIX_RUN_INFRA_PATTERNS) expect(reasons.some(reason => pattern.test(reason))).toBe(true);
+    for (const reason of reasons) expect(routedOutcomeCause({ outcome: 'failed', reason })).toBe('launcher');
+    const head = 'abc', id = { pr: 7, head };
+    expect(consecutiveUnproductiveOnHead({ 'we#7': [{ head, outcome: 'no-change' }, { head, outcome: 'pushed' }] }, id)).toBe(0);
+    expect(consecutiveUnproductiveOnHead({ 'we#7': [{ head, outcome: 'no-change' }, { head, outcome: 'failed' }] }, id)).toBe(1);
+  });
+  it('an invalid cause counts as unknown', async () => {
+    const { routedOutcomeCause, consecutiveUnproductiveOnHead, recordRoutedOutcome } = await import('../fix-slot-borrow.mjs');
+    for (const cause of [null, '', 'MODEL', 'typo', 1, {}]) {
+      const row = { head: 'abc', outcome: 'no-change', cause };
+      expect(routedOutcomeCause(row)).toBe('unknown');
+      expect(consecutiveUnproductiveOnHead({ 'we#7': [row, row] }, { pr: 7, head: 'abc' })).toBe(0);
+      let table = {};
+      recordRoutedOutcome({ ...row, pr: 7, store: { read: () => table, write: value => { table = value; } }, readClaim: () => null });
+      expect(table['we#7'][0]).toMatchObject({ cause: 'unknown', handling: 'unhandled' });
+    }
+  });
+  it('strict routed evidence refuses corrupt files and failed durable writes', async () => {
+    const { readRoutedOutcomes, recordRoutedOutcome, routedOutcomePath } = await import('../fix-slot-borrow.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'strict-routed-'));
+    vi.stubEnv('WE_COORDINATION_ROOT', dir);
+    try {
+      const id = { repo: 'we', pr: 7, head: 'abc' }, path = routedOutcomePath(id);
+      expect(readRoutedOutcomes({ ...id, strict: true })).toEqual({});
+      mkdirSync(join(dir, 'fix-routed-outcomes'));
+      for (const text of ['{', 'null', '[]', '{"we#7":{}}', '{"we#7":[null]}']) {
+        writeFileSync(path, text);
+        expect(() => readRoutedOutcomes({ ...id, strict: true })).toThrow();
+        expect(() => recordRoutedOutcome({ ...id, outcome: 'failed', cause: 'unknown', readClaim: () => null })).toThrow();
+      }
+      rmSync(path); rmSync(join(dir, 'fix-routed-outcomes'), { recursive: true });
+      writeFileSync(join(dir, 'fix-routed-outcomes'), 'blocks directory');
+      expect(() => recordRoutedOutcome({ ...id, outcome: 'failed', cause: 'unknown', readClaim: () => null })).toThrow();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('excluded rows on another head never reset model history', async () => {
+    const { consecutiveUnproductiveOnHead } = await import('../fix-slot-borrow.mjs');
+    const rows = [{ head: 'abc', outcome: 'no-change', cause: 'model' },
+      { head: 'old', outcome: 'failed', cause: 'launcher' }, { head: 'abc', outcome: 'no-change', cause: 'model' }];
+    expect(consecutiveUnproductiveOnHead({ 'we#7': rows }, { pr: 7, head: 'abc' })).toBe(2);
+  });
   it('bounds history, counts only trailing failures on the head, clears on push, and routes fallback', async () => {
     const { recordRoutedOutcome, consecutiveUnproductiveOnHead, chooseFixExecutor, claudeOnlyReason } = await import('../fix-slot-borrow.mjs');
     let table = {};
@@ -213,7 +279,7 @@ describe('routed Codex outcomes', () => {
     try {
       const a = { repo: 'we', pr: 1, head: 'h1', readClaim: () => null };
       const b = { repo: 'fui', pr: 2, head: 'h2', readClaim: () => null };
-      for (let i = 0; i < 2; i++) { recordRoutedOutcome({ ...a, outcome: 'no-change' }); recordRoutedOutcome({ ...b, outcome: 'failed', note: 'x' }); }
+      for (let i = 0; i < 2; i++) { recordRoutedOutcome({ ...a, outcome: 'no-change' }); recordRoutedOutcome({ ...b, outcome: 'failed', cause: 'model', note: 'x' }); }
       expect(consecutiveUnproductiveOnHead(readRoutedOutcomes(a), a)).toBe(2);
       expect(consecutiveUnproductiveOnHead(readRoutedOutcomes(b), b)).toBe(2);
       expect(readRoutedOutcomes(b)['fui#2'][0]).toMatchObject({ note: 'x' });
