@@ -4500,6 +4500,53 @@ function prePrReviewBypass(head) {
   return found.includes('literal') ? 'literal' : found.includes('dynamic') ? 'dynamic' : null;
 }
 
+/** Read raw creation argv without evaluating shell expansions or consulting gh configuration.
+ * Keep quote provenance: '$GH' is literal text, while "$GH" is an unreadable command. */
+function rawPrCreation(head) {
+  // Unlike ordinary argv scanning, shellWords keeps whitespace INSIDE command substitutions
+  // in the same raw word (`$(printf gh)` / `\`printf gh\``), without executing it.
+  const tokens = shellWords(head).map(argvWordShape);
+  const start = wrapperPrefixLength(tokens.map(word => word.value));
+  const shapes = tokens.slice(start);
+  const words = shapes.map(shape => shape.value);
+  const hidden = i => shapes[i]?.dynamicAt >= 0 || shapes[i]?.split;
+  if (words[0]?.split('/').at(-1) !== 'gh' && !hidden(0)) return null;
+  let i = 1;
+  // gh's global value flags may be separate or attached. They precede the command.
+  while (words[i]?.startsWith('-')) {
+    if (hidden(i)) return 'dynamic';
+    const flag = words[i++];
+    if (['-R', '--repo', '--hostname'].includes(flag)) {
+      if (shapes[i]?.split) return 'dynamic';
+      i += 1;
+    }
+    if (flag === '--') break;
+  }
+  if (words[i] === 'pr') {
+    if (hidden(i + 1)) return 'dynamic';
+    if (['create', 'new'].includes(words[i + 1])) return hidden(0) ? 'dynamic' : 'literal';
+    return null;
+  }
+  if (words[i] !== 'api') return null;
+  const args = words.slice(i + 1);
+  if (args.includes('graphql')) {
+    return args.some(arg => /\bcreatePullRequest\b/.test(arg)) ? 'literal' : null;
+  }
+  // Fields/input imply POST unless an explicit method overrides it. Individual-PR endpoints
+  // are edits, not creation; templated owner/repo placeholders are valid gh endpoints.
+  if (!args.some(arg => /^(?:\/)?repos\/[^/]+\/[^/]+\/pulls$/.test(arg))) return null;
+  let method = null;
+  let payload = false;
+  for (let k = 0; k < args.length; k++) {
+    const arg = args[k];
+    if (arg === '-X' || arg === '--method') method = args[++k];
+    else if (/^(?:-X.|--method=)/.test(arg)) method = arg.replace(/^(?:-X|--method=)/, '');
+    else if (/^(?:-[fF]|--(?:raw-field|field|input)(?:=|$))/.test(arg)) payload = true;
+  }
+  return (method ? method.toUpperCase() === 'POST' : payload) ? 'literal' : null;
+}
+
+
 export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLiveLease = false, markedLeaseSlug = null, contestedHolderSlug = null, dispatchKind = null, cwd = null, daemonCloneRoots = [], fixClaimedBranches = [], pushTargets = [], fixPushes = [] } = {}) {
   const s = segment.trim();
   if (!s) return null;
@@ -4760,7 +4807,10 @@ export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLi
   }
 
   // Reuse command-position normalization so paths/env wrappers match, but quoted prose does not.
-  if (!hasLeadingEnvEscape(s, 'RAW_PR_CREATE_OK') && atCommand(/^gh\s+pr\s+create\b/))
+  const creation = rawPrCreation(s);
+  if (!hasLeadingEnvEscape(s, 'RAW_PR_CREATE_OK') && creation === 'dynamic')
+    return 'raw PR creation carries a shell expansion the guard cannot read and may omit the `authored-by-actor` stamp. Write the gh command and subcommand literally and use the open-pr operation. Operator fallback: prefix `RAW_PR_CREATE_OK=1`.';
+  if (!hasLeadingEnvEscape(s, 'RAW_PR_CREATE_OK') && creation === 'literal')
     return 'raw `gh pr create` opens a PR with no `authored-by-actor` stamp, so the review gate cannot prove reviewer independence and the mandatory referral reviewer\'s rulings are ignored (plateau-app #204). Open it with `node <web-everything lane>/scripts/operations/run.mjs open-pr --ref=<branch> …` run from the target repo\'s lane clone (works for plateau-app and frontierui too), or repair an existing PR with `node scripts/pr-body-edit.mjs --pr=<n> --repair`. Escape hatch: prefix `RAW_PR_CREATE_OK=1`.';
 
   // Operator-only bypass: inspect script argv, not prose or Node option values.
