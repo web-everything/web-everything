@@ -67,6 +67,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { planNoteComment } from '../reconcile-note-comment.mjs';
+import operatorPendingFixture from './fixtures/7490-operator-send-back-pending.json';
 
 // ── fixtures — measured shapes, 2026-08-26 ───────────────────────────────────────────────────────────────────
 const NOW = Date.parse('2026-08-26T17:34:00Z');
@@ -3972,6 +3973,58 @@ describe('#101 operator send-back re-arms a red-CI PR once as a fix', () => {
   it('a bodiless send-back does not re-arm', () => {
     const r = plan([sendBack({ body: '🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.' })]);
     expect(r.dispatch.map((d) => d.mode)).not.toContain('operator-send-back');
+  });
+});
+
+describe('SENDBACK-FIX-ADMISSION supplied #7490 thread shape', () => {
+  const freshPr = () => structuredClone(operatorPendingFixture.pr);
+  const plan = (pr = freshPr(), extra = {}) => planReconcile({ prs: [pr], agents: [], durableCounts: {},
+    now: Date.parse(operatorPendingFixture.now), operatorRulingExtraRounds: { value: 0, source: 'fixture' },
+    ciHealBudget: { cap: 3, source: 'fixture' }, ciHealBudgetRestore: {}, verdictSettings: {}, codeqlOwnBudget: {},
+    roundExtensionAnchor: { value: 'grant', source: 'fixture' }, reviewLabelHeal: 'off', ...extra });
+  const operatorRows = result => result.dispatch.filter(row => row.mode === 'operator-send-back');
+
+  it('#7490 supplied evidence plans an operator-send-back fix row on head 5c08128a, carrying the 11-25 21:35 ET send-back body', () => {
+    const rows = operatorRows(plan());
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ kind: 'fix', prNumber: 7490, mode: 'operator-send-back', phase: 'bounced',
+      headRefOid: operatorPendingFixture.pr.headRefOid,
+      operatorSendBack: { verdictId: 'SB1', login: 'chalbert', body: operatorPendingFixture.operatorBody } });
+  });
+  it.each(['bot author', 'mismatched attribution', 'empty body', 'accepted', 'consumed', 'wrong body head'])(
+    'does not plan an operator-send-back row for %s evidence', fault => {
+      const pr = freshPr();
+      const comment = pr.comments.at(-1);
+      if (fault === 'bot author') comment.author.login = 'plateau-reviewer[bot]';
+      if (fault === 'mismatched attribution') comment.body = comment.body.replace('Recorded by chalbert', 'Recorded by outsider');
+      if (fault === 'empty body') comment.body = comment.body.split('\n\n').slice(0, 2).join('\n\n');
+      if (fault === 'accepted') pr.labels.push({ name: 'review:accepted' });
+      if (fault === 'consumed') pr.comments.push({ id: 'fixture-rearm', author: AUTOMATION,
+        createdAt: '2026-11-26T03:00:00Z', body: REARM_COMMENT_MARKER });
+      if (fault === 'wrong body head') comment.body += `\n\non head ${'b'.repeat(40)}`;
+      expect(operatorRows(plan(pr))).toEqual([]);
+    });
+  it('consumed send-back stays consumed across fresh process state and a replacement head', () => {
+    const pr = freshPr();
+    pr.comments.push({ id: 'fixture-rearm', author: AUTOMATION, createdAt: '2026-11-26T03:00:00Z', body: REARM_COMMENT_MARKER });
+    expect(operatorRows(plan(structuredClone(pr)))).toEqual([]);
+    expect(operatorRows(plan(structuredClone(pr)))).toEqual([]);
+    pr.headRefOid = 'c'.repeat(40);
+    pr.rowsHead = pr.headRefOid;
+    expect(operatorRows(plan(pr))).toEqual([]);
+  });
+  it('unconsumed send-back plans the identical single row and attempt count after restart', () => {
+    const first = operatorRows(plan());
+    const restarted = operatorRows(plan());
+    expect(first).toHaveLength(1);
+    expect(restarted).toEqual(first);
+    expect(restarted[0].attempts).toBe(1);
+  });
+  it('operator send-back at the durable cap refuses without a takeover row', () => {
+    const result = plan(freshPr(), { durableCounts: { 7490: 5 }, roundCapAction: 'takeover' });
+    expect(operatorRows(result)).toEqual([]);
+    expect(result.dispatch.filter(row => row.takeover)).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', attempts: 5, cap: 5 }));
   });
 });
 

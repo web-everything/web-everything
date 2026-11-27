@@ -1,0 +1,46 @@
+{
+  "provenance": {
+    "source": "handoff/designs/sendback-fix-admission-deep-prep-2026-11-26.md, Problem evidence",
+    "observedAtET": "2026-11-26 17:17 ET",
+    "kind": "reconstructed-from-supplied-evidence",
+    "completeCapturedThread": false,
+    "note": "The brief supplies head, labels, mergeability and review/send-back times, but no raw thread, comment ids, check rollup or send-back body. Those fields below are synthetic fixture data, not a live capture."
+  },
+  "now": "2026-11-26T22:17:00Z",
+  "operatorBody": "fix A4",
+  "pr": {
+    "number": 7490,
+    "state": "OPEN",
+    "isDraft": false,
+    "headRefName": "topic-sendback-fixture",
+    "headRefOid": "5c08128a38265cd374dee696d0019eccf06aed3d",
+    "baseRefName": "main",
+    "mergeable": "MERGEABLE",
+    "mergeStateStatus": "CLEAN",
+    "rowsComplete": true,
+    "rowsHead": "5c08128a38265cd374dee696d0019eccf06aed3d",
+    "commentsComplete": true,
+    "labels": [
+      { "name": "review:changes" },
+      { "name": "review:human" },
+      { "name": "review-round:4" },
+      { "name": "status:sent-back-review" },
+      { "name": "red-team:pending" }
+    ],
+    "statusCheckRollup": [{ "name": "gate", "status": "COMPLETED", "conclusion": "SUCCESS" }],
+    "comments": [
+      {
+        "id": "fixture-advisory",
+        "author": { "login": "web-everything" },
+        "createdAt": "2026-11-25T23:18:00Z",
+        "body": "**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.**\n\n### Findings (1)\n- Repair the admitted finding.\n\n---\n\nNet basis: `bbbbbbbb..5c08128a38265cd374dee696d0019eccf06aed3d`"
+      },
+      {
+        "id": "SB1",
+        "author": { "login": "chalbert" },
+        "createdAt": "2026-11-26T02:35:00Z",
+        "body": "🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.\n\nfix A4"
+      }
+    ]
+  }
+}
