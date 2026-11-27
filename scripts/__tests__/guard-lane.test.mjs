@@ -165,6 +165,50 @@ describe('laneGuardDecision — Standards-owned paths', () => {
     expect(result.stderr).toMatch(/Standards-owned/);
   });
 
+  // The OS applies `..` AFTER following a symlink; collapsing `..` lexically first lands on an unrelated path.
+  describe('symlink followed by parent-directory segments', () => {
+    const drafts = path.join(standards, 'drafts');
+    const deepLink = path.join(ws, 'deep-link');
+    const relLink = path.join(ws, 'rel-link');
+    const danglingLink = path.join(ws, 'dangling-link');
+    const statusFile = path.join(standards, 'STATUS.md');
+    writeFileSync(statusFile, 'x');
+    symlinkSync(path.join(drafts, 'core', 'authority'), deepLink);
+    symlinkSync('.operations/handoff/standards/drafts', relLink);
+    symlinkSync(path.join(standards, 'not-yet-created'), danglingLink);
+
+    it('resolveReal applies `..` to the symlink target, not lexically', () => {
+      // String concatenation on purpose: path.join would collapse the `..` lexically in the test itself.
+      expect(resolveReal(`${deepLink}/../../../STATUS.md`)).toBe(statusFile);
+      expect(resolveReal(`${deepLink}/../../../new/deep/x.md`))
+        .toBe(path.join(standards, 'new/deep/x.md'));
+      expect(resolveReal(`${relLink}/../STATUS.md`)).toBe(statusFile);
+      expect(resolveReal(`${danglingLink}/x.md`)).toBe(path.join(standards, 'not-yet-created/x.md'));
+    });
+
+    it.each(['1', '0'])('CLI refuses `..` after a symlink into Standards for marker %s', (marker) => {
+      for (const file of [
+        `${deepLink}/../../../STATUS.md`,
+        `${deepLink}/../../../new/deep/x.md`,
+        `${relLink}/../STATUS.md`,
+        `${danglingLink}/new/x.md`,
+        `${deepLink}/./../../.././STATUS.md`,
+      ]) {
+        for (const optOut of [false, true]) {
+          const result = runHook(marker, file, optOut);
+          expect(result.error).toBeUndefined();
+          expect(result.status, `${file} optOut=${optOut}: ${result.stderr}`).toBe(2);
+          expect(result.stderr).toMatch(/Standards-owned/);
+        }
+      }
+    });
+
+    it('CLI does not over-block `..` that leaves Standards via a symlink', () => {
+      const result = runHook('1', `${deepLink}/../../../../../allowed.md`, true);
+      expect(result.status, result.stderr).not.toBe(2);
+    });
+  });
+
   it('CLI fails closed with proposal guidance when target ancestry cannot be resolved', () => {
     const loop = path.join(ws, 'loop');
     symlinkSync(loop, loop);

@@ -84,7 +84,7 @@
  * scripts/backlog-guard.mjs). Standards identity errors fail closed; other internal errors fail open.
  */
 import { hookRoot } from './lib/hook-root.mjs';
-import { readFileSync, realpathSync, statSync } from 'node:fs';
+import { readFileSync, readlinkSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isForeignOccupancy, laneWorkerSession, isLeaseStale, describeLease } from './lib/lane-lease.mjs';
@@ -264,11 +264,39 @@ function hasStandardsAncestor(real, weRoot) {
 /** Resolve a target to its REAL path: follow symlinks; for a not-yet-existing file realpath the nearest
  *  existing ancestor dir so the location still classifies; fall back to the raw resolved path. */
 export function resolveReal(file) {
-  let real = path.resolve(file);
-  try { real = realpathSync(real); } catch {
-    try { real = path.join(realpathSync(path.dirname(real)), path.basename(real)); } catch { /* keep raw */ }
+  // The OS applies `..` AFTER following a symlink, so the raw string must NOT be lexically collapsed
+  // first (`path.resolve`/`join` would turn `link/../x` into a sibling of `link`). Walk segment by segment,
+  // keeping a canonical prefix: a symlink (even a dangling one) is expanded in place, `..` pops the REAL
+  // prefix, and once a segment does not exist the remaining tail can no longer be traversed, so it is
+  // appended lexically.
+  const raw = String(file);
+  const queue = (path.isAbsolute(raw) ? raw : process.cwd() + SEP + raw).split(SEP).filter((s) => s !== '' && s !== '.');
+  let current = SEP;
+  let hops = 0;
+  try {
+    while (queue.length) {
+      const seg = queue.shift();
+      if (seg === '..') { current = path.dirname(current); continue; }
+      const next = path.join(current, seg);
+      let link = null;
+      try { link = readlinkSync(next); } catch (error) {
+        if (error.code !== 'EINVAL' && error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error;
+        if (error.code !== 'EINVAL') return path.join(current, seg, ...queue); // missing tail: lexical
+      }
+      if (link === null) { current = next; continue; } // not a symlink (an existing file or directory)
+      if (++hops > 40) throw Object.assign(new Error('symlink loop'), { code: 'ELOOP' });
+      if (path.isAbsolute(link)) current = SEP;
+      queue.unshift(...link.split(SEP).filter((s) => s !== '' && s !== '.'));
+    }
+    return current;
+  } catch {
+    // Unreadable/looping path: keep the previous best-effort behaviour (the CLI's ancestry check fails closed).
+    let real = path.resolve(raw);
+    try { real = realpathSync(real); } catch {
+      try { real = path.join(realpathSync(path.dirname(real)), path.basename(real)); } catch { /* keep raw */ }
+    }
+    return real + '';
   }
-  return real + '';
 }
 
 // ── CLI wrapper: stdin event → exit code (only when run directly, not when imported by the test) ──────────
