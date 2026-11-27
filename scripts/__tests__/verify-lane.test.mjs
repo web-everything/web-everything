@@ -15,6 +15,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, chmodSync, readdirSync, renameSync } from 'node:fs';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -49,7 +50,7 @@ describe('declared guard refusal (hermetic producer)', () => {
     '../lib/verify-remote-routing.mjs', '../lib/verify-shard-run.mjs', '../lib/tree-watchdog.mjs',
     '../lib/remote-fallback-log.mjs',
   ];
-  async function deletedGuardProducer({ declared, mode = 'verify', unreadable = false, scanCommands = [] }) {
+  async function deletedGuardProducer({ declared, mode = 'verify', unreadable = false, scanCommands = [], settingSource = 'fixture', origin = 'same', failingGuard = false }) {
     const root = join(dir, 'lane-4');
     mkdirSync(join(root, '.git'), { recursive: true });
     writeFileSync(join(root, 'package.json'), JSON.stringify({ scripts: { 'test:unit': 'true' } }));
@@ -71,10 +72,13 @@ describe('declared guard refusal (hermetic producer)', () => {
       static now() { return RealDate.parse('2026-11-26T12:00:00Z'); }
     });
     vi.spyOn(process, 'cwd').mockReturnValue(root);
+    vi.spyOn(performance, 'now').mockReturnValue(0);
     vi.spyOn(process, 'exit').mockImplementation(code => { exit = code; throw stopped; });
     vi.spyOn(process.stderr, 'write').mockImplementation(text => { stderr += text; return true; });
     process.argv = [process.execPath, 'verify-lane.mjs', mode, `--repo=${root}`, '--json'];
     vi.stubEnv('HOME', root);
+    mkdirSync(join(root, 'tmp'));
+    vi.stubEnv('TMPDIR', join(root, 'tmp'));
     vi.stubEnv('WE_COORDINATION_ROOT', join(root, 'coordination'));
     vi.doMock('../lib/tools-root-guard.mjs', () => ({}));
     vi.doMock('../lib/build-policy.mjs', () => ({ resolveBuildPolicy: () => ({ finalGate: 'related', finalGateStandards: 'selected', sources: { finalGate: 'tool', finalGateStandards: 'tool' } }) }));
@@ -86,18 +90,51 @@ describe('declared guard refusal (hermetic producer)', () => {
     vi.doMock('../lib/verify-lane-gate.mjs', () => ({ ...guardCore,
       initializeVerifierIdentity: () => ({ sha, scriptsClean: true }),
       describeGate: () => 'fixture selected gate',
-      verifySetting: key => settings[key], verifySettingSource: () => 'fixture',
+      verifySetting: key => settings[key], verifySettingSource: () => settingSource,
+      verifyPhaseAdmissionEnabled: () => false,
       resolveDefaultGate: () => ({ command: "npx vitest run 'selected.test.mjs'", testCommand: "npx vitest run 'selected.test.mjs'", scanCommands,
         gateReasons: [], decision: { mode: 'shrink', reasons: [], changedFiles: ['source.mjs'], settingsSource: { standards: 'fixture' }, standards: { policy: 'always' } } }),
       ...(unreadable ? { alwaysRunPlan: options => guardCore.alwaysRunPlan({ ...options, fileExists: () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); } }) } : {}),
     }));
     vi.doMock('../readiness/heavy-admission.mjs', () => ({ admissionLockRoot: () => join(root, 'admission'), resolveCap: () => 1, resolveTimeoutMs: () => 1,
-      acquireSlotBlocking: async () => { effects.push('admission'); throw new Error('refusal must precede admission'); } }));
+      classifyCommandKind: () => 'vitest', releaseOwnedSlot: () => { effects.push('release'); },
+      acquireSlotBlocking: async () => {
+        effects.push('admission');
+        if (!failingGuard) throw new Error('refusal must precede admission');
+        return { ok: true, waitedMs: 0, slot: 0 };
+      } }));
+    vi.doMock('../lib/remote-fallback-log.mjs', () => ({ recordLocalSlotFallback: () => {} }));
+    vi.doMock('../lib/verify-base-rerun.mjs', () => ({ baseRerunCandidate: () => null, classifyPreExisting: () => null }));
+    vi.doMock('../lib/verify-shared-marker.mjs', () => ({ executedTestCount: () => 1 }));
+    vi.doMock('../lib/verify-remote-routing.mjs', () => ({
+      remoteInfrastructureFailure: () => null, localPhaseReason: () => 'fixture-local',
+      phaseAdmissionPlan: ({ command }) => ({ command, takeLocalSlot: true }), localPhaseShape: () => null,
+      shouldConfirmRemoteRed: () => false, readRemoteReport: () => [],
+      phaseRunLocation: () => ({ location: 'local' }), mergeRunLocation: () => 'local',
+    }));
+    vi.doMock('../lib/tree-watchdog.mjs', () => ({ startTreeWatchdog: () => ({ stop: () => {}, fired: () => false }) }));
     vi.doMock('node:child_process', () => {
       const unexpected = (...args) => { effects.push({ command: 'unexpected-subprocess', args }); throw new Error('unexpected fixture subprocess'); };
-      const fake = { spawn: unexpected, spawnSync: unexpected, execSync: unexpected, execFile: unexpected, exec: unexpected, fork: unexpected,
+      const fake = { spawn: (command, args, options) => {
+        if (!failingGuard) return unexpected(command, args, options);
+        effects.push({ command: 'gate', args: [command, ...args], cwd: options.cwd });
+        const child = new EventEmitter();
+        child.pid = 1234;
+        child.stdout = new EventEmitter(); child.stdout.setEncoding = () => {};
+        child.stderr = new EventEmitter(); child.stderr.setEncoding = () => {};
+        const guard = command.includes('kept.test.mjs');
+        const report = /--outputFile.json='([^']+)'/.exec(command)?.[1];
+        if (report) writeFileSync(report, JSON.stringify({ testResults: [{ name: join(root, 'kept.test.mjs'),
+          status: 'failed', assertionResults: [{ status: 'failed' }] }] }));
+        queueMicrotask(() => { child.emit('exit', guard ? 1 : 0, null); child.emit('close', guard ? 1 : 0, null); });
+        return child;
+      }, spawnSync: unexpected, execSync: unexpected, execFile: unexpected, exec: unexpected, fork: unexpected,
         execFileSync: (command, args, options) => {
       effects.push({ command, args, cwd: options?.cwd });
+      if (command === 'git' && args.slice(-3).join(' ') === 'remote get-url origin') {
+        if (options.cwd === root && origin === 'absent') throw Object.assign(new Error('no origin'), { status: 2, stderr: "error: No such remote 'origin'" });
+        return options.cwd === root && origin === 'mismatched' ? 'https://github.com/fixture/other.git' : 'https://github.com/fixture/declared.git';
+      }
       if (command !== 'git' || options?.cwd !== root) throw new Error('unexpected external call');
       if (args.includes('--absolute-git-dir')) return join(root, '.git');
       if (args.includes('rev-parse') && args.includes('HEAD')) return sha;
@@ -120,7 +157,8 @@ describe('declared guard refusal (hermetic producer)', () => {
     return { exit, json: JSON.parse(stdout.trim()), stderr, effects, markerPath: join(root, '.git', '.lane-verify') };
   }
   function guardCoreSettings() {
-    return { alwaysRunTests: [], retryFailed: 0, revertRed: 'off', skipLocalForCardOnly: false };
+    return { alwaysRunTests: [], retryFailed: 0, isolatedRetry: 'off', revertRed: 'off', skipLocalForCardOnly: false,
+      phaseTimeoutMs: 1000, slotHeartbeatMs: 1000 };
   }
   it.each([
     ['one deleted', ['deleted.test.mjs', 'kept.test.mjs'], 'verify', false, []],
@@ -139,6 +177,27 @@ describe('declared guard refusal (hermetic producer)', () => {
     expect(result.json.phases.alwaysRun.missing).toContain(declared[0]);
     expect(result.effects).not.toContain('admission');
     expect(result.effects.every(call => call.command === 'git')).toBe(true);
+    expect(existsSync(result.markerPath)).toBe(false);
+  });
+  it('absent origin keeps file-sourced required guards and refuses a deleted guard before admission', async () => {
+    const result = await deletedGuardProducer({ declared: ['deleted.test.mjs'], settingSource: 'file', origin: 'absent' });
+    expect(result.exit, result.stderr).toBe(3);
+    expect(result.json).toMatchObject({ status: 'gate-refused', reason: 'missing-required-guard', ok: false });
+    expect(result.json.phases.alwaysRun).toMatchObject({ planned: ['deleted.test.mjs'], missing: ['deleted.test.mjs'], executed: false, result: 'refused' });
+    expect(result.stderr).not.toContain('guard-policy-other-repository');
+    expect(result.effects).not.toContain('admission');
+    expect(result.effects.every(call => call.command === 'git')).toBe(true);
+    expect(existsSync(result.markerPath)).toBe(false);
+  });
+  it('mismatched origin with a failing file-sourced guard still fails verification', async () => {
+    const result = await deletedGuardProducer({ declared: ['kept.test.mjs'], mode: 'run', settingSource: 'file', origin: 'mismatched', failingGuard: true });
+    expect(result.exit, result.stderr).toBe(2);
+    expect(result.json).toMatchObject({ status: 'red', exitCode: 1 });
+    expect(result.json.phases.alwaysRun).toMatchObject({ planned: ['kept.test.mjs'], ran: ['kept.test.mjs'], executed: true, result: 'failed' });
+    expect(result.effects.filter(call => call.command === 'gate').map(call => call.args[0])).toEqual([
+      "npx vitest run 'selected.test.mjs'", expect.stringContaining("npx vitest run 'kept.test.mjs'"),
+    ]);
+    expect(result.stderr).not.toContain('guard-policy-other-repository');
     expect(existsSync(result.markerPath)).toBe(false);
   });
 });

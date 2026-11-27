@@ -609,36 +609,10 @@ if (!resolvedGate && typeof flags.gate === 'string') {
   }
 }
 
-// File policy belongs to the verifier's repository. Explicit declarations apply to every operated checkout;
-// unrelated/originless checkouts do not acquire WE's repository-specific guard list. A failed identity read
-// is not evidence of a sibling: only Git's explicit "no such remote" result establishes an originless checkout.
-function declaredGuardsForCheckout() {
-  const declared = verifySetting('alwaysRunTests', process.env);
-  const toolingRoot = resolve(fileURLToPath(new URL('../', import.meta.url)));
-  if (verifySettingSource('alwaysRunTests', process.env) !== 'file' || REPO === toolingRoot || !declared?.length) return declared;
-  const origin = root => {
-    try {
-      const value = execFileSync('git', hardenLaneGitArgs(['remote', 'get-url', 'origin']), { cwd: root,
-        env: GIT_ENV, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000, maxBuffer: 64 * 1024 }).trim();
-      const slug = repoSlugFromRemote(value);
-      if (!slug) throw new Error('unrecognized guard policy repository');
-      return slug;
-    } catch (error) {
-      if (error.status === 2 && /No such remote ['"]origin['"]/.test(String(error.stderr))) return null;
-      throw error;
-    }
-  };
-  const target = origin(REPO);
-  if (target !== null && target === origin(toolingRoot)) return declared;
-  process.stderr.write('verify-lane: guard-policy-other-repository — WE file declarations do not apply; declare this checkout\'s guards explicitly.\n');
-  return [];
-}
+// Resolved declarations remain required regardless of checkout origin or setting provenance.
+// Repository moves must migrate the policy explicitly; identity is never evidence that a guard ran.
 function planRequiredGuards({ reportFile = null } = {}) {
-  let declared;
-  try { declared = declaredGuardsForCheckout(); }
-  catch {
-    return alwaysRunPlan({ declared: verifySetting('alwaysRunTests', process.env), fileExists: () => { throw new Error('guard policy repository unreadable'); } });
-  }
+  const declared = verifySetting('alwaysRunTests', process.env);
   return alwaysRunPlan({ declared, reportFile, testTimeoutFactor: resolvedGate?.decision?.testTimeoutFactor ?? 1,
     // Scan argv alone proves nothing. Run each declared guard with a guard-owned executed-file report, even when
     // a scanner also named it. This keeps scan failure/outcome evidence independent and never credits a skipped scan.
@@ -1469,7 +1443,7 @@ if (exitCode === 0 && !signal && !verificationInfrastructureFailure({ exitCode, 
   }
 }
 
-// Keep evaluated empty plans visible, including WE guards deliberately excluded by repository identity policy.
+// Keep evaluated empty plans visible when the resolved policy deliberately declares no guards.
 const builtPhases = buildVerifyPhases({ admission: { mode: phaseAdmission ? 'phase' : 'gate', phases: admissionPhases }, admissionWaitMs: admission.waitedMs, ...phaseMs, gateMs, decision: resolvedGate?.decision, outcomes,
   alwaysRun: guardGate ? alwaysRun : null });
 builtPhases.executedTests = sharedTestCounts.length && sharedTestCounts.every(Number.isSafeInteger)
