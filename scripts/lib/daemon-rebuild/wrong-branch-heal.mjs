@@ -128,6 +128,9 @@ export function parseTrackedChanges(stdout) {
  */
 export function healWrongBranch({ git, adoptedHead = null, settings = resolveWrongBranchHealSettings(), now = Date.now }) {
   const out = (r) => String(r?.stdout ?? '').trim();
+  // Both save paths share one fixed-command write site; keep the original push-gate budget.
+  const updateRef = (ref, sha, { message, oldSha } = {}) =>
+    git(['update-ref', ...(message ? ['-m', message] : []), ref, sha, ...(oldSha ? [oldSha] : [])]);
   const head = git(['symbolic-ref', '--short', 'HEAD']);
   const branch = head.status === 0 ? out(head) : null;
   const main = git(['rev-parse', '--verify', '--quiet', 'refs/heads/main']);
@@ -183,7 +186,7 @@ export function healWrongBranch({ git, adoptedHead = null, settings = resolveWro
       const timestamp = now();
       if (!Number.isSafeInteger(timestamp) || timestamp < 0) return { healed: false, reason: 'save-failed' };
       savedRef = `refs/we/wrong-branch-heal/${timestamp}-${headSha.slice(0, 9)}`;
-      const saved = git(['update-ref', savedRef, headSha, '0000000000000000000000000000000000000000']);
+      const saved = updateRef(savedRef, headSha, { oldSha: '0000000000000000000000000000000000000000' });
       if (saved?.status !== 0) return { healed: false, reason: 'save-failed' };
     } catch { return { healed: false, reason: 'save-failed' }; }
     const changedBeforeSwitch = reverify();
@@ -201,11 +204,11 @@ export function healWrongBranch({ git, adoptedHead = null, settings = resolveWro
 
   let savedRef = null;
   if (changedPaths.length) {
-    const created = git(['stash', 'create', `wrong-branch-heal: tracked changes on ${branch}`]);
+    const created = git(['stash', 'create', 'wrong-branch-heal: tracked store changes']);
     const sha = out(created);
     if (created.status !== 0 || !sha) return { healed: false, reason: 'save-failed' };
     savedRef = `refs/we/wrong-branch-heal/${now()}`;
-    if (git(['update-ref', '-m', `wrong-branch-heal from ${branch}`, savedRef, sha]).status !== 0) {
+    if (updateRef(savedRef, sha, { message: `wrong-branch-heal from ${branch}` }).status !== 0) {
       return { healed: false, reason: 'save-failed' };
     }
     // Only tracked store files change here (the rule proved it); untracked files are untouched by reset.

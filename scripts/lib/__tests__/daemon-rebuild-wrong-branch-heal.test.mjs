@@ -1,11 +1,27 @@
+// @vitest-environment node
 import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { findRawPushes } from '../push-gate-lint.mjs';
 import { planWrongBranchHeal, healWrongBranch, parseTrackedChanges, resolveWrongBranchHealSettings, IN_PROGRESS_MARKERS } from '../daemon-rebuild/wrong-branch-heal.mjs';
 
 const settings = { branches: ['ops/review-requests'], pathPrefixes: ['verdict-ledger/'] };
+
+it('keeps detached recovery within the original two Git exceptions and rejects an added push', () => {
+  const file = 'scripts/lib/daemon-rebuild/wrong-branch-heal.mjs';
+  const source = readFileSync(new URL('../daemon-rebuild/wrong-branch-heal.mjs', import.meta.url), 'utf8');
+  const allow = JSON.parse(readFileSync(new URL('../../push-gate-allowlist.json', import.meta.url), 'utf8'));
+  const budget = allow.entries[file].sites;
+  expect(budget).toBe(2);
+  const sites = findRawPushes(source, file);
+  expect(sites).toHaveLength(budget);
+  // Each counted call must visibly pin its command; renaming a helper cannot hide a new exemption.
+  expect(sites.map(site => source.split('\n')[site.line - 1].match(/git\(\['(merge-base|update-ref)'/)?.[1]).sort())
+    .toEqual(['merge-base', 'update-ref']);
+  expect(findRawPushes(`${source}\ngit(['push', 'origin', 'main']);`, file).length).toBeGreaterThan(budget);
+});
 
 // DAEMON-CLONE-DETACHED-HEAL fixtures never inherit Git configuration, hooks, cwd or daemon state.
 const detachedTemps = [];
