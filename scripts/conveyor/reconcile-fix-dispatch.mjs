@@ -1910,10 +1910,8 @@ export function dispatchFix(planned, {
     // #x0jphk5 — nothing was actually spawned: release so a legitimate retry for this same PR is never blocked
     // by our own failed attempt.
     const released = releaseClaim({ repo, pr: planned.pr, kind: 'fix', owner: claimOwner, lockRoot: claimRoot });
-    if (pushHoldRefused) {
-      if (released?.released !== true) pushHoldRefused.reason += '; claim-release-unconfirmed: inspect the reservation before retrying';
-      return pushHoldRefused;
-    }
+    if (pushHoldRefused && released?.released !== true) pushHoldRefused.reason += '; claim-release-unconfirmed: inspect the reservation before retrying';
+    if (pushHoldRefused) return pushHoldRefused;
     // #3850 — the CLI's own stderr proves no agent started AND names a fault the dispatcher can heal (trust
     // the scratch root). Re-grant now and surface it as a transient environment fault, never a dispatch failure.
     // Grants the REAL session dir (`grantDispatchTrust` collapses it to the scratch root under the default policy,

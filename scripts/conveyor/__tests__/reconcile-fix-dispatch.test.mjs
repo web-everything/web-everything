@@ -13,7 +13,7 @@ import { FIX_OVERLAP_PROSE_GLOBS, stripProseScope } from '../fix-scope-policy.mj
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { probeHeldLandAdvanceBatch } from '../soak/breaks/fix-push-hold-repair-starvation.mjs';
+import pushHoldBreak, { probeHeldLandAdvanceBatch } from '../soak/breaks/fix-push-hold-repair-starvation.mjs';
 import * as ghThrottle from '../../lib/gh-throttle.mjs';
 import {
   createFixPassPrReader, fetchPrFilesPaginated, replayFixLaunch, withStaleBase, withPlannedContext, dispatchFix, readLivePushHold, isSmokeDryRunPr, fetchCardScopeAtRef, fetchPrDiffPaths, isDiffTooLargeError, PermanentScopeReadError, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
@@ -130,6 +130,41 @@ describe('BLD-8102 — operator holds at every fixer launch', () => {
       rmSync(root, { recursive: true, force: true });
     }
   };
+
+  it('preserves the soak fixPresent invariant in the exported production functions', () => fixture(f => {
+    // Materialize imported code in the fixture: the probe never reads the real checkout or ambient cwd.
+    const repoRoot = f.root;
+    const source = join(repoRoot, 'scripts/conveyor/reconcile-fix-dispatch.mjs');
+    mkdirSync(dirname(source), { recursive: true });
+    writeFileSync(source, [readLivePushHold, runReconcileFixDispatch, dispatchFix].map(String).join('\n'));
+    expect(pushHoldBreak.fixPresent(repoRoot)).toBe(true);
+  }));
+
+  it.each(['hold-label', 'unreadable'].flatMap(hold => [
+    ['confirmed', { released: true }], ['unreleased', { released: false }],
+    ['missing', undefined], ['null', null], ['malformed', { released: 'true' }],
+  ].map(([release, evidence]) => [hold, release, evidence])))(
+    'push-hold refusal never launches or falls through (%s, claim release %s)', (hold, _release, evidence) => fixture(f => {
+      if (hold === 'hold-label') f.state.labels.push('hold:fix');
+      else f.runGh.mockImplementation(() => { throw Object.assign(Error('fixture gh timeout'), { code: 'ETIMEDOUT' }); });
+      const releaseClaim = vi.fn(args => evidence?.released === true ? f.releaseClaim(args) : evidence);
+      const healTrust = vi.fn(), spawnBorrowed = vi.fn(), launchWrapped = vi.fn();
+      const result = dispatchFix(f.planned, { ...f.options, repo: 'we', releaseClaim,
+        healTrust, spawnBorrowed, launchWrapped });
+      const holdReason = hold === 'hold-label' ? 'hold:fix'
+        : 'Cannot read live labels/push authority; restore evidence before retrying';
+      const suffix = evidence?.released === true ? ''
+        : '; claim-release-unconfirmed: inspect the reservation before retrying';
+      expect(result).toEqual({ refused: true, outcome: 'push-hold', hold: { code: hold, reason: holdReason },
+        reason: `push-hold: PR #${f.planned.pr} not launched: ${hold} (${holdReason})${suffix}`,
+        pr: f.planned.pr, itemNum: f.planned.itemNum, lane: f.planned.lane });
+      expect(f.acquireClaim).toHaveBeenCalledTimes(1);
+      expect(releaseClaim).toHaveBeenCalledTimes(1);
+      expect(releaseClaim).toHaveBeenCalledWith({ repo: 'we', pr: f.planned.pr,
+        kind: 'fix', owner: f.options.claimOwner, lockRoot: f.options.claimRoot });
+      expect(f.state.claimed).toBe(evidence?.released !== true);
+      for (const launch of [f.spawnAgent, spawnBorrowed, launchWrapped, healTrust]) expect(launch).not.toHaveBeenCalled();
+    }));
 
   it('review changes dispatch refuses hold label and kill sentinel independently', () => fixture(f => {
     f.state.labels.push('hold:fix');
