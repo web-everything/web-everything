@@ -3103,12 +3103,14 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
     const protectedHolds = new Map();
     const registryHolds = new Map();
     let blockers = inFlight.filter((c) => {
-      if (!overlapsInFlight(scopeFor(entry), [overlapClaim(c)])) return false;
-      const shared = registryEntries(scopeFor(entry)).filter(file => overlapsInFlight([file], [overlapClaim(c)]));
-      if (shared.length && !c.landing) {
-        if (settings?.holdMode === 'active-session' && c.claim && expired(c.claim)) {
-          decide(entry, c, 'holdMode', false, 'fixer heartbeat exceeds claim TTL'); return false;
-        }
+      const registryHolder = !c.landing && (!picked.includes(c) || acceptedIds.has(c.id))
+        && !(settings?.holdMode === 'active-session' && c.claim && expired(c.claim));
+      // Registry eligibility never releases the holder's ordinary-file reservations.
+      const overlapScope = !c.landing && !registryHolder
+        ? scopeFor(entry)?.filter(file => !registryEntries([file]).length) : scopeFor(entry);
+      if (!overlapsInFlight(overlapScope, [overlapClaim(c)])) return false;
+      const shared = registryEntries(overlapScope).filter(file => overlapsInFlight([file], [overlapClaim(c)]));
+      if (shared.length && registryHolder) {
         registryHolds.set(c.id, shared);
         protectedIds.add(c.id);
         if (settings) decide(entry, c, 'overlapGranularity', true, 'shared registry: file hold, no bypass');
@@ -3116,13 +3118,13 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
       }
       if (urgentPrs.has(entry.pr)) return false;
       if (!settings) return true; // Public API compatibility: historical policy when omitted.
-      if (settings.holdMode === 'active-session' && c.claim && expired(c.claim)) {
+      if (settings.holdMode === 'active-session' && !c.build && c.claim && expired(c.claim)) {
         decide(entry, c, 'holdMode', false, 'fixer heartbeat exceeds claim TTL'); return false;
       }
       let observation = { overlap: true, why: 'shared file held' };
       if (settings.overlapGranularity === 'region') {
         const results = [];
-        for (const file of scopeFor(entry) ?? []) {
+        for (const file of overlapScope ?? []) {
           for (const held of stripProseScope(c.scope) ?? []) {
             if (!overlapsInFlight([file], [{ scope: [held] }])) continue;
             let result = { overlap: true, why: 'region observation unavailable; retaining file hold', failedClosed: true };
@@ -3186,7 +3188,7 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
     // Deduplicate claims for the same fixer when formatting the queue position.
     const ahead = [...new Set(blockers.map((c) => c.id))];
     const waiter = { ...entry, id: `fix PR #${entry.pr}`, scope: entry.overlapScope ?? entry.scope };
-    if (hit && (registryEntries(scopeFor(entry)).length || settings?.holdMode === 'active-session')) released.push(waiter);
+    if (hit && settings?.holdMode === 'active-session') released.push(waiter);
     else picked.push(waiter);
     if (hit) {
       const registryBlockers = blockers.filter(c => registryHolds.has(c.id));
