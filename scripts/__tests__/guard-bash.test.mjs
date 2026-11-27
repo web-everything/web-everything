@@ -1415,7 +1415,8 @@ describe('guard-bash — differential write-shape table (#2108 review r5)', () =
 describe('guard-bash — raw PR creation loses the author stamp', () => {
   it('requires a visible gh command or operation before rejecting unknown command words', () => {
     for (const command of ['$CMD $ARG', '"$TOOL" "$F"', '"$BIN" "$@"',
-      'env FOO=1 "$CMD" "$ARG"', '$HOME/bin/tool $x']) {
+      'env FOO=1 "$CMD" "$ARG"', '$HOME/bin/tool $x', '$CMD -R $R view',
+      '"$CMD" --repo=$R list', '"$CMD" --hostname "$@" version']) {
       expect.soft(decide(command), command).toBeNull();
     }
     for (const command of ['gh "$SUB"', 'gh -R a/b "$SUB"',
@@ -1462,15 +1463,52 @@ describe('guard-bash — raw PR creation loses the author stamp', () => {
       }
     }
   });
-  it('allows read commands with expanded repository values and denies opaque flag words', () => {
-    for (const command of ['gh -R $R pr view 1', 'gh --repo $REPO pr list',
-      'gh pr -R $R view 1', 'gh --repo "$REPO" pr list']) {
+  it('allows read commands with quoted single repository values and denies opaque flag words', () => {
+    for (const command of ['gh -R "$R" pr view 1', 'gh --repo "$REPO" pr list',
+      'gh pr -R "$R" view 1', 'gh --repo="$REPO" pr list', 'gh pr -R"$R" view 1',
+      'gh pr -R "repos/*" view', 'gh pr -R repos/\\* view', 'gh pr -R \'$R\' view',
+      'gh pr -R "$*" view', 'gh pr -R "${REPOS[*]}" view']) {
       expect.soft(decide(command), command).toBeNull();
     }
     for (const command of ['gh --$FLAG a/b pr create', 'gh -R$R pr create',
       'gh --repo $REPO pr create', 'gh $FLAGS pr create', 'gh pr --$FLAG a/b create']) {
       expect.soft(decide(command), command).toMatch(/expansion/);
     }
+  });
+  it('requires the raw-create override when persistent values can inject or remove arguments', () => {
+    const reported = "R='a/b create --title t --head feature --base main --body'; gh pr -R $R view";
+    expect(decide(reported)).toMatch(/expansion/);
+    expect(decide('gh pr -R a/b create --title t --head feature --base main --body view'))
+      .toMatch(/authored-by-actor/);
+    for (const flag of ['-R ', '--repo ', '--hostname ', '-R', '--repo=', '--hostname=']) {
+      for (const value of ['$R', '${R}', '"a/b"$R', '$(printf repo)', '`printf repo`',
+        '"$@"', '"${REPOS[@]}"', '{a/b,create}', 'repos/*', 'repos/?', 'repos/[ab]',
+        'a/very/long/repository/prefix/*']) {
+        for (const command of [`gh pr ${flag}${value} view`, `gh ${flag}${value} pr view`,
+          `gh ${flag}${value} api repos/a/b/pulls -X GET`]) {
+          expect.soft(decide(command), command).toMatch(/expansion/);
+          expect.soft(decide(`RAW_PR_CREATE_OK=1 ${command}`), command).toBeNull();
+        }
+      }
+    }
+    // An empty unquoted value can consume `pr` as the flag value and expose `create`.
+    expect(decide('gh -R $R pr create')).toMatch(/expansion/);
+    expect(decide('RAW_PR_CREATE_OK=1 gh pr -R $R view')).toBeNull();
+  });
+  it('denies splitting persistent values through the hook stdin boundary', () => {
+    const command = "R='a/b create --title t --head feature --base main --body'; gh pr -R $R view";
+    const output = execFileSync(process.execPath, ['scripts/guard-bash.mjs'], {
+      input: JSON.stringify({ tool_input: { command } }), encoding: 'utf8',
+    });
+    expect(JSON.parse(output).hookSpecificOutput).toMatchObject({
+      permissionDecision: 'deny', permissionDecisionReason: expect.stringMatching(/RAW_PR_CREATE_OK=1/),
+    });
+  });
+  it('bounds pattern scanning in long persistent values', () => {
+    const start = performance.now();
+    expect(decide(`gh pr -R ${'{'.repeat(4000)}repo} view`)).toBeNull();
+    expect(decide(`gh pr -R ${'{'.repeat(4000)}a,b} view`)).toMatch(/expansion/);
+    expect(performance.now() - start).toBeLessThan(HANG_BUDGET_MS);
   });
   it('normalizes REST creation endpoints and denies unreadable methods', () => {
     for (const endpoint of ['repos/a/b/pulls', '/repos/a/b/pulls', 'repos/a/b/pulls?x=1',

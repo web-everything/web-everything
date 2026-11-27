@@ -4390,11 +4390,20 @@ function isBraceExpansion(raw, i) {
  *  in `"…"`) or unquoted glob/brace pattern, or -1; `split` marks an expansion that can become any number of
  *  new words: an UNQUOTED one (word splitting), or a quoted `"$@"` / `"${@…}"` / `"${a[@]…}"` / `"${!…}"`
  *  (`"${!a[@]}"`, `"${!p@}"`, and indirection `"${!x}"`, which becomes `"$@"` when `x=@`), which bash expands to
- *  one word PER element even inside `"…"`. `'…'` and `$'…'` text never expands. */
-function argvWordShape(raw) {
+ *  one word PER element even inside `"…"`. `'…'` and `$'…'` text never expands.
+ *  `splitPatterns` also tracks unquoted glob/brace expansion throughout values for the raw-PR parser. */
+function argvWordShape(raw, splitPatterns = false) {
   let value = '';
   let dynamicAt = -1;
   let split = false;
+  let literalBraceEnd = -1;
+  const braceExpansion = i => {
+    if (i <= literalBraceEnd) return false;
+    if (isBraceExpansion(raw, i)) return true;
+    const close = raw.indexOf('}', i + 1);
+    literalBraceEnd = close < 0 ? raw.length : close;
+    return false;
+  };
   const mark = () => { if (dynamicAt < 0) dynamicAt = value.length; };
   const expands = (t, j) => t[j] === '`' || (t[j] === '$' && /[\w{(@*#?$!-]/.test(t[j + 1] || ''));
   // Sticky, so each `$` is tested in place and the read stays linear. `${#a[@]}` (a count), `"$*"` /
@@ -4425,11 +4434,14 @@ function argvWordShape(raw) {
       continue;
     }
     if (expands(raw, i)) { mark(); split = true; }
-    // A pattern only matters while it can sit inside a flag-name prefix of the flag, so the brace scan runs
-    // at most once per prefix position, and it is one indexOf + slice test (no backtracking regex), so the
-    // whole read stays linear in the word.
-    else if (dynamicAt < 0 && value.length <= SKIP_PRE_PR_REVIEW.length
-      && ('*?['.includes(raw[i]) || (raw[i] === '{' && isBraceExpansion(raw, i)))) mark();
+    // Raw PR option values need pattern detection at any offset. Stop once splitting is known;
+    // cache literal brace spans so nested non-expansions cannot cause repeated suffix scans.
+    // Other callers only need patterns in the bounded flag-name prefix, as before.
+    else if ((splitPatterns ? !split : (dynamicAt < 0 && value.length <= SKIP_PRE_PR_REVIEW.length))
+      && ('*?['.includes(raw[i]) || (raw[i] === '{' && braceExpansion(i)))) {
+      mark();
+      if (splitPatterns) split = true;
+    }
     value += raw[i];
   }
   // A NUL only ever comes from a `$'…'` fragment, and `runValue` already ends THAT fragment there.
@@ -4509,14 +4521,14 @@ function rawPrCreation(head) {
   let masked = '';
   const opaque = new Map();
   for (const raw of shellWords(head)) {
-    const shape = argvWordShape(raw);
+    const shape = argvWordShape(raw, true);
     if (shape.dynamicAt >= 0 || shape.split) {
       opaque.set(masked.length, shape);
       masked += 'x'.repeat(raw.length) + ' ';
     } else masked += raw + ' ';
   }
   const tokens = headWords(masked, true).map(word => opaque.get(word.start)
-    ?? argvWordShape(masked.slice(word.start, word.end)));
+    ?? argvWordShape(masked.slice(word.start, word.end), true));
   const start = wrapperPrefixLength(tokens.map(word => word.value));
   const shapes = tokens.slice(start);
   const words = shapes.map(shape => shape.value);
@@ -4524,25 +4536,34 @@ function rawPrCreation(head) {
   if (words[0]?.split('/').at(-1) !== 'gh' && !hidden(0)) return null;
   let i = 1;
   let uncertain = hidden(0);
-  // Persistent flags may precede either command word. A dynamic value marks a creation
-  // as unreadable, but does not turn a known `pr list/view` into a creation command.
+  // Persistent flags may precede either command word. Only single-argument dynamic values
+  // preserve a visible read command: splitting values can inject `create` or consume `pr`.
   const skipFlags = () => {
     while (words[i]?.startsWith('-')) {
       const flag = words[i];
       const valueFlag = ['-R', '--repo', '--hostname'].includes(flag);
       const attachedValue = /^(?:-R.|--(?:repo|hostname)=)/.test(flag);
+      if (shapes[i]?.split) return false;
       if (hidden(i)) {
         const prefix = flag.slice(0, shapes[i].dynamicAt);
         if (!attachedValue || !/^(?:-R|--(?:repo|hostname)=)/.test(prefix)) return false;
         uncertain = true;
       }
       i += 1;
-      if (valueFlag) { uncertain ||= hidden(i); i += 1; }
+      if (valueFlag) {
+        if (shapes[i]?.split) return false;
+        uncertain ||= hidden(i);
+        i += 1;
+      }
       if (flag === '--') break;
     }
     return true;
   };
-  if (!skipFlags()) return 'dynamic';
+  if (!skipFlags()) {
+    // A splitting value alone still does not identify an unknown launcher as gh.
+    if (hidden(0) && !words.slice(i).some(word => ['pr', 'api'].includes(word))) return null;
+    return 'dynamic';
+  }
   // An unknown launcher AND unknown subcommand alone do not identify a gh operation (`$CMD $ARG`).
   // A visible `gh` still fails closed on its subcommand; an unknown launcher with visible `pr`/`api`
   // continues below. Leave other launchers to their own guards, including dynamic Node invocations.
