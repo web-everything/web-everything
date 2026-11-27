@@ -33,6 +33,11 @@ status also handles live-to-zombie transitions during a poll. Missing memory
 fields on a process that is still live remain an error. Other errors invalidate
 the measurement.
 
+At least one poll must observe the root's stat identity. If none does (including
+when every root read is omitted), final accounting fails and emits an `error`
+record with null resource metrics. Rerun the profile to obtain sizing evidence;
+the child's verdict is preserved.
+
 `reapedCpuSec` is the wrapper's change in `cutime + cstime` across the root's
 lifetime, divided by `getconf CLK_TCK`. The baseline is read after getconf;
 between baseline and final accounting the wrapper spawns only the root.
@@ -79,7 +84,9 @@ single-wrapper per shard; this format does not provide concurrent-writer locking
 Summary recursively reads `*.jsonl`, including nested artifact directories. It
 skips invalid JSON, versions other than 1, empty/non-string job labels, and
 nonfinite/non-numeric `peakTreeRssMb`, `cpuSec`, `samplerCpuSec`, `wallSec`, or
-`exitCode`. Error records are skipped. Optional runner/timestamp values must be
+`exitCode`. Negative `peakTreeRssMb`, `cpuSec`, `samplerCpuSec`, or `wallSec`
+also invalidate a row before deduplication, ratio calculation or P90 ranking.
+Zero remains valid, with null ratios for zero wall time. Error records are skipped. Optional runner/timestamp values must be
 strings. Duplicate `(job, runner, at)` identities keep the first record; distinct
 runs remain separate rows. Rows sort by job, timestamp, then runner using string
 order. Columns are job, runner, at, peakTreeRssMb, cpuSec, avgThreads,

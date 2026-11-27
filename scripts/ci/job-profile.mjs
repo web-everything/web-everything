@@ -82,6 +82,7 @@ export function createSampler({ procRoot, rootPid, fs: io = fs }) {
       peakTree = Math.max(peakTree, sum);
     },
     result(ticks) {
+      if (rootIdentity === undefined) fail('missing root observation; rerun profile');
       let orphanTicks = 0;
       for (const p of known.values()) if (p.orphan && p.pid !== rootPid) orphanTicks += p.user + p.system;
       return { peakTreeRssMb: Math.floor(peakTree / 1024), peakProcRssMb: Math.floor(peakProc / 1024), orphanCpuSecLowerBound: orphanTicks / ticks };
@@ -129,6 +130,7 @@ export function summarize(dir, io = fs) {
       catch { skipped++; continue; }
       if (!row || row.v !== 1 || typeof row.job !== 'string' || !row.job.trim() || Object.hasOwn(row, 'error')
         || !['peakTreeRssMb', 'cpuSec', 'samplerCpuSec', 'wallSec', 'exitCode'].every(k => typeof row[k] === 'number' && Number.isFinite(row[k]))
+        || ['peakTreeRssMb', 'cpuSec', 'samplerCpuSec', 'wallSec'].some(k => row[k] < 0)
         || ['runner', 'at'].some(k => row[k] !== undefined && typeof row[k] !== 'string')) { skipped++; continue; }
       row = { ...row, runner: row.runner ?? '', at: row.at ?? '' };
       const id = JSON.stringify([row.job, row.runner, row.at]);

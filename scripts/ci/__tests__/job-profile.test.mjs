@@ -41,7 +41,7 @@ function harness({ code = 0, signal = null, noProc = false, env = {}, onSpawn, o
     getClockTicks: vi.fn(() => 100),
     setInterval: fn => { intervals.add(fn); return fn; }, clearInterval: fn => intervals.delete(fn),
     setTimeout: (fn, ms) => { const timer = { fn, ms }; timeouts.add(timer); return timer; }, clearTimeout: timer => timeouts.delete(timer),
-    spawn: vi.fn(() => { onSpawn?.(proc); return child; }),
+    spawn: vi.fn(() => { processFile(proc, 100); onSpawn?.(proc); return child; }),
   };
   const out = join(dir, 'profile.jsonl');
   return { dir, proc, out, deps, child, signals, intervals, timeouts,
@@ -113,6 +113,28 @@ describe('process tree sampler', () => {
 });
 
 describe('command contract', () => {
+  it('rejects never-observed roots as sizing evidence while preserving child verdicts', async () => {
+    const s = sampler(temp()); s.poll(); s.poll(true);
+    expect(() => s.result(100)).toThrow(/root/);
+    for (const code of [0, 3]) {
+      for (const missing of ['absent', 'ENOENT', 'ESRCH', 'EACCES']) {
+        const h = harness({ code, onSpawn: proc => fs.rmSync(join(proc, '100'), { recursive: true }) });
+        if (missing !== 'absent') h.deps.fs = { ...fs, readdirSync: (path, ...args) => {
+          const entries = fs.readdirSync(path, ...args);
+          return path === h.proc && !args.length ? [...entries, '100'] : entries;
+        }, readFileSync: (path, ...args) => {
+          if (path === join(h.proc, '100/stat')) throw error(missing);
+          return fs.readFileSync(path, ...args);
+        } };
+        const done = h.start(); h.tick(); h.finish();
+        expect(await done).toBe(code);
+        expect(h.stderr()).toContain('job-profile: accounting failed ERR\n');
+        expect(h.record()).toMatchObject({ exitCode: code, peakTreeRssMb: null, peakProcRssMb: null, cpuSec: null, samplerCpuSec: null });
+        expect(h.record().error).toContain('accounting');
+        expect(api.summarize(h.dir)).toBe('no valid records (skipped: 1)\n');
+      }
+    }
+  });
   it('keeps valid metrics and continues sampling after a live descendant becomes a readable zombie', async () => {
     const h = harness({ onSpawn: proc => {
       processFile(proc, 100); processFile(proc, 101, { ppid: 100, rss: 30 });
@@ -185,8 +207,17 @@ describe('command contract', () => {
     fs.writeFileSync(child, `import { writeSync } from 'node:fs';
 writeSync(1, Buffer.alloc(1024 * 1024, 65)); writeSync(2, Buffer.alloc(1024 * 1024, 66));`);
     fs.writeFileSync(driver, `import { runProfile } from ${JSON.stringify(new URL('../job-profile.mjs', import.meta.url).href)};
+import { spawn } from 'node:child_process';
+import { mkdirSync, writeFileSync } from 'node:fs';
 process.exitCode = await runProfile(['--job=bytes', '--proc-root=' + ${JSON.stringify(proc)}, '--', process.execPath, ${JSON.stringify(child)}], {
-  cwd: ${JSON.stringify(dir)}, env: {}, getClockTicks: () => 100, now: () => 0, at: () => 'fixture'
+  cwd: ${JSON.stringify(dir)}, env: {}, getClockTicks: () => 100, now: () => 0, at: () => 'fixture',
+  spawn: (...args) => {
+    const child = spawn(...args), root = ${JSON.stringify(proc)} + '/' + child.pid;
+    mkdirSync(root);
+    writeFileSync(root + '/stat', ${JSON.stringify(stat(100))}.replace(/^100 /, child.pid + ' '));
+    writeFileSync(root + '/status', 'VmRSS: 0 kB\\nVmHWM: 0 kB\\n');
+    return child;
+  }
 });`);
     const result = spawnSync(process.execPath, [driver], { cwd: dir, env: {}, timeout: 10000, maxBuffer: 3 * 1024 * 1024 });
     expect(result.error).toBeUndefined(); expect(result.status).toBe(0);
@@ -265,6 +296,19 @@ process.exitCode = await runProfile(['--job=bytes', '--proc-root=' + ${JSON.stri
 
 describe('summary', () => {
   const record = (job, peak, extra = {}) => ({ v: 1, job, runner: 'fixture', at: 'a', peakTreeRssMb: peak, cpuSec: 2, samplerCpuSec: 0.01, wallSec: 2, exitCode: 0, ...extra });
+  it('excludes negative resource metrics and wall times before deduplication, P90 and overhead ratios', () => {
+    for (const field of ['peakTreeRssMb', 'cpuSec', 'samplerCpuSec', 'wallSec']) {
+      const root = temp(), file = join(root, 'metrics.jsonl');
+      const bad = record('a', 100, { [field]: -100 });
+      fs.writeFileSync(file, JSON.stringify(bad));
+      expect(api.summarize(root)).toBe('no valid records (skipped: 1)\n');
+      fs.writeFileSync(file, [bad, record('a', 100), record('zero', 0, { cpuSec: 0, samplerCpuSec: 0, wallSec: 0 })].map(JSON.stringify).join('\n'));
+      const output = api.summarize(root);
+      expect(output).toContain('records: 2\njobs: 2\nskipped: 1\np90 peakTreeRssMb: 100\n');
+      expect(output).toContain('a\tfixture\ta\t100\t2\t1\t0.005\t0\n');
+      expect(output).toContain('zero\tfixture\ta\t0\t0\tnull\tnull\t0\n');
+    }
+  });
   it('sorts nested records, deduplicates identities, validates lines and ranks only successful rows', () => {
     const root = temp(); fs.mkdirSync(join(root, 'nested'));
     const a = record('a', 100);
