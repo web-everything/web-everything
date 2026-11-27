@@ -161,6 +161,16 @@ export function dispatchBroadcastHooks({ hooks, repoRoot }) {
   }));
 }
 
+// Compare all execution options, independent of JSON property order. In particular an async
+// hook is never evidence that the corresponding blocking deny guard is already installed.
+function hookIdentity(group, hook) {
+  const canonical = (value) => Array.isArray(value) ? value.map(canonical)
+    : value && typeof value === 'object'
+      ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonical(value[key])])) : value;
+  const { hooks, ...options } = group;
+  return JSON.stringify(canonical([options, hook]));
+}
+
 /**
  * xl5reby — THE SAFETY GAP: a dispatched worker starts in `.operations/dispatch/<id>`, which has no repo
  * `.claude/settings.json`, so the repo's PreToolUse guards (guard-bash, guard-lane, ...) never ran for it.
@@ -169,7 +179,7 @@ export function dispatchBroadcastHooks({ hooks, repoRoot }) {
  * and not `--settings` or user-level hooks: the local settings file is read fresh from the start directory on
  * every task (the `--settings` JSON is skipped when the CLI hands out a pre-warmed spare session, see the
  * header), and it is scoped to this one worker, so nothing leaks to the operator's other sessions. ADDITIVE and
- * IDEMPOTENT (a command already present is not added twice); never throws.
+ * IDEMPOTENT (a hook with identical options is not added twice); never throws.
  * @param {{cwd: string, repoRoot?: string, readFile?: Function, writeFile?: Function, mkdir?: Function}} o
  * @returns {{ok: boolean, path?: string, count?: number, reason?: string}}
  */
@@ -192,11 +202,14 @@ export function ensureDispatchGuardHooks({
     if (!existing || typeof existing !== 'object' || Array.isArray(existing)) existing = {};
     const hooks = existing.hooks && typeof existing.hooks === 'object' && !Array.isArray(existing.hooks) ? { ...existing.hooks } : {};
     for (const [event, groups] of Object.entries(wanted)) {
-      const merged = Array.isArray(hooks[event]) ? hooks[event].map((g) => ({ ...g, hooks: [...(g?.hooks ?? [])] })) : [];
-      const have = new Set(merged.flatMap((g) => (g.hooks ?? []).map((h) => `${g.matcher ?? ''}\u0000${h.command}`)));
+      // Invalid local entries cannot veto installation of required guards in any event.
+      const merged = (Array.isArray(hooks[event]) ? hooks[event] : [])
+        .filter((g) => g && typeof g === 'object' && !Array.isArray(g) && Array.isArray(g.hooks))
+        .map((g) => ({ ...g, hooks: g.hooks.filter((h) => h && typeof h === 'object' && !Array.isArray(h) && typeof h.type === 'string') }));
+      const have = new Set(merged.flatMap((g) => g.hooks.map((h) => hookIdentity(g, h))));
       for (const g of groups) {
         const fresh = g.hooks.filter((h) => {
-          const key = `${g.matcher ?? ''}\u0000${h.command}`;
+          const key = hookIdentity(g, h);
           if (have.has(key)) return false;
           have.add(key);
           return true;

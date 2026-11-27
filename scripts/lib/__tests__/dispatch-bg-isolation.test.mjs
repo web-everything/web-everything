@@ -193,6 +193,56 @@ describe('xl5reby dispatched worker effective settings include the repo guard ho
     }] }], PostToolUse: [] });
   });
 
+  it.each(['UserPromptSubmit', 'PostToolUse'])('malformed existing %s entries cannot prevent deny guard installation', (event) => {
+    broadcastFixture(({ cwd, REPO }) => {
+      const path = join(cwd, '.claude/settings.local.json');
+      const retained = { matcher: '*', hooks: [{ type: 'command', command: 'echo retained' }] };
+      const fs = memoryFs({ [path]: JSON.stringify({ env: { FIXTURE: '1' }, hooks: {
+        [event]: [null, { hooks: {} }, { hooks: 'invalid' }, { hooks: [null] }, retained],
+      } }) });
+      expect(ensureDispatchGuardHooks({ cwd, repoRoot: REPO, ...fs }).ok).toBe(true);
+      const settings = JSON.parse(fs.files[path]);
+      expect(settings.hooks.PreToolUse).toEqual([
+        { matcher: 'Edit|Write', hooks: [{ type: 'command', command: `node "${REPO}/scripts/guard-lane.mjs"` }] },
+        { matcher: 'Bash', hooks: [{ type: 'command', command: `node "${REPO}/scripts/guard-bash.mjs"` }] },
+      ]);
+      expect(settings.env).toEqual({ FIXTURE: '1' });
+      expect(settings.hooks[event]).toContainEqual(retained);
+      for (const control of ['UserPromptSubmit', 'PostToolUse']) {
+        expect(settings.hooks[control]).toContainEqual({ hooks: [{ type: 'command',
+          command: `node "${REPO}/scripts/broadcast-inject.mjs"`,
+        }] });
+      }
+    });
+  });
+
+  it('duplicate filtering preserves blocking pinned hooks and distinct options on installation and retry', () => {
+    broadcastFixture(({ cwd, REPO }) => {
+      const command = `sh -c 'launcher="$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs"; [ -f "$launcher" ] || { echo "Pinned guard: dedicated clone launcher missing; run scripts/hooks/sync-guard-clone.mjs" >&2; exit 2; }; node "$launcher" scripts/guard-bash.mjs; code=$?; [ "$code" -eq 0 ] || exit 2'`;
+      expect(pinnedHookScript(command)).toBe('scripts/guard-bash.mjs');
+      const asyncHook = { type: 'command', command, async: true };
+      const blockingHook = { type: 'command', command };
+      const groups = [
+        { matcher: 'Bash', hooks: [asyncHook, blockingHook, { ...blockingHook, timeout: 5 }] },
+      ];
+      const path = join(cwd, '.claude/settings.local.json');
+      const fs = memoryFs({
+        [join(REPO, '.claude/settings.json')]: JSON.stringify({ hooks: { PreToolUse: groups } }),
+        [path]: JSON.stringify({ hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [asyncHook] }] } }),
+      });
+      expect(ensureDispatchGuardHooks({ cwd, repoRoot: REPO, ...fs }).ok).toBe(true);
+      const once = fs.files[path];
+      expect(JSON.parse(once).hooks.PreToolUse.flatMap((group) => group.hooks))
+        .toEqual([asyncHook, blockingHook, { ...blockingHook, timeout: 5 }]);
+      expect(ensureDispatchGuardHooks({ cwd, repoRoot: REPO, ...fs }).ok).toBe(true);
+      expect(fs.files[path]).toBe(once);
+      // The same async-first ordering must also retain the blocking hook in a fresh install.
+      delete fs.files[path];
+      expect(ensureDispatchGuardHooks({ cwd, repoRoot: REPO, ...fs }).ok).toBe(true);
+      expect(JSON.parse(fs.files[path]).hooks.PreToolUse).toEqual(groups);
+    });
+  });
+
   it.each([undefined, '{broken'])('unreadable repo settings (%s) retain both operator control events', (body) => {
     broadcastFixture(({ cwd, REPO }) => {
       const fs = memoryFs(body === undefined ? {} : { [join(REPO, '.claude/settings.json')]: body });
