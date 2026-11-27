@@ -34,7 +34,12 @@ import { assertCapability, repoProfile } from '../lib/repo-profile.mjs';
  */
 import { execFileSync } from 'node:child_process';
 import { stripVTControlCharacters } from 'node:util';
-import { resolve } from 'node:path';
+import { resolve, join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { openSync, readSync, closeSync } from 'node:fs';
+import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
+import { acquireLockDir, releaseLockDir } from '../readiness/file-locks.mjs';
+import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { fileURLToPath } from 'node:url';
 
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
@@ -48,7 +53,7 @@ import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from './fix-procedure.mjs';
 import { FIX_END_INFRA_STALL_PREFIX } from '../lib/ruling-ledger.mjs';
 import { REARM_COMMENT_MARKER } from './rearm-review.mjs';
-import { CHANGES_VERDICT_PREFIX, latestChangesVerdict, rearmCoversVerdict } from '../review-set-label.mjs';
+import { CHANGES_VERDICT_PREFIX, latestChangesVerdict, rearmCoversVerdict, rearmVerdictKey } from '../review-set-label.mjs';
 import { annotateLapsedStandDowns } from './stand-down.mjs';
 import { countUnresolvedStandDowns } from './reconcile-core.mjs';
 
@@ -278,6 +283,70 @@ export function defaultPostComment({ slug, pr, body, exec = execFileSync }) {
   exec('gh', ['pr', 'comment', String(pr), '--repo', slug, '--body-file', '-'], { ...ghOpts(), input: body, stdio: ['pipe', 'pipe', 'pipe'] });
 }
 
+/** Round accounting is independent of comment publication. The shared claim is never
+ * reclaimed automatically: a crashed holder or pending attempt needs human inspection.
+ * Legacy readers without node ids share a conservative timestamp/body budget; they
+ * cannot obtain a fresh budget just by replaying identical unbound verdicts.
+ * Ledger reads are bounded to 64 KiB; corruption, oversize and ambiguity all hold.
+ */
+function reserveOrphanAttempt({ root, slug, pr, comments, nowMs, fs }) {
+  const trusted = comments.filter(c => isTrustedMarkerAuthor(c) && atMs(c) != null);
+  const verdict = latestChangesVerdict(trusted);
+  if (!verdict) throw new Error('missing verdict — human inspection required');
+  const round = rearmVerdictKey(verdict) ?? createHash('sha256')
+    .update(JSON.stringify([atMs(verdict), verdict.body])).digest('hex');
+  const resource = `orphan-redispatch:${slug}:${pr}:${round}`;
+  const id = createHash('sha256').update(resource).digest('hex');
+  const path = join(root, `${id}.json`);
+  const hold = reason => `${reason} — human inspection required; reconcile the round ledger and claim before retrying`;
+  if (!acquireLockDir(root, resource, { owner: resource, path: resource, pid: null,
+    heartbeatAt: new Date(nowMs).toISOString() })) return { hold: hold('ambiguous or active attempt claim') };
+  const release = () => releaseLockDir(root, resource);
+  try {
+    const historical = trusted.slice(trusted.indexOf(verdict) + 1).filter(c =>
+      lead(c).startsWith(ORPHAN_GUARD_MARKER) && /re-dispatched/.test(lead(c).split('\n')[0])).length;
+    let record;
+    try {
+      const fd = fs.openSync(path, 'r');
+      try {
+        // Include one overflow byte. Bound the read itself, even if the file grows
+        // or its pathname is replaced after opening; short reads share this budget.
+        const buffer = Buffer.alloc(65537);
+        let used = 0;
+        while (used < buffer.length) {
+          const count = fs.readSync(fd, buffer, used, buffer.length - used, used);
+          if (count === 0) break;
+          used += count;
+        }
+        if (used > 65536) throw new Error('oversized attempt history');
+        record = JSON.parse(buffer.toString('utf8', 0, used));
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e;
+      record = { version: 1, resource, confirmed: historical, pending: false };
+    }
+    if (record?.version !== 1 || record.resource !== resource || !Number.isSafeInteger(record.confirmed)
+      || record.confirmed < 0 || typeof record.pending !== 'boolean'
+      || (record.markerError !== undefined && typeof record.markerError !== 'string')) {
+      throw new Error('invalid attempt ledger');
+    }
+    if (record.pending) return { hold: hold('ambiguous pending attempt'), release };
+    record.confirmed = Math.max(record.confirmed, historical);
+    if (record.confirmed >= ORPHAN_REDISPATCH_CAP) return {
+      hold: hold(`${record.confirmed} confirmed guard re-dispatches (cap ${ORPHAN_REDISPATCH_CAP}) — a person must take it`), release,
+    };
+    record.pending = true;
+    const save = () => writeJsonAtomic(path, record);
+    save(); // Must be durable before calling the dispatcher.
+    return { record, save, release };
+  } catch (e) {
+    release();
+    return { hold: hold(`unreadable attempt ledger: ${String(e?.message ?? e).split('\n')[0]}`) };
+  }
+}
+
 /**
  * ONE guard pass over every constellation repo. Never throws; one PR's failure never stops the rest.
  * Optional `settled` retains stable none verdicts between passes, keyed by `${slug}#${pr}` → {head, at}.
@@ -305,6 +374,8 @@ export async function runOrphanFixRoundPass({
   graceMs = DEFAULT_ORPHAN_GRACE_MS,
   resolveProfile = repoProfile,
   cardReadable = (ref) => referralCardReadable(ref, ROOT),
+  attemptRoot = join(resolveCoordinationRoot({ env }), 'orphan-redispatch-attempts'),
+  attemptFs = { openSync, readSync, closeSync },
 } = {}) {
   const enabled = orphanGuardEnabled(env);
   const rows = [], deferred = [], deferredSettled = [], newlySettled = [];
@@ -351,6 +422,7 @@ export async function runOrphanFixRoundPass({
     settled?.delete(cacheKey);
     handled += 1;
     const row = { repo: slug, pr: p.number };
+    let attempt;
     try {
       const owned = await isOwned(key, p.number);
       const comments = owned ? [] : await readComments(p.number, slug);
@@ -373,21 +445,35 @@ export async function runOrphanFixRoundPass({
       if (plan.decision === 'redispatch') {
         const refusal = assertCapability(slug, 'fix', { resolveProfile });
         if (refusal) { row.result = `not-done: ${refusal.why}`; continue; }
-        redispatched = true;
+        attempt = reserveOrphanAttempt({ root: attemptRoot, slug, pr: p.number, comments, nowMs, fs: attemptFs });
+        if (attempt.hold) {
+          plan.decision = row.decision = 'escalate';
+          plan.reason = row.reason = attempt.hold;
+        } else redispatched = true;
       }
       const labels = labelNames(p.labels);
       const r = plan.decision === 'rearm' ? await rearm({ slug, pr: p.number, head: p.headRefOid })
         : plan.decision === 'redispatch' ? await redispatch({ slug, pr: p.number, reconcile })
           : await escalate({ slug, pr: p.number, labels });
+      if (attempt?.record && (r?.ok === true || r?.ok === false)) {
+        if (r.ok) attempt.record.confirmed += 1;
+        attempt.record.pending = false;
+        attempt.save();
+      }
       if (!r?.ok) { row.result = `not-done: ${r?.why ?? '?'}`; continue; }
-      row.result = plan.decision === 'rearm' ? 're-armed' : plan.decision === 'redispatch' ? 're-dispatched' : 'escalated';
-      try { postComment({ slug, pr: p.number, body: buildOrphanGuardComment({ decision: plan.decision, reason: plan.reason, prNumber: p.number }) }); }
-      catch (e) { row.result += ` (marker comment failed: ${String(e?.message ?? e).split('\n')[0]})`; }
+      row.result = plan.decision === 'rearm' ? 're-armed' : plan.decision === 'redispatch' ? 're-dispatched'
+        : attempt?.hold ? `escalated: ${attempt.hold}` : 'escalated';
+      try { await postComment({ slug, pr: p.number, body: buildOrphanGuardComment({ decision: plan.decision, reason: plan.reason, prNumber: p.number }) }); }
+      catch (e) {
+        const diagnostic = stripVTControlCharacters(String(e?.message ?? e)).split('\n')[0].slice(0, 2000);
+        row.result += ` (marker comment failed: ${diagnostic})`;
+        if (attempt?.record) { attempt.record.markerError = diagnostic; attempt.save(); }
+      }
     } catch (e) {
       if (!rows.includes(row)) rows.push(row);
       row.decision ??= 'error';
       row.result = `error: ${String(e?.message ?? e).split('\n')[0]}`;
-    }
+    } finally { attempt?.release?.(); }
   }
   // A listed repo's cursor becomes its first deferred PR (or clears); an unlisted repo's cursor is kept untouched.
   const nextRepoCursors = { ...repoCursors };

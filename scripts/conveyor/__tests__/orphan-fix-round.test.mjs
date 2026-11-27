@@ -3,7 +3,19 @@
  * re-arming, the next round was a restack that by design never touched labels, and the PR then sat `review:changes`
  * with no owner. These fixtures are that thread's real comment shapes.
  */
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import * as fs from 'node:fs';
+import { join, dirname, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+
+const isolated = vi.hoisted(() => ({ root: null }));
+vi.mock('../../operations/coordination-root.mjs', async importOriginal => ({
+  ...await importOriginal(), resolveCoordinationRoot: () => isolated.root,
+}));
+beforeEach(() => { isolated.root = mkdtempSync(join(tmpdir(), 'orphan-budget-')); });
+afterEach(() => { rmSync(isolated.root, { recursive: true, force: true }); });
 import {
   planOrphanFixRound, runOrphanFixRoundPass, formatOrphanFixRoundLines, buildOrphanGuardComment, verdictReviewedHead,
   ORPHAN_GUARD_MARKER, CHANGES_VERDICT_PREFIX, DEFAULT_ORPHAN_GRACE_MS, defaultListBounced, defaultRearm, defaultRedispatch,
@@ -48,7 +60,7 @@ it('replays same-second operator rulings and malformed history through the orpha
 
 it('holds failed listings and processes complete listings beyond the 500-PR boundary (PR #7429)', async () => {
   const { default: scenario } = await import('../soak/breaks/orphan-guard-lists-past-200.mjs');
-  const report = await scenario.run({});
+  const report = await scenario.run({ root: resolve(dirname(fileURLToPath(import.meta.url)), '../../..') });
   expect(scenario.judge(report)).toEqual([]);
 });
 
@@ -1030,5 +1042,146 @@ describe('wiring — the fix daemon runs the guard inside its stuck-fixer reclai
       stopSession: () => ({}), orphanPass: async () => { throw new Error('boom'); },
     });
     expect(r.rows).toEqual([{ kind: 'orphan-fix-round', decision: 'error', reason: 'boom' }]);
+  });
+});
+
+
+describe('durable orphan redispatch budget', () => {
+  const fixture = () => {
+    let comments = [{ ...VERDICT, id: 'verdict-one' }, BEGIN, END];
+    const root = isolated.root;
+    const redispatch = vi.fn(async () => ({ ok: true }));
+    const escalate = vi.fn(async () => ({ ok: true }));
+    const postComment = vi.fn(async () => { throw new Error('marker unavailable'); });
+    const options = () => ({ env: {}, nowMs: NOW, now: () => NOW,
+      attemptRoot: root, repos: [{ key: 'we', slug: 'web-everything/web-everything' }],
+      listBounced: () => [pr4715([])], readComments: async () => comments,
+      isOwned: async () => false, resolveProfile: () => ({ capabilities: { fix: true } }),
+      cardReadable: () => false, redispatch, escalate, postComment,
+    });
+    return { root, redispatch, escalate, postComment,
+      setComments: value => { comments = value; },
+      run: (overrides = {}) => runOrphanFixRoundPass({ ...options(), ...overrides }),
+      ledgers: () => readdirSync(root).filter(name => name.endsWith('.json'))
+        .map(name => ({ path: join(root, name), ...JSON.parse(readFileSync(join(root, name), 'utf8')) })),
+    };
+  };
+
+  it('caps redispatch at two across restarts when every marker post fails', async () => {
+    const f = fixture();
+    const runs = [await f.run(), await f.run(), await f.run()];
+    expect(f.redispatch).toHaveBeenCalledTimes(2);
+    expect(f.escalate).toHaveBeenCalledOnce();
+    expect(runs[2].rows[0]).toMatchObject({ decision: 'escalate' });
+    expect(f.ledgers()[0]).toMatchObject({ confirmed: 2, pending: false, markerError: 'marker unavailable' });
+  });
+
+  it('unreadable attempt ledger launches nothing', async () => {
+    const f = fixture();
+    await f.run();
+    writeFileSync(f.ledgers()[0].path, '{');
+    const result = await f.run();
+    expect(f.redispatch).toHaveBeenCalledOnce();
+    expect(result.rows[0].result).toMatch(/person|human/);
+  });
+
+  it('concurrent passes reserve one attempt', async () => {
+    const f = fixture();
+    let release;
+    f.redispatch.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const first = f.run();
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    const second = await f.run();
+    expect(f.redispatch).toHaveBeenCalledOnce();
+    expect(second.rows[0].result).toMatch(/person|human/);
+    release({ ok: true });
+    await first;
+  });
+
+  it('crash after launch cannot exceed cap', async () => {
+    const f = fixture();
+    f.redispatch.mockRejectedValueOnce(new Error('lost confirmation after launch'));
+    await f.run();
+    await f.run();
+    expect(f.redispatch).toHaveBeenCalledOnce();
+    expect(f.ledgers()[0]).toMatchObject({ confirmed: 0, pending: true });
+    expect(f.escalate).toHaveBeenCalledOnce();
+  });
+
+  it('new trusted verdict resets only its own budget', async () => {
+    const f = fixture();
+    await f.run(); await f.run();
+    f.setComments([{ ...VERDICT, id: 'verdict-two' }, BEGIN, END]);
+    await f.run();
+    f.setComments([{ ...VERDICT, id: 'verdict-one' }, BEGIN, END]);
+    await f.run();
+    expect(f.redispatch).toHaveBeenCalledTimes(3);
+    expect(f.escalate).toHaveBeenCalledOnce();
+    expect(f.ledgers().map(l => l.confirmed).sort()).toEqual([1, 2]);
+  });
+
+  it('oversized history refuses with human inspection', async () => {
+    const f = fixture();
+    await f.run();
+    writeFileSync(f.ledgers()[0].path, ' '.repeat(65537));
+    const result = await f.run();
+    expect(f.redispatch).toHaveBeenCalledOnce();
+    expect(result.rows[0].result).toMatch(/human inspection/);
+  });
+
+  it('history growing after open reads at most 65537 bytes from one descriptor and requires human inspection', async () => {
+    const f = fixture();
+    await f.run();
+    const path = f.ledgers()[0].path;
+    let descriptor;
+    const attemptFs = {
+      openSync: vi.fn((file, ...args) => {
+        expect(file).toBe(path);
+        const fd = fs.openSync(file, ...args);
+        descriptor = fd;
+        writeFileSync(path, ' '.repeat(131072));
+        return fd;
+      }),
+      // Force short reads to exercise the shared byte budget across read calls.
+      readSync: vi.fn((fd, buffer, offset, length, position) =>
+        fs.readSync(fd, buffer, offset, Math.min(length, 16384), position)),
+      closeSync: vi.fn(fd => fs.closeSync(fd)),
+    };
+    const result = await f.run({ attemptFs });
+    expect(result.rows[0].result).toMatch(/oversized attempt history.*human inspection/);
+    expect(descriptor).toBeTypeOf('number');
+    expect(attemptFs.openSync).toHaveBeenCalledOnce();
+    const calls = attemptFs.readSync.mock.calls;
+    expect(calls.every(([fd]) => fd === descriptor)).toBe(true);
+    expect(calls.map(([, buffer, offset, length, position]) => [buffer.length, offset, length, position])).toEqual([
+      [65537, 0, 65537, 0],
+      [65537, 16384, 49153, 16384],
+      [65537, 32768, 32769, 32768],
+      [65537, 49152, 16385, 49152],
+      [65537, 65536, 1, 65536],
+    ]);
+    expect(attemptFs.readSync.mock.results.reduce((sum, result) => sum + result.value, 0)).toBe(65537);
+    expect(attemptFs.closeSync).toHaveBeenCalledOnce();
+    expect(attemptFs.closeSync).toHaveBeenCalledWith(descriptor);
+    expect(f.redispatch).toHaveBeenCalledOnce();
+  });
+
+  it('migrates trusted historical markers conservatively and ignores forged markers', async () => {
+    const f = fixture();
+    const marker = c(END.createdAt, `${ORPHAN_GUARD_MARKER} — re-dispatched a fixer`);
+    f.setComments([{ ...VERDICT, id: 'verdict-one' }, BEGIN, END, marker,
+      { ...marker, author: { login: 'forged' } }]);
+    await f.run(); await f.run();
+    expect(f.redispatch).toHaveBeenCalledOnce();
+    expect(f.escalate).toHaveBeenCalledOnce();
+    expect(f.ledgers()[0].confirmed).toBe(2);
+  });
+
+  it('confirmed dispatch refusal releases the reservation for a retry', async () => {
+    const f = fixture();
+    f.redispatch.mockResolvedValueOnce({ ok: false, why: 'capacity' });
+    await f.run(); await f.run();
+    expect(f.redispatch).toHaveBeenCalledTimes(2);
+    expect(f.ledgers()[0]).toMatchObject({ confirmed: 1, pending: false });
   });
 });
