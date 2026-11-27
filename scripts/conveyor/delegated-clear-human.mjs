@@ -8,7 +8,7 @@
  * shadow: shadow appends a `would-approve` daemon event and changes nothing.
  *
  * Eligible = review:human held, advisory:accepted or review:accepted present, red-team:clear on the CURRENT head,
- * the NET diff scores humanRequired=false, every check passes apart from the review hold (`merge-gate`), and the
+ * the NET diff scores humanRequired=false, every required check present and green, and the
  * live head still equals the evaluated head at write time. Every unreadable input fails closed.
  *
  * WIRING (not done here, outside this file's scope): register in skills-src/conveyor/runner.mjs beside
@@ -21,6 +21,7 @@ import { readDeclaredSettings } from '../lib/settings-files.mjs';
 import { ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { appendDaemonEvent } from '../lib/daemon-events.mjs';
 import { hasReviewLabel, REVIEW_LABELS, scoreEscalation } from '../lib/review-escalation.mjs';
+import { DECLARED_REQUIRED_STATUS_CHECKS } from '../lib/required-status-checks.mjs';
 
 export const R11_REASON = 'Standing delegation R11 (operator chalbert, Claude Code chat 2026-10-21 21:50 ET): "Ok, I allow you to approve any of those until this is changed"';
 export const MODES = Object.freeze(['off', 'shadow', 'on']);
@@ -44,19 +45,28 @@ export function resolveDelegatedClearHumanMode({ env = {}, platform = {}, repo =
 
 const names = (labels) => (labels || []).map((l) => (typeof l === 'string' ? l : l?.name));
 
-function checksPass(rollup) {
-  if (!Array.isArray(rollup) || rollup.length === 0) return { ok: false, why: 'no check rollup' };
+function checksPass(rollup, requiredChecks) {
+  if (!Array.isArray(requiredChecks) || requiredChecks.length === 0) return { ok: false, why: 'required check list invalid' };
+  for (const name of requiredChecks) {
+    if (typeof name !== 'string' || !name.trim() || REVIEW_HOLD_CHECK.test(name)) return { ok: false, why: 'required check list invalid' };
+  }
+  if (!Array.isArray(rollup)) return { ok: false, why: 'no check rollup' };
+  const present = new Set();
   for (const c of rollup) {
     const name = c?.name || c?.context || '';
     if (REVIEW_HOLD_CHECK.test(name)) continue;
     const verdict = String(c?.conclusion || c?.state || '').toUpperCase();
     if (!OK_CONCLUSIONS.has(verdict) && verdict !== 'SUCCESS') return { ok: false, why: `check ${name || '?'} is ${verdict || 'pending'}` };
+    present.add(name);
+  }
+  for (const name of requiredChecks) {
+    if (!present.has(name)) return { ok: false, why: `required check ${name} missing` };
   }
   return { ok: true };
 }
 
 /** Pure given its injected readers. Returns `{eligible, failed, evidence}`; any throw or unknown input is a refusal. */
-export function evaluateEligibility(pr, { scoreNet, redTeamClearAtHead } = {}) {
+export function evaluateEligibility(pr, { scoreNet, redTeamClearAtHead, requiredChecks } = {}) {
   const failed = [];
   const labels = pr?.labels || [];
   const head = typeof pr?.headRefOid === 'string' && /^[0-9a-f]{40}$/i.test(pr.headRefOid) ? pr.headRefOid : null;
@@ -65,7 +75,7 @@ export function evaluateEligibility(pr, { scoreNet, redTeamClearAtHead } = {}) {
   const accepted = hasReviewLabel(labels, REVIEW_LABELS.accepted) ? REVIEW_LABELS.accepted
     : names(labels).includes('advisory:accepted') ? 'advisory:accepted' : null;
   if (!accepted) failed.push('no review:accepted / advisory:accepted');
-  const checks = checksPass(pr?.statusCheckRollup);
+  const checks = checksPass(pr?.statusCheckRollup, requiredChecks);
   if (!checks.ok) failed.push(checks.why);
   let shape = null;
   if (head) {
@@ -101,7 +111,7 @@ export function loadDelegatedClearHumanMode({ env = process.env, readFile = read
   return resolveDelegatedClearHumanMode({ env, platform, repo });
 }
 
-export async function runDelegatedClearHuman({ prs = [], mode = 'shadow', scoreNet, redTeamClearAtHead, readLiveHead,
+export async function runDelegatedClearHuman({ prs = [], repo, mode = 'shadow', scoreNet, redTeamClearAtHead, readLiveHead,
   emit = (e) => appendDaemonEvent({ kind: e.kind, pr: e.pr, daemon: 'delegated-clear-human', detail: { head: e.head, evidence: e.evidence } }),
   clearHuman = clearHumanViaCli } = {}) {
   const out = { mode, wouldApprove: [], cleared: [], headMovedAfterClear: [], refused: [] };
@@ -109,7 +119,7 @@ export async function runDelegatedClearHuman({ prs = [], mode = 'shadow', scoreN
   if (mode !== 'shadow' && mode !== 'on') return out;
   for (const pr of prs) {
     if (!hasReviewLabel(pr?.labels || [], REVIEW_LABELS.human)) continue;
-    const r = evaluateEligibility(pr, { scoreNet, redTeamClearAtHead });
+    const r = evaluateEligibility(pr, { scoreNet, redTeamClearAtHead, requiredChecks: DECLARED_REQUIRED_STATUS_CHECKS[repo] });
     if (!r.eligible) { out.refused.push({ pr: pr.number, failed: r.failed }); continue; }
     if (mode === 'shadow') {
       await emit({ kind: 'would-approve', pr: pr.number, head: r.evidence.head, evidence: r.evidence });
@@ -169,7 +179,7 @@ async function main(argv) {
   process.stderr.write(`delegatedClearHuman.mode=${mode} (${modeArg ? 'flag' : resolved.source})\n`);
   const readers = await liveReaders({ repo });
   readers.redTeamClearAtHead = await liveRedTeam({ repo });
-  const out = await runDelegatedClearHuman({ prs, mode, ...readers });
+  const out = await runDelegatedClearHuman({ prs, repo, mode, ...readers });
   process.stdout.write(`${JSON.stringify(out)}\n`);
 }
 
