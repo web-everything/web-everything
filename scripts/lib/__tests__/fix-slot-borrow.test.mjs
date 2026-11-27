@@ -3,7 +3,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createDispatchThrottle, resolveFixBorrowSettings } from '../dispatch-throttle.mjs';
-import { createFixBorrowGate, BORROW_REASON } from '../fix-slot-borrow.mjs';
+import { createFixBorrowGate, BORROW_REASON, consecutiveUnproductiveOnHead, recordRoutedOutcome, claudeOnlyReason } from '../fix-slot-borrow.mjs';
+import { FIX_EXECUTOR_CHAIN_DEFAULT, pickChainRung } from '../fix-executor-chain.mjs';
 import { runReconcileFixDispatch } from '../../conveyor/reconcile-fix-dispatch.mjs';
 import { acquireFixDispatchClaim, releaseFixDispatchClaim } from '../../conveyor/fix-dispatch-claim.mjs';
 import { planBuildDispatch, BUILD_DISPATCH_POLICY } from '../../conveyor/build-dispatch-policy.mjs';
@@ -177,6 +178,113 @@ describe('a borrowed fix is a normal claim that the build daemon counts', () => 
   });
 });
 
+
+describe('routed escalation count: model rows and total backstop', () => {
+  const id = { repo: 'fixture', pr: 17, head: 'h' };
+  const row = (cause, extra = {}) => ({ head: id.head, outcome: 'failed', ...(cause === undefined ? {} : { cause }), ...extra });
+  const tableFor = rows => ({ 'fixture#17': rows });
+
+  it.each([
+    ['two legacy rows keep the main count', [row(), row()], 2],
+    ['two launcher rows do not escalate', [row('launcher'), row('launcher')], 0],
+    ['three launcher rows hit the backstop', Array.from({ length: 3 }, () => row('launcher')), 2],
+    ['four launcher rows keep climbing', Array.from({ length: 4 }, () => row('launcher')), 3],
+    ['one model and one input row count one', [row('model'), row('input')], 1],
+    ['one model and two infra rows hit the backstop', [row('model'), row('infra'), row('infra')], 2],
+    ['three model and one launcher row count three', [row('model'), row('model'), row('model'), row('launcher')], 3],
+    ['two explicit model rows count two', [row('model'), row('model')], 2],
+    ['an invalid cause fails toward main', [row('bogus'), row('model')], 2],
+    ['a head change breaks the walk', [row('launcher', { head: 'g' }), row('model'), row('model')], 2],
+    ['a push breaks the walk', [row('model'), row('model'), row('model', { outcome: 'pushed' }), row('launcher')], 0],
+    ['a later different head excludes older model rows', [row('model'), row('model', { head: 'g' }), row('input')], 0],
+  ])('%s', (_name, rows, expected) => {
+    expect(consecutiveUnproductiveOnHead(tableFor(rows), id)).toBe(expected);
+  });
+
+  it('exports the closed non-model cause list and the three-row backstop', async () => {
+    const { ROUTED_NON_MODEL_CAUSES, ROUTED_HEAD_MAX_ROWS } = await import('../fix-slot-borrow.mjs');
+    expect(ROUTED_NON_MODEL_CAUSES).toEqual(['launcher', 'input', 'infra']);
+    expect(Object.isFrozen(ROUTED_NON_MODEL_CAUSES)).toBe(true);
+    expect(ROUTED_HEAD_MAX_ROWS).toBe(3);
+  });
+
+  it.each(['launcher', 'input', 'infra', 'model', undefined, null, '', 'bogus', 'MODEL', 1, {}, ['infra']])(
+    'classifies only an explicit non-model cause: %j', async cause => {
+      const { routedOutcomeCause } = await import('../fix-slot-borrow.mjs');
+      expect(routedOutcomeCause?.(row(cause))).toBe(['launcher', 'input', 'infra'].includes(cause) ? cause : 'model');
+    },
+  );
+
+  it('counts legacy and invalid causes without guessing from diagnostic text', () => {
+    const rows = [undefined, null, '', 'bogus', 1, {}, ['infra']].map(cause => row(cause, { reason: 'no-finding: RPC failed', note: 'launcher infra input' }));
+    expect(consecutiveUnproductiveOnHead(tableFor(rows), id)).toBe(rows.length);
+  });
+
+  it('bounds the backstop delay to one run for every mixture of causes', () => {
+    for (let total = 3; total <= 10; total++) {
+      for (let model = 0; model <= total; model++) {
+        const rows = Array.from({ length: total }, (_, i) => row(i < model ? 'model' : ['launcher', 'input', 'infra'][i % 3]));
+        expect(consecutiveUnproductiveOnHead(tableFor(rows), id)).toBe(Math.max(model, total - 1));
+      }
+    }
+  });
+
+  it('keeps the escalation threshold at two counted runs', () => {
+    expect(claudeOnlyReason({ codexUnproductive: 1 })).toBeNull();
+    expect(claudeOnlyReason({ codexUnproductive: 2 })).not.toBeNull();
+  });
+
+  it('launcher-only history advances monotonically to the terminal chain rung', () => {
+    const indices = Array.from({ length: 8 }, (_, i) => {
+      const rows = Array.from({ length: i + 1 }, () => row('launcher'));
+      const decision = pickChainRung({ chain: FIX_EXECUTOR_CHAIN_DEFAULT, launcherAvailable: () => true,
+        codexUnproductive: consecutiveUnproductiveOnHead(tableFor(rows), id) });
+      return FIX_EXECUTOR_CHAIN_DEFAULT.indexOf(decision.rung);
+    });
+    expect(indices.slice(0, 2)).toEqual([0, 0]);
+    expect(indices).toEqual([...indices].sort((a, b) => a - b));
+    expect(indices[FIX_EXECUTOR_CHAIN_DEFAULT.length]).toBe(FIX_EXECUTOR_CHAIN_DEFAULT.length - 1);
+  });
+
+  it.each(['launcher', 'input', 'infra', 'model', 'bogus', null, '', 1, {}, ['infra']])(
+    'stores only normalized explicit causes: %j', cause => {
+      const store = memLedger();
+      const readClaim = vi.fn(() => null);
+      recordRoutedOutcome({ ...id, cause, outcome: 'failed', reason: 'local reason', note: 'agent note',
+        now: 1_700_000_000_000, store, readClaim });
+      expect(store.read()['fixture#17']).toEqual([{ at: 1_700_000_000_000, head: 'h', outcome: 'failed',
+        reason: 'local reason', note: 'agent note', cause: ['launcher', 'input', 'infra'].includes(cause) ? cause : 'model' }]);
+      expect(readClaim.mock.calls).toEqual([['fix'], ['ci-heal']]);
+    },
+  );
+
+  it('retains the exact legacy row shape when cause is omitted', () => {
+    const store = memLedger();
+    recordRoutedOutcome({ ...id, outcome: 'failed', now: 1_700_000_000_000, store, readClaim: () => null });
+    expect(store.read()['fixture#17']).toEqual([{ at: 1_700_000_000_000, head: 'h', outcome: 'failed', reason: '', note: '' }]);
+  });
+
+  it.each(['fix', 'ci-heal'])('a borrowed %s claim still writes nothing, including cause', borrowedKind => {
+    const store = { read: vi.fn(), write: vi.fn() };
+    expect(recordRoutedOutcome({ ...id, outcome: 'failed', cause: 'model', now: 1_700_000_000_000, store,
+      readClaim: kind => kind === borrowedKind ? { meta: { borrowed: { executor: 'codex' } } } : null })).toEqual({});
+    expect(store.read).not.toHaveBeenCalled();
+    expect(store.write).not.toHaveBeenCalled();
+  });
+
+  it('retains ten caused rows and clears only this PR on a push', () => {
+    const store = memLedger();
+    const record = { ...id, now: 1_700_000_000_000, store, readClaim: () => null };
+    recordRoutedOutcome({ ...record, pr: 18, cause: 'model', outcome: 'failed' });
+    for (let i = 0; i < 12; i++) recordRoutedOutcome({ ...record, cause: 'launcher', outcome: 'failed', now: record.now + i });
+    expect(store.read()['fixture#17']).toHaveLength(10);
+    expect(store.read()['fixture#17'][0].at).toBe(record.now + 2);
+    expect(consecutiveUnproductiveOnHead(store.read(), id)).toBe(9);
+    recordRoutedOutcome({ ...record, cause: 'model', outcome: 'pushed' });
+    expect(store.read()).not.toHaveProperty('fixture#17');
+    expect(store.read()['fixture#18']).toHaveLength(1);
+  });
+});
 
 describe('routed Codex outcomes', () => {
   it('bounds history, counts only trailing failures on the head, clears on push, and routes fallback', async () => {
