@@ -1,10 +1,16 @@
 #!/usr/bin/env node
 import { deriveAgyFixAdmission } from '../lib/agy-fix-admission.mjs';
+import { ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 import { readCiJobLog } from '../lib/gh-ci-log.mjs';
 import { stripVTControlCharacters } from 'node:util';
 import { boundedCiLogTail } from '../lib/ci-log-evidence.mjs';
 import { buildStandDownComment } from '../conveyor/stand-down.mjs';
+import { buildNoCodeOwedStandDown } from '../conveyor/fix-procedure.mjs';
+import { noCodeOwedAuthorization, rearmWindow } from '../conveyor/rearm-review.mjs';
+import { createGhProvider } from '../lib/review-label-provider.mjs';
+import { readGh } from '../lib/proc-read.mjs';
+import { randomUUID } from 'node:crypto';
 import { repeatedFindingPlan, applyScopeReset, resolveFixSafety } from '../conveyor/repeated-finding-reset.mjs';
 /**
  * @file scripts/operations/fix-run.mjs
@@ -640,6 +646,19 @@ export async function resolveFixProvider(name) {
  * Card 5947 (live #5045, 2026-10-13): CI evidence and pre-lane outcomes are launcher-owned.
  * @returns {Promise<{code:number, result:string|null}>}
  */
+export function emitNoCodeOwedStandDown(binding, { readState, write }) {
+  try {
+    const body = buildNoCodeOwedStandDown(binding);
+    const state = readState();
+    if (!state || state.clean !== true || state.head !== binding.head || state.prHead !== binding.head
+      || state.claimId !== binding.claimId) throw new Error('fresh head, clean worktree or claim proof is missing or changed');
+    write(`${body}\n`);
+    return { emitted: true };
+  } catch (e) {
+    return { emitted: false, reason: `no-code evidence withheld; operator inspection required: ${singleLine(e?.message ?? e)}` };
+  }
+}
+
 export async function runFixCli(argv = [], {
   run = sh,
   recordPush = undefined,
@@ -653,12 +672,20 @@ export async function runFixCli(argv = [], {
   },
   spawnCodex = async (...args) => (await import('./codex-delivery-provider.mjs')).defaultSpawnCodexAgent(...args),
   readComments = readAllComments,
+  readNoCodeSnapshot = ({ repo, pr, cwd }) => {
+    const provider = createGhProvider({ exec: (args, opts) => readGh(args, {
+      ...opts, cwd, timeout: 60_000, maxBuffer: 8 * 1024 * 1024,
+    }) });
+    const state = provider.readPrState(repo, pr);
+    return { ...state, reviews: provider.readPrReviews(repo, pr) };
+  },
   readCiHeal = readCiHealInputs,
   timingPolicy = resolveTimingPolicy().fix,
   readChecks = readReviewChecks,
   readRequired = getRequiredStatusChecks,
   sleep = delay,
   clock = Date.now,
+  createRunId = randomUUID,
   appendLoopRow = appendFixLoopRow,
   releaseClaim = releaseBorrowedClaim,
   recordOutcome = recordBorrowOutcome,
@@ -681,6 +708,7 @@ export async function runFixCli(argv = [], {
   writeErr = (l) => process.stderr.write(l),
 } = {}) {
   let launch;
+  const runId = createRunId();
   let laneRelease = null;
   // How this launch (borrowed or routed) ended. Recorded in the borrow ledger (repeated failures stop the PR borrowing)
   // and, for routed non-Claude repairs, the per-head ledger (repeated failures advance the chain). The claim is released on EVERY
@@ -1232,6 +1260,31 @@ export async function runFixCli(argv = [], {
         } else {
           outcome = FIX_RUN_OUTCOME.NO_CHANGE_UNPROVEN;
           reason = evidence.reason ?? `missing or unverified fix evidence: ${evidence.missing.join(', ')}`;
+        }
+      }
+      if (launch.repairKind !== 'ci-heal' && !openSendBacks.length && !evidence.reason) {
+        try {
+          // Absence of send-backs proves nothing about the outstanding review finding. Re-read the operator
+          // window and live forge holds while the lane is still owned, immediately before terminal emission.
+          const comments = await readComments(pr, { repo: launch.repo });
+          if (!Array.isArray(comments) || rearmWindow(comments).resumeHead !== before) {
+            throw new Error('no current operator-authorized first resume at this head');
+          }
+          const repo = launch.repo ?? ghRepoSlug('we');
+          const snapshot = await readNoCodeSnapshot({ repo, pr, cwd: weRoot });
+          const authorization = noCodeOwedAuthorization({ comments, liveHead: snapshot?.headRefOid,
+            labels: snapshot?.labels?.map(l => l?.name), reviews: snapshot?.reviews });
+          if (!authorization.allowed) throw new Error(authorization.reason);
+          const emission = emitNoCodeOwedStandDown({ repo, pr: Number(pr), head: before, runId, claimId: holder, reason }, {
+            readState: () => {
+              const state = probeLaneHead({ lanePath, pr, repo: launch.repo, holder, run, readLease });
+              return { head: state.laneHead, prHead: state.prHead, clean: state.clean, claimId: state.lease?.holder };
+            }, write,
+          });
+          if (!emission.emitted) write(`fix-run: ${emission.reason}\n`);
+        } catch (e) {
+          // Withholding terminal evidence cannot fall through to a same-head rearm.
+          write(`fix-run: no-code evidence withheld; operator inspection required: ${singleLine(e?.message ?? e)}\n`);
         }
       }
       result = `${outcome} (${singleLine(reason)}; claim released, PR is re-planned)`;

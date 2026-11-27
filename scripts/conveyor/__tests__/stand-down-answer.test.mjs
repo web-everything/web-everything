@@ -550,7 +550,8 @@ describe('explicit no-code-owed ceremony', () => {
     const dir = mkdtempSync(join(tmpdir(), 'no-code-rearm-'));
     const stateFile = join(dir, 'state.json');
     const logFile = join(dir, 'calls.jsonl');
-    const snapshot = { ...pr(headedComments), headRefOid: HEAD, comments: [{ ...trusted('🔁 review — changes requested', 'IC_changes'), createdAt: '2026-11-25T11:45:50Z' }, ...headedComments], ...over };
+    // An observed empty formal-review list permits the ceremony; an omitted list is unreadable evidence.
+    const snapshot = { ...pr(headedComments), headRefOid: HEAD, reviews: [], comments: [{ ...trusted('🔁 review — changes requested', 'IC_changes'), createdAt: '2026-11-25T11:45:50Z' }, ...headedComments], ...over };
     writeFileSync(stateFile, JSON.stringify(snapshot));
     writeFileSync(logFile, '');
     // Every subprocess stays local. Unknown GitHub calls fail; git cannot read or write a real checkout.
@@ -634,6 +635,21 @@ else if (a[0] === 'api' && a[1] === 'repos/web-everything/web-everything/issues/
   const headedSnapshot = () => ({ comments: [{ ...trusted('🔁 review — changes requested', 'IC_changes'), createdAt: '2026-11-25T11:45:50Z' }, begin, stop,
     trusted(buildOperatorAnswer({ ...record, standDownId: stop.id, disposition: 'rearm-review', noCodeOwed: true, head: HEAD }), 'IC_headed'),
     { ...begin, id: 'IC_resumed' }] });
+  it.each([
+    ['omitted', undefined], ['null', null], ['malformed', [{}]],
+    ['changes requested', [{ state: 'CHANGES_REQUESTED' }]],
+    ['oversized', Array(1001).fill({ state: 'APPROVED' })],
+  ])('headed no-code CLI refuses %s formal reviews before a label swap', (_name, reviews) => {
+    const h = makeRearmCli({ ...headedSnapshot(), reviews });
+    try {
+      const r = h.rearm();
+      expect(r.status, r.stdout + r.stderr).toBe(1);
+      expect(r.stdout).toContain('formal reviews unreadable, oversized or still hold the repair');
+      expect(h.state().labels).toEqual([{ name: 'review:changes' }]);
+      expect(h.calls().filter(a => a[0] === 'pr' && a[1] === 'edit')).toEqual([]);
+      expect(h.state().comments.filter(c => c.body.startsWith(REARM_COMMENT_MARKER))).toEqual([]);
+    } finally { rmSync(h.dir, { recursive: true, force: true }); }
+  }, 120000);
   it('headed answer → resumed claim → pinned review:pending swap and durable 🔧 marker', () => {
     const h = makeRearmCli(headedSnapshot());
     try {

@@ -66,6 +66,42 @@ import {
   fixDispatchSessionName, DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES, normalizeBranch,
 } from './fix-claim-store.mjs';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from '../lib/constellation-repos.mjs';
+import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+
+const NO_CODE_HEADING = '⚠️ conveyor fix — no-code-owed stand-down';
+const NO_CODE_PREFIX = '<!-- conveyor-no-code-owed:';
+const noCodeError = () => new Error('no-code evidence withheld; operator must inspect the repair and supply complete bounded evidence');
+function noCodeIdentity(value) {
+  return value && typeof value.repo === 'string' && /^[\w.-]+\/[\w.-]+$(?![\s\S])/.test(value.repo)
+    && Number.isSafeInteger(value.pr) && value.pr > 0
+    && typeof value.head === 'string' && /^[0-9a-f]{40}$(?![\s\S])/i.test(value.head)
+    && ['runId', 'claimId'].every(key => typeof value[key] === 'string' && value[key].length > 0
+      && value[key].length <= 200 && !/[\s\x00-\x1f\x7f-\x9f]/.test(value[key]));
+}
+
+/** Terminal bookkeeping only: never acceptance, and never authority for another run or claim. */
+export function buildNoCodeOwedStandDown(value) {
+  if (!noCodeIdentity(value) || typeof value.reason !== 'string' || !value.reason.trim()
+    || value.reason.length > 1000 || /[\x00-\x1f\x7f-\x9f]/.test(value.reason)) throw noCodeError();
+  const { repo, pr, head, runId, claimId, reason } = value;
+  const data = JSON.stringify({ version: 1, repo, pr, head, runId, claimId, reason })
+    .replace(/</g, '\\u003c').replace(/>/g, '\\u003e');
+  return `${NO_CODE_HEADING}\n${NO_CODE_PREFIX}${data} -->`;
+}
+
+/** Require the exact producer format, rejecting duplicates, quoted records and trailing prose. */
+export function parseNoCodeOwedStandDown(comment, expected) {
+  if (!noCodeIdentity(expected) || !isTrustedMarkerAuthor({ ...comment, viewerDidAuthor: false })
+    || typeof comment?.body !== 'string' || comment.body.length > 8192) return null;
+  const start = `${NO_CODE_HEADING}\n${NO_CODE_PREFIX}`;
+  if (!comment.body.startsWith(start) || !comment.body.endsWith(' -->')) return null;
+  try {
+    const record = JSON.parse(comment.body.slice(start.length, -4));
+    if (record.version !== 1 || buildNoCodeOwedStandDown(record) !== comment.body
+      || ['repo', 'pr', 'head', 'runId', 'claimId'].some(key => record[key] !== expected[key])) return null;
+    return record;
+  } catch { return null; }
+}
 
 /** The claim-store `kind` a fix-procedure claim is filed under — distinct from the dispatcher's own `fix` /
  *  `ci-heal` spawn claims, so a dispatcher's claim and the fixer's own claim never share one slot. */
