@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 const b = {
   id: 'supersede-bot-author-shapes',
-  title: 'a REST bot author and its GraphQL identity stand down the superseded PR despite large closed history',
+  title: 'a REST bot author and its GraphQL identity stand down the superseded PR despite large closed history and a lagging search index',
   card: 'PR 7559 bot author identity send-back',
   fixedBy: { sha: 'lane/supersede-watch-harden', where: 'working tree', paths: ['scripts/conveyor/supersede-watch.mjs'] },
   fixPresent(root) {
@@ -37,7 +37,8 @@ const b = {
           return JSON.stringify({ data: { repository: { pullRequest: { ...source,
             author: { login: bodyReads % 2 ? 'web-everything' : 'web-everything[bot]' } } } } });
         }
-        if (args.some(a => a.startsWith('q='))) return JSON.stringify({ data: { search: { issueCount: 1 } } });
+        // GitHub search lags REST for hours: it has not indexed the merge yet, so it counts 0 where REST lists 1.
+        if (args.some(a => a.startsWith('q='))) return JSON.stringify({ data: { search: { issueCount: 0 } } });
         return JSON.stringify({ data: { repository: { pullRequests: { totalCount: args.includes('s[]=OPEN') ? 1 : history.length + 1 } } } });
       }
       const url = new URL(args[1], 'https://fixture.invalid');

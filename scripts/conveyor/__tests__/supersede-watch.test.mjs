@@ -151,7 +151,8 @@ describe('runSupersedeWatch', () => {
     const rows = defaultReadMergedPrs({ repo, lookbackDays: 14,
       now: Date.parse('2026-10-10T00:00:00Z'), exec, requireComplete });
     expect(rows).toHaveLength(99);
-    expect(exec).toHaveBeenCalledTimes(requireComplete ? 8 : 2);
+    // Complete: two scans of two pages, each followed by one search lower-bound read.
+    expect(exec).toHaveBeenCalledTimes(requireComplete ? 6 : 2);
   });
   it.each([defaultReadOpenNumbers, defaultReadMergedPrs])('refuses incomplete lists at the page cap with an operator fallback (%s)', read => {
     const exec = vi.fn(() => JSON.stringify(Array.from({ length: 100 }, (_, i) => ({
@@ -367,17 +368,44 @@ describe('bound supersede evidence', () => {
     expect(runSupersedeWatch(opts).applied.every(a => a.ok === false)).toBe(true);
     expect(opts.postHold).not.toHaveBeenCalled();
   });
-  it.each([{ number: 99 }, { headRefOid: 'c'.repeat(40) }, { state: 'CLOSED' }])('moved candidate refuses: %j', fields => {
+  it.each([{ number: 99 }, { headRefOid: 'c'.repeat(40) }, { state: 'CLOSED' }, { id: 'OTHER' }])('moved candidate refuses: %j', fields => {
     const opts = hardOptions();
     opts.readPr.mockReturnValueOnce(hardTarget()).mockReturnValue({ ...hardTarget(), ...fields });
     runSupersedeWatch(opts);
     expect(opts.postHold).not.toHaveBeenCalled();
+  });
+  it('candidate ID changes before write refuses', () => {
+    const opts = hardOptions();
+    opts.readPr.mockReturnValueOnce(hardTarget()).mockReturnValue({ ...hardTarget(), id: 'PR_REPLACED' });
+    const result = runSupersedeWatch(opts);
+    expect(result.applied).toEqual([expect.objectContaining({ ok: false, error: expect.stringMatching(/candidate moved/) })]);
+    expect(opts.postHold).not.toHaveBeenCalled();
+    expect(result.evidence).toBeUndefined();
+  });
+  it('candidate ID changes during read-back refuses completion', () => {
+    const opts = hardOptions();
+    opts.postHold.mockImplementation(({ hold: h }) => {
+      opts.readPr.mockReturnValue({ ...hardTarget(), id: 'PR_REPLACED', comments: [{ author: { login: 'web-everything' },
+        body: buildSupersededStandDownComment(h) }] });
+      return { ok: true, labeled: true };
+    });
+    const result = runSupersedeWatch(opts);
+    expect(result.applied).toEqual([expect.objectContaining({ ok: false, error: expect.stringMatching(/read-back.*retry/i) })]);
+    expect(result.evidence).toBeUndefined();
   });
   it('effect read-back must observe the trusted hold before recording completion', () => {
     const opts = hardOptions();
     const result = runSupersedeWatch(opts);
     expect(opts.postHold).toHaveBeenCalledTimes(1);
     expect(result.applied).toEqual([expect.objectContaining({ ok: false, error: expect.stringMatching(/read-back.*retry/i) })]);
+    expect(result.evidence).toBeUndefined();
+  });
+  it('a post that is not ok records no evidence', () => {
+    const opts = hardOptions();
+    opts.postHold.mockReturnValue({ ok: false, error: 'label failed' });
+    const result = runSupersedeWatch(opts);
+    expect(result.applied).toEqual([expect.objectContaining({ ok: false })]);
+    expect(result.evidence).toBeUndefined();
   });
   it('stable bound snapshot stores candidate identity and version after trusted read-back', () => {
     const opts = hardOptions();
@@ -440,11 +468,83 @@ describe('complete listing replay', () => {
         body: buildSupersededStandDownComment({ pr: 10, by: 20, mergedAt: hardSource().mergedAt }) }] });
       return { ok: true, labeled: true };
     });
-    expect(runSupersedeWatch(opts).applied).toEqual([expect.objectContaining({ ok: false })]);
+    const result = runSupersedeWatch(opts);
+    expect(result.applied).toEqual([expect.objectContaining({ ok: false })]);
+    expect(result.evidence).toBeUndefined();
   });
 });
 
 describe('closed completeness paths', () => {
+  const openRows = (mutate = () => ({})) => Array.from({ length: 3 }, (_, i) => ({ number: i + 1, state: 'open',
+    body: `body ${i}`, user: { login: 'someone' }, updated_at: '2026-11-25T11:00:00Z', ...mutate(i) }));
+  /** An exec whose second full scan of the list differs by `mutate`; counts are always consistent. */
+  const driftingExec = (first, second) => {
+    let scans = 0;
+    return (_cmd, args) => {
+      if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequests: { totalCount: first.length } } } });
+      const page = Number(new URL(args[1], 'https://fixture.invalid').searchParams.get('page'));
+      if (page === 1) scans += 1;
+      return JSON.stringify(page === 1 ? (scans <= 1 ? first : second) : []);
+    };
+  };
+  it('unrelated open PR activity between scans still yields the complete open numbers', () => {
+    const exec = driftingExec(openRows(), openRows(i => ({ updated_at: '2026-11-25T12:00:00Z', body: `edited ${i}` })));
+    expect(defaultReadOpenNumbers({ repo, exec, requireComplete: true })).toEqual([1, 2, 3]);
+  });
+  it('the open list is read in creation order so activity cannot shift its pages', () => {
+    const urls = [];
+    defaultReadOpenNumbers({ repo, requireComplete: false, exec: (_cmd, args) => { urls.push(args[1]); return '[]'; } });
+    expect(urls[0]).toMatch(/state=open&sort=created&direction=desc/);
+  });
+  const mergedRows = (mutate = () => ({})) => [{ number: 20, state: 'closed', body: 'Supersedes: #10',
+    user: { login: 'web-everything' }, merged_at: hardSource().mergedAt, updated_at: hardSource().updatedAt, ...mutate() }];
+  const mergedExec = (first, second, issueCount = 1) => {
+    let scans = 0;
+    return (_cmd, args) => {
+      if (args[1] === 'graphql') return JSON.stringify({ data: { search: { issueCount } } });
+      scans += 1;
+      return JSON.stringify(scans <= 1 ? first : second);
+    };
+  };
+  const readMerged = exec => defaultReadMergedPrs({ repo, exec, now: hardNow, lookbackDays: 14, requireComplete: true });
+  it.each([{ body: 'Supersedes: #99' }, { user: { login: 'someone-else' } }, { merged_at: '2026-11-25T10:00:01Z' }])(
+    'same-membership version drift in a planner field refuses the merged inventory: %j', fields => {
+      expect(() => readMerged(mergedExec(mergedRows(), mergedRows(() => fields)))).toThrow(/inventory changed.*retry/);
+    });
+  it('a merged PR updated only by comment or label between scans does not refuse', () => {
+    const rows = readMerged(mergedExec(mergedRows(), mergedRows(() => ({ updated_at: '2026-11-25T11:30:00Z' }))));
+    expect(rows.map(r => r.number)).toEqual([20]);
+  });
+  it.each([0, 1])('a lagging search index (issueCount %i below the REST rows) still returns them', issueCount => {
+    const rows = mergedRows();
+    const second = [...rows, { ...rows[0], number: 21, body: '' }];
+    expect(readMerged(mergedExec(second, second, issueCount)).map(r => r.number)).toEqual([20, 21]);
+  });
+  it('a search index claiming more merges than REST returned refuses', () => {
+    expect(() => readMerged(mergedExec(mergedRows(), mergedRows(), 2))).toThrow(/incomplete closed PR list.*retry/);
+  });
+  it('search index lag does not stop the daemon tick from dispatching the fix half', async () => {
+    const opts = hardOptions();
+    const rows = mergedRows();
+    const exec = vi.fn((_cmd, args) => {
+      if (args[1] === 'graphql') {
+        if (args.some(a => a.startsWith('q='))) return JSON.stringify({ data: { search: { issueCount: 0 } } });
+        return JSON.stringify({ data: { repository: { pullRequests: { totalCount: 1 } } } });
+      }
+      return JSON.stringify(new URL(args[1], 'https://fixture.invalid').searchParams.get('state') === 'open'
+        ? [{ number: 10, state: 'open' }] : rows);
+    });
+    opts.postHold.mockImplementation(({ hold: h }) => {
+      opts.readPr.mockReturnValue({ ...hardTarget(), comments: [{ author: { login: 'web-everything' },
+        body: buildSupersededStandDownComment(h) }] });
+      return { ok: true, labeled: true };
+    });
+    const tick = () => runSupersedeWatch({ ...opts, readMergedPrs: undefined, readOpenNumbers: undefined, exec });
+    const fixTick = vi.fn(noopDispatch);
+    await runTickAllRepos({ ...tickFakes(), repos: [opts.repo], fixTick, supersedeTick: tick });
+    expect(fixTick).toHaveBeenCalledTimes(1);
+    expect(opts.postHold).toHaveBeenCalledTimes(1);
+  });
   it('processes recent supersedes when historical closed inventory exceeds the cap', async () => {
     const opts = hardOptions();
     const source = hardSource();

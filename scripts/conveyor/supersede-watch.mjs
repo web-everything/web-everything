@@ -32,10 +32,15 @@ const ghJson = (args, exec) => JSON.parse(String(exec('gh', args, {
   stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', maxBuffer: 64 * 1024 * 1024,
 }) || 'null'));
 
-/** Bracket the relevant inventory count and require two matching identity/version scans.
- * Counts alone miss balanced membership replacement across mutable REST pages. This
- * detects observed churn; it is not an atomic GitHub snapshot. Effects revalidate below.
- * The count covers recent merges; paging stops at the updated-date lookback boundary.
+/** Require two matching scans of the inventory, bracketed by a count where one is authoritative.
+ * Counts alone miss balanced membership replacement across mutable REST pages, so the two scans
+ * must also agree on what the planner reads: PR numbers for the open list, and number, merge time,
+ * body and author for the merged window (comments, labels and pushes change `updated_at` and are
+ * not churn). This detects observed churn; it is not an atomic GitHub snapshot. Effects revalidate below.
+ * Open list: the GraphQL repository total must equal the unique REST rows before and after the scan.
+ * Merged window: REST is the inventory; GitHub search lags it for hours, so its `issueCount` is only a
+ * lower bound and the read refuses only when search claims MORE merges than REST returned.
+ * Paging stops at the updated-date lookback boundary.
  */
 function readPullPages({ repo, state, exec, since, requireComplete = false, confirm = true }) {
   const incomplete = (why) => new Error(`incomplete ${state} PR list in ${slugOf(repo)}: ${why}; operator must inspect the full list and retry next tick`);
@@ -51,12 +56,16 @@ function readPullPages({ repo, state, exec, since, requireComplete = false, conf
     if (out?.errors?.length || !Number.isSafeInteger(count) || count < 0) throw incomplete('unreadable count proof');
     return count;
   };
-  const expected = requireComplete ? readCount() : null;
+  const windowed = since !== undefined;
+  const expected = requireComplete && !windowed ? readCount() : null;
   if (expected >= MAX_LIST_PAGES * PAGE_SIZE) throw new Error(`PR list page cap reached in ${slugOf(repo)}; operator must narrow the inventory or inspect the full list before dispatch; retry next tick`);
   const rows = [];
   const ids = new Set();
   for (let page = 1; page <= MAX_LIST_PAGES; page += 1) {
-    const batch = ghJson(['api', `repos/${slugOf(repo)}/pulls?state=${state}&sort=updated&direction=desc&per_page=${PAGE_SIZE}&page=${page}`], exec);
+    // Open: creation order, so activity on an open PR cannot shift rows between pages. Closed: update order,
+    // which the lookback boundary stop needs (a merge updates its PR).
+    const sort = state === 'open' ? 'created' : 'updated';
+    const batch = ghJson(['api', `repos/${slugOf(repo)}/pulls?state=${state}&sort=${sort}&direction=desc&per_page=${PAGE_SIZE}&page=${page}`], exec);
     if (!Array.isArray(batch) || batch.length > PAGE_SIZE || batch.some(p => !Number.isSafeInteger(p?.number) || p.number < 1
       || (state === 'closed' && (!Number.isFinite(Date.parse(p.updated_at)) || (p.merged_at !== null && (
         !Number.isFinite(Date.parse(p.merged_at)) || (p.body !== null && typeof p.body !== 'string')
@@ -64,7 +73,7 @@ function readPullPages({ repo, state, exec, since, requireComplete = false, conf
       throw new Error(`unreadable ${state} PR list in ${slugOf(repo)}; operator must inspect evidence and retry next tick`);
     }
     for (const row of batch) {
-      if (requireComplete && ids.has(row.number)) throw incomplete(`duplicate #${row.number}; ${ids.size} unique of claimed ${expected}`);
+      if (requireComplete && ids.has(row.number)) throw incomplete(`duplicate #${row.number}; ${ids.size} unique rows so far`);
       ids.add(row.number);
       rows.push(row);
     }
@@ -73,11 +82,16 @@ function readPullPages({ repo, state, exec, since, requireComplete = false, conf
     if (batch.length < PAGE_SIZE || (since !== undefined && batch.some(p => Date.parse(p.updated_at) < since))) {
       const relevant = since === undefined ? rows : rows.filter(p => p.merged_at !== null && Date.parse(p.merged_at) >= since);
       const uniqueCount = since === undefined ? ids.size : new Set(relevant.map(p => p.number)).size;
-      if (requireComplete && (uniqueCount !== expected || readCount() !== expected)) throw incomplete(`${uniqueCount} unique of claimed ${expected}, or count changed`);
+      if (requireComplete && windowed) {
+        const indexed = readCount();
+        if (indexed > uniqueCount) throw incomplete(`${uniqueCount} unique merged rows but search indexes ${indexed}`);
+      } else if (requireComplete && (uniqueCount !== expected || readCount() !== expected)) {
+        throw incomplete(`${uniqueCount} unique of claimed ${expected}, or count changed`);
+      }
       if (requireComplete && confirm) {
         const confirmed = readPullPages({ repo, state, exec, since, requireComplete, confirm: false });
-        const version = list => JSON.stringify(list.map(p => [p.number, p.state, p.updated_at,
-          p.merged_at, p.body, p.user?.login, p.user?.is_bot]).sort((a, b) => a[0] - b[0]));
+        const version = list => JSON.stringify(list.map(p => state === 'open' ? [p.number]
+          : [p.number, p.merged_at, p.body, p.user?.login, p.user?.is_bot]).sort((a, b) => a[0] - b[0]));
         if (version(relevant) !== version(confirmed)) throw incomplete('inventory changed between scans');
       }
       return relevant;
@@ -88,7 +102,8 @@ function readPullPages({ repo, state, exec, since, requireComplete = false, conf
 
 /** Low-level merged list; daemon completeness checks cover only the lookback window. */
 export function defaultReadMergedPrs({ repo, lookbackDays, now = Date.now(), exec = execFileSync, requireComplete = false }) {
-  const since = now - lookbackDays * 86_400_000;
+  // Whole seconds: GitHub timestamps and the search qualifier have none, so REST and search agree at the boundary.
+  const since = Math.floor((now - lookbackDays * 86_400_000) / 1000) * 1000;
   return readPullPages({ repo, state: 'closed', exec, since, requireComplete })
     .filter(p => Date.parse(p.merged_at) >= since)
     .map(p => ({ number: p.number, body: p.body, state: 'MERGED', mergedAt: p.merged_at, author: p.user }));
@@ -232,7 +247,6 @@ export function runSupersedeWatch({
           throw new Error('hold authority changed before write; retry next tick');
         const bound = { candidateId: current.id, candidateHead: current.headRefOid,
           sourceId: fresh.id, version: fresh.updatedAt, snapshot: snapshotVersion(fresh) };
-        evidence.push({ pr: hold.pr, ...bound });
         const posted = postHold({ repo, hold });
         if (!posted?.ok) return { ...hold, ...posted, ok: false };
         const observed = readPr({ repo, pr: hold.pr });
@@ -240,6 +254,8 @@ export function runSupersedeWatch({
         if (observed.state !== 'OPEN' || observed.id !== current.id || observed.headRefOid !== current.headRefOid
           || !supersedeHoldsOn(observed.comments).includes(hold.by))
           throw new Error('effect read-back incomplete; inspect the PR and retry next tick');
+        // Evidence names only an effect the trusted read-back observed.
+        evidence.push({ pr: hold.pr, ...bound });
         return { ...hold, ...posted };
       }
       catch (e) { return { ...hold, ok: false, error: String(e?.message || e).split('\n')[0] }; }

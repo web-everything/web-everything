@@ -469,8 +469,11 @@ function handleOpenPrPage(store, rest) {
       return { stderr: 'fake-gh: unsupported merged inventory search\n', exitCode: 1 };
     }
     const repoState = requireRepo(store, match[1]);
+    // Real GitHub search is eventually consistent: `repoState.searchIndexMissing` lists PR numbers
+    // the index has not (or never) caught up on, so the count can sit below the authoritative REST list.
+    const lagging = new Set(repoState.searchIndexMissing ?? []);
     const issueCount = Object.values(repoState.prs).filter(pr => pr.state === 'MERGED'
-      && Date.parse(pr.mergedAt) >= Date.parse(match[2])).length;
+      && !lagging.has(pr.number) && Date.parse(pr.mergedAt) >= Date.parse(match[2])).length;
     return jsonResult({ data: { search: { issueCount } } });
   }
   const inventoryQuery = 'query($o:String!,$n:String!,$s:[PullRequestState!]!){repository(owner:$o,name:$n){pullRequests(states:$s){totalCount}}}';

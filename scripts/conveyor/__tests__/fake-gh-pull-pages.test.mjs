@@ -46,7 +46,8 @@ describe('fake GitHub REST pull list used by supersede-watch', () => {
       closed.closedAt = closed.updatedAt;
     });
     const open = defaultReadOpenNumbers({ repo, exec, requireComplete: true });
-    expect(open).toEqual(Array.from({ length: 251 }, (_, index) => index + 1));
+    // The open list is read newest-created first so activity cannot shift its pages; only membership matters.
+    expect([...open].sort((a, b) => a - b)).toEqual(Array.from({ length: 251 }, (_, index) => index + 1));
     const merged = defaultReadMergedPrs({ repo, lookbackDays: 7, now, exec, requireComplete: true });
     expect(merged.map(pr => pr.number)).toEqual(Array.from({ length: 251 }, (_, index) => index + 252));
     expect(merged[0]).toEqual({ number: 252, body: 'Supersedes #9999', state: 'MERGED',
@@ -115,7 +116,29 @@ describe('fake GitHub REST pull list used by supersede-watch', () => {
     expect(() => count(`repo:${repo} is:pr is:merged`)).toThrow(/unsupported merged inventory search/);
   });
 
-  it.each(['page=0', 'page=1.5', 'per_page=101', 'state=merged', 'sort=unknown', 'unknown=1'])(
+  it('models search-index lag: the count drops lagging merges while the REST list keeps them', () => {
+    const { gh, exec } = fixture();
+    withStore(gh.env.FAKE_GH_STORE, store => {
+      const state = store.repos[repo];
+      for (let index = 0; index < 3; index += 1) {
+        const pr = openPrPure(state, { head: 'fixture', body: '', author: 'agent', now });
+        pr.state = 'MERGED';
+        pr.mergedAt = new Date(now - index * 60_000).toISOString();
+        pr.updatedAt = pr.mergedAt;
+      }
+      state.searchIndexMissing = [2];
+    });
+    const since = new Date(now - 86400000).toISOString();
+    const indexed = JSON.parse(exec('gh', ['api', 'graphql', '-f',
+      'query=query($q:String!){search(query:$q,type:ISSUE){issueCount}}', '-f', `q=repo:${repo} is:pr is:merged merged:>=${since}`],
+    { encoding: 'utf8' })).data.search.issueCount;
+    expect(indexed).toBe(2);
+    // The daemon's default merged reader trusts REST as the inventory and uses search only as a lower bound.
+    expect(defaultReadMergedPrs({ repo, lookbackDays: 7, now, exec, requireComplete: true }).map(pr => pr.number))
+      .toEqual([1, 2, 3]);
+  });
+
+  it.each(['page=0','page=1.5', 'per_page=101', 'state=merged', 'sort=unknown', 'unknown=1'])(
     'rejects unsupported pagination instead of returning an empty success: %s', query => {
       const { api } = fixture();
       expect(() => api(query)).toThrow(/unsupported pulls pagination/);
