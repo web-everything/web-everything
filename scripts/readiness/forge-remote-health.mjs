@@ -172,3 +172,12 @@ export async function recordRemoteResult({root,settings,clock=Date.now,result,ho
 export function peekRemoteTelemetry({root,host='forge'}) {
   try{return readState(remoteHealthFile(root,host)).telemetry;}catch{return null;}
 }
+
+/** Advisory read only: the locked health check remains authoritative, including quarantine. */
+export function peekRemoteBreaker({root,host,clock=Date.now}) {
+  let state;
+  try { state=readState(remoteHealthFile(root,host),()=>seedLegacyBackoff(root,host)); }
+  catch(error) { if(!error.salvage)return {open:false};state=error.salvage; }
+  return clock()<state.backoffUntil && state.trigger!=='forge-unreachable'
+    ? {open:true,reason:`backoff-${state.trigger}`} : {open:false};
+}

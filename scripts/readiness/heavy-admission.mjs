@@ -1289,13 +1289,13 @@ function resolveTimeoutCancelWaitMs(env) {
 }
 
 export async function runWithRemoteDecision({
-  argv, policy, cwd, env, host = 'forge', clock = Date.now,
+  argv, policy, cwd, env, host, clock = Date.now,
   lockRoot = admissionLockRoot(cwd, env), readTelemetry,
   timeoutMs = classifyAdmissionCommandKind(argv.map(shellQuoteWord).join(' '), env) === 'files'
     ? resolveFastRunTimeoutMs(env)
     : env ? resolveCeilingMs(env) : DEFAULT_ADMISSION_CEILING_MS,
   loadPerCore = () => loadavg()[0] / cpus().length,
-  remoteExec, remoteClientOverride = null, onDecision, targetExec, sshOptions,
+  remoteExec, remoteClientOverride = null, onDecision, targetExec, sshOptions, readCapability = readRunnerBundleCapability,
   log = (line) => process.stderr.write(line), appendEvent = appendClientOverrideEvent,
   // Under test the real host's load must not change routing; tests inject this seam.
   hostOverloaded = () => !isUnderTest(env ?? {}) && hostOverloadedForRemote(env),
@@ -1319,22 +1319,57 @@ export async function runWithRemoteDecision({
   const hosts = policy.settings.remote.hosts ?? DEFAULT_REMOTE_HOSTS;
   const customTargets = !isDefaultRemoteHosts(hosts);
   const externalClient = policy.settings.remote.clientPath != null || remoteClientOverride != null;
-  let targetMissing = false;
-  if (customTargets && policy.settings.remote.enabled
-    && (policy.settings.remote.mode === 'always' || Number.isFinite(load)
-      && (load > policy.settings.remote.loadPerCoreThreshold || isOverloaded()))) {
-    const target = await pickRemoteTarget({hosts, exec:targetExec, cwd, sshOptions});
-    targetMissing = !target;
-    if (target) {
-      host = target.alias; root = target.root;
-      log(`heavy-admission: remote.hosts=${JSON.stringify(hosts)} (${policy.sources['remote.hosts'] ?? 'standard'}); selected=${host} skipped=${JSON.stringify(target.skipped)}\n`);
+  const remoteRoot = join(dirname(lockRoot), 'remote');
+  const localFallback = (reason, detail = null) => {
+    recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock});
+    log(`heavy-admission: remote unavailable (${oneLine(reason)}) - falling back to local admission\n`);
+    return { handled: false };
+  };
+  // Confinement must precede shared health access; repeat before the existing post-decision path.
+  const confinement = () => {
+    try {
+      mkdirSync(remoteRoot, {recursive:true});
+      const probe = mkdtempSync(join(remoteRoot, '.write-probe-'));
+      rmdirSync(probe);
+    } catch (error) {
+      if (['EPERM', 'EACCES', 'EROFS'].includes(error?.code)) return error.code;
+      // A race or other failure still belongs to the normal remote-health path.
     }
+    return null;
+  };
+  const route = runnerBundleOk => {
+    let decision = decideRemote({policy,loadPerCore:load,argv,cwd,runnerBundleOk});
+    if (!decision.remote && !decision.needsGit && policy.settings.remote.enabled && policy.settings.remote.mode === 'above-threshold'
+      && Number.isFinite(load) && isOverloaded()) decision = withNeedsGit({remote:true,reason:`${decision.reason}; host overloaded`},argv,cwd,bundleKeepsRemote(policy.settings.remote,runnerBundleOk),policy.settings.remote.manifest);
+    return decision;
+  };
+  let targetMissing = false;
+  const skipped = [];
+  let decision;
+  if (customTargets) {
+    decision = route(true);
+    if (decision.remote) {
+      const denied = confinement();
+      if (denied) {
+        onDecision?.(decision);
+        log(`heavy-admission: remote (${decision.reason})\n`);
+        return localFallback('confined-local', `${denied} ${oneLine(basename(remoteRoot))}`);
+      }
+      const {peekRemoteBreaker,checkRemoteHealth} = await import('./forge-remote-health.mjs');
+      const target = await pickRemoteTarget({hosts,exec:targetExec,cwd,sshOptions,onSkip:entry=>skipped.push(entry),
+        breaker:alias=>peekRemoteBreaker({root:remoteRoot,host:alias,clock}),
+        admit:({alias})=>checkRemoteHealth({root:remoteRoot,settings:policy.settings.remote,clock,readTelemetry,host:alias})});
+      targetMissing = !target;
+      if (target) {
+        host = target.alias; root = target.root;
+        log(`heavy-admission: remote.hosts=${JSON.stringify(hosts)} (${policy.sources['remote.hosts'] ?? 'standard'}); selected=${host} skipped=${JSON.stringify(target.skipped)}\n`);
+        decision = route(readCapability({root:remoteRoot,host,clock,unknownOk:!externalClient}));
+      } else decision = {remote:false,reason:'no-healthy-remote'};
+    }
+  } else {
+    host ??= hosts[0].alias; root = hosts[0].root;
+    decision = route(readCapability({root:remoteRoot,host,clock,unknownOk:!externalClient}));
   }
-  const runnerBundleOk = readRunnerBundleCapability({ root: join(dirname(lockRoot ?? admissionLockRoot(cwd, env)), 'remote'), host, clock, unknownOk: !externalClient });
-  let decision = decideRemote({ policy, loadPerCore: load, argv, cwd, runnerBundleOk });
-  if (!decision.remote && !decision.needsGit && policy.settings.remote.enabled && policy.settings.remote.mode === 'above-threshold'
-    && Number.isFinite(load) && isOverloaded()) decision = withNeedsGit({ remote: true, reason: `${decision.reason}; host overloaded` }, argv, cwd, bundleKeepsRemote(policy.settings.remote, runnerBundleOk), policy.settings.remote.manifest);
-  if (targetMissing) decision = {remote:false,reason:'no-healthy-remote'};
   onDecision?.(decision);
   log(`heavy-admission: ${decision.remote ? 'remote' : 'local'} (${decision.reason})\n`);
   if (decision.needsGit) recordRemoteFallback({lockRoot, reason: decision.manifestRefusal ?? 'needs-git', cwd, argv, env, clock});
@@ -1343,28 +1378,14 @@ export async function runWithRemoteDecision({
     await logManifestVerdict({env,mode:policy.settings.remote.manifest,error:{code:decision.manifestRefusal}});
   }
   if (targetMissing) {
-    recordRemoteFallback({lockRoot,reason:'no-healthy-remote',cwd,argv,env,clock});
+    recordRemoteFallback({lockRoot,reason:'no-healthy-remote',detail:JSON.stringify(skipped),cwd,argv,env,clock});
     log('location=local reason=no-healthy-remote\n');
   }
   if (!decision.remote) return { handled: false };
-  const remoteRoot = join(dirname(lockRoot), 'remote');
-  const localFallback = (reason, detail = null) => {
-    recordRemoteFallback({lockRoot, reason, detail, cwd, argv, env, clock});
-    log(`heavy-admission: remote unavailable (${oneLine(reason)}) - falling back to local admission\n`);
-    return { handled: false };
-  };
   // Caller confinement is local evidence, not a Forge health failure. Exercise writes before
   // importing health code so a denied caller cannot mutate the host-shared health state.
-  try {
-    mkdirSync(remoteRoot, {recursive:true});
-    const probe = mkdtempSync(join(remoteRoot, '.write-probe-'));
-    rmdirSync(probe);
-  } catch (error) {
-    if (['EPERM', 'EACCES', 'EROFS'].includes(error?.code)) {
-      return localFallback('confined-local', `${error.code} ${oneLine(basename(remoteRoot))}`);
-    }
-    // A race or other failure still belongs to the normal remote-health path.
-  }
+  const denied = confinement();
+  if (denied) return localFallback('confined-local', `${denied} ${oneLine(basename(remoteRoot))}`);
   // Local heartbeat workers can be terminated during import. Keep Forge's top-level awaits out of
   // that import graph: terminating an evaluating async module can crash Node with SIGTRAP.
   const { checkRemoteHealth, recordRemoteResult, peekRemoteTelemetry } = await import('./forge-remote-health.mjs');
