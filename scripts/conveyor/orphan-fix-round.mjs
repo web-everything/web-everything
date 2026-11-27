@@ -35,10 +35,12 @@ import { assertCapability, repoProfile } from '../lib/repo-profile.mjs';
 import { execFileSync } from 'node:child_process';
 import { stripVTControlCharacters } from 'node:util';
 import { resolve, join } from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { hostname } from 'node:os';
 import { openSync, readSync, closeSync } from 'node:fs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
-import { acquireLockDir, releaseLockDir } from '../readiness/file-locks.mjs';
+import { acquireLockDir, readLockEntry, releaseLockDir } from '../readiness/file-locks.mjs';
+import { pidIdentity, pidIdentityStamp, pidNamespace } from '../lib/pid-alive.mjs';
 import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { fileURLToPath } from 'node:url';
 
@@ -283,8 +285,12 @@ export function defaultPostComment({ slug, pr, body, exec = execFileSync }) {
   exec('gh', ['pr', 'comment', String(pr), '--repo', slug, '--body-file', '-'], { ...ghOpts(), input: body, stdio: ['pipe', 'pipe', 'pipe'] });
 }
 
+const activeAttemptClaims = new Set();
+
 /** Round accounting is independent of comment publication. The shared claim is never
  * reclaimed automatically: a crashed holder or pending attempt needs human inspection.
+ * A provably live holder only defers this pass. Same-process tokens track in-flight work;
+ * other processes require a matching host, PID namespace and process identity stamp.
  * Legacy readers without node ids share a conservative timestamp/body budget; they
  * cannot obtain a fresh budget just by replaying identical unbound verdicts.
  * Ledger reads are bounded to 64 KiB; corruption, oversize and ambiguity all hold.
@@ -298,10 +304,25 @@ function reserveOrphanAttempt({ root, slug, pr, comments, nowMs, fs }) {
   const resource = `orphan-redispatch:${slug}:${pr}:${round}`;
   const id = createHash('sha256').update(resource).digest('hex');
   const path = join(root, `${id}.json`);
-  const hold = reason => `${reason} — human inspection required; reconcile the round ledger and claim before retrying`;
-  if (!acquireLockDir(root, resource, { owner: resource, path: resource, pid: null,
-    heartbeatAt: new Date(nowMs).toISOString() })) return { hold: hold('ambiguous or active attempt claim') };
-  const release = () => releaseLockDir(root, resource);
+  const hold = reason => ({ kind: 'ambiguous',
+    hold: `${reason} — human inspection required; reconcile the round ledger and claim before retrying` });
+  const token = randomUUID();
+  const meta = { token, host: hostname(), namespace: pidNamespace(), ...pidIdentityStamp(process.pid) };
+  if (!acquireLockDir(root, resource, { owner: resource, path: resource, pid: process.pid, meta,
+    heartbeatAt: new Date(nowMs).toISOString() })) {
+    const holder = readLockEntry(root, resource);
+    const local = holder?.meta?.host === meta.host && holder?.meta?.namespace === meta.namespace;
+    const busy = holder?.owner === resource && holder?.path === resource && local && (
+      (holder.pid === process.pid && activeAttemptClaims.has(holder.meta?.token)) ||
+      (holder.pid !== process.pid && typeof holder.meta?.runnerStart === 'string' && holder.meta.runnerStart
+        && typeof holder.meta?.runnerArgv === 'string' && holder.meta.runnerArgv
+        && pidIdentity(holder.pid, { expectStart: holder.meta.runnerStart, expectArgv: holder.meta.runnerArgv }).alive === true));
+    return busy ? { kind: 'busy', hold: 'active attempt claim' } : hold('ambiguous attempt claim');
+  }
+  activeAttemptClaims.add(token);
+  const release = () => {
+    try { releaseLockDir(root, resource); } finally { activeAttemptClaims.delete(token); }
+  };
   try {
     const historical = trusted.slice(trusted.indexOf(verdict) + 1).filter(c =>
       lead(c).startsWith(ORPHAN_GUARD_MARKER) && /re-dispatched/.test(lead(c).split('\n')[0])).length;
@@ -332,10 +353,10 @@ function reserveOrphanAttempt({ root, slug, pr, comments, nowMs, fs }) {
       || (record.markerError !== undefined && typeof record.markerError !== 'string')) {
       throw new Error('invalid attempt ledger');
     }
-    if (record.pending) return { hold: hold('ambiguous pending attempt'), release };
+    if (record.pending) return { ...hold('ambiguous pending attempt'), release };
     record.confirmed = Math.max(record.confirmed, historical);
     if (record.confirmed >= ORPHAN_REDISPATCH_CAP) return {
-      hold: hold(`${record.confirmed} confirmed guard re-dispatches (cap ${ORPHAN_REDISPATCH_CAP}) — a person must take it`), release,
+      ...hold(`${record.confirmed} confirmed guard re-dispatches (cap ${ORPHAN_REDISPATCH_CAP}) — a person must take it`), release,
     };
     record.pending = true;
     const save = () => writeJsonAtomic(path, record);
@@ -343,7 +364,7 @@ function reserveOrphanAttempt({ root, slug, pr, comments, nowMs, fs }) {
     return { record, save, release };
   } catch (e) {
     release();
-    return { hold: hold(`unreadable attempt ledger: ${String(e?.message ?? e).split('\n')[0]}`) };
+    return hold(`unreadable attempt ledger: ${String(e?.message ?? e).split('\n')[0]}`);
   }
 }
 
@@ -446,6 +467,13 @@ export async function runOrphanFixRoundPass({
         const refusal = assertCapability(slug, 'fix', { resolveProfile });
         if (refusal) { row.result = `not-done: ${refusal.why}`; continue; }
         attempt = reserveOrphanAttempt({ root: attemptRoot, slug, pr: p.number, comments, nowMs, fs: attemptFs });
+        if (attempt.kind === 'busy') {
+          row.decision = 'defer';
+          row.reason = attempt.hold;
+          row.result = `deferred: ${attempt.hold}`;
+          deferred.push({ repo: slug, pr: p.number });
+          continue;
+        }
         if (attempt.hold) {
           plan.decision = row.decision = 'escalate';
           plan.reason = row.reason = attempt.hold;

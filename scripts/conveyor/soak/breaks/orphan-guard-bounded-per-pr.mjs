@@ -1,5 +1,8 @@
 /** The orphan guard must bound redispatch work and resume deferred PRs between passes. */
 import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ghRepoSlug } from '../../../lib/constellation-repos.mjs';
 
@@ -7,11 +10,15 @@ const root = fileURLToPath(new URL('../../../../', import.meta.url));
 
 // Replay the supplied checkout behaviorally, including historical checkouts without the bounds.
 export function probe(checkout) {
-  const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+  const scratch = mkdtempSync(join(tmpdir(), 'orphan-bounded-soak-'));
+  let child;
+  try {
+    child = spawnSync(process.execPath, ['--input-type=module', '-e', `
     import { deepStrictEqual, strictEqual, ok } from 'node:assert';
     import { join } from 'node:path';
     import { pathToFileURL } from 'node:url';
-    const [checkout, repo] = process.argv.slice(1);
+    const [checkout, repo, scratch] = process.argv.slice(1);
+    let fixtureId = 0;
     const { runOrphanFixRoundPass } = await import(
       pathToFileURL(join(checkout, 'scripts/conveyor/orphan-fix-round.mjs')));
     const comment = (createdAt, body) => ({
@@ -30,6 +37,7 @@ export function probe(checkout) {
       const calls = [], reads = [];
       const reconcile = () => { throw new Error('injected redispatch must not run a planner'); };
       return { calls, reads, options: {
+        attemptRoot: join(scratch, String(fixtureId++)),
         repos: [{ key: 'we', slug: repo }], env: {},
         nowMs: Date.parse('2026-10-10T12:00:00Z'), now: () => time, deadlineAt, reconcile,
         listBounced: () => prs,
@@ -122,7 +130,10 @@ export function probe(checkout) {
       deepStrictEqual(escalated.sort(), ['org/a#2', 'org/b#2'],
         'each repo must keep its own deferred PR so every capped orphan escalates');
     }
-  `, checkout, ghRepoSlug('we')], { encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024 });
+  `, checkout, ghRepoSlug('we'), scratch], { encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024 });
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
   return { violations: child.status === 0 ? [] : [
     `bounded orphan-guard replay failed: ${child.error?.message ?? child.stderr ?? child.signal ?? child.status}`,
   ] };

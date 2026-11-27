@@ -7,7 +7,9 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import * as fs from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
+import { acquireLockDir, lockDirFor } from '../../readiness/file-locks.mjs';
+import * as processIdentity from '../../lib/pid-alive.mjs';
 import { fileURLToPath } from 'node:url';
 
 const isolated = vi.hoisted(() => ({ root: null }));
@@ -1085,6 +1087,21 @@ describe('durable orphan redispatch budget', () => {
     expect(result.rows[0].result).toMatch(/person|human/);
   });
 
+  it('identical verdicts without node IDs retain their exhausted budget across passes', async () => {
+    const f = fixture();
+    f.setComments([{ ...VERDICT }, BEGIN, END]);
+    await f.run();
+    f.setComments([{ ...VERDICT }, BEGIN, END]);
+    await f.run({ nowMs: NOW + 60_000 });
+    f.setComments([{ ...VERDICT }, BEGIN, END]);
+    const result = await f.run({ nowMs: NOW + 120_000 });
+    expect(f.redispatch).toHaveBeenCalledTimes(2);
+    expect(f.escalate).toHaveBeenCalledOnce();
+    expect(result.rows[0].decision).toBe('escalate');
+    expect(f.ledgers()).toHaveLength(1);
+    expect(f.ledgers()[0]).toMatchObject({ confirmed: 2, pending: false });
+  });
+
   it('concurrent passes reserve one attempt', async () => {
     const f = fixture();
     let release;
@@ -1093,9 +1110,11 @@ describe('durable orphan redispatch budget', () => {
     await vi.waitFor(() => expect(release).toBeTypeOf('function'));
     const second = await f.run();
     expect(f.redispatch).toHaveBeenCalledOnce();
-    expect(second.rows[0].result).toMatch(/person|human/);
     release({ ok: true });
     await first;
+    expect(second.rows[0]).toMatchObject({ decision: 'defer', result: 'deferred: active attempt claim' });
+    expect(second.deferred).toEqual([{ repo: 'web-everything/web-everything', pr: 4715 }]);
+    expect(f.escalate).not.toHaveBeenCalled();
   });
 
   it('crash after launch cannot exceed cap', async () => {
@@ -1106,6 +1125,90 @@ describe('durable orphan redispatch budget', () => {
     expect(f.redispatch).toHaveBeenCalledOnce();
     expect(f.ledgers()[0]).toMatchObject({ confirmed: 0, pending: true });
     expect(f.escalate).toHaveBeenCalledOnce();
+  });
+
+  it('abandoned attempt claims remain held regardless of age', async () => {
+    const f = fixture();
+    await f.run();
+    const resource = f.ledgers()[0].resource;
+    const entry = { owner: resource, path: resource, pid: null, heartbeatAt: '2000-01-01T00:00:00Z' };
+    expect(acquireLockDir(f.root, resource, entry)).toBe(true);
+    f.redispatch.mockClear();
+    const result = await f.run({ nowMs: NOW + 365 * 24 * 60 * 60_000 });
+    expect(f.redispatch).not.toHaveBeenCalled();
+    expect(f.escalate).toHaveBeenCalledOnce();
+    expect(result.rows[0].result).toMatch(/human inspection/);
+    expect(JSON.parse(readFileSync(join(lockDirFor(f.root, resource), 'lock.json'), 'utf8'))).toEqual(entry);
+  });
+
+  it.each([
+    ['live process', true, {}, 'defer'],
+    ['dead process', false, {}, 'escalate'],
+    ['unknown process', null, {}, 'escalate'],
+    ['foreign host', true, { host: 'another-host' }, 'escalate'],
+    ['foreign namespace', true, { namespace: 'another-namespace' }, 'escalate'],
+    ['missing identity stamp', true, { runnerStart: null }, 'escalate'],
+  ])('%s claim is never reclaimed and is classified conservatively', async (_name, alive, metaPatch, decision) => {
+    const f = fixture();
+    await f.run();
+    const resource = f.ledgers()[0].resource;
+    const entry = { owner: resource, path: resource, pid: process.pid + 1,
+      heartbeatAt: '2000-01-01T00:00:00Z', meta: {
+        host: hostname(), namespace: processIdentity.pidNamespace(),
+        runnerStart: 'stored-start', runnerArgv: 'stored-command', ...metaPatch,
+      } };
+    expect(acquireLockDir(f.root, resource, entry)).toBe(true);
+    const identity = vi.spyOn(processIdentity, 'pidIdentity').mockReturnValue({ alive });
+    f.redispatch.mockClear();
+    f.postComment.mockClear();
+    try {
+      const result = await f.run();
+      expect(result.rows[0].decision).toBe(decision);
+      expect(f.redispatch).not.toHaveBeenCalled();
+      expect(f.escalate).toHaveBeenCalledTimes(decision === 'defer' ? 0 : 1);
+      expect(f.postComment).toHaveBeenCalledTimes(decision === 'defer' ? 0 : 1);
+      expect(JSON.parse(readFileSync(join(lockDirFor(f.root, resource), 'lock.json'), 'utf8'))).toEqual(entry);
+      if (decision === 'defer') {
+        expect(identity).toHaveBeenCalledWith(entry.pid, { expectStart: 'stored-start', expectArgv: 'stored-command' });
+        expect(result.nextCursor).toEqual({ repo: 'web-everything/web-everything', pr: 4715 });
+      } else expect(result.rows[0].result).toMatch(/human inspection/);
+    } finally { identity.mockRestore(); }
+  });
+
+  it.each([
+    ['wrong version', { version: 2 }],
+    ['resource mismatch', { resource: 'another-round' }],
+    ['fractional confirmed', { confirmed: 0.5 }],
+    ['negative confirmed', { confirmed: -1 }],
+    ['unsafe confirmed', { confirmed: Number.MAX_SAFE_INTEGER + 1 }],
+    ['non-boolean pending', { pending: 'false' }],
+    ['invalid marker error', { markerError: 123 }],
+  ])('invalid ledger %s launches nothing and requires human inspection', async (_name, invalid) => {
+    const f = fixture();
+    await f.run();
+    const { path, ...record } = f.ledgers()[0];
+    const corrupt = JSON.stringify({ ...record, ...invalid });
+    writeFileSync(path, corrupt);
+    f.redispatch.mockClear();
+    const result = await f.run();
+    expect(f.redispatch).not.toHaveBeenCalled();
+    expect(f.escalate).toHaveBeenCalledOnce();
+    expect(result.rows[0].result).toMatch(/invalid attempt ledger.*human inspection/);
+    expect(readFileSync(path, 'utf8')).toBe(corrupt);
+  });
+
+  it('missing verdict at reservation launches nothing', async () => {
+    const f = fixture();
+    const comments = [{ ...VERDICT, id: 'verdict-one' }, BEGIN, END];
+    f.setComments(comments);
+    const result = await f.run({ resolveProfile: () => {
+      // Evidence disappearing between planning and reservation must fail closed.
+      comments.shift();
+      return { capabilities: { fix: true } };
+    } });
+    expect(f.redispatch).not.toHaveBeenCalled();
+    expect(result.rows[0].result).toMatch(/missing verdict.*human inspection/);
+    expect(f.ledgers()).toEqual([]);
   });
 
   it('new trusted verdict resets only its own budget', async () => {
