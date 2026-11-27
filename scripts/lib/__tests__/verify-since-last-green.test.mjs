@@ -6,21 +6,48 @@
  *   falls back to the whole-PR selection. The lane marker stays keyed to the exact HEAD it verified. Real git in a
  *   temp repo (the eligibility checks are git ancestry questions; a fake runner would only restate the code).
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
-import { resolveDefaultGate, matchRequestedDefaultGate, describeGate } from '../verify-lane-gate.mjs';
+import { resolveDefaultGate as resolveGate, matchRequestedDefaultGate, describeGate } from '../verify-lane-gate.mjs';
 import { decideSinceLastGreen, findLastGreenAncestor, LAST_GREEN_LOOKBACK } from '../../readiness/test-selection.mjs';
 import { recordGreenLedger, hasGreenLedger, shouldRecordGreen, greenLedgerDir, greenLedgerWritable, verifyGateDecision, VERIFY_GREEN_LEDGER_ENV } from '../lane-verify.mjs';
 import { validateVerifySettings, resolveVerifySettings } from '../verify-settings.mjs';
+import { hostSaturation } from '../verify-ci-only.mjs';
+
+// An idle host deterministically reproduces the old fixture's load-dependent failure,
+// without letting a missed injection read the machine's process table or load.
+vi.mock('../verify-ci-only.mjs', async (importOriginal) => ({
+  ...await importOriginal(),
+  hostSaturation: vi.fn(() => ({ known: true, saturated: false, reason: 'fixture idle host' })),
+}));
+// The gate also initializes a default config at import time; these tests supply
+// fileConfig explicitly and must not load the checkout or platform preferences.
+vi.mock('../verify-settings.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, loadVerifySettingsFile: () => actual.validateVerifySettings(null) };
+});
 
 const fileConfig = validateVerifySettings({ relatedMode: 'import-only', standards: 'always', skipLocalForCardOnly: false, relatedMaxTests: 0 });
+// Broad deltas historically refuse local selection in this suite. Pin that policy
+// input: real host capacity may legitimately permit a full-suite delta instead.
+const resolveDefaultGate = (options) => resolveGate({
+  saturation: () => ({ known: true, saturated: true, reason: 'fixture saturated host' }),
+  ...options,
+});
 
 let repo;
 let ledger;
-const git = (args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+const git = (args) => execFileSync('git', args, {
+  cwd: repo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000, maxBuffer: 1024 * 1024,
+  env: {
+    PATH: process.env.PATH, HOME: repo, TMPDIR: tmpdir(),
+    GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(repo, 'gitconfig'),
+    GIT_AUTHOR_DATE: '2026-01-01T00:00:00Z', GIT_COMMITTER_DATE: '2026-01-01T00:00:00Z',
+  },
+}).trim();
 const write = (path, text) => { mkdirSync(join(repo, path, '..'), { recursive: true }); writeFileSync(join(repo, path), text); };
 const commit = (msg, files) => { for (const [p, t] of Object.entries(files)) write(p, t); git(['add', '-A']); git(['commit', '-q', '-m', msg]); return git(['rev-parse', 'HEAD']); };
 const markGreen = (sha) => recordGreenLedger({ dir: ledger, sha, record: { status: 'green' } });
@@ -28,15 +55,16 @@ const hasGreen = (sha) => hasGreenLedger({ dir: ledger, sha });
 const resolve = (env = {}) => resolveDefaultGate({ runGit: git, env: { WE_VERIFY_SELECTION: 'since-last-green', ...env }, fileConfig, hasGreen });
 
 beforeEach(() => {
+  vi.mocked(hostSaturation).mockClear();
   repo = mkdtempSync(join(tmpdir(), 'since-green-'));
   ledger = mkdtempSync(join(tmpdir(), 'since-green-ledger-'));
-  git(['init', '-q', '-b', 'main']);
+  git(['init', '-q', '--template=', '-b', 'main']);
   git(['config', 'user.email', 't@t']); git(['config', 'user.name', 't']); git(['config', 'commit.gpgsign', 'false']);
   commit('base', { 'scripts/lib/a.mjs': 'export const a = 1;\n', 'scripts/lib/b.mjs': 'export const b = 1;\n', 'README.md': '# r\n' });
   git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
   git(['checkout', '-q', '-b', 'pr']);
 });
-afterEach(() => { rmSync(repo, { recursive: true, force: true }); rmSync(ledger, { recursive: true, force: true }); });
+afterEach(() => { vi.unstubAllEnvs(); rmSync(repo, { recursive: true, force: true }); rmSync(ledger, { recursive: true, force: true }); });
 
 describe('since-last-green selection (#xgqwuq5)', () => {
   it('a fixer-only commit after a green selects only the delta', () => {
@@ -138,6 +166,25 @@ describe('since-last-green selection (#xgqwuq5)', () => {
     expect(gate.decision.changedFiles).toEqual(['package.json', 'scripts/lib/a.mjs']);
   });
 
+  // Isolate outside input: host CPU/process saturation, which controls config/deps fallback selection.
+  it.each([
+    ['ordinary environment', {}],
+    ['urgent-verify shard environment', {
+      CI: 'true', GITHUB_ACTIONS: 'true', WE_VERIFY_SELECTION: 'pr', WE_DIFF_TEST_SELECTION: '0',
+      WE_VERIFY_GREEN_LEDGER_DIR: 'unused-host-ledger', WE_STRIP_POOL_ROOT_FROM_CHILD: '1',
+      LANE_POOL_ROOT: 'unused-host-pool',
+    }],
+  ])('config/deps fallback uses fixture saturation without probing the host (%s)', (_name, ambientEnv) => {
+    for (const [key, value] of Object.entries(ambientEnv)) vi.stubEnv(key, value);
+    markGreen(commit('author', { 'scripts/lib/a.mjs': 'export const a = 2;\n' }));
+    commit('fixer', { 'package.json': '{"name":"x"}\n' });
+    const gate = resolve();
+    expect(hostSaturation).not.toHaveBeenCalled();
+    expect(gate.decision.selectionMode.mode).toBe('pr');
+    expect(gate.decision.mode).toBe('blocked');
+    expect(gate.decision.changedFiles).toEqual(['package.json', 'scripts/lib/a.mjs']);
+  });
+
   // Review round 1, finding 1: card-only is CI's WHOLE-PR definition, never the delta's. A fixer commit that touches
   // only a backlog card, on a PR that also carries code, must still run a real (delta) gate and never card-only-skip.
   describe('skipLocalForCardOnly (shipped value: true)', () => {
@@ -224,9 +271,10 @@ describe('since-last-green selection (#xgqwuq5)', () => {
   it('the marker binding is unchanged: a green for the earlier head never satisfies the gate for HEAD', () => {
     const green = commit('author', { 'scripts/lib/a.mjs': 'export const a = 2;\n' });
     const head = commit('fixer', { 'scripts/lib/b.mjs': 'export const b = 2;\n' });
-    const record = { sha: green, status: 'green', startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), exitCode: 0, suites: 'x' };
-    expect(verifyGateDecision({ record, headSha: head, requireVerified: true }).ok).toBe(false);
-    expect(verifyGateDecision({ record: { ...record, sha: head }, headSha: head, requireVerified: true }).ok).toBe(true);
+    const nowMs = Date.parse('2026-01-01T00:00:00Z');
+    const record = { sha: green, status: 'green', startedAt: new Date(nowMs).toISOString(), finishedAt: new Date(nowMs).toISOString(), exitCode: 0, suites: 'x' };
+    expect(verifyGateDecision({ record, headSha: head, requireVerified: true, nowMs }).ok).toBe(false);
+    expect(verifyGateDecision({ record: { ...record, sha: head }, headSha: head, requireVerified: true, nowMs }).ok).toBe(true);
   });
 });
 
