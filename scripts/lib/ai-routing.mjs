@@ -5,6 +5,10 @@ import { resolvePolicyModel, resolvePolicyEffort } from './dispatch-routing-poli
 import { CODEX_MODEL_CATALOGUE, CODEX_EFFORT_MAP, codexModelSupportsEffort } from './codex-model-routing.mjs';
 import { FIX_EXECUTOR_RUNGS } from './fix-executor-chain.mjs';
 import { loadAccountMap } from './claude-account.mjs';
+import { createRoutingOverrideLogger } from '../operations/routing-override.mjs';
+
+const sessionObservers = new WeakMap();
+const defaultSessionLog = event => console.error(JSON.stringify(event));
 
 export const AI_ROUTING_ROLES = Object.freeze(['review', 'red-team', 'red-team-recheck', 'fix', 'build', 'prepare', 'ci-heal', 'worker', 'judge', 'helper']);
 const WRITERS = new Set(['fix', 'build', 'prepare', 'ci-heal', 'worker']);
@@ -85,13 +89,14 @@ function checkExecutors(role, value) {
   if (WRITERS.has(role) && chain.at(-1)?.provider !== 'claude') throw new TypeError('writer chain must end with Claude');
 }
 
-export function resolveAiRouting({ env = process.env, tool = readSettings().aiRouting, platform, log, accountMap } = {}) {
+export function resolveAiRouting({ env = process.env, tool = readSettings().aiRouting, platform, log, accountMap,
+  session = false, routing, routingPlatform, available = ['codex', 'claude'], resume = {}, operatorOverride } = {}) {
   const valid = aiRoutingValidators({ accountMap });
   const quiet = () => {};
   const { WE_AI_ROUTING: rawAiRouting, ...cascadeEnv } = env ?? {};
   // Read the platform once, then validate combinations at each layer boundary.
   const base = cascadePolicy('aiRouting', undefined, { standard: AI_ROUTING_STANDARD, valid, platform,
-    env: cascadeEnv, envValues: {}, log: quiet });
+    env: cascadeEnv, envValues: {}, operatorOverride, log: quiet });
   let envBlock;
   if (rawAiRouting !== undefined) {
     try { envBlock = JSON.parse(rawAiRouting); if (!object(envBlock)) throw new TypeError(); }
@@ -134,6 +139,7 @@ export function resolveAiRouting({ env = process.env, tool = readSettings().aiRo
     }
     resolved = next;
   }
+  if (session) resolveSessions(resolved, { env, routing, routingPlatform, available, resume, operatorOverride, log });
   for (const detail of resolved.invalid) diagnostic(detail, log);
   // Values and provenance describe the same retained snapshot.
   resolved.leafValues = {};
@@ -145,10 +151,73 @@ export function resolveAiRouting({ env = process.env, tool = readSettings().aiRo
 /** Return explicit routing inputs. Account selection stays in settings until its PR1b consumer exists. */
 export function aiRoutingInputs(role, resolved) {
   if (!AI_ROUTING_ROLES.includes(role)) throw new TypeError(`ai-routing: unknown role ${role}`);
+  if (resolved.session && !resolved.sessionRoles.includes(role)) throw new TypeError(`ai-routing: missing route for ${role}; restore routing.providerOrder or supply an explicit valid route`);
   const setting = resolved.value[role];
   const coordinator = Object.fromEntries(Object.entries(setting.coordinator).filter(([key, value]) => key !== 'account' && value !== 'inherit'));
   return {
     coordinator: Object.keys(coordinator).length ? structuredClone(coordinator) : undefined,
     executors: setting.executors === 'inherit' ? undefined : structuredClone(setting.executors),
   };
+}
+
+/** New sessions opt in at the launch boundary; existing override-only callers retain their
+ * evidence/tier routers. Legacy explicit role pins win over the shared order; persisted
+ * resume identities win over both and are never re-aliased. No orchestrator model is read.
+ */
+function resolveSessions(resolved, { env, routing, routingPlatform, available, resume, operatorOverride, log }) {
+  const standard = { providerOrder: ['codex', 'claude'] };
+  const policy = cascadePolicy('routing', routing ?? readSettings().routing, {
+    standard, platform: routingPlatform, env, operatorOverride,
+    envValues: { providerOrder: env.WE_ROUTING_PROVIDER_ORDER === undefined ? undefined
+      : (() => { try { return JSON.parse(env.WE_ROUTING_PROVIDER_ORDER); } catch { return null; } })() },
+    valid: { providerOrder: value => Array.isArray(value) && value.length > 0 && value.length <= 2
+      && new Set(value).size === value.length && value.every(p => ['codex', 'claude'].includes(p)),
+      '': () => false }, log: () => {},
+  });
+  resolved.session = true;
+  resolved.sessionRoles = [];
+  const orderInvalid = policy.invalid.some(detail => detail.includes('providerOrder'));
+  if (orderInvalid) resolved.invalid.push('routing.providerOrder invalid; restore a distinct codex/claude providerOrder (at most two providers) or ask the operator to repair policy');
+  resolved.sources['routing.providerOrder'] = policy.sources.providerOrder;
+  // Conservative routine tiers: helper alone can use a small model. Preparation keeps
+  // Astra and review/judge roles retain full-capability models and high effort.
+  const security = new Set(['review', 'red-team', 'red-team-recheck', 'judge']);
+  for (const role of AI_ROUTING_ROLES) {
+    const old = resolved.value[role].coordinator;
+    const persisted = resume[role];
+    try {
+      if (Object.hasOwn(resume, role) && (!object(persisted)
+        || typeof persisted.provider !== 'string' || persisted.provider === 'inherit'
+        || typeof persisted.model !== 'string' || persisted.model === 'inherit')) {
+        throw new TypeError('resume requires explicit provider and model');
+      }
+      if (orderInvalid && !persisted) throw new TypeError('invalid providerOrder');
+      const pinned = old.provider !== 'inherit';
+      const provider = persisted?.provider ?? (pinned ? old.provider : policy.value.providerOrder.find(p => available.includes(p)));
+      if (!provider) throw new TypeError('no available provider');
+      const model = persisted?.model ?? (pinned ? old.model : provider === 'codex'
+        ? (role === 'helper' ? 'luna' : role === 'prepare' ? 'astra' : 'sol')
+        : (role === 'helper' ? 'haiku' : 'sonnet'));
+      if (!model || model === 'inherit') throw new TypeError('explicit model required');
+      const canonical = resolvePolicyModel(provider, model);
+      if (security.has(role) && /luna|haiku|flash/.test(canonical)) throw new TypeError('security floor excludes small models');
+      if (!persisted && !available.includes(provider)) throw new TypeError('pinned provider unavailable');
+      const coordinator = persisted ? structuredClone(persisted) : { provider, model: canonical,
+        effort: old.effort !== 'inherit' ? old.effort : security.has(role) ? 'high' : role === 'helper' ? 'low' : 'medium' };
+      checkCombination(coordinator);
+      if (!persisted) coordinator.account = old.account;
+      resolved.value[role].coordinator = coordinator;
+      for (const key of Object.keys(coordinator)) resolved.sources[`${role}.coordinator.${key}`] = persisted ? 'resume'
+        : pinned ? resolved.sources[`${role}.coordinator.${key}`] ?? 'standard' : policy.sources.providerOrder;
+      resolved.sessionRoles.push(role);
+      if (log !== false) {
+        const sink = log ?? defaultSessionLog;
+        if (!sessionObservers.has(sink)) sessionObservers.set(sink, createRoutingOverrideLogger({ log: sink }));
+        sessionObservers.get(sink)({ key: role, provider: coordinator.provider, model: coordinator.model,
+          effort: coordinator.effort, source: resolved.sources[`${role}.coordinator.model`] });
+      }
+    } catch (error) {
+      resolved.invalid.push(`${role}: missing route (${error.message}); restore routing.providerOrder or supply an explicit valid route`);
+    }
+  }
 }

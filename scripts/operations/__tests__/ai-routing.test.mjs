@@ -38,3 +38,83 @@ it('registered ai-routing collector returns all ten roles, settings, sources and
     read.mockRestore();
   }
 });
+
+const sessionFixture = extra => ({ env: {}, platform: {}, tool: {}, accountMap: { accounts: {} },
+  log: false, operatorOverride: {}, session: true, routing: { providerOrder: ['codex', 'claude'] }, routingPlatform: {}, ...extra });
+
+it('every routine session resolves an explicit model from one providerOrder policy', () => {
+  for (const order of [['codex', 'claude'], ['claude', 'codex']]) {
+    const resolved = routing.resolveAiRouting(sessionFixture({ routing: { providerOrder: order } }));
+    for (const role of routing.AI_ROUTING_ROLES) {
+      expect(routing.aiRoutingInputs(role, resolved).coordinator).toMatchObject({
+        provider: order[0], model: expect.stringMatching(/^(gpt-|claude-)/),
+      });
+    }
+  }
+});
+
+it('missing session routes refuse with an operator recovery diagnostic instead of inheriting', () => {
+  const resolved = routing.resolveAiRouting(sessionFixture({ available: [] }));
+  expect(resolved.invalid).toContainEqual(expect.stringMatching(/missing route.*restore.*providerOrder/));
+  expect(() => routing.aiRoutingInputs('helper', resolved)).toThrow(/missing route/);
+});
+
+it('migrates explicit old overrides ahead of provider order and preserves resumed identity', () => {
+  const legacy = { helper: { coordinator: { provider: 'claude', model: 'sonnet' } } };
+  const resolved = routing.resolveAiRouting(sessionFixture({ tool: legacy }));
+  expect(routing.aiRoutingInputs('helper', resolved).coordinator).toMatchObject({ provider: 'claude', model: 'claude-sonnet-5-5' });
+  const resume = { helper: { provider: 'codex', model: 'gpt-6-sol', effort: 'high' } };
+  const resumed = routing.resolveAiRouting(sessionFixture({ resume, routing: { providerOrder: ['claude'] } }));
+  expect(routing.aiRoutingInputs('helper', resumed).coordinator).toEqual(resume.helper);
+});
+
+it('excludes small models from security roles even in legacy overrides', () => {
+  for (const role of ['review', 'red-team', 'red-team-recheck', 'judge']) {
+    const resolved = routing.resolveAiRouting(sessionFixture({ tool: { [role]: { coordinator: { provider: 'codex', model: 'luna' } } } }));
+    expect(resolved.invalid).toContainEqual(expect.stringMatching(/security floor/));
+    expect(() => routing.aiRoutingInputs(role, resolved)).toThrow(/missing route/);
+  }
+});
+
+it('invalid and oversized provider orders refuse visibly with a recovery path', () => {
+  for (const providerOrder of [[], ['unknown'], ['codex', 'codex'], Array(1000).fill('codex')]) {
+    const resolved = routing.resolveAiRouting(sessionFixture({ routing: { providerOrder } }));
+    expect(resolved.invalid).toContainEqual(expect.stringMatching(/providerOrder.*restore/));
+    expect(() => routing.aiRoutingInputs('helper', resolved)).toThrow(/missing route/);
+  }
+});
+
+it('session provider order follows standard, platform, tool and environment provenance', () => {
+  const cases = [
+    [{ routing: {} }, 'codex', 'standard'],
+    [{ routing: {}, routingPlatform: { providerOrder: ['claude'] } }, 'claude', 'platform'],
+    [{ routingPlatform: { providerOrder: ['claude'] } }, 'codex', 'tool'],
+    [{ env: { WE_ROUTING_PROVIDER_ORDER: '["claude"]' } }, 'claude', 'env'],
+  ];
+  for (const [options, provider, source] of cases) {
+    const resolved = routing.resolveAiRouting(sessionFixture(options));
+    expect(routing.aiRoutingInputs('helper', resolved).coordinator.provider).toBe(provider);
+    expect(resolved.sources['helper.coordinator.model']).toBe(source);
+  }
+});
+
+it('repeated session resolution logs only route or source changes including return to default', () => {
+  const log = vi.fn();
+  const resolve = extra => routing.resolveAiRouting(sessionFixture({ log, ...extra }));
+  resolve({}); resolve({});
+  resolve({ routing: {}, routingPlatform: { providerOrder: ['codex', 'claude'] } });
+  resolve({ routing: { providerOrder: ['claude'] } });
+  resolve({ routing: {} }); resolve({ routing: {} });
+  const helperEvents = log.mock.calls.map(([event]) => event).filter(event => event?.key === 'helper');
+  expect(helperEvents.map(event => [event.provider, event.source])).toEqual([
+    ['codex', 'tool'], ['codex', 'platform'], ['claude', 'tool'], ['codex', 'standard'],
+  ]);
+});
+
+it('incomplete resume identity refuses rather than borrowing a new-session model or provider', () => {
+  for (const identity of [{ model: 'gpt-6-sol' }, { provider: 'codex' }, {}, { provider: 'codex', model: 'inherit' }]) {
+    const resolved = routing.resolveAiRouting(sessionFixture({ resume: { helper: identity } }));
+    expect(() => routing.aiRoutingInputs('helper', resolved)).toThrow(/missing route/);
+    expect(resolved.invalid).toContainEqual(expect.stringMatching(/resume.*explicit/));
+  }
+});

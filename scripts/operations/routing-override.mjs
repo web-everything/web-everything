@@ -26,6 +26,20 @@ export function planRoutingOverride(input, policy = DEFAULT_ROUTING_POLICY) {
   return { key, patch, source: 'platform', cleared: clear };
 }
 
+/** Each observer owns its last effective route, so independent consumers never suppress
+ * one another. Source-only changes and a return to the default are observable too. */
+export function createRoutingOverrideLogger({ log = event => console.error(JSON.stringify(event)) } = {}) {
+  const previous = new Map();
+  return event => {
+    const signature = JSON.stringify([event.provider, event.model, event.effort ?? null, event.source]);
+    if (previous.get(event.key) === signature) return;
+    try {
+      log(structuredClone(event));
+      previous.set(event.key, signature);
+    } catch { /* observation must not reject a validated route */ }
+  };
+}
+
 export function routingOverrideOperation() {
   return op(ROUTING_OVERRIDE_OP, {
     input: {

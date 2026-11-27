@@ -347,3 +347,20 @@ it.each(['model', 'provider'])('keeps %s reserved for juror controls on judged o
   });
   expect(() => buildCliSpec(declaration)).toThrow(`declares an input field \`${field}\` that collides`);
 });
+
+it('repeated effective override logs once; source changes, value changes and clear each log once', async () => {
+  const { createRoutingOverrideLogger } = await import('../routing-override.mjs');
+  const log = vi.fn();
+  const observe = createRoutingOverrideLogger({ log });
+  const route = { provider: 'codex', model: 'gpt-6.1-sol' };
+  const first = { key: 'helper', ...route, source: 'platform' };
+  observe(first); observe({ ...first });
+  observe({ ...first, source: 'env' });
+  observe({ ...first, source: 'env', model: 'gpt-6-astra' });
+  observe({ key: 'helper', ...route, source: 'standard', cleared: true });
+  observe({ key: 'helper', ...route, source: 'standard', cleared: true });
+  expect(log.mock.calls.map(([event]) => event)).toEqual([
+    first, { ...first, source: 'env' }, { ...first, source: 'env', model: 'gpt-6-astra' },
+    { key: 'helper', ...route, source: 'standard', cleared: true },
+  ]);
+});
