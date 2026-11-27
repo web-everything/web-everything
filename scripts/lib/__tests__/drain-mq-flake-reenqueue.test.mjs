@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { decideMqSameHead, mqSameHeadGuard } from '../drain-queue-safety.mjs';
+import { readSettings } from '../settings-files.mjs';
 
 vi.mock('../settings-files.mjs', async importOriginal => ({
   ...await importOriginal(), readSettings: vi.fn(() => ({ drain: {} })),
@@ -206,6 +207,80 @@ describe('rerun-confirmed MQ flakes through mqSameHeadGuard', () => {
     expect(decision.hold).toBe(true);
     expect(decision.line).toMatch(/3 removals on this head/);
     expectPosts(f, []);
+  });
+
+  describe('mqEjectAfterFailures', () => {
+    const app = { slug: 'github-actions', id: 15368 };
+    const gh = check => ({ ...check, app });
+    const second = (original, id, conclusion) => gh({ ...rerun(original, id, conclusion),
+      started_at: '2026-11-01T13:50:00Z', completed_at: conclusion === null ? null : '2026-11-01T13:52:00Z' });
+    const chain = (...conclusions) => {
+      const a = gh(job(21));
+      return [a, gh(rerun(a, 41, conclusions[0])), ...(conclusions[1] !== undefined ? [second(a, 61, conclusions[1])] : [])];
+    };
+
+    // The environment may only tighten this key, so raising it is a settings-file (tool/platform) change.
+    const setting = value => vi.mocked(readSettings).mockReturnValue({ drain: { mqEjectAfterFailures: value } });
+    afterEach(() => vi.mocked(readSettings).mockReturnValue({ drain: {} }));
+
+    it('the environment cannot raise it: env 3 leaves F,F,S held', () => {
+      vi.stubEnv('WE_DRAIN_MQ_EJECT_AFTER_FAILURES', '3');
+      expect(fixture({ checks: chain('failure', 'success') }).guard().hold).toBe(true);
+    });
+
+    it('mqEjectAfterFailures 3 re-enqueues after F,F,S as a rerun-confirmed flake', () => {
+      setting(3);
+      const f = fixture({ checks: chain('failure', 'success') });
+      expectRerunRetry(f.guard());
+      expectPosts(f, []);
+    });
+
+    it('mqEjectAfterFailures 3 requests only the second attempt after F,F and holds F,F,F', () => {
+      setting(3);
+      const f = fixture({ checks: chain('failure') });
+      expect(f.guard().hold).toBe(true);
+      expectPosts(f, [41]);
+      const h = fixture({ checks: [...chain('failure', 'failure'), second(job(21), 81, 'success')] });
+      expect(h.guard().hold).toBe(true);
+      expectPosts(h, []);
+    });
+
+    it('the default of 1 holds F,F,S and logs the shadow verdict', () => {
+      const f = fixture({ checks: chain('failure', 'success') });
+      const decision = f.guard();
+      expect(decision.hold).toBe(true);
+      expect(decision.reason ?? decision.line).toContain('mq-flake-shadow: actual=hold at3=confirmed failures=2');
+      expectPosts(f, []);
+    });
+
+    it('the shadow token also rides on a retry line', () => {
+      const f = fixture({ checks: chain('success') });
+      const decision = f.guard();
+      expectRerunRetry(decision);
+      expect(decision.line).toContain('mq-flake-shadow: actual=confirmed at3=confirmed');
+    });
+
+    it('refused chain evidence at 3 holds with a reason instead of falling back to main-red retry', () => {
+      setting(3);
+      const noApp = chain('failure', 'success').map(c => ({ ...c, app: undefined }));
+      const f = fixture({ checks: noApp });
+      const decision = f.guard();
+      expect(decision.hold).toBe(true);
+      expect(decision.reason ?? decision.line).toMatch(/operator must inspect/);
+      expectPosts(f, []);
+    });
+
+    it('classifies the key as a safety setting so the environment may only tighten it', async () => {
+      const { classify, directionFor } = await import('../settings-safe-direction.mjs');
+      expect(classify('drain', 'mqEjectAfterFailures')).toBe('safety');
+      expect(directionFor('drain', 'mqEjectAfterFailures').safe).toBe('min');
+    });
+
+    it.each(['5', 'x', '0'])('an invalid env value %s falls back to the default of 1', value => {
+      vi.stubEnv('WE_DRAIN_MQ_EJECT_AFTER_FAILURES', value);
+      const f = fixture({ checks: chain('failure', 'success') });
+      expect(f.guard().hold).toBe(true);
+    });
   });
 
   it('requests at most ten reruns at the failed-job bound, once per Actions job', () => {

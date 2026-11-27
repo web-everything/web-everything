@@ -89,7 +89,8 @@ import { resolveReal } from './guard-lane.mjs';
 import { readGit, execRead } from './lib/proc-read.mjs';
 import { createBuildOutputCleaner } from './lib/lane-build-output.mjs';
 import { boundedGitCommand, BOUNDED_GIT_GRACE_MS } from './lib/git-bounded.mjs';
-import { ensureLaneAlternates, findPrimaryForPool, poolNameFromLanePath } from './lib/lane-alternates.mjs';
+import { canonicalRepoSlug, ensureLaneAlternates, findPrimaryForPool, poolNameFromLanePath } from './lib/lane-alternates.mjs';
+import { CONSTELLATION_REPOS } from './lib/constellation-repos.mjs';
 // #4415 — live incident 2026-09-29: `deadLeasePlan`'s own `gh pr list --state all` (below) was a bare,
 // unattributed, GraphQL-backed `execFileSync`, run on EVERY `acquire` and EVERY `list --acquirable` scan
 // across every session in every pool — measured as the top unattributed slice of the app's GraphQL bucket
@@ -373,7 +374,50 @@ try {
 }
 
 // ── repo descriptor resolution ──────────────────────────────────────────────────────────────────────
+const poolRepoName = (origin) => canonicalRepoSlug(origin)?.split('/').at(-1)
+  || basename(origin || '').replace(/\.git$/i, '').toLowerCase();
+const poolEvidenceLine = (value) => String(value).split(/\r?\n/)[0]
+  .replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ').slice(0, 200);
+
+/** Nonfatal qualification: a bad sibling must not prevent trying the next known primary. */
+function qualifyPoolPrimary(candidate, poolName) {
+  try {
+    if (!statSync(candidate).isDirectory()) return { ok: false, reason: 'not a directory' };
+    const env = laneGitHardeningEnv({ ...scrubGitRepoEnv(process.env), GIT_OPTIONAL_LOCKS: '0' });
+    const options = { timeout: LOCAL_GIT_TIMEOUT_MS, env };
+    const singleLine = (out, probe) => {
+      if (!out || /[\r\n]/.test(out)) throw new Error(`${probe}: empty or ambiguous output`);
+      return out;
+    };
+    const topLevel = singleLine(git(['rev-parse', '--show-toplevel'], candidate, options), 'git rev-parse --show-toplevel');
+    const paths = [candidate, topLevel];
+    for (const dir of [candidate, topLevel]) {
+      const gitDir = resolve(dir, singleLine(git(['rev-parse', '--git-dir'], dir, options), 'git rev-parse --git-dir'));
+      const commonDir = resolve(dir, singleLine(git(['rev-parse', '--git-common-dir'], dir, options), 'git rev-parse --git-common-dir'));
+      paths.push(gitDir, commonDir, dirname(commonDir));
+    }
+    // Unlike a best-effort realpath fallback, an unreadable owner is never evidence of a primary.
+    const roots = [resolve(POOL_ROOT)];
+    try { roots.push(realpathSync(POOL_ROOT)); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    for (const path of paths) {
+      for (const ownedPath of [resolve(path), realpathSync(path)]) {
+        if (roots.some(root => ownedPath === root || ownedPath.startsWith(`${root}${sep}`))
+          || ownedPath.split(sep).some(part => /^lane-\d+$/.test(part))) {
+          return { ok: false, reason: 'lane-shaped owner or path under a pool root' };
+        }
+      }
+    }
+    const origin = singleLine(git(['remote', 'get-url', 'origin'], candidate, options), 'git remote get-url origin');
+    if (poolRepoName(origin) !== poolName.toLowerCase()) return { ok: false, reason: `origin names ${poolEvidenceLine(poolRepoName(origin))}, expected ${poolName}` };
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, reason: poolEvidenceLine(error?.stderr || error?.cause?.stderr || error.message) };
+  }
+}
+
 function resolveRepo(repoFlags = flags) {
+  const originSource = repoFlags.origin || repoFlags.reference || repoFlags.repo ? 'explicit' : 'caller';
   // The inherited smoke origin belongs to the caller. Explicit repository/pool selection (including
   // cross-pool recovery's recursive calls) must resolve that primary's own origin instead.
   const inheritedOrigin = !repoFlags.reference && !repoFlags.repo && !repoFlags.pool
@@ -475,6 +519,29 @@ function resolveRepo(repoFlags = flags) {
     // Origin authority comes from the selected primary; release still cleans the caller's registry.
     return cmd === 'release' ? { ...selectedRepo, registryReferencePath: topLevel } : selectedRepo;
   }
+  // Growth binds the named pool's own primary. Recovery/deletion/push binding is deferred;
+  // those commands must refuse here, before they inspect or mutate any lane.
+  if ((needsOrigin || cmd === 'salvage-unpushed') && explicitPool && !repoFlags.origin && !repoFlags.reference && !repoFlags.repo
+    && poolRepoName(originUrl) !== explicitPool.toLowerCase()) {
+    const meta = Object.values(CONSTELLATION_REPOS).find(entry => entry.slug.split('/').at(-1).toLowerCase() === explicitPool.toLowerCase());
+    const candidates = [...new Set([explicitPool, ...(meta?.dirs || [])])].map(name => join(dirname(topLevel), name));
+    const binding = cmd === 'acquire' || cmd === 'provision' || (cmd === 'list' && repoFlags.acquirable);
+    const reasons = [];
+    for (const candidate of candidates) {
+      const qualification = binding ? qualifyPoolPrimary(candidate, explicitPool)
+        : { ok: false, reason: `automatic primary binding is deferred for ${cmd}` };
+      if (qualification.ok) {
+        // Re-read ownership and origin, rather than promoting qualification's earlier snapshot.
+        const selectedRepo = resolveRepo({ ...repoFlags, reference: candidate });
+        if (poolRepoName(selectedRepo.originUrl) !== explicitPool.toLowerCase()) {
+          fail(`${cmd} --pool=${explicitPool}: primary origin changed during resolution — pass --reference=<${explicitPool} checkout> or --origin=<url>`);
+        }
+        return { ...selectedRepo, originSource: `primary:${candidate}` };
+      }
+      reasons.push(`${candidate}: ${qualification.reason}`);
+    }
+    fail(`${cmd} --pool=${explicitPool}: no primary checkout for pool ${explicitPool} whose origin names ${explicitPool} (looked in ${reasons.join(', ')}) — pass --reference=<${explicitPool} checkout> or --origin=<url>`);
+  }
   if (!originUrl && !explicitPool) {
     fail(`could not determine an origin URL — pass --origin=<url> (looked in ${topLevel})`);
   }
@@ -493,7 +560,7 @@ function resolveRepo(repoFlags = flags) {
   // origin scan above. Null means no validated primary: the proof then runs under the strict lane transport rules.
   const primaryPath = alternatesReferencePath
     || (repoFlags.origin && (cmd === 'gc' || cmd === 'release') && !scanOwnership().laneShaped ? topLevel : null);
-  return { name, originUrl: canonicalOrigin ? originUrl || null : null, referencePath: topLevel, alternatesReferencePath, primaryPath, branch, poolDir: join(POOL_ROOT, name) };
+  return { name, originUrl: canonicalOrigin ? originUrl || null : null, originSource, referencePath: topLevel, alternatesReferencePath, primaryPath, branch, poolDir: join(POOL_ROOT, name) };
 }
 
 const laneDir = (repo, n) => join(repo.poolDir, `lane-${n}`);
@@ -1775,6 +1842,17 @@ function laneStatus(repo, n, { leasedOnly = false, statusCache = null } = {}) {
 // leased, yet every scan ran `status --porcelain` + `rev-list` (+ a second porcelain for litter) in each one.
 // `nowMs`/`ttlMs` must be the SAME values the caller hands `isLaneAcquirable`, so both reads agree on staleness.
 let laneEligibilityProbeFailed = false; // Sticky: local inspection failure never proves capacity exhaustion.
+const laneEligibilityProbeErrors = new Map();
+function eligibilityProbeCause(dirtyOrAhead, branch) {
+  const first = dirtyOrAhead.probeErrors?.[0];
+  return first ? `${first.probe}: ${poolEvidenceLine(first.error)}`
+    : `git rev-list --count origin/${branch}..HEAD: unparseable output`;
+}
+function eligibilityProbeSummary() {
+  const failures = [...laneEligibilityProbeErrors].sort(([a], [b]) => a - b);
+  return failures.slice(0, 3).map(([n, cause]) => `lane-${n} (${cause})`).join(', ')
+    + (failures.length > 3 ? `, +${failures.length - 3} more` : '');
+}
 function laneAcquirableInfo(repo, n, remoteShasBox = null, nowMs = Date.now(), ttlMs = ttlMsFromFlags()) {
   const dir = laneDir(repo, n);
   if (!existsSync(dir)) return { lane: n, exists: false };
@@ -1802,7 +1880,9 @@ function laneAcquirableInfo(repo, n, remoteShasBox = null, nowMs = Date.now(), t
   const dirtyOrAhead = effectiveDirtyOrAhead(dir, repo.branch, getRemoteShas);
   if (dirtyOrAhead.probeFailed) {
     laneEligibilityProbeFailed = true;
-    log(`  lane-${n}: eligibility probe failed — growth/recovery blocked; inspect local git status/history, then retry`);
+    const cause = eligibilityProbeCause(dirtyOrAhead, repo.branch);
+    laneEligibilityProbeErrors.set(n, cause);
+    log(`  lane-${n}: eligibility probe failed (${cause}) — growth/recovery blocked; inspect local git status/history, then retry`);
   }
   return { lane: n, exists: true, lease, dirtyOrAhead };
 }
@@ -1871,6 +1951,7 @@ function cmdProvision(repo) {
   // `provisionLane`/`cloneLane`/`refreshLane`, no `ensureDeps` (npm ci), nothing — the exact contract
   // `reclaim --dry-run` already holds elsewhere in this file (see `cmdReclaim`).
   if (flags['dry-run']) {
+    log(`clone source: ${repo.originUrl}`);
     const existingCount = existingLanes(repo).length;
     if (flags.acquirable) {
       log(
@@ -3053,7 +3134,7 @@ async function cmdAcquire(repo) {
                 `scan was still running when this call's --wait-ms elapsed (lock contention); this is NOT ` +
                 `necessarily because all ${lanes.length} lane(s) are held/dirty — retry, or raise --wait-ms`
             : laneEligibilityProbeFailed
-              ? `no free lane in pool "${repo.name}" — local eligibility probe failed; growth/recovery blocked — inspect local git status/history, then retry`
+              ? `no free lane in pool "${repo.name}" — local eligibility probe failed; growth/recovery blocked — inspect local git status/history, then retry; failed: ${eligibilityProbeSummary()}`
             : sawProvisionFailure
               // #3407 — every candidate this call tried was claimed but then failed to PROVISION (a network
               // blip, #2924's re-verify, a bad --base, an npm hiccup) — a different fact from "held/dirty", so
@@ -6076,4 +6157,8 @@ if (flags.lane !== undefined && (
   fail('--lane requires a lane number');
 }
 
-await COMMANDS[cmd](resolveRepo());
+const repo = resolveRepo();
+if (process.env.LANE_POOL_TRACE_ORIGIN === '1') {
+  log(`lane-pool: bound origin ${repo.originUrl || 'none'} (from ${repo.originSource})`.replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' '));
+}
+await COMMANDS[cmd](repo);

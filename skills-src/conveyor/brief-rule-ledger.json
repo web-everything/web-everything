@@ -1712,8 +1712,8 @@
         },
         {
           "brief": "skills-src/conveyor/fix-agent-brief.md",
-          "key": "38ed01bba5",
-          "text": "down** exactly as step 2 says (`stand-down.mjs {{PR_NUM}} --reason=needs-judgment`) — this population is never"
+          "key": "9bcce8517b",
+          "text": "down** by running the needs-judgment stand-down block in step 2 exactly as written — this population is never"
         },
         {
           "brief": "skills-src/conveyor/fix-agent-brief.md",
