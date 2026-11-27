@@ -43,3 +43,9 @@ describe('settings safe direction', () => {
     expect(isLoosening('enum:strict,normal,lax', 'normal', 'other')).toBe(true);
   });
 });
+
+
+it('missing boolean evidence refuses even a safe target', () => {
+  expect(isLoosening('true', undefined, true)).toBe(true);
+  expect(isLoosening('false', 'bad', false)).toBe(true);
+});

@@ -507,3 +507,145 @@ describe('R907 malformed review capacity evidence', () => {
     }).value.maxLiveReviewRounds).toBe(3);
   });
 });
+
+
+describe('SD15 owner layers', () => {
+  const quiet = () => {};
+  const safety = { policy: 'ciUnitRerun', standard: { maxFiles: 9 }, log: quiet };
+  it('an unclassified safety leaf cannot be loosened through the environment', () => {
+    const r = resolveCascade({ policy: 'futureGate', standard: { required: true }, safetyLeaves: ['required'],
+      envValues: { required: false }, log: quiet });
+    expect(r.value.required).toBe(true);
+    expect(r.sources.required).toBe('standard');
+    expect(r.invalid.join(' ')).toMatch(/unclassified.*repair/);
+  });
+  it('company org team repo sources remain distinct', () => {
+    const r = resolveCascade({ standard: {}, company: { a: 1 }, org: { b: 2 }, team: { c: 3 }, repo: { d: 4 } });
+    expect(r.value).toEqual({ a: 1, b: 2, c: 3, d: 4 });
+    expect(r.sources).toEqual({ a: 'company', b: 'org', c: 'team', d: 'repo' });
+  });
+  it('nine conflicting owner layers resolve in declared precedence order', () => {
+    const names = ['standard', 'platform', 'company', 'org', 'team', 'repo', 'tool', 'env', 'operator'];
+    const values = [1, 2, 3, 4, 5, 6, 8, 7, 9];
+    const confirmations = {};
+    for (let i = 1; i < names.length; i++) confirmations[names[i]] = { maxFiles: names.slice(0, i) };
+    for (let highest = 8; highest >= 0; highest--) {
+      const layers = Object.fromEntries(names.slice(0, highest + 1).map((name, i) =>
+        [name === 'env' ? 'envValues' : name, { maxFiles: values[i] }]));
+      const r = resolveCascade({ ...layers, policy: 'ciUnitRerun', confirmations, log: quiet });
+      expect(r.value.maxFiles).toBe(values[highest]);
+      expect(r.sources.maxFiles).toBe(names[highest]);
+      expect(formatCascadeSourcesLine('ciUnitRerun', r)).toContain(`maxFiles=${values[highest]} (${names[highest]})`);
+    }
+  });
+  it('missing owner confirmation refuses', () => {
+    const r = resolveCascade({ ...safety, company: { maxFiles: 2 }, org: { maxFiles: 3 }, team: { maxFiles: 4 },
+      confirmations: { org: { maxFiles: ['company'] }, team: { maxFiles: ['org'] } } });
+    expect(r.value.maxFiles).toBe(3);
+    expect(r.sources.maxFiles).toBe('org');
+    expect(r.invalid.join(' ')).toMatch(/team.*company.*confirmation/);
+  });
+  it('checks every lower owner even when the immediate value is looser', () => {
+    const r = resolveCascade({ ...safety, company: { maxFiles: 2 }, org: { maxFiles: 5 }, team: { maxFiles: 4 },
+      confirmations: { org: { maxFiles: ['company'] } } });
+    expect(r.value.maxFiles).toBe(5);
+    expect(r.invalid.join(' ')).toMatch(/team.*company.*confirmation/);
+  });
+  it('type mismatch refuses and valid tightening still applies', () => {
+    const r = resolveCascade({ ...safety, company: { maxFiles: 4 }, envValues: { maxFiles: '3' } });
+    expect(r.value.maxFiles).toBe(4);
+    expect(r.invalid).toHaveLength(1);
+    expect(resolveCascade({ ...safety, company: { maxFiles: 4 }, envValues: { maxFiles: 3 } }).sources.maxFiles).toBe('env');
+  });
+  it('env redirect cannot supply operator-only keys', () => {
+    const path = file({ findingClasses: { probe: 'allow' }, routingOverrides: { probe: 1 } });
+    const warn = vi.fn();
+    const r = readPlatformPreferences({ env: { [PLATFORM_PREFERENCES_ENV]: path }, readFile: readFileSync, warn,
+      operatorPath: join(dir, 'trusted-operator.json') });
+    expect(r.prefs).toEqual({});
+    expect(warn).toHaveBeenCalledTimes(2);
+  });
+  it.each(['platform', 'company', 'org', 'team', 'repo', 'tool', 'operator'])(
+    'malformed owner layer refuses safety resolution instead of falling through: %s', layer => {
+      const path = file({}); writeFileSync(path, '{');
+      const r = cascadePolicy('ciUnitRerun', {}, { ...safety, platform: {}, env: {}, operatorOverride: {},
+        ownerFiles: { [layer]: path }, readFile: readFileSync, operatorPath: join(dir, 'operator.json') });
+      expect(r.value.maxFiles).toBeUndefined();
+      expect(r.sources.maxFiles).toBe(`unresolved:${layer}`);
+      expect(r.invalid.join(' ')).toMatch(new RegExp(`${layer}.*repair`));
+      expect(r.layered?.maxFiles).toBeUndefined();
+    });
+  it('old five-layer fixture migrates explicitly', () => {
+    const persisted = JSON.parse('{"standard":{"limit":1},"platform":{"limit":2},"tool":{"limit":3},"envValues":{"limit":4},"operatorOverride":{"maxLiveReviewRounds":5}}');
+    const r = resolveCascade({ ...persisted, capacityLeaves: ['maxLiveReviewRounds'] });
+    expect(r.value).toEqual({ limit: 4, maxLiveReviewRounds: 5 });
+    expect(r.sources).toEqual({ limit: 'env', maxLiveReviewRounds: 'operator-db' });
+  });
+  it('real reader resolves frozen owner files and emits daemon provenance', () => {
+    const ownerFiles = Object.freeze({ company: file({ ciUnitRerun: { maxFiles: 6 } }), team: file({ ciUnitRerun: { maxFiles: 4 } }) });
+    const lines = [];
+    const r = cascadePolicy('ciUnitRerun', {}, { ...safety, platform: {}, ownerFiles, readFile: readFileSync,
+      operatorOverride: {}, envValues: { maxFiles: 5 }, env: { WE_POLICY_CASCADE_LOG: '1' }, log: line => lines.push(line) });
+    expect(r.value.maxFiles).toBe(4);
+    expect(r.sources.maxFiles).toBe('team');
+    expect(lines.join(' ')).toMatch(/maxFiles=4 \(team\).*env.maxFiles=5/);
+  });
+});
+
+
+describe('SD15 personal preferences provenance', () => {
+  it('personal values stay distinct from platform defaults and win over tool values', () => {
+    const platformPath = file({ ui: { colour: 'platform', density: 'compact' } });
+    const operatorPath = file({ ui: { colour: 'personal' } });
+    const r = cascadePolicy('ui', { colour: 'tool' }, { standard: {}, env: {}, readFile: readFileSync,
+      platformPaths: [platformPath], operatorPath, operatorOverride: {}, log: () => {} });
+    expect(r.value).toEqual({ colour: 'personal', density: 'compact' });
+    expect(r.sources).toEqual({ colour: 'operator', density: 'platform' });
+  });
+  it('an env-selected safety file has env trust and cannot loosen the standard', () => {
+    const path = file({ ciUnitRerun: { maxFiles: 10 } });
+    const r = cascadePolicy('ciUnitRerun', {}, { standard: { maxFiles: 2 },
+      env: { [PLATFORM_PREFERENCES_ENV]: path }, readFile: readFileSync,
+      operatorPath: join(dir, 'operator.json'), operatorOverride: {}, log: () => {} });
+    expect(r.value.maxFiles).toBe(2);
+    expect(r.sources.maxFiles).toBe('standard');
+    expect(r.invalid.join(' ')).toMatch(/env.maxFiles=10/);
+  });
+  it('an unclassified safety value without a default remains unresolved with repair provenance', () => {
+    const r = resolveCascade({ policy: 'futureGate', safetyLeaves: ['required'], envValues: { required: false }, log: () => {} });
+    expect(r.value?.required).toBeUndefined();
+    expect(r.invalid.join(' ')).toMatch(/unclassified.*repair/);
+  });
+});
+
+
+it('operator loosening requires the affected env owner confirmation', () => {
+  const r = resolveCascade({ policy: 'ciUnitRerun', standard: { maxFiles: 9 },
+    envValues: { maxFiles: 2 }, operator: { maxFiles: 3 }, confirmations: {}, log: () => {} });
+  expect(r.value.maxFiles).toBe(2);
+  expect(r.sources.maxFiles).toBe('env');
+  expect(r.invalid.join(' ')).toMatch(/operator.*env.*confirmation/);
+});
+
+it('confirmations cannot authorize an incomparable safety value', () => {
+  const r = resolveCascade({ policy: 'ciUnitRerun', standard: { maxFiles: 9 }, company: { maxFiles: 'bad' },
+    confirmations: { company: { maxFiles: ['standard'] } }, log: () => {} });
+  expect(r.value.maxFiles).toBe(9);
+  expect(r.invalid.join(' ')).toMatch(/company.*incomparable.*repair/);
+});
+
+
+it.each([
+  ['scalar', true, false, '', true, { '': 'standard' }],
+  ['object', { required: true }, { required: false }, 'required', { required: true }, { required: 'standard' }],
+])('an env-selected %s reader-declared safety value preserves the standard value and source',
+  (_shape, standard, redirected, leaf, expected, sources) => {
+    const path = file({ futureGate: redirected });
+    const r = cascadePolicy('futureGate', undefined, { standard, safetyLeaves: [leaf],
+      env: { [PLATFORM_PREFERENCES_ENV]: path }, readFile: readFileSync,
+      operatorPath: join(dir, 'operator.json'), operatorOverride: {}, log: () => {} });
+    expect(r.value).toEqual(expected);
+    expect(r.sources).toEqual(sources);
+    expect(r.platform).toEqual(leaf === '' ? undefined : {});
+    expect(r.invalid.join(' ')).toMatch(/unclassified safety; repair direction/);
+  });

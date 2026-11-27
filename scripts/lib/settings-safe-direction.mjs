@@ -8,7 +8,7 @@
  *   'min' | 'max'      numbers; the safe direction is smaller / larger
  *   'subset'           arrays; a tighter value is a subset of the current one (an exemption list may only shrink)
  *   'enum:a,b,c'       ordered, tightest first
- * A key with no entry is `unclassed` (shadow-reported only in slice 1; counts as loosening once slice 5 lands).
+ * A key with no entry is `unclassed`; a reader-declared safety leaf without a direction refuses overrides.
  * Values that cannot be compared (type mismatch, missing current value) count as loosening: fail closed.
  */
 
@@ -41,7 +41,7 @@ export function isLoosening(entry, from, to) {
   if (typeof safe !== 'string') return true;
   // Validate both sides for the kind BEFORE the equality shortcut: equal malformed values are still loosening.
   if (safe === 'true' || safe === 'false') {
-    if (typeof to !== 'boolean') return true;
+    if (typeof from !== 'boolean' || typeof to !== 'boolean') return true;
     if (typeof from === 'boolean' && from === to) return false;
     return to !== (safe === 'true');
   }

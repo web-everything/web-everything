@@ -4,18 +4,11 @@
  *   practice"; card x5wnfcg #5600; operator go 2026-10-10). Generalised from the per-key resolver in PR #4708's
  *   `merge-delivery-policy.mjs`, so every setting shares one resolver instead of each re-implementing the layers:
  *
- *     1. STANDARD default (Ship Evermore) — the reader's own built-in value.
- *     2. PLATFORM preference (Platform Forever, team level, shared by every tool) — the policy's key in
- *        `we:scripts/lib/delivery-platform-preferences.json` (PR #4708's home until Platform Forever has its own
- *        store), over the legacy platform file `we:scripts/lib/delivery-priority-settings.json`. Env
- *        `WE_PLATFORM_PREFERENCES_FILE` replaces both (tests, a one-off live proof).
- *     3. TOOL / repo override (Longshore settings) — the reader's settings file block (`we:scripts/settings/*.json`
- *        or its own per-feature file). Only when this repo deliberately differs from the team.
- *     4. ENV — the reader's existing env override (unchanged; each reader keeps its own env parsing).
- *     5. OPERATOR DB — capacity-only host overrides, above env (source: operator-db).
- *
- *   Each LEAF resolves independently: the tool value when it is set AND valid, else the platform's, else the
- *   reader's standard default. An invalid value never overrides a lower layer; it is named in `invalid`.
+ *   Order: standard → platform default → company → org → team → repo → tool → env → operator override.
+ *   The capacity-only operator store retains its historical `operator-db` source name at the final tier.
+ *   File-backed owner blocks enter through `ownerFiles` (policy-keyed JSON), never an env-selected owner path.
+ *   Personal preferences remain in the merged compatibility view but resolve as `operator`, distinct from platform.
+ *   An env-selected file has no operator authority; safety values pass through tighten-only env validation.
  *
  *   SOURCE LOG: {@link cascadePolicy} prints one `policy-cascade · <policy>: leaf=value (layer), …` line per process
  *   per distinct effective set, so a long-running daemon logs each setting's source once (and again only if it
@@ -23,7 +16,8 @@
  *   the line lands in the daemon's log) or when `WE_POLICY_CASCADE_LOG=1` — never into a short CLI's stderr that a caller may parse.
  *   `WE_POLICY_CASCADE_LOG=0` turns it off; silent under test unless `=1`.
  *
- *   Never throws. A missing platform file is "layer not set"; an unreadable one is skipped and named in `errors`.
+ *   A missing legacy platform file is "layer not set". Broken owner evidence makes safety values unresolved;
+ *   provenance names the broken layer and requires repair before admission.
  */
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -39,11 +33,11 @@ export const PLATFORM_PREFERENCES_PATH = join(HERE, 'delivery-platform-preferenc
 export const LEGACY_PLATFORM_PREFERENCES_PATHS = Object.freeze([join(HERE, 'delivery-priority-settings.json')]);
 export const PLATFORM_PREFERENCES_ENV = 'WE_PLATFORM_PREFERENCES_FILE';
 /** Operator-owned final platform layer; never written inside a checkout. */
-export function operatorPreferencesPath(env = process.env) {
-  return String(env?.[PLATFORM_PREFERENCES_ENV] ?? '').trim() || join(homedir(), '.claude', 'platform-preferences.json');
+export function operatorPreferencesPath(_env = process.env) {
+  return join(homedir(), '.claude', 'platform-preferences.json');
 }
 export const POLICY_CASCADE_LOG_ENV = 'WE_POLICY_CASCADE_LOG';
-export const CASCADE_LAYERS = Object.freeze(['standard', 'platform', 'tool', 'env', 'operator-db']);
+export const CASCADE_LAYERS = Object.freeze(['standard', 'platform', 'company', 'org', 'team', 'repo', 'tool', 'env', 'operator', 'operator-db']);
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const UNSAFE = new Set(['__proto__', 'constructor', 'prototype']);
@@ -62,9 +56,11 @@ function mergeLeaves(base, over) {
  * repo platform copies are ignored with a warning. Never throws.
  * @returns {{prefs:object, errors:string[]}}
  */
-export function readPlatformPreferences({ env = process.env, readFile = readFileSync, warn = message => console.error(message) } = {}) {
+export function readPlatformPreferences({ env = process.env, readFile = readFileSync, warn = message => console.error(message), operatorPath = operatorPreferencesPath(),
+  platformPaths = [...LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH] } = {}) {
   const override = String(env?.[PLATFORM_PREFERENCES_ENV] ?? '').trim();
-  const paths = override ? [override] : [...LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH, operatorPreferencesPath(env)];
+  const paths = override ? [override] : [...platformPaths, operatorPath];
+  const layers = { platform: {}, operator: {} };
   const prefs = {};
   const errors = [];
   for (const path of paths) {
@@ -72,20 +68,25 @@ export function readPlatformPreferences({ env = process.env, readFile = readFile
       const data = JSON.parse(String(readFile(path, 'utf8')));
       if (!isObj(data)) { errors.push(`${path}: not a JSON object`); continue; }
       for (const [k, v] of Object.entries(data)) {
-        if (['routingOverrides', 'findingClasses'].includes(k) && (path !== operatorPreferencesPath(env)
+        if (['routingOverrides', 'findingClasses'].includes(k) && (override || path !== operatorPath
           || [...LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH].some(repoPath => resolve(repoPath) === resolve(path)))) {
           warn(`policy-cascade: ${path}: ignoring ${k}; only the operator-owned preferences file may set it`);
           continue;
         }
         // Per-leaf merge: a later file (the operator's) overrides only the leaves it sets; it never drops the
         // earlier file's other leaves of the same policy (an operator `build.priority` must not erase `build.finalGate`).
-        if (!UNSAFE.has(k) && !k.startsWith('$')) prefs[k] = isObj(prefs[k]) && isObj(v) ? mergeLeaves(prefs[k], v) : v;
+        if (!UNSAFE.has(k) && !k.startsWith('$')) {
+          prefs[k] = isObj(prefs[k]) && isObj(v) ? mergeLeaves(prefs[k], v) : v;
+          const layer = !override && path === operatorPath ? layers.operator : layers.platform;
+          layer[k] = isObj(layer[k]) && isObj(v) ? mergeLeaves(layer[k], v) : v;
+        }
       }
     } catch (e) {
       if (e?.code !== 'ENOENT') errors.push(`${path}: ${String(e?.message ?? e).split('\n')[0]}`);
     }
   }
-  return { prefs, errors };
+  // Preserve the public merged view for existing readers while the cascade retains owner provenance.
+  return Object.defineProperty({ prefs, errors }, 'layers', { value: layers });
 }
 
 /** IO: one policy's platform preference (`undefined` when the team set none). Never throws. */
@@ -121,34 +122,63 @@ function setLeaf(obj, parts, value) {
 }
 
 /**
- * PURE: resolve one policy through the five layers. A null operatorOverride means the store is unreadable;
+ * PURE: resolve one policy through the declared owner layers. A null operatorOverride means the store is unreadable;
  * capacityLeaves retain the stricter lower-layer value or finite code fallback.
  * @param {{standard?:unknown, platform?:unknown, tool?:unknown, envValues?:Record<string,unknown>,
  *   valid?:Record<string,(v:unknown)=>boolean>|((v:unknown)=>boolean)}} layers
+ *   Owner blocks have the same shape (or are scalars). `confirmations[layer][leaf]` lists affected lower owners;
+ *   these are trusted reader inputs, never taken from env or candidate JSON. Unknown safety paths must be declared
+ *   in `safetyLeaves`; a missing direction refuses their overrides. Legacy five-layer blocks retain their historical
+ *   ownership until migrated to explicit owner blocks/confirmations. `layerErrors` refuses safety resolution.
  *   `standard` / `platform` / `tool` are blocks of the same shape (or scalars). `envValues` maps a TOP-LEVEL key ('' for
  *   a scalar policy) → an already parsed env value (undefined = env not set). `valid` is one predicate (scalar
  *   policy) or top-level key → predicate; a key with no predicate accepts any value.
  * @returns {{value:unknown, sources:Record<string,string>, leafValues:Record<string,unknown>, invalid:string[]}}
  *   `sources` names the layer of every effective leaf, keyed by its dotted path ('' for a scalar policy).
  */
-export function resolveCascade({ standard, platform, tool, envValues = {}, valid = {}, operatorOverride, capacityLeaves, policy, log = console.error } = {}) {
+export function resolveCascade({ standard, platform, company, org, team, repo, tool, operator,
+  envValues = {}, valid = {}, operatorOverride, capacityLeaves, policy, safetyLeaves = [], confirmations,
+  layerErrors = {}, log = console.error } = {}) {
   const shadow = [];
   const check = (path, v) => (typeof valid === 'function' ? valid(v) : ((valid?.[path.join('.')] ?? valid?.[path[0]])?.(v) ?? true));
   const eff = new Map();
   const at = (path) => (path.length ? `.${path.join('.')}` : '');
   const invalid = [];
-  for (const [key, { path, v }] of leaves(standard)) eff.set(key, { path, v, layer: 'standard' });
-  for (const [name, layer] of [['platform', platform], ['tool', tool]]) {
-    if (layer === undefined || layer === null) continue;
+  const history = new Map();
+  const isSafety = leaf => safetyLeaves.includes(leaf) || classify(policy, leaf) === 'safety';
+  // Historical five-layer settings remain reader-owned. Once owner layers/confirmations are supplied,
+  // every ancestor participates; callers migrate persisted settings by supplying their owner confirmations.
+  const ownerAware = confirmations !== undefined || [company, org, team, repo, operator].some(v => v !== undefined);
+  const remember = (key, entry) => history.set(key, [...(history.get(key) ?? []), entry]);
+  const apply = (name, layer) => {
+    if (layer === undefined || layer === null) return;
     for (const [key, { path, v }] of leaves(layer)) {
-      if (name === 'tool' && path[0] === 'findingClasses') {
-        console.error('policy-cascade: ignoring tool findingClasses; only the operator-owned preferences file may set it');
+      const leaf = path.join('.');
+      if (path[0] === 'findingClasses' && name !== 'operator') {
+        log(`policy-cascade: ignoring ${name} findingClasses; only the operator-owned preferences file may set it`);
         continue;
       }
       if (!check(path, v)) { invalid.push(`${name}${at(path)}=${JSON.stringify(v)}`); continue; }
-      eff.set(key, { path, v, layer: name });
+      if (ownerAware && isSafety(leaf)) {
+        const entry = directionFor(policy, leaf);
+        if (entry && isLoosening(entry, v, v)) {
+          invalid.push(`${name}${at(path)}: incomparable safety value; repair value`);
+          continue;
+        }
+        const ancestors = history.get(key) ?? [];
+        const missing = ancestors.filter(({ v: from, layer: owner }) => isLoosening(entry, from, v)
+          && !(Array.isArray(confirmations?.[name]?.[leaf]) && confirmations[name][leaf].includes(owner)));
+        if (missing.length || !entry) {
+          invalid.push(`${name}${at(path)}: ${!entry ? 'unclassified safety; repair direction' : `${missing.map(e => e.layer).join(', ')} owner confirmation required`}`);
+          continue;
+        }
+      }
+      const entry = { path, v, layer: name };
+      eff.set(key, entry); remember(key, entry);
     }
-  }
+  };
+  for (const [key, { path, v }] of leaves(standard)) { const entry = { path, v, layer: 'standard' }; eff.set(key, entry); remember(key, entry); }
+  for (const [name, layer] of [['platform', platform], ['company', company], ['org', org], ['team', team], ['repo', repo], ['tool', tool]]) apply(name, layer);
   for (const [k, raw] of Object.entries(envValues ?? {})) {
     let v = raw;
     if (v === undefined) continue;
@@ -160,20 +190,20 @@ export function resolveCascade({ standard, platform, tool, envValues = {}, valid
     }
     const path = k === '' ? [] : [k];
     if (!check(path, v)) { invalid.push(`env${at(path)}=${JSON.stringify(v)}`); continue; }
-    if (policy) {
-      // D15: env may only tighten a classed safety leaf; an unclassed leaf applies as before and is shadow-reported.
+    if (policy || safetyLeaves.length) {
+      // Unknown safety semantics refuse; unclassified non-safety preferences retain their legacy shadow notice.
       const refused = [];
       // An object under a classed leaf is judged as one value (it cannot be a safe boolean/list); else leaf by leaf.
       const probes = isObj(v) && classify(policy, path.join('.')) === 'unclassed' ? [...leaves(v).values()].map(l => l.path) : [[]];
       for (const rel of probes) {
         const full = [...path, ...rel];
         const leaf = full.join('.');
-        if (classify(policy, leaf) === 'unclassed') { shadow.push(`env.${leaf || policy}`); continue; }
+        if (classify(policy, leaf) === 'unclassed' && !isSafety(leaf)) { shadow.push(`env.${leaf || policy}`); continue; }
         const entry = directionFor(policy, leaf);
         const to = rel.length ? rel.reduce((o, p) => o?.[p], v) : v;
         const from = eff.get(full.join(SEP))?.v;
-        if (entry?.kind === 'safety' && isLoosening(entry, from, to)) {
-          const text = `env.${leaf || policy}=${JSON.stringify(to)} (loosens; env may only tighten)`;
+        if (isSafety(leaf) && isLoosening(entry, from, to)) {
+          const text = `env.${leaf || policy}=${JSON.stringify(to)} (${!entry ? 'unclassified safety; repair direction; default retained' : 'loosens; env may only tighten'})`;
           invalid.push(text);
           if (!loosenLogged.has(text)) { loosenLogged.add(text); try { log(`policy-cascade: refused ${text}`); } catch { /* never throws */ } }
           refused.push({ rel, from });
@@ -189,7 +219,12 @@ export function resolveCascade({ standard, platform, tool, envValues = {}, valid
     // An env value replaces the whole top-level key (drop the nested leaves it shadows).
     for (const key of [...eff.keys()]) if (path.length && eff.get(key).path[0] === k) eff.delete(key);
     eff.set(path.join(SEP), { path, v, layer: 'env' });
+    for (const { path: relative, v: leafValue } of leaves(v).values()) {
+      const full = [...path, ...relative];
+      remember(full.join(SEP), { path: full, v: leafValue, layer: 'env' });
+    }
   }
+  apply('operator', operator);
   const defaults = leaves(standard);
   const paths = capacityLeaves ?? [...defaults.values()].map(({ path }) => path.join('.')).filter(leaf =>
     Object.keys(CAPACITY_LEAVES).some(key => (key === leaf || key.endsWith(`.${leaf}`))));
@@ -224,6 +259,16 @@ export function resolveCascade({ standard, platform, tool, envValues = {}, valid
       const codeDefault = [...defaults.values()].find(e => e.path.join('.') === leaf)?.v;
       const v = failClosedCapacity(specKey, current, { codeDefault, log });
       eff.set(key, { path, v, layer: v === current ? entry?.layer ?? 'standard' : 'standard' });
+    }
+  }
+  for (const [layer, reason] of Object.entries(layerErrors)) {
+    invalid.push(`${layer}: ${reason}; repair layer before safety resolution`);
+    for (const [key, entry] of eff) if (isSafety(entry.path.join('.'))) {
+      eff.set(key, { ...entry, v: undefined, layer: `unresolved:${layer}` });
+    }
+    for (const leaf of safetyLeaves) {
+      const path = leaf ? leaf.split('.') : [];
+      eff.set(path.join(SEP), { path, v: undefined, layer: `unresolved:${layer}` });
     }
   }
   const sources = {};
@@ -283,22 +328,57 @@ export function logCascadeSources(policy, resolved, { env = process.env, log = (
  * @param {{standard?:unknown, envValues?:Record<string,unknown>, valid?:object|Function, platform?:unknown,
  *   env?:object, log?:Function}} [o]
  */
-export function cascadePolicy(policy, tool, { standard, envValues, valid, platform, operatorOverride, env = process.env, log } = {}) {
+export function cascadePolicy(policy, tool, { standard, envValues, valid, platform, operatorOverride, company, org, team, repo, operator,
+  safetyLeaves, confirmations, ownerFiles = {}, readFile = readFileSync, operatorPath, platformPaths,
+  env = process.env, log } = {}) {
+  const layers = { platform, company, org, team, repo, tool, operator };
+  const layerErrors = {};
+  for (const [name, path] of Object.entries(ownerFiles)) {
+    if (!Object.hasOwn(layers, name)) { layerErrors[name] = 'unknown owner layer'; continue; }
+    try {
+      const data = JSON.parse(String(readFile(path, 'utf8')));
+      if (!isObj(data)) throw new Error('not a JSON object');
+      layers[name] = policy.split('.').reduce((v, key) => v?.[key], data);
+    } catch (error) { layerErrors[name] = String(error?.message ?? error).split('\n')[0]; }
+  }
+  if (layers.platform === undefined) {
+    const result = readPlatformPreferences({ env, readFile, ...(operatorPath ? { operatorPath } : {}), ...(platformPaths ? { platformPaths } : {}) });
+    const block = data => policy.split('.').reduce((v, key) => v?.[key], data);
+    layers.platform = block(result.layers.platform);
+    if (layers.operator === undefined) layers.operator = block(result.layers.operator);
+    if (env?.[PLATFORM_PREFERENCES_ENV]) {
+      // The redirect is not owner evidence. Safety entries re-enter through tighten-only env validation.
+      const redirected = layers.platform;
+      layers.platform = undefined;
+      const trusted = {};
+      const untrusted = {};
+      for (const { path, v } of leaves(redirected).values()) {
+        if (classify(policy, path.join('.')) === 'safety' || safetyLeaves?.includes(path.join('.'))) {
+          if (path.length) setLeaf(untrusted, path, v); else untrusted[''] = v;
+        } else if (path.length) setLeaf(trusted, path, v);
+        else layers.platform = v;
+      }
+      if (isObj(redirected)) layers.platform = trusted;
+      envValues = { ...untrusted, ...envValues };
+    }
+    if (result.errors.length) layerErrors.platform = result.errors.join('; ');
+  }
+  tool = layers.tool;
   if (policy === 'findingClasses') {
     if (tool != null || Object.values(envValues ?? {}).some(v => v !== undefined))
       console.error('policy-cascade: ignoring tool/env findingClasses; only the operator-owned preferences file may set it');
     tool = undefined;
     envValues = {};
   }
-  let plat = platform;
-  if (plat === undefined) { try { plat = platformPreference(policy, { env }); } catch { plat = undefined; } }
+  const plat = layers.platform;
   if (operatorOverride === undefined) operatorOverride = readOperatorPolicy(policy, { env, log });
   const capacityLeaves = capacityPolicyLeaves(policy);
-  const resolved = resolveCascade({ standard, platform: plat, tool, envValues, valid, operatorOverride, capacityLeaves, policy, log });
+  const shared = { ...layers, tool, valid, operatorOverride, capacityLeaves, policy, safetyLeaves, confirmations, layerErrors, log };
+  const resolved = resolveCascade({ ...shared, standard, envValues });
   logCascadeSources(policy, resolved, { env, ...(log ? { log } : {}) });
   // `layered`: platform under tool only (no standard, no env) — the drop-in replacement for a reader's tool block.
   const layered = resolveCascade({ standard: operatorOverride === null && capacityLeaves.length ? standard : undefined,
-    platform: plat, tool, valid, operatorOverride, capacityLeaves, log }).value;
+    ...shared }).value;
   return { ...resolved, platform: plat, layered };
 }
 
