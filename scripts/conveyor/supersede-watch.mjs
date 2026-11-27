@@ -32,18 +32,22 @@ const ghJson = (args, exec) => JSON.parse(String(exec('gh', args, {
   stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', maxBuffer: 64 * 1024 * 1024,
 }) || 'null'));
 
-/** Count brackets and unique identities prove completeness despite mutable REST update ordering.
- * No short/old page alone establishes coverage. Any discrepancy requires an operator retry.
+/** Bracket the relevant inventory count and require two matching identity/version scans.
+ * Counts alone miss balanced membership replacement across mutable REST pages. This
+ * detects observed churn; it is not an atomic GitHub snapshot. Effects revalidate below.
+ * The count covers recent merges; paging stops at the updated-date lookback boundary.
  */
-function readPullPages({ repo, state, exec, since, requireComplete = false }) {
+function readPullPages({ repo, state, exec, since, requireComplete = false, confirm = true }) {
   const incomplete = (why) => new Error(`incomplete ${state} PR list in ${slugOf(repo)}: ${why}; operator must inspect the full list and retry next tick`);
   const [owner, name] = slugOf(repo).split('/');
   const readCount = () => {
-    const out = ghJson(['api', 'graphql', '-f',
+    const out = since !== undefined ? ghJson(['api', 'graphql', '-f',
+      'query=query($q:String!){search(query:$q,type:ISSUE){issueCount}}',
+      '-f', `q=repo:${slugOf(repo)} is:pr is:merged merged:>=${new Date(since).toISOString()}`], exec) : ghJson(['api', 'graphql', '-f',
       'query=query($o:String!,$n:String!,$s:[PullRequestState!]!){repository(owner:$o,name:$n){pullRequests(states:$s){totalCount}}}',
       '-f', `o=${owner}`, '-f', `n=${name}`, '-f', `s[]=${state === 'open' ? 'OPEN' : 'CLOSED'}`,
       ...(state === 'closed' ? ['-f', 's[]=MERGED'] : [])], exec);
-    const count = out?.data?.repository?.pullRequests?.totalCount;
+    const count = since !== undefined ? out?.data?.search?.issueCount : out?.data?.repository?.pullRequests?.totalCount;
     if (out?.errors?.length || !Number.isSafeInteger(count) || count < 0) throw incomplete('unreadable count proof');
     return count;
   };
@@ -64,15 +68,25 @@ function readPullPages({ repo, state, exec, since, requireComplete = false }) {
       ids.add(row.number);
       rows.push(row);
     }
-    if (batch.length < PAGE_SIZE || (!requireComplete && since !== undefined && batch.every(p => Date.parse(p.updated_at) < since))) {
-      if (requireComplete && (ids.size !== expected || readCount() !== expected)) throw incomplete(`${ids.size} unique of claimed ${expected}, or count changed`);
-      return rows;
+    // The list is sorted by updated_at descending, and a merge updates its PR.
+    // Stop at the first page crossing the boundary, including a mixed recent/old page.
+    if (batch.length < PAGE_SIZE || (since !== undefined && batch.some(p => Date.parse(p.updated_at) < since))) {
+      const relevant = since === undefined ? rows : rows.filter(p => p.merged_at !== null && Date.parse(p.merged_at) >= since);
+      const uniqueCount = since === undefined ? ids.size : new Set(relevant.map(p => p.number)).size;
+      if (requireComplete && (uniqueCount !== expected || readCount() !== expected)) throw incomplete(`${uniqueCount} unique of claimed ${expected}, or count changed`);
+      if (requireComplete && confirm) {
+        const confirmed = readPullPages({ repo, state, exec, since, requireComplete, confirm: false });
+        const version = list => JSON.stringify(list.map(p => [p.number, p.state, p.updated_at,
+          p.merged_at, p.body, p.user?.login, p.user?.is_bot]).sort((a, b) => a[0] - b[0]));
+        if (version(relevant) !== version(confirmed)) throw incomplete('inventory changed between scans');
+      }
+      return relevant;
     }
   }
   throw new Error(`PR list page cap reached in ${slugOf(repo)}; operator must narrow the inventory or inspect the full list before dispatch; retry next tick`);
 }
 
-/** Low-level merged list, normalized to the planner shape. The daemon requires count proof via requireComplete. */
+/** Low-level merged list; daemon completeness checks cover only the lookback window. */
 export function defaultReadMergedPrs({ repo, lookbackDays, now = Date.now(), exec = execFileSync, requireComplete = false }) {
   const since = now - lookbackDays * 86_400_000;
   return readPullPages({ repo, state: 'closed', exec, since, requireComplete })
@@ -114,7 +128,7 @@ const authorLogin = p => {
 };
 const snapshotVersion = (p) => JSON.stringify([p.id, p.number, p.body, p.state, authorLogin(p),
   p.mergedAt, p.updatedAt, p.headRefOid, p.lastEditedAt, p.editor?.login ?? null]);
-function validateSnapshot(p, listed, now) {
+export function validateSnapshot(p, listed, now) {
   if (!p || p.number !== listed.number || typeof p.id !== 'string' || !p.id
     || p.state !== 'MERGED' || (p.body !== null && typeof p.body !== 'string')
     || !isTrustedSupersedeAuthor(p) || authorLogin(p) !== authorLogin(listed) || !/^[a-f0-9]{40}$/i.test(p.headRefOid ?? '')
@@ -205,8 +219,10 @@ export function runSupersedeWatch({
     const applied = apply ? holds.map((hold) => {
       try {
         const source = mergedPrs.find(p => p.number === hold.by);
-        const fresh = validateSnapshot(readBodyEdit({ repo, pr: hold.by }), source, now);
-        if (snapshotVersion(fresh) !== snapshotVersion(source)) throw new Error('source version changed; retry next tick');
+        const fresh = readBodyEdit({ repo, pr: hold.by });
+        // Report version drift before field validation can obscure the version refusal.
+        if (fresh && snapshotVersion(fresh) !== snapshotVersion(source)) throw new Error('source version changed; retry next tick');
+        validateSnapshot(fresh, source, now);
         const candidate = openPrs.find(p => p.number === hold.pr);
         const current = readPr({ repo, pr: hold.pr });
         validateCandidate(current, hold.pr);

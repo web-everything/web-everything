@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 const b = {
   id: 'supersede-bot-author-shapes',
-  title: 'a REST bot author and its GraphQL identity stand down the superseded PR',
+  title: 'a REST bot author and its GraphQL identity stand down the superseded PR despite large closed history',
   card: 'PR 7559 bot author identity send-back',
   fixedBy: { sha: 'lane/supersede-watch-harden', where: 'working tree', paths: ['scripts/conveyor/supersede-watch.mjs'] },
   fixPresent(root) {
@@ -25,6 +25,10 @@ const b = {
     const target = { number: 10, id: 'PR_10', state: 'OPEN', headRefOid: 'b'.repeat(40), labels: [], comments: [] };
     let bodyReads = 0;
     let writes = 0;
+    let closedPages = 0;
+    const old = '2020-01-01T00:00:00Z';
+    const history = Array.from({ length: 12000 }, (_, i) => ({ number: i + 100,
+      state: 'closed', body: '', merged_at: old, updated_at: old, user: source.author }));
     const exec = (cmd, args) => {
       if (cmd !== 'gh' || args[0] !== 'api') throw new Error(`unexpected IO: ${cmd} ${args.join(' ')}`);
       if (args[1] === 'graphql') {
@@ -33,12 +37,16 @@ const b = {
           return JSON.stringify({ data: { repository: { pullRequest: { ...source,
             author: { login: bodyReads % 2 ? 'web-everything' : 'web-everything[bot]' } } } } });
         }
-        return JSON.stringify({ data: { repository: { pullRequests: { totalCount: 1 } } } });
+        if (args.some(a => a.startsWith('q='))) return JSON.stringify({ data: { search: { issueCount: 1 } } });
+        return JSON.stringify({ data: { repository: { pullRequests: { totalCount: args.includes('s[]=OPEN') ? 1 : history.length + 1 } } } });
       }
       const url = new URL(args[1], 'https://fixture.invalid');
-      const rows = url.searchParams.get('state') === 'open' ? [{ number: 10 }] : [{ number: 20,
-        body: source.body, merged_at: source.mergedAt, updated_at: source.updatedAt, user: { login: 'web-everything[bot]' } }];
-      return JSON.stringify(rows);
+      const open = url.searchParams.get('state') === 'open';
+      if (!open) closedPages += 1;
+      const rows = open ? [{ number: 10 }] : [{ number: 20,
+        body: source.body, merged_at: source.mergedAt, updated_at: source.updatedAt, user: { login: 'web-everything[bot]' } }, ...history];
+      const page = Number(url.searchParams.get('page'));
+      return JSON.stringify(rows.slice((page - 1) * 100, page * 100));
     };
     const tick = () => runSupersedeWatch({ repo, now: Date.parse('2026-11-26T12:00:00Z'),
       settings: { hold: true, lookbackDays: 14 }, exec, readPr: () => target,
@@ -53,9 +61,10 @@ const b = {
       violations.push('equivalent REST/GraphQL bot authors did not stand down PR 10');
     if (results.some(r => r.bodyEditFailures || r.blocked)) violations.push('trusted bot evidence was rejected');
     if (writes !== 1 || results[1].holds.length !== 0) violations.push('retry did not observe the existing hold');
+    if (closedPages > 6) violations.push('closed history exceeded three REST pages per tick');
     const lines = formatSupersedeLines({ repos: results });
     lines.forEach(line => log?.(line));
-    return { violations, results, writes, bodyReads, lines };
+    return { violations, results, writes, bodyReads, closedPages, lines };
   },
   judge: report => report.violations,
 };

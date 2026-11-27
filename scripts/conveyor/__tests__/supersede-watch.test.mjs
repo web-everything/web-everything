@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildSupersededStandDownComment } from '../stand-down.mjs';
 import { setMarkdownLoader } from '../supersede-rule.mjs';
-import { runSupersedeWatch, formatSupersedeLines, defaultReadMergedPrs, defaultReadOpenNumbers, defaultReadBodyEdit } from '../supersede-watch.mjs';
+import { runSupersedeWatch, formatSupersedeLines, defaultReadMergedPrs, defaultReadOpenNumbers, defaultReadBodyEdit, validateSnapshot } from '../supersede-watch.mjs';
 import { runTickAllRepos, runSupersedeAllRepos } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
 
 const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/supersede/pr4522-2026-10-09.json'), 'utf8'));
@@ -135,17 +135,23 @@ describe('runSupersedeWatch', () => {
       state: 'MERGED', mergedAt: all[0].merged_at });
     expect(exec).toHaveBeenCalledTimes(6);
   });
-  it('stops merged pagination at an old updated page, not an old merge updated recently', () => {
+  it.each([false, true])('stops merged pagination at an old updated page, not an old merge updated recently (requireComplete=%s)', requireComplete => {
     const recent = '2026-10-09T00:00:00Z', old = '2026-01-01T00:00:00Z';
-    const exec = vi.fn().mockReturnValueOnce(JSON.stringify(Array.from({ length: 100 }, (_, i) => ({
+    const first = Array.from({ length: 100 }, (_, i) => ({
       number: i + 1, body: null, state: 'closed', merged_at: i === 0 ? old : recent, updated_at: recent, user: { login: 'bot' },
-    })))).mockReturnValueOnce(JSON.stringify(Array.from({ length: 100 }, (_, i) => ({
+    }));
+    const second = Array.from({ length: 100 }, (_, i) => ({
       number: i + 101, body: '', state: 'closed', merged_at: old, updated_at: old, user: { login: 'bot' },
-    }))));
+    }));
+    const exec = vi.fn((_cmd, args) => {
+      if (args[1] === 'graphql') return JSON.stringify({ data: { search: { issueCount: 99 } } });
+      const page = Number(new URL(args[1], 'https://fixture.invalid').searchParams.get('page'));
+      return JSON.stringify(page === 1 ? first : second);
+    });
     const rows = defaultReadMergedPrs({ repo, lookbackDays: 14,
-      now: Date.parse('2026-10-10T00:00:00Z'), exec });
+      now: Date.parse('2026-10-10T00:00:00Z'), exec, requireComplete });
     expect(rows).toHaveLength(99);
-    expect(exec).toHaveBeenCalledTimes(2);
+    expect(exec).toHaveBeenCalledTimes(requireComplete ? 8 : 2);
   });
   it.each([defaultReadOpenNumbers, defaultReadMergedPrs])('refuses incomplete lists at the page cap with an operator fallback (%s)', read => {
     const exec = vi.fn(() => JSON.stringify(Array.from({ length: 100 }, (_, i) => ({
@@ -439,6 +445,132 @@ describe('complete listing replay', () => {
 });
 
 describe('closed completeness paths', () => {
+  it('processes recent supersedes when historical closed inventory exceeds the cap', async () => {
+    const opts = hardOptions();
+    const source = hardSource();
+    const old = '2020-01-01T00:00:00Z';
+    const history = Array.from({ length: 12000 }, (_, i) => ({ number: i + 100,
+      state: 'closed', body: '', user: source.author, merged_at: old, updated_at: old }));
+    const closed = [{ number: source.number, state: 'closed', body: source.body,
+      user: source.author, merged_at: source.mergedAt, updated_at: source.updatedAt }, ...history];
+    let closedPages = 0;
+    const exec = vi.fn((_cmd, args) => {
+      if (args[1] === 'graphql') {
+        if (args.some(a => a.startsWith('q='))) {
+          expect(args).toContain('q=repo:fixture/project is:pr is:merged merged:>=2026-11-12T12:00:00.000Z');
+          return JSON.stringify({ data: { search: { issueCount: 1 } } });
+        }
+        const totalCount = args.includes('s[]=OPEN') ? 1 : closed.length;
+        return JSON.stringify({ data: { repository: { pullRequests: { totalCount } } } });
+      }
+      const url = new URL(args[1], 'https://fixture.invalid');
+      if (url.searchParams.get('state') === 'open') return JSON.stringify([{ number: 10, state: 'open' }]);
+      closedPages++;
+      const page = Number(url.searchParams.get('page'));
+      return JSON.stringify(closed.slice((page - 1) * 100, page * 100));
+    });
+    opts.postHold.mockImplementation(({ hold: h }) => {
+      opts.readPr.mockReturnValue({ ...hardTarget(), comments: [{ author: source.author,
+        body: buildSupersededStandDownComment(h) }] });
+      return { ok: true, labeled: true };
+    });
+    const tick = () => runSupersedeWatch({ ...opts, readMergedPrs: undefined, readOpenNumbers: undefined, exec });
+    const result = tick();
+    expect(result.blocked, result.error).not.toBe(true);
+    expect(result.applied).toEqual([expect.objectContaining({ pr: 10, by: 20, ok: true })]);
+    expect(closedPages).toBeLessThanOrEqual(3);
+    const fixTick = vi.fn(noopDispatch);
+    await runTickAllRepos({ ...tickFakes(), repos: [opts.repo], fixTick, supersedeTick: tick });
+    expect(fixTick).toHaveBeenCalledTimes(1);
+    expect(closedPages).toBeLessThanOrEqual(6);
+  });
+  it('balanced membership replacement cannot establish complete inventory', () => {
+    const initial = Array.from({ length: 200 }, (_, i) => ({ number: i + 1, state: 'open' }));
+    const current = [{ number: 201, state: 'open' }, ...initial.slice(1)];
+    let reads = 0;
+    const exec = vi.fn((_cmd, args) => {
+      if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequests: { totalCount: 200 } } } });
+      const page = Number(new URL(args[1], 'https://fixture.invalid').searchParams.get('page'));
+      const rows = reads++ === 0 ? initial : current;
+      return JSON.stringify(rows.slice((page - 1) * 100, page * 100));
+    });
+    const opts = hardOptions();
+    opts.readOpenNumbers = () => defaultReadOpenNumbers({ repo: opts.repo, exec, requireComplete: true });
+    expect(runSupersedeWatch(opts)).toMatchObject({ blocked: true, error: expect.stringMatching(/inventory changed.*retry/) });
+    expect(opts.postHold).not.toHaveBeenCalled();
+    expect(runSupersedeWatch(opts).blocked).not.toBe(true);
+    expect(opts.postHold).toHaveBeenCalledTimes(1);
+  });
+  it.each(['missing', 'errors', 'changed', 'omitted'])('default merged window count proof refuses %s evidence', mode => {
+    let counts = 0;
+    const exec = (_cmd, args) => {
+      if (args[1] === 'graphql') {
+        const issueCount = mode === 'missing' ? null : (mode === 'changed' ? ++counts : 1);
+        return JSON.stringify({ data: { search: { issueCount } }, ...(mode === 'errors' ? { errors: [{ message: 'partial' }] } : {}) });
+      }
+      return JSON.stringify(mode === 'omitted' ? [] : [{ number: 20, body: '', state: 'closed',
+        merged_at: hardSource().mergedAt, updated_at: hardSource().updatedAt, user: hardSource().author }]);
+    };
+    const opts = hardOptions();
+    opts.readMergedPrs = () => defaultReadMergedPrs({ repo: opts.repo, exec, now: hardNow, lookbackDays: 14, requireComplete: true });
+    expect(runSupersedeWatch(opts)).toMatchObject({ blocked: true, holds: [], applied: [], error: expect.stringMatching(/incomplete closed PR list.*retry/) });
+    expect(opts.postHold).not.toHaveBeenCalled();
+  });
+  it('duplicate identity refuses even when the unique count matches', () => {
+    const rows = Array.from({ length: 200 }, (_, i) => ({ number: i + 1, state: 'open' }));
+    rows.splice(100, 0, rows[99]);
+    const exec = (_cmd, args) => {
+      if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequests: { totalCount: 200 } } } });
+      const page = Number(new URL(args[1], 'https://fixture.invalid').searchParams.get('page'));
+      return JSON.stringify(rows.slice((page - 1) * 100, page * 100));
+    };
+    expect(() => defaultReadOpenNumbers({ repo, exec, requireComplete: true })).toThrow(/duplicate #100/);
+  });
+  it('updatedAt-only concurrent edit refuses with source version changed', () => {
+    const opts = hardOptions();
+    opts.readBodyEdit.mockReturnValueOnce(hardSource()).mockReturnValue({ ...hardSource(), updatedAt: '2026-11-25T11:01:00Z' });
+    expect(runSupersedeWatch(opts).applied).toEqual([expect.objectContaining({ ok: false, error: 'source version changed; retry next tick' })]);
+    expect(opts.postHold).not.toHaveBeenCalled();
+  });
+  it.each(['updatedAt', 'mergedAt'])('future %s refuses with null lastEditedAt', field => {
+    const opts = hardOptions();
+    const future = '2027-01-01T00:00:00Z';
+    const source = { ...hardSource(), [field]: future, ...(field === 'mergedAt' ? { updatedAt: future } : {}) };
+    expect(() => validateSnapshot(source, source, hardNow)).toThrow(/unreadable or changed merged PR #20 snapshot; operator.*retry/);
+    opts.readMergedPrs.mockReturnValue([source]);
+    opts.readBodyEdit.mockReturnValue(source);
+    expect(runSupersedeWatch(opts)).toMatchObject({ holds: [], bodyEditFailures: 1 });
+    expect(opts.postHold).not.toHaveBeenCalled();
+  });
+  it('edit metadata-only concurrent edit is rejected by the source version bind', () => {
+    const opts = hardOptions();
+    const fresh = { ...hardSource(), lastEditedAt: '2026-11-25T10:30:00Z', editor: { login: 'web-everything' } };
+    // Shape validation and trusted-editor planning accept these facts; only version drift refuses.
+    expect(validateSnapshot(fresh, hardSource(), hardNow)).toEqual(fresh);
+    opts.readBodyEdit.mockReturnValueOnce(hardSource()).mockReturnValue(fresh);
+    expect(runSupersedeWatch(opts).applied).toEqual([expect.objectContaining({ ok: false, error: 'source version changed; retry next tick' })]);
+    expect(opts.postHold).not.toHaveBeenCalled();
+  });
+  it('evidence call cap blocks with operator retry', () => {
+    const open = Array.from({ length: 9900 }, (_, i) => ({ number: i + 1, state: 'open' }));
+    const closed = Array.from({ length: 3000 }, (_, i) => ({ number: i + 10000, state: 'closed',
+      body: '', user: { login: 'web-everything' }, merged_at: hardSource().mergedAt, updated_at: hardSource().updatedAt }));
+    const exec = vi.fn((_cmd, args) => {
+      if (args[1] === 'graphql') {
+        if (args.some(a => a.startsWith('q='))) return JSON.stringify({ data: { search: { issueCount: closed.length } } });
+        return JSON.stringify({ data: { repository: { pullRequests: { totalCount: args.includes('s[]=OPEN') ? open.length : closed.length } } } });
+      }
+      const url = new URL(args[1], 'https://fixture.invalid');
+      const rows = url.searchParams.get('state') === 'open' ? open : closed;
+      const page = Number(url.searchParams.get('page'));
+      return JSON.stringify(rows.slice((page - 1) * 100, page * 100));
+    });
+    const postHold = vi.fn();
+    expect(runSupersedeWatch({ repo, now: hardNow, settings: { hold: true, lookbackDays: 14 }, exec, postHold }))
+      .toMatchObject({ blocked: true, error: expect.stringMatching(/call cap.*operator.*retry/) });
+    expect(exec).toHaveBeenCalledTimes(256);
+    expect(postHold).not.toHaveBeenCalled();
+  });
   it.each([null, undefined, -1, '200', 1.5])('missing or unreadable inventory count blocks the default authority: %j', totalCount => {
     const postHold = vi.fn();
     const exec = vi.fn(() => JSON.stringify({ data: { repository: { pullRequests: { totalCount } } } }));

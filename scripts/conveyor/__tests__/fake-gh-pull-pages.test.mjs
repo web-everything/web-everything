@@ -95,6 +95,26 @@ describe('fake GitHub REST pull list used by supersede-watch', () => {
     expect(() => count(['OPEN'], query.replace('totalCount', 'nodes{id}'))).toThrow(/unsupported graphql query/);
   });
 
+  it('counts only merged PRs inside the requested window and rejects unsupported searches', () => {
+    const { gh, exec } = fixture();
+    const since = new Date(now - 86400000).toISOString();
+    withStore(gh.env.FAKE_GH_STORE, store => {
+      const state = store.repos[repo];
+      const old = openPrPure(state, { head: 'fixture', now });
+      old.state = 'MERGED';
+      old.mergedAt = new Date(now - 2 * 86400000).toISOString();
+      const boundary = openPrPure(state, { head: 'fixture', now });
+      boundary.state = 'MERGED';
+      boundary.mergedAt = since;
+      openPrPure(state, { head: 'fixture', now }).state = 'CLOSED';
+      openPrPure(state, { head: 'fixture', now });
+    });
+    const count = search => JSON.parse(exec('gh', ['api', 'graphql', '-f',
+      'query=query($q:String!){search(query:$q,type:ISSUE){issueCount}}', '-f', `q=${search}`], { encoding: 'utf8' }));
+    expect(count(`repo:${repo} is:pr is:merged merged:>=${since}`).data.search.issueCount).toBe(1);
+    expect(() => count(`repo:${repo} is:pr is:merged`)).toThrow(/unsupported merged inventory search/);
+  });
+
   it.each(['page=0', 'page=1.5', 'per_page=101', 'state=merged', 'sort=unknown', 'unknown=1'])(
     'rejects unsupported pagination instead of returning an empty success: %s', query => {
       const { api } = fixture();
