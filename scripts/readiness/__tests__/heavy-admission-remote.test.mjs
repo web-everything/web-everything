@@ -20,7 +20,7 @@ import { markerContent, createMarkerReaper } from '../forge-slot-markers.mjs';
 
 vi.mock('../forge-slot-markers.mjs', async original => {
   const actual = await original();
-  return {...actual, heldTombstone:vi.fn(actual.heldTombstone)};
+  return {...actual, heldTombstone:vi.fn(actual.heldTombstone), createMarkerReaper:vi.fn(actual.createMarkerReaper)};
 });
 
 vi.mock('../forge-run-finish.mjs', () => ({createRunFinisher: vi.fn(() => vi.fn(async () => ({finished: true})))}));
@@ -320,18 +320,27 @@ describe('R1017 remote marker provenance and nonce plumbing', () => {
   it('wires the finish transport into admission reaping for an old cancelled active run', async () => {
     const f = fixture({remote: {maxConcurrent: 1}}), root = join(f.lockRoot, '..', 'remote'), run = 'r-' + 'c'.repeat(32), nonce = 'd'.repeat(32);
     const {easternTimestamp} = await import('../forge-exec-run.mjs');
-    let now = Date.now();
+    const {createMarkerReaper: realCreateMarkerReaper} = await vi.importActual('../forge-slot-markers.mjs');
+    // This wiring case owns a Forge marker; target-switch recovery is covered separately.
+    f.host = 'forge';
+    f.cwd = join(f.lockRoot, '..');
+    f.env = {NODE_ENV: 'test'};
+    f.hostOverloaded = () => false;
+    let now = Date.parse('2026-11-26T20:00:00-05:00');
     f.clock = () => now;
     f.sleep = vi.fn(async () => { now += 10_000; });
+    const deadPid = 424242;
+    vi.mocked(createMarkerReaper).mockImplementationOnce(options => realCreateMarkerReaper({
+      ...options, liveness: pid => pid === deadPid ? 'dead' : 'unknown',
+    }));
     mkdirSync(root, {recursive: true});
     const file = join(root, 'slot-0.unconfirmed');
-    const child = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))']);
-    writeFileSync(file, JSON.stringify({v: 1, host: 'forge', owner: 'dead', pid: Number(child.stdout.toString()), at: now - 600_000}));
+    writeFileSync(file, JSON.stringify({v: 1, host: 'forge', owner: 'dead', pid: deadPid, at: now - 600_000}));
     utimesSync(file, (now - 600_000) / 1000, (now - 600_000) / 1000);
     const st = statSync(file);
     writeFileSync(file + '.run', JSON.stringify({owner: 'dead', run, nonce, slot: 'forge-exec-2'}));
     writeFileSync(file + '.dead', JSON.stringify({key: `slot-0.unconfirmed:${st.ino}:${st.mtimeMs}`, at: now - 120_000}));
-    f.readTelemetry = async () => ({...await healthyRead(), sampledAtET: easternTimestamp(now), activeRuns: 1, activeRunIds: [run],
+    f.readTelemetry = async () => ({cores: 8, loadPerCore: 0.1, memFreePct: 90, sampledAtET: easternTimestamp(now), activeRuns: 1, activeRunIds: [run],
       recent: [{runId: run, code: f.sleep.mock.calls.length ? 97 : null, startedAtET: easternTimestamp(now - 500_000), stageMs: {install: 0, run: 0}}]});
     const finish = vi.fn(async () => ({finished: true}));
     vi.mocked(createRunFinisher).mockReturnValueOnce(finish);
