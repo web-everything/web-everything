@@ -203,7 +203,7 @@ export function resolveDeliveryIdentity({ platform = {}, tool = {}, env = {}, pi
     if (!isObj(layer?.callerRoles)) continue;
     for (const [caller, role] of Object.entries(layer.callerRoles)) if (isRole(role)) callerRoles[caller] = role;
   }
-  return { roles, sources, invalid, anyConfigured: GITHUB_APP_ROLES.some((r) => roles[r]), callerRoles };
+  return { roles, sources, invalid, anyConfigured: IDENTITY_ROLES.some((r) => roles[r]), callerRoles };
 }
 
 let cachedTool;
@@ -262,15 +262,21 @@ function primaryInstallation(installations) {
   return installations['web-everything'] ?? Object.values(installations)[0];
 }
 
-/** Both steward credential paths share the same configuration and App separation boundary. */
-function stewardApp(identity, env) {
+/** All steward credential paths share the same configuration and App separation boundary. */
+function stewardAppConfiguration(identity, env) {
   const app = normaliseRoleApp(identity?.roles?.steward);
-  const keyRef = app && resolveKeyRef(app.key, env);
-  if (!app || !keyRef || identity.invalid?.some(s => s.endsWith('.steward') || s.startsWith(IDENTITY_ENV))
+  if (!app || identity.invalid?.some(s => s.endsWith('.steward') || s.startsWith(IDENTITY_ENV))
     || GITHUB_APP_ROLES.some(r => String(identity.roles?.[r]?.appId ?? '').trim() === app.appId)
     || String(env?.WE_GITHUB_APP_ID ?? '').trim() === app.appId) {
     throw new Error('steward identity refused; operator must configure a distinct delivery.identity.steward App and key');
   }
+  return app;
+}
+
+function stewardApp(identity, env) {
+  const app = stewardAppConfiguration(identity, env);
+  const keyRef = resolveKeyRef(app.key, env);
+  if (!keyRef) throw new Error('steward identity refused; operator must configure a distinct delivery.identity.steward App and key');
   return { app, keyRef };
 }
 
@@ -323,10 +329,14 @@ export function buildIdentityChain({ requestedRole = FALLBACK_ROLE, identity, en
  * PURE: the role table the generated `gh` shim bakes in — `{role: {cachePath, installations}}` for every configured
  * role. Empty when nothing is configured (the shim then behaves exactly as before).
  */
-export function shimRoleTable({ identity, cachePath }) {
+export function shimRoleTable({ identity, cachePath, env = {} }) {
   const out = {};
   for (const role of IDENTITY_ROLES) {
-    const app = identity?.roles?.[role];
+    let app = identity?.roles?.[role];
+    if (role === STEWARD_ROLE) {
+      // Cached tokens need no local signing key, but must satisfy the same App configuration boundary.
+      try { app = stewardAppConfiguration(identity, env); } catch { continue; }
+    }
     if (app) out[role] = { cachePath: roleCachePath(cachePath, app.appId), installations: { ...app.installations } };
   }
   return out;
