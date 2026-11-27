@@ -41,9 +41,17 @@ export default {
       for (const elapsed of [0, 60000, 120000]) {
         const plan = planReconcile({ prs, requiredChecks, agents: [], advisoryReviewOnHumanHandoff: 'on',
           now: Date.parse('2026-11-18T12:00:00Z') + elapsed, reviewTiming: { startAfter: 'ci-green' } });
-        const expected = scenario === 'workflow hold' ? 'review' : 'ci-heal';
         const kinds = plan.dispatch.map(row => row.kind);
         log?.(`${elapsed}: ${scenario}, dispatch=${kinds.join(',')}`);
+        // Policy (ci-heal admission): unreadable merge-gate evidence (wrong head, unreadable job, another failed
+        // step) is refused for a person to inspect; it is neither excused into review nor admitted as ci-heal.
+        // Only a readable workflow hold reaches review, and only real CI failure is repaired.
+        if (['wrong head', 'unreadable job', 'other failed step'].includes(scenario)) {
+          if (kinds.includes('ci-heal') || kinds.includes('review'))
+            violations.push(`${elapsed}: ${scenario} unreadable evidence must be refused, got ${kinds.join(',')}`);
+          continue;
+        }
+        const expected = scenario === 'workflow hold' ? 'review' : 'ci-heal';
         if (!kinds.includes(expected) || kinds.includes(expected === 'review' ? 'ci-heal' : 'review'))
           violations.push(`${elapsed}: ${scenario} expected ${expected}, got ${kinds.join(',')}`);
       }
