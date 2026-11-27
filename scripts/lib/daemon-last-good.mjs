@@ -17,6 +17,11 @@
  *   - `daemon-rebuild.mjs` writes `state.held` (why, since when, which checks failed) whenever a smoke failure
  *     keeps the clone on its last-good build, and clears it on the next adoption; the health watch's
  *     `daemon-held-on-last-good` sign reads the same record.
+ *   Holding has four sources, in priority order: a held record, the existing 20-minute build lease,
+ *   a same-host live owner's heartbeat, or a fresh adoption. A heartbeat only holds the exact adopted HEAD
+ *   with a clean tree, for at most 5 minutes since its last write and 90 minutes since the lease began.
+ *   It must match the lease's valid token, positive integer pid and host; unknown evidence never extends
+ *   holding. It does not extend rebuild grace or writer-side lease liveness.
  *
  *   Deliberately import-light (node builtins and the standalone clone-layout helper only):
  *   `main-staleness.mjs` imports this, and `daemon-rebuild.mjs` imports `main-staleness.mjs`, so importing `daemon-overlays.mjs` (→ `daemon-self-sync.mjs` →
@@ -47,6 +52,25 @@ export const DEFAULT_LAST_GOOD_MAX_AGE_MS = 24 * 60 * 60_000;
  *  (re-stated, not imported — see the file header's import-cycle note). */
 export const REBUILD_LEASE_STALE_ENV = 'WE_DAEMON_REBUILD_LEASE_STALE_MS';
 export const REBUILD_LEASE_STALE_MS_DEFAULT = 20 * 60_000;
+
+export const BUILD_HEARTBEAT_STALE_MS = 5 * 60_000;
+export const BUILD_HEARTBEAT_MAX_MS = 90 * 60_000;
+
+/** Token-scoped sidecar; mirrored by daemon-rebuild/lease.mjs without closing the import cycle. */
+export function buildHeartbeatFileOf(root, env, token) {
+  return join(daemonStateDir(env), `${cloneKeyOf(root)}.build-heartbeat.${token}.json`);
+}
+
+/** Read only the current lease token's heartbeat. Missing, malformed or unreadable evidence is no heartbeat. */
+export function readBuildHeartbeatFile(root, env = process.env) {
+  try {
+    const token = readRebuildStateFile(root, env)?.building?.token;
+    if (typeof token !== 'string' || !/^\d+-[0-9a-f]{8}$/.test(token)) return null;
+    return JSON.parse(readFileSync(buildHeartbeatFileOf(root, env, token), 'utf8'));
+  } catch {
+    return null;
+  }
+}
 
 /** `<WE_DAEMON_STATE_DIR || ~/.claude/daemon-self-sync-state>`. */
 export function daemonStateDir(env = process.env) {
@@ -104,12 +128,21 @@ export function readRebuildStateFile(root, env = process.env) {
  * the `WE_STALE_GUARD_REBUILD_GRACE_MS` window in {@link lastGoodForClone}): live 2026-10-09 19:18:51Z, PR #4624,
  * a just-adopted build was refused for a whole fix pass in the gap before its next rebuild began. `heldSince`/`ageMs`/`overAge` come from `state.held`
  * when recorded; with no `held` record the age is unknown (`null`, never over).
- * @param {{headSha:string|null, state:object|null, dirty?:boolean, nowMs:number, maxAgeMs:number}} o
+ * Four holding sources, in priority order: held record, existing bounded lease, heartbeat, fresh adoption.
+ * Heartbeat requires a non-adopt-only lease on this host, an exactly matching valid token/pid/host, a live
+ * owner, heartbeat age 0..5 minutes and build age 0..90 minutes (inclusive). Unknown or throwing liveness
+ * refuses heartbeat holding. HEAD equality and a clean tree still apply; grace and lease bounds are unchanged.
+ * @param {{headSha:string|null, state:object|null, dirty?:boolean, nowMs:number, maxAgeMs:number,
+ *   heartbeat?:object|null, ownerAlive?:(building:object)=>boolean, thisHost?:string|null,
+ *   heartbeatStaleMs?:number, buildMaxMs?:number, leaseStaleMs?:number, freshAdoptMs?:number}} o
  * @returns {{onLastGood:boolean, lastGood:string|null, held:object|null, heldSince:string|null,
- *   ageMs:number|null, overAge:boolean}}
+ *   ageMs:number|null, overAge:boolean, holdingBy:'held'|'lease'|'heartbeat'|'fresh-adoption'|null,
+ *   heartbeatAgeMs:number|null, buildAgeMs:number|null}}
  */
 export function decideLastGood({
   headSha, state, dirty = false, nowMs, maxAgeMs, leaseStaleMs = REBUILD_LEASE_STALE_MS_DEFAULT, freshAdoptMs = 0,
+  heartbeat = null, ownerAlive = () => false, thisHost = null,
+  heartbeatStaleMs = BUILD_HEARTBEAT_STALE_MS, buildMaxMs = BUILD_HEARTBEAT_MAX_MS,
 }) {
   const lastGood = state?.adopted?.head ?? null;
   const held = state?.held ?? null;
@@ -122,12 +155,29 @@ export function decideLastGood({
   // the adoption is younger than `freshAdoptMs` (0 = off, the pre-fix rule).
   const adoptedMs = Date.parse(state?.adopted?.at || '');
   const freshAdoption = freshAdoptMs > 0 && Number.isFinite(adoptedMs) && nowMs - adoptedMs <= freshAdoptMs;
-  const holding = !!held || building || freshAdoption;
+  const lease = state?.building;
+  const heartbeatMs = typeof heartbeat?.at === 'string' ? Date.parse(heartbeat.at) : NaN;
+  const heartbeatAgeMs = Number.isFinite(nowMs - heartbeatMs) ? nowMs - heartbeatMs : null;
+  const buildAgeMs = Number.isFinite(nowMs - leaseStartedMs) ? nowMs - leaseStartedMs : null;
+  let heartbeatHolding = false;
+  if (lease && !lease.adoptOnly && typeof thisHost === 'string' && thisHost.length > 0 && lease.host === thisHost
+    && typeof lease.token === 'string' && /^\d+-[0-9a-f]{8}$/.test(lease.token)
+    && Number.isSafeInteger(lease.pid) && lease.pid > 0
+    && heartbeat?.token === lease.token && heartbeat.pid === lease.pid && heartbeat.host === lease.host
+    && heartbeatAgeMs !== null && heartbeatAgeMs >= 0 && heartbeatAgeMs <= heartbeatStaleMs
+    && buildAgeMs !== null && buildAgeMs >= 0 && buildAgeMs <= buildMaxMs) {
+    try { heartbeatHolding = ownerAlive(lease) === true; } catch { /* Unknown liveness refuses heartbeat holding. */ }
+  }
+  const holdingBy = held ? 'held' : building ? 'lease' : heartbeatHolding ? 'heartbeat' : freshAdoption ? 'fresh-adoption' : null;
+  const holding = holdingBy !== null;
   const onLastGood = !!(lastGood && headSha && headSha === lastGood && !dirty && holding);
   const sinceMs = Date.parse(held?.since || '');
   const ageMs = Number.isFinite(sinceMs) ? Math.max(0, nowMs - sinceMs) : null;
   return {
     onLastGood,
+    holdingBy,
+    heartbeatAgeMs: heartbeatHolding ? heartbeatAgeMs : null,
+    buildAgeMs,
     lastGood,
     held,
     heldSince: held?.since ?? null,
@@ -139,13 +189,18 @@ export function decideLastGood({
 /**
  * IO shell over {@link decideLastGood} for one clone.
  * @param {{root:string, headSha:string|null, dirty?:boolean, env?:NodeJS.ProcessEnv, now?:number,
- *   readState?:typeof readRebuildStateFile}} o
+ *   readState?:typeof readRebuildStateFile, readHeartbeat?:typeof readBuildHeartbeatFile,
+ *   ownerAlive?:(building:object)=>boolean}} o
  */
 export function lastGoodForClone({
   root, headSha, dirty = false, env = process.env, now = Date.now(), readState = readRebuildStateFile,
+  readHeartbeat = readBuildHeartbeatFile, ownerAlive = leaseOwnerAlive,
 }) {
+  let heartbeat = null;
+  try { heartbeat = readHeartbeat(root, env); } catch { /* Unreadable heartbeat leaves today's rule unchanged. */ }
   return decideLastGood({
     headSha, state: readState(root, env), dirty, nowMs: now, maxAgeMs: lastGoodMaxAgeMs(env),
+    heartbeat, ownerAlive, thisHost: hostname(),
     leaseStaleMs: Number(env?.[REBUILD_LEASE_STALE_ENV]) > 0 ? Number(env[REBUILD_LEASE_STALE_ENV]) : REBUILD_LEASE_STALE_MS_DEFAULT,
     freshAdoptMs: staleGuardRebuildGraceMs(env),
   });

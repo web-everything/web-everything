@@ -4,7 +4,7 @@
 import { rebuildReaders } from './evidence-context.mjs';
 
 
-import { readFileSync, mkdirSync, writeFileSync, renameSync } from 'node:fs';
+import { readFileSync, mkdirSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { hostname } from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -92,6 +92,54 @@ export const ACTIVE_BUILD_TOKENS = new Set();
  *  the slowest live smoke seen (~6 min) so a real build is never taken over mid-smoke. */
 export const REBUILD_LEASE_STALE_ENV = 'WE_DAEMON_REBUILD_LEASE_STALE_MS';
 export const DEFAULT_REBUILD_LEASE_STALE_MS = 20 * 60_000;
+
+export const BUILD_HEARTBEAT_INTERVAL_MS = 60_000;
+
+/** One owner's sidecar: overlapping lease holders never write or remove each other's evidence. */
+export function buildHeartbeatPath(root, env, token) {
+  return join(stateDir(env), `${cloneKey(root)}.build-heartbeat.${token}.json`);
+}
+
+/** Lock-free smoke liveness, from slot acquisition until smoke/adoption settles. Failures leave no new proof. */
+export function startBuildHeartbeat({ root, env, lease, now, intervalMs = BUILD_HEARTBEAT_INTERVAL_MS }) {
+  const { token, pid, host, startedAt } = lease;
+  if (typeof token !== 'string' || !/^\d+-[0-9a-f]{8}$/.test(token)
+    || !Number.isSafeInteger(pid) || pid <= 0 || typeof host !== 'string' || !host
+    || !Number.isFinite(Date.parse(startedAt)) || !Number.isFinite(intervalMs) || intervalMs <= 0) {
+    console.error('build-heartbeat-invalid: heartbeat disabled; last-good uses existing holding bounds — inspect the build lease');
+    return { stop() {} };
+  }
+  const file = buildHeartbeatPath(root, env, token);
+  const tmp = `${file}.tmp-${process.pid}`;
+  let stopped = false;
+  const remove = (path) => {
+    try { unlinkSync(path); } catch (e) {
+      if (e?.code !== 'ENOENT') console.error(`build-heartbeat-cleanup-failed: ${e?.code ?? 'unknown'} — leftover evidence expires; inspect the heartbeat sidecar`);
+    }
+  };
+  const write = () => {
+    if (stopped) return;
+    try {
+      mkdirSync(dirname(file), { recursive: true });
+      writeFileSync(tmp, `${JSON.stringify({ token, pid, host, startedAt, at: new Date(now()).toISOString() })}\n`, 'utf8');
+      renameSync(tmp, file);
+    } catch (e) {
+      remove(tmp);
+      console.error(`build-heartbeat-write-failed: ${e?.code ?? 'unknown'} — no renewed heartbeat holding; inspect the state directory`);
+    }
+  };
+  write();
+  const timer = setInterval(write, intervalMs);
+  timer.unref();
+  return {
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      clearInterval(timer);
+      remove(file);
+    },
+  };
+}
 
 /** Effective lifetime shared by lease liveness and smoke queue admission. */
 export function rebuildLeaseStaleMs(env = process.env) {

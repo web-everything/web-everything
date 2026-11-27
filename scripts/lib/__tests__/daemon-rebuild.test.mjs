@@ -27,13 +27,14 @@ import {
   readyBuildVerified, resolveOverlayConflict, OVERLAY_EDGE_RESOLVE_ENV,
 } from '../daemon-rebuild.mjs';
 import {
-  addOverlay, removeOverlay, readOverlays, overlayFilePath, writeOverlays, recordEdgeResolution,
+  addOverlay, removeOverlay, readOverlays, overlayFilePath, writeOverlays, recordEdgeResolution, cloneKey,
 } from '../daemon-overlays.mjs';
 import { acquireRead, releaseRead } from '../daemon-clone-lock.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { readOverlayConflictWakes, markOverlayConflictWake } from '../overlay-conflict-wake.mjs';
 import { writeRebuildState } from '../daemon-rebuild/state.mjs';
 import { rebuildCommitEnv } from '../daemon-rebuild/shared.mjs';
+import { lastGoodForClone } from '../daemon-last-good.mjs';
 
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
@@ -549,6 +550,188 @@ beforeEach(() => {
 afterEach(() => {
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
   tempDirs.length = 0;
+});
+
+describe('BUILD-LEASE-SMOKE-AWARE writer', () => {
+  let f, clock;
+  beforeEach(() => {
+    f = makeFixture();
+    advanceMain(f.originDir, (dir) => writeFile(dir, 'heartbeat-fixture.mjs', 'export const built = true;\n'));
+    Object.assign(f.env, {
+      WE_DAEMON_SMOKE_STATE_DIR: f.stateDir, WE_DAEMON_SMOKE_MAX_CONCURRENT: '2',
+      WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: '100', WE_DAEMON_SMOKE_BEHIND_PRIORITY_THRESHOLD: '0',
+    });
+    vi.stubEnv('WE_DAEMON_STATE_DIR', f.stateDir);
+    vi.stubEnv('WE_DAEMON_CLONE_LOCK_ROOT', f.lockDir);
+    clock = Date.parse('2026-11-27T21:21:54Z');
+  });
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
+  const path = (token) => join(f.stateDir, `${cloneKey(f.cloneDir)}.build-heartbeat.${token}.json`);
+  const read = (file) => JSON.parse(readFileSync(file, 'utf8'));
+  const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const options = () => ({
+    root: f.cloneDir, env: f.env, now: () => clock++, asJob: false, versions: null,
+    prState: async () => { throw new Error('unexpected GitHub read'); }, spawnerOwners: () => [], readerStartTimeOf: () => null,
+    run: (args, opts) => gitRun(args, { ...opts, cwd: opts?.cwd ?? f.cloneDir }),
+    lockOpts: LOCK_OPTS, log: { error: vi.fn() }, buildHeartbeatMs: 20,
+  });
+  it('T15 writes immediately and renews while a clone reader holds its slot', async () => {
+    let file;
+    const runSmoke = vi.fn(async () => {
+      const lease = readRebuildState(f.cloneDir, f.env).building;
+      file = path(lease.token);
+      expect(existsSync(file)).toBe(true);
+      const first = read(file);
+      expect(first).toMatchObject({ token: lease.token, pid: process.pid, host: hostname(), startedAt: lease.startedAt });
+      const slot = await acquireRead(f.cloneDir, { lockRoot: f.lockDir, now: () => clock });
+      expect(slot.ok).toBe(true);
+      try {
+        await delay(120);
+        expect(Date.parse(read(file).at)).toBeGreaterThan(Date.parse(first.at));
+      } finally { await releaseRead(f.cloneDir, { lockRoot: f.lockDir }); }
+      return { verdict: 'pass', attempts: 1, smoke: { results: [] } };
+    });
+    const result = await rebuildClone({ ...options(), runSmoke });
+    expect(runSmoke).toHaveBeenCalledOnce();
+    expect(result.adopted).toBe(true);
+    expect(existsSync(file)).toBe(false);
+  });
+  it.each(['pass', 'code', 'throw'])('T16 cleans its heartbeat after %s smoke', async (kind) => {
+    const files = new Set();
+    const observed = [];
+    const runSmoke = vi.fn(async ({ root }) => {
+      const lease = readRebuildState(f.cloneDir, f.env).building;
+      const file = path(lease.token); files.add(file);
+      observed.push(existsSync(file));
+      expect(existsSync(file)).toBe(true);
+      if (kind === 'throw') throw new Error('injected smoke failure');
+      return kind === 'pass' || !existsSync(join(root, 'heartbeat-fixture.mjs')) ? { verdict: 'pass', attempts: 1, smoke: { results: [] } }
+        : { verdict: 'code', attempts: 1, smoke: { results: [{ name: 'unit', ok: false, mayBeTransient: false, detail: 'injected code rejection' }] } };
+    });
+    const result = await rebuildClone({ ...options(), runSmoke });
+    expect(runSmoke).toHaveBeenCalled();
+    expect(observed.length).toBeGreaterThan(0);
+    expect(observed.every(Boolean)).toBe(true);
+    expect(result.reason ?? 'pass').toBe(kind === 'pass' ? 'pass' : kind === 'throw' ? 'smoke-threw' : 'smoke-rejected');
+    for (const file of files) expect(existsSync(file)).toBe(false);
+  });
+  it('T18 overlapping token writers cannot overwrite or remove a successor heartbeat', async () => {
+    const root = f.cloneDir, env = f.env;
+    const head = gitOk(root, ['rev-parse', 'HEAD']).trim();
+    writeRebuildState(root, { adopted: { head, at: new Date(clock - 120 * 60_000).toISOString() } }, env);
+    const deferred = () => {
+      let resolve;
+      const promise = new Promise((done) => { resolve = done; });
+      return { promise, resolve };
+    };
+    const startedA = deferred(), startedB = deferred(), finishA = deferred(), finishB = deferred();
+    const runSmoke = (started, finish) => async () => {
+      started.resolve(readRebuildState(root, env).building);
+      await finish.promise;
+      return { verdict: 'pass', attempts: 1, smoke: { results: [] } };
+    };
+    const a = rebuildClone({ ...options(), readyOnly: true, runSmoke: runSmoke(startedA, finishA) });
+    const entered = (started, result) => Promise.race([started.promise, result.then((value) => {
+      throw new Error(`smoke did not start: ${value.reason}`);
+    })]);
+    let b;
+    try {
+      const leaseA = await entered(startedA, a);
+      clock += 35 * 60_000; // The unchanged lease rule permits takeover while A still smokes.
+      b = rebuildClone({ ...options(), readyOnly: true, runSmoke: runSmoke(startedB, finishB) });
+      const leaseB = await entered(startedB, b);
+      expect(leaseB.token).not.toBe(leaseA.token);
+      const firstA = read(path(leaseA.token)), firstB = read(path(leaseB.token));
+      clock += 35 * 60_000;
+      await delay(80);
+      expect(Date.parse(read(path(leaseA.token)).at)).toBeGreaterThan(Date.parse(firstA.at));
+      expect(Date.parse(read(path(leaseB.token)).at)).toBeGreaterThan(Date.parse(firstB.at));
+      finishA.resolve(); await a;
+      expect(existsSync(path(leaseA.token))).toBe(false);
+      const successor = read(path(leaseB.token));
+      expect(successor.token).toBe(leaseB.token);
+      expect(lastGoodForClone({ root, env, now: clock, headSha: head })).toMatchObject({ onLastGood: true, holdingBy: 'heartbeat' });
+      finishB.resolve(); await b;
+      expect(existsSync(path(leaseB.token))).toBe(false);
+    } finally {
+      finishA.resolve(); finishB.resolve();
+      await Promise.allSettled([a, b]);
+    }
+  });
+  it('T17 writer and import-light reader pin the same token-scoped path', async () => {
+    const { buildHeartbeatPath, BUILD_HEARTBEAT_INTERVAL_MS } = await import('../daemon-rebuild/lease.mjs');
+    const { buildHeartbeatFileOf, BUILD_HEARTBEAT_STALE_MS, BUILD_HEARTBEAT_MAX_MS } = await import('../daemon-last-good.mjs');
+    for (const token of ['123-deadbeef', '456-cafebabe']) {
+      expect(buildHeartbeatPath(f.cloneDir, f.env, token)).toBe(path(token));
+      expect(buildHeartbeatFileOf(f.cloneDir, f.env, token)).toBe(path(token));
+    }
+    expect(BUILD_HEARTBEAT_INTERVAL_MS).toBe(60_000);
+    expect(BUILD_HEARTBEAT_STALE_MS).toBe(5 * 60_000);
+    expect(BUILD_HEARTBEAT_MAX_MS).toBe(90 * 60_000);
+  });
+  it('writer logs failed writes and repeated cleanup never throws', async () => {
+    const { startBuildHeartbeat } = await import('../daemon-rebuild/lease.mjs');
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const blocked = join(f.base, 'not-a-directory'); writeFileSync(blocked, 'blocked');
+    const hb = startBuildHeartbeat({ root: f.cloneDir, env: { ...f.env, WE_DAEMON_STATE_DIR: blocked },
+      lease: { token: '123-deadbeef', pid: process.pid, host: hostname(), startedAt: new Date(clock).toISOString() },
+      now: () => clock, intervalMs: 20 });
+    try {
+      expect(log.mock.calls.some(([line]) => line.includes('build-heartbeat-write-failed'))).toBe(true);
+      expect(readdirSync(f.stateDir).some((name) => name.includes('.build-heartbeat.'))).toBe(false);
+    } finally { expect(() => { hb.stop(); hb.stop(); }).not.toThrow(); }
+  });
+  it('writer removes a failed rename temporary file and logs failed cleanup', async () => {
+    const { startBuildHeartbeat } = await import('../daemon-rebuild/lease.mjs');
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const lease = { token: '123-deadbeef', pid: process.pid, host: hostname(), startedAt: new Date(clock).toISOString() };
+    mkdirSync(path(lease.token)); // Rename onto a directory fails, without permission-dependent host behaviour.
+    const hb = startBuildHeartbeat({ root: f.cloneDir, env: f.env, lease, now: () => clock, intervalMs: 20 });
+    try {
+      expect(log.mock.calls.some(([line]) => line.includes('build-heartbeat-write-failed'))).toBe(true);
+      expect(existsSync(`${path(lease.token)}.tmp-${process.pid}`)).toBe(false);
+    } finally { hb.stop(); hb.stop(); }
+    expect(log.mock.calls.some(([line]) => line.includes('build-heartbeat-cleanup-failed'))).toBe(true);
+  });
+  it('writer cleans its heartbeat when smokeAndAdopt itself rejects', async () => {
+    const smoke = await import('../daemon-rebuild/smoke.mjs');
+    let file;
+    vi.spyOn(smoke, 'smokeAndAdopt').mockImplementationOnce(async ({ lease }) => {
+      file = path(lease.token);
+      expect(existsSync(file)).toBe(true);
+      throw new Error('injected phase rejection');
+    });
+    await expect(rebuildClone({ ...options(), runSmoke: passSmoke() })).rejects.toThrow('injected phase rejection');
+    expect(existsSync(file)).toBe(false);
+  });
+  it.each(['adopt-only', 'versioned', 'queue-timeout'])('excluded %s path never starts a heartbeat', async (kind) => {
+    const lease = await import('../daemon-rebuild/lease.mjs');
+    const writer = vi.spyOn(lease, 'startBuildHeartbeat');
+    const runSmoke = passSmoke();
+    const opts = { ...options(), runSmoke };
+    const slots = [];
+    try {
+      if (kind === 'adopt-only') opts.adoptOnly = true;
+      if (kind === 'versioned') {
+        const runtime = await import('../daemon-version-runtime.mjs');
+        vi.spyOn(runtime, 'versionedRebuild').mockResolvedValueOnce({ moved: false, reason: 'fixture-versioned' });
+        opts.versions = { dir: f.base, clone: f.cloneDir };
+      }
+      if (kind === 'queue-timeout') {
+        const { acquireSmokeSlot } = await import('../daemon-smoke-slots.mjs');
+        for (let i = 0; i < 2; i++) {
+          const slot = await acquireSmokeSlot({ env: f.env, now: () => clock, log: opts.log });
+          expect(slot.acquired).toBe(true); slots.push(slot);
+        }
+        opts.sleep = async (ms) => { clock += ms; };
+      }
+      const result = await rebuildClone(opts);
+      expect(result.reason).toBe(kind === 'adopt-only' ? 'needs-build' : kind === 'versioned' ? 'fixture-versioned' : 'smoke-queue-timeout');
+      expect(writer).not.toHaveBeenCalled();
+      expect(runSmoke).not.toHaveBeenCalled();
+      expect(readdirSync(f.stateDir).some((name) => name.includes('.build-heartbeat.'))).toBe(false);
+    } finally { for (const slot of slots) await slot.release(); }
+  });
 });
 
 describe('rebuildClone', () => {
