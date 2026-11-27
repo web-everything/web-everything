@@ -4542,7 +4542,11 @@ function rawPrCreation(head) {
     }
     return true;
   };
-  if (!skipFlags() || hidden(i)) return 'dynamic';
+  if (!skipFlags()) return 'dynamic';
+  // An unknown launcher AND unknown subcommand alone do not identify a gh operation (`$CMD $ARG`).
+  // A visible `gh` still fails closed on its subcommand; an unknown launcher with visible `pr`/`api`
+  // continues below. Leave other launchers to their own guards, including dynamic Node invocations.
+  if (hidden(i)) return hidden(0) ? null : 'dynamic';
   if (words[i] === 'pr') {
     i += 1;
     if (!skipFlags() || hidden(i)) return 'dynamic';

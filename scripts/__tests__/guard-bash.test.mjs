@@ -1413,6 +1413,24 @@ describe('guard-bash — differential write-shape table (#2108 review r5)', () =
 });
 
 describe('guard-bash — raw PR creation loses the author stamp', () => {
+  it('requires a visible gh command or operation before rejecting unknown command words', () => {
+    for (const command of ['$CMD $ARG', '"$TOOL" "$F"', '"$BIN" "$@"',
+      'env FOO=1 "$CMD" "$ARG"', '$HOME/bin/tool $x']) {
+      expect.soft(decide(command), command).toBeNull();
+    }
+    for (const command of ['gh "$SUB"', 'gh -R a/b "$SUB"',
+      '$GH pr "$SUB"', '"$GH" -R a/b pr create',
+      '"$GH" api repos/a/b/pulls -X POST',
+      '"$GH" api graphql -f \'query=mutation { createPullRequest(input: {}) { id } }\'']) {
+      expect.soft(decide(command), command).toMatch(/expansion/);
+    }
+    // Raw-creation permission cannot authorize the independent operator-only review bypass.
+    const gated = ['pr', 'land'].join('-');
+    for (const prefix of ['', 'RAW_PR_CREATE_OK=1 ']) {
+      expect.soft(decide(`${prefix}"$NODE" "$@" scripts/${gated}.mjs`), prefix)
+        .toMatch(/--skipPrePrReview/);
+    }
+  });
   it('denies creation across persistent-flag positions and expanded command words', () => {
     for (const action of ['create', 'new']) {
       for (const flags of ['-R a/b', '--repo a/b', '--hostname github.example']) {
