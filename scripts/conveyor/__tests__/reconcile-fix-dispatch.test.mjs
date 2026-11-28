@@ -47,6 +47,169 @@ const item3438 = { num: '3438', slug: 'wire-reconcile-pass', specPath: 'backlog/
 const item3439 = { num: '3439', slug: 'other-thing', specPath: 'backlog/3439-other-thing.md', scope: ['we:scripts/other.mjs'] };
 const findItemStub = (key, _loadItems) => (key === '3438' ? item3438 : key === '3439' ? item3439 : null);
 
+describe('launchUncertain reports only provably-unlaunched refusals', () => {
+  let root;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'launch-proof-'));
+    const preferences = join(root, 'preferences.json');
+    writeFileSync(preferences, '{}');
+    vi.stubEnv('WE_PLATFORM_PREFERENCES_FILE', preferences);
+    vi.stubEnv('WE_COORDINATION_ROOT', join(root, 'coordination'));
+    vi.stubEnv('LANE_POOL_ROOT', join(root, 'lanes'));
+    vi.spyOn(settingsFiles, 'readSettings').mockReturnValue({});
+    vi.spyOn(settingsFiles, 'readDeclaredSettings').mockReturnValue({ settings: {}, errors: [], tainted: [], sources: {} });
+    vi.useFakeTimers();
+    vi.setSystemTime(1000);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const row = fields => ({ kind: 'fix', prNumber: 7, headRefName: 'lane/3438-fixture', ...fields });
+  const run = (extra = {}, fields = {}) => runReconcileFixDispatch({
+    root, repo: 'we', dryRun: false, checkStaleness: FRESH,
+    resolveProfile: () => ({ capabilities: { fix: true, ciHeal: true } }),
+    reconcile: () => ({ dispatch: [row(fields)], refusals: [], notes: [] }),
+    findItemFn: findItemStub, loadItems: () => [], fetchItemlessDiffPaths: () => [],
+    listBuildClaims: () => [], listFixClaims: () => [], readPrView: () => { throw new Error('unexpected PR read'); },
+    pickFreeLanes: () => [], dispatch: () => ({ pr: 7 }),
+    readPushHold: () => null, tryResume: () => ({ resumed: false }), tryResumeRound: null,
+    dispatchThrottle: { tryAdmit: () => ({ admit: true }) }, queueAdmission: null,
+    prStack: null, prStackSettings: {}, priorityShadow: null, landingBlockedState: null,
+    fixSettings: { ...FIX_SETTINGS_DEFAULTS, strongerModelFromRound: 0 },
+    readMainRedPriorityRecord: () => null, now: 1000, clock: () => 1000, stepNow: () => 1000, stepLog: () => {},
+    ...extra,
+  });
+  const attempted = () => ({ resumed: false, resumeAttempt: { attempted: true } });
+  const throws = () => { throw new Error('resume interrupted'); };
+  const round = { attempts: 1 };
+  const conflict = { labels: [CONFLICT_LABEL] };
+  const direct = (planned, extra = {}) => dispatchFix(planned, {
+    root, repo: 'we', readBrief: () => REAL_TEMPLATE_STUB,
+    executorDecision: { executor: 'claude', policyRoute: { model: 'sonnet', effort: 'high' } },
+    mintSessionId: () => '11111111-1111-4111-8111-111111111111', claimOwner: 'fixture-owner',
+    acquireClaim: () => ({ ok: true }), releaseClaim: () => {}, stampExecutor: () => {},
+    readFixClaim: () => null, postNotice: () => {}, wrapFix: false,
+    sessionCwdFor: () => join(root, 'session'), ensureSessionCwd: cwd => cwd,
+    grantConflictHelper: () => ({ ok: true }), isolateSession: () => ({}), healTrust: () => {},
+    resolveSettingsEnv: () => ({}), advisorFor: () => null, recordAdvisor: () => {},
+    fixSettings: { ...FIX_SETTINGS_DEFAULTS, strongerModelFromRound: 0 },
+    readHistoryInputs: () => null, loadLadder: () => ({}), readPushHold: () => null,
+    home: root, checkoutExists: () => true, readPackageJson: () => ({}),
+    spawnAgent: () => { throw new Error('unexpected spawn'); }, ...extra,
+  });
+
+  it('no-lane with no resume attempt leaves the PR out of launchUncertain', () => {
+    expect(run()).toMatchObject({ launchUncertain: [], dispatched: [], refusals: [{ pr: 7, kind: 'no-lane' }] });
+  });
+  it('no-lane after an attempted round resume lists the PR', () => {
+    expect(run({ tryResumeRound: attempted }, round).launchUncertain).toEqual([7]);
+  });
+  it('no-lane after an attempted conflict resume lists the PR', () => {
+    expect(run({ tryResume: attempted }, conflict).launchUncertain).toEqual([7]);
+  });
+  it('a throwing round resume lists the PR', () => {
+    expect(run({ tryResumeRound: throws }, round).launchUncertain).toEqual([7]);
+  });
+  it('a throwing conflict resume lists the PR', () => {
+    expect(run({ tryResume: throws }, conflict).launchUncertain).toEqual([7]);
+  });
+  it.each([{}, { resumeAttempt: undefined }, { resumeAttempt: null }, { resumeAttempt: { attempted: false } }])(
+    'declined resume with resumeAttempt null, or with none, leaves the PR out (%j)', fields => {
+      for (const shape of [round, conflict]) {
+        expect(run({ tryResume: () => ({ resumed: false, ...fields }), tryResumeRound: () => ({ resumed: false, ...fields }) }, shape)
+          .launchUncertain).toEqual([]);
+      }
+    });
+  it.each([null, 'invalid', 1, [], { resumed: 'false' }, { resumed: false, resumeAttempt: {} },
+    { resumed: false, resumeAttempt: 'invalid' }, { resumed: false, resumeAttempt: { attempted: false, refused: 'error' } }])(
+    'malformed resume result (non-object, attempted missing) lists the PR (%j)', result => {
+      for (const shape of [round, conflict]) {
+        expect(run({ tryResume: () => result, tryResumeRound: () => result }, shape).launchUncertain).toEqual([7]);
+      }
+    });
+  it('null or undefined conflict-resume evidence refuses a fresh launch even with a free lane', () => {
+    for (const attempt of [null, undefined]) {
+      const dispatch = vi.fn(() => ({ pr: 7 }));
+      const result = run({ pickFreeLanes: () => [9], tryResume: () => attempt, dispatch }, conflict);
+      expect(result).toMatchObject({ launchUncertain: [7], dispatched: [],
+        refusals: [{ pr: 7, kind: 'dispatch-failed', why: expect.stringContaining('resume') }] });
+      expect(dispatch).not.toHaveBeenCalled();
+    }
+  });
+  it('a malformed truthy resume never cold-launches', () => {
+    for (const resumed of ['false', 1, {}, []]) {
+      for (const shape of [round, conflict]) {
+        const dispatch = vi.fn(() => ({ pr: 7 }));
+        const resume = () => ({ resumed, resumeAttempt: { attempted: true } });
+        const result = run({ pickFreeLanes: () => [9], tryResume: resume, tryResumeRound: resume, dispatch }, shape);
+        expect(dispatch).not.toHaveBeenCalled();
+        expect(result).toMatchObject({ launchUncertain: [7], dispatched: [],
+          refusals: [{ pr: 7, kind: 'dispatch-failed', why: expect.stringContaining('resume') }] });
+      }
+    }
+  });
+  it('held after an uncertain resume lists the PR; held with no resume leaves it out', () => {
+    const extra = { pickFreeLanes: () => [9], dispatch: () => ({ held: true }) };
+    expect(run(extra).launchUncertain).toEqual([]);
+    expect(run({ ...extra, tryResumeRound: attempted }, round).launchUncertain).toEqual([7]);
+  });
+  it('in-loop push-hold after an uncertain resume lists the PR; with no resume leaves it out', () => {
+    const probe = resume => {
+      let reads = 0;
+      return run({ pickFreeLanes: () => [9], ...(resume ? { tryResumeRound: attempted } : {}),
+        readPushHold: () => ++reads === (resume ? 3 : 2) ? { code: 'hold-label', reason: 'held' } : null,
+        dispatch: () => { throw new Error('must stop at hold'); } }, resume ? round : {});
+    };
+    expect(probe(false)).toMatchObject({ launchUncertain: [], refusals: [{ kind: 'push-hold' }] });
+    expect(probe(true)).toMatchObject({ launchUncertain: [7], refusals: [{ kind: 'push-hold' }] });
+  });
+  it.each([true, false, undefined])('dispatch refused with notStarted %s requires positive proof', notStarted => {
+    expect(run({ pickFreeLanes: () => [9], dispatch: () => ({ refused: true, outcome: 'new-kind', notStarted }) })
+      .launchUncertain).toEqual(notStarted === true ? [] : [7]);
+  });
+  it.each(['ENOENT', 'ETIMEDOUT'])('dispatch throw with launchProvedNotStarted or ETIMEDOUT (%s)', code => {
+    expect(run({ pickFreeLanes: () => [9], dispatch: planned => direct(planned, {
+      spawnAgent: () => { throw Object.assign(new Error(code), { code }); },
+    }) }).launchUncertain).toEqual(code === 'ENOENT' ? [] : [7]);
+  });
+  it('trust-refusal replacement error stays out (retryable)', () => {
+    expect(run({ pickFreeLanes: () => [9], dispatch: planned => direct(planned, {
+      spawnAgent: () => { throw Object.assign(new Error('refused'), { stderr: 'Workspace not trusted' }); },
+    }) }).launchUncertain).toEqual([]);
+  });
+  it('trust-refusal stderr cannot erase timeout or kill uncertainty', () => {
+    for (const termination of [{ code: 'ETIMEDOUT' }, { signal: 'SIGTERM' }, { killed: true }]) {
+      const healTrust = vi.fn();
+      const result = run({ pickFreeLanes: () => [9], dispatch: planned => direct(planned, {
+        healTrust,
+        spawnAgent: () => { throw Object.assign(new Error('launch interrupted'), {
+          status: 1, stderr: 'Workspace not trusted', ...termination,
+        }); },
+      }) });
+      expect(result).toMatchObject({ launchUncertain: [7], dispatched: [], refusals: [{ kind: 'dispatch-failed' }] });
+      expect(healTrust).not.toHaveBeenCalled();
+    }
+  });
+  it('dispatchFix push-hold before launch leaves the PR out', () => {
+    const result = run({ pickFreeLanes: () => [9], dispatch: planned => direct(planned, {
+      readPushHold: () => ({ code: 'hold-label', reason: 'review:human' }),
+    }) });
+    expect(result).toMatchObject({ launchUncertain: [], refusals: [{ kind: 'push-hold' }] });
+  });
+  it('postNotice throw before launch stays retryable', () => {
+    expect(run({ pickFreeLanes: () => [9], dispatch: planned => direct(planned, { postNotice: throws }) })
+      .launchUncertain).toEqual([]);
+  });
+  it('read-deferred and unsupported-repo returns carry an empty array', () => {
+    expect(run({ reconcile: () => ({ deferred: true, reason: 'unreadable' }) }).launchUncertain).toEqual([]);
+    expect(run({ resolveProfile: () => ({ capabilities: { fix: false } }), readUnsupported: () => [], recordUnsupported: () => {} })
+      .launchUncertain).toEqual([]);
+  });
+});
+
 describe('planFixesFromReconcile', () => {
   it('narrows to `kind:\'fix\'` entries and plans one per dispatchable PR', () => {
     const entries = [
@@ -1552,10 +1715,17 @@ describe('runReconcileFixDispatch — read reconcile-pass, plan, assign a lane, 
         unsupportedPath,
         reconcile: () => ({ dispatch: [], refusals: [] }),
         checkStaleness: FRESH,
-      fetchItemlessDiffPaths: () => [],
+        fetchItemlessDiffPaths: () => [],
+        loadItems: () => [], pickFreeLanes: () => [],
+        listBuildClaims: () => [], listFixClaims: () => [],
+        prStack: null, prStackSettings: {}, priorityShadow: null,
+        fixSettings: { ...FIX_SETTINGS_DEFAULTS },
+        readMainRedPriorityRecord: () => null,
+        now: 1000, clock: () => 1000, stepNow: () => 1000, stepLog: () => {},
       });
       expect(result).toEqual({
         handled: 0, deferred: [], nextCursor: null,
+        launchUncertain: [],
         dispatched: [], refusals: [], scopeRanks: [], reconcileRefusals: 0, reconcileRefusalDetails: [],
       });
     } finally { rmSync(dir, { recursive: true, force: true }); }
