@@ -28,7 +28,7 @@ beforeEach(() => {
   probeContext = { checkout: root, pool: 'fixture-pool', poolRoot: join(root, 'pools') };
   probes = { reviewJobs: () => [], pidIdentity: () => ({ alive: false }), leases: () => '[]', sessions: () => '[]' };
 });
-afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); });
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); });
 function record(extra = {}, id = 'review-pr-pr7603-dead', age = HOUR) {
   const r = { ...newRunRecord({ id, op: 'review-pr', input: { repo, pr } }),
     pending: { kind: 'judge', step: 'judgeAdvisory', stepIndex: 0 },
@@ -276,7 +276,10 @@ it('alert-publication-failure-retries', () => {
   expect(fs.readdirSync(join(root, 'red-team-status', 'skip-published'))).toHaveLength(1);
 });
 it('warm-cache-same-size-preserved-mtime-rejection', () => {
-  const r = record(); record({}, 'review-pr-pr7603-holder');
+  // Stay beyond the quiet horizon even when the filesystem rounds restored mtimes.
+  const started = age => ({ stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(now - age).toISOString() }] });
+  const r = record(started(3 * HOUR), undefined, HOUR + 1000);
+  record(started(2 * HOUR), 'review-pr-pr7603-holder', HOUR + 1000);
   const query = () => evidence().settleBounds.completeHeadRead({ pr, head, at: now + HOUR });
   expect(query()).toEqual({ complete: true, blocked: false });
   const old = fs.statSync(runPath(r.id, dir));
@@ -307,12 +310,13 @@ async function runtimeSweep({ leaseMs = 0, sessionMs = 0, pidMs = 0, count = 1, 
     probes.pidIdentity = () => { time += pidMs; return { alive: true }; };
   }
   for (let i=0; i<young; i++) { const r = record({}, `review-pr-young-${i}`, 30 * 60000); snapshots.set(r.id, r); }
-  for (let i=0; i<unrelated; i++) fs.writeFileSync(join(dir, `unrelated-${i}.json`), '{}');
+  // Unrelated entries are listing evidence only: inject them rather than benchmark the host disk.
+  const unrelatedFiles = Array.from({ length: unrelated }, (_, i) => `unrelated-${i}.json`);
   let listings = 0;
   // The cumulative-probe case isolates scheduler progress from filesystem throughput. Its writer inventory
-  // is fixed; sidecars added by the sweep are not writers. The 77,700-file case below uses real fresh listings.
+  // is fixed; sidecars added by the sweep are not writers. The large-store case still refreshes real writers.
   const fixedInventory = count === 20000 ? fs.readdirSync(dir) : null;
-  const readdir = path => { listings++; return fixedInventory ?? fs.readdirSync(path); };
+  const readdir = path => { listings++; return fixedInventory ?? fs.readdirSync(path).concat(unrelatedFiles); };
   const started = Date.now();
   const logicalClock = () => time + Date.now() - started;
   probes.leases = () => { time += leaseMs; return '[]'; };
@@ -362,14 +366,17 @@ it('large-store', async () => {
 }, 120000);
 
 it('stalled-job-stopped-by-reattach', async () => {
+  // Launch, child claim, staleness and retry admission must share a clock. Advancing only
+  // observation.now would put the freshly scheduled retry in the observation's past.
+  const wallNow = vi.spyOn(Date, 'now').mockReturnValue(now);
   const { REVIEW_RUN_REAP_KIND } = await jobModule();
   const store = jobStore(); record();
   const r = enqueueJob({ store, codeSha: 'a'.repeat(40), kindDef: REVIEW_RUN_REAP_KIND, input: input(), now });
   let child, exited, ready;
   const entry = `import { runReviewRunReapJob } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../review-run-reap-job.mjs')).href)};
-    await runReviewRunReapJob({host:'fixture-host',readStart:()=> 'fixture-start',heartbeatIntervalMs:10,
+    await runReviewRunReapJob({host:'fixture-host',readStart:()=> 'fixture-start',now:()=>${now},heartbeatIntervalMs:10,
       reaperOptions:{now:${now},log:()=>{},probes:{reviewJobs:()=>[],pidIdentity:()=>({alive:false}),
-        leases:()=>{process.send('ready');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,5000);return '[]'},sessions:()=> '[]'}}});`;
+        leases:()=>{process.send('ready');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0);return '[]'},sessions:()=> '[]'}}});`;
   launchJob({ store, id: r.id, kindDef: REVIEW_RUN_REAP_KIND, env, evict: () => {},
     snapshot: { repoDir: root, materialize: into => {
       fs.mkdirSync(join(into, 'scripts/lib'), { recursive: true });
@@ -383,13 +390,21 @@ it('stalled-job-stopped-by-reattach', async () => {
     } });
   try {
     expect((await ready)[0]).toBe('ready');
+    wallNow.mockReturnValue(now + 61000);
     let alive = true; const stop = vi.fn(async () => {
       expect(child.kill('SIGKILL')).toBe(true); await exited; alive = false; return { gone: true };
     });
     await reattachTick({ store, kinds: kindRegistry([REVIEW_RUN_REAP_KIND]), maxConcurrent: 1,
-      observation: { now: Date.now() + 61000, slept: false, gapMs: 0 }, probe: () => alive ? 'alive' : 'dead', stop,
+      observation: { now: Date.now(), slept: false, gapMs: 0 }, probe: () => alive ? 'alive' : 'dead', stop,
       reapGroup: () => ({ gone: true }), launch: () => { throw Error('retry should back off'); } });
-    expect(stop).toHaveBeenCalledTimes(1); expect(store.read(r.id).job.status).toBe('retrying');
+    expect(stop).toHaveBeenCalledTimes(1);
+    // Runtime retries are queued records with a future admission time, not a separate status.
+    const retry = store.read(r.id).job;
+    expect(retry.status).toBe('queued');
+    expect(retry.attempts).toBe(1);
+    expect(retry.handle).toBeNull();
+    expect(Date.parse(retry.nextAttemptAt)).toBeGreaterThan(Date.now());
+    expect(retry.timeline.at(-1)).toMatchObject({ event: 'requeued' });
   } finally {
     if (child && child.exitCode === null && child.signalCode === null) { expect(child.kill('SIGKILL')).toBe(true); await exited; }
   }
