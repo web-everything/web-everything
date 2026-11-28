@@ -31,6 +31,8 @@ import * as policyCascade from '../policy-cascade.mjs';
 
 // Network fixtures carry the same pinned identities and complete pages as the production reader.
 const fixtureIdentity = { headRefOid: 'a'.repeat(40), baseRefOid: 'b'.repeat(40) };
+// Pinned main-based rows enable local Git reads; API fixtures must not consult the checkout's origin.
+const unavailableGit = () => { throw new Error('no local history in API fixture'); };
 const fixtureOid = n => n.toString(16).padStart(40, '0');
 const commitsPage = (commits, identity = fixtureIdentity) => JSON.stringify([{ data: { repository: {
   pullRequest: { ...identity, commits: { totalCount: commits.length, pageInfo: { hasNextPage: false, endCursor: null },
@@ -455,13 +457,13 @@ describe('card-only exclusion (operator ruling 2026-10-09 ~17:05 ET)', () => {
     const scope = { excludeCardOnly: true, excludeStackedAwaitingBase: true };
     const fork = { ...code(9), headRefName: 'release', baseRefName: 'main', isCrossRepository: true };
     const draft = { ...code(6), headRefName: 'lane/d6', baseRefName: 'release', labels: [{ name: 'review-status:awaiting-base' }] };
-    expect(countOpenPrsForRepo('we', { exec: execFor([fork, draft]), env: {}, scope })).toMatchObject({ count: 2, stacked: 0 });
+    expect(countOpenPrsForRepo('we', { exec: execFor([fork, draft]), git: unavailableGit, env: {}, scope })).toMatchObject({ count: 2, stacked: 0 });
     // fail-closed: a row that does not say where its head lives is never a base either
     const { isCrossRepository: _omit, ...unknown } = fork;
-    expect(countOpenPrsForRepo('we', { exec: execFor([unknown, draft]), env: {}, scope })).toMatchObject({ count: 2, stacked: 0 });
+    expect(countOpenPrsForRepo('we', { exec: execFor([unknown, draft]), git: unavailableGit, env: {}, scope })).toMatchObject({ count: 2, stacked: 0 });
     // the same base name owned by an upstream PR does stack (a fork CHILD is fine — only the base must be upstream)
     const upstream = { ...fork, number: 10, isCrossRepository: false };
-    expect(countOpenPrsForRepo('we', { exec: execFor([fork, upstream, { ...draft, isCrossRepository: true }]), env: {}, scope })).toMatchObject({ count: 2, stacked: 1, stackedPrNumbers: [6] });
+    expect(countOpenPrsForRepo('we', { exec: execFor([fork, upstream, { ...draft, isCrossRepository: true }]), git: unavailableGit, env: {}, scope })).toMatchObject({ count: 2, stacked: 1, stackedPrNumbers: [6] });
   });
 
   it('an unavailable count still reports the resolved excludeCardOnly (so pr-land does not fall back to the default)', () => {
@@ -1282,6 +1284,7 @@ describe('R384 focus regression guarantees', () => {
     excludeFocus: true, focusRefs: ['lane/r384-1'], ...extra });
   const count = (rows, extra = {}) => {
     const commitsReads = [];
+    const git = vi.fn(unavailableGit);
     const exec = (args) => {
       if (args[1] === 'list') return JSON.stringify(rows.map(row => ({ ...fixtureIdentity, ...row })));
       if (args[0] === 'api' && args[1] === 'graphql') {
@@ -1291,14 +1294,16 @@ describe('R384 focus regression guarantees', () => {
       }
       throw new Error(`unexpected call: ${JSON.stringify(args)}`);
     };
-    const result = countOpenPrsForRepo('we', { exec, env: {}, scope: scope(extra) });
-    return { result, commitsReads };
+    const result = countOpenPrsForRepo('we', { exec, git, env: {}, scope: scope(extra) });
+    return { result, commitsReads, git };
   };
 
   it('excludes exact upstream refs and focus labels without any commits lookup for either', () => {
-    const { result, commitsReads } = count([row(1), row(2, { labels: [{ name: 'focus' }] }), row(3)]);
+    const { result, commitsReads, git } = count([row(1), row(2, { labels: [{ name: 'focus' }] }), row(3)]);
     expect(result).toMatchObject({ count: 1, prNumbers: [3], focus: 2, focusPrNumbers: [1, 2], unresolved: 0 });
     expect(commitsReads).toEqual([3]);
+    expect(git).toHaveBeenCalledOnce();
+    expect(git.mock.calls[0].slice(0, 2)).toEqual(['git', ['remote', 'get-url', 'origin']]);
   });
 
   it('counts fork heads, unknown repository identity, near-match refs and title-only matches', () => {
@@ -1311,9 +1316,10 @@ describe('R384 focus regression guarantees', () => {
   });
 
   it('exempts a labelled fork independently of the upstream-only ref list', () => {
-    const { result, commitsReads } = count([row(1, { isCrossRepository: true, labels: [{ name: 'focus' }] })]);
+    const { result, commitsReads, git } = count([row(1, { isCrossRepository: true, labels: [{ name: 'focus' }] })]);
     expect(result).toMatchObject({ count: 0, prNumbers: [], focus: 1, focusPrNumbers: [1] });
     expect(commitsReads).toEqual([]);
+    expect(git).not.toHaveBeenCalled();
   });
 
   it('counts listed refs and labelled PRs when focus exclusion is disabled', () => {
@@ -1331,9 +1337,10 @@ describe('R384 focus regression guarantees', () => {
   });
 
   it('keeps accepted focus PRs in the accepted split and never reads their commits', () => {
-    const { result, commitsReads } = count([row(1, { labels: [{ name: 'focus' }, { name: 'review:accepted' }] })]);
+    const { result, commitsReads, git } = count([row(1, { labels: [{ name: 'focus' }, { name: 'review:accepted' }] })]);
     expect(result).toMatchObject({ count: 0, prNumbers: [], focus: 0, focusPrNumbers: [], accepted: 1, acceptedPrNumbers: [1] });
     expect(commitsReads).toEqual([]);
+    expect(git).not.toHaveBeenCalled();
   });
 
   it.each([
