@@ -382,11 +382,31 @@ describe('audit negative guarantees', () => {
 
 // @repo-scanning-test scope=files — scoped source inventory, with throwaway-tree detection cases below.
 function authorizedPushImporters(root, files, env) {
+  // Comments are valid between import tokens; dynamic imports also accept template literals.
+  const trivia = String.raw`(?:\s|\/\*[\s\S]*?\*\/|\/\/[^\r\n]*)*`;
+  const importer = new RegExp(String.raw`(?:\bfrom${trivia}|\bimport${trivia}(?:\(${trivia})?|\brequire${trivia}\(${trivia})`
+    + "['\"`][^'\"`]*authorized-push\\.mjs['\"`]");
   return scopedScanFiles(files, env).filter(path => !/(?:^|\/)(?:__tests__|soak)(?:\/|$)/.test(path)
     && /\.[cm]?[jt]sx?$/.test(path)
-    && /(?:\bfrom\s*|\bimport\s*(?:\(\s*)?|\brequire\s*\(\s*)['"][^'"]*authorized-push\.mjs['"]/.test(readFileSync(join(root, path), 'utf8')));
+    && importer.test(readFileSync(join(root, path), 'utf8')));
 }
 describe('M12a authorized-push production importer tripwire', () => {
+  it('detects production imports with from-comments and dynamic backticks in full and scoped scans', () => {
+    const root = mkdtempSync(join(tmpdir(), 'authorized-push-import-syntax-'));
+    const sources = [
+      "import { authorizedPush } from /* binding */ './authorized-push.mjs';",
+      "export { authorizedPush } from // binding\n './authorized-push.mjs';",
+      'import(`./authorized-push.mjs`);',
+    ];
+    const files = sources.map((_, index) => `consumer-${index}.mjs`);
+    try {
+      sources.forEach((source, index) => writeFileSync(join(root, files[index]), source));
+      expect(authorizedPushImporters(root, files, {})).toEqual(files);
+      for (const file of files) {
+        expect(authorizedPushImporters(root, files, { VERIFY_SCAN_FILES: JSON.stringify([file]) })).toEqual([file]);
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   it('REPO_SCAN: no tracked production script imports authorized-push', () => {
     const root = fileURLToPath(new URL('../../../', import.meta.url));
     const files = execFileSync('git', ['ls-files', '-z', '--', 'scripts/'],
