@@ -32,6 +32,8 @@ import * as policyCascade from '../policy-cascade.mjs';
 // Network fixtures carry the same pinned identities and complete pages as the production reader.
 const fixtureIdentity = { headRefOid: 'a'.repeat(40), baseRefOid: 'b'.repeat(40) };
 const fixtureOid = n => n.toString(16).padStart(40, '0');
+// API fixtures must not fall through to the checkout's Git transport for main-based PRs.
+const noLocalHistory = () => { throw new Error('no local history in API fixture'); };
 const commitsPage = (commits, identity = fixtureIdentity) => JSON.stringify([{ data: { repository: {
   pullRequest: { ...identity, commits: { totalCount: commits.length, pageInfo: { hasNextPage: false, endCursor: null },
     nodes: commits.map((commit, i) => ({ commit: { oid: fixtureOid(i + 100), ...commit,
@@ -455,13 +457,13 @@ describe('card-only exclusion (operator ruling 2026-10-09 ~17:05 ET)', () => {
     const scope = { excludeCardOnly: true, excludeStackedAwaitingBase: true };
     const fork = { ...code(9), headRefName: 'release', baseRefName: 'main', isCrossRepository: true };
     const draft = { ...code(6), headRefName: 'lane/d6', baseRefName: 'release', labels: [{ name: 'review-status:awaiting-base' }] };
-    expect(countOpenPrsForRepo('we', { exec: execFor([fork, draft]), env: {}, scope })).toMatchObject({ count: 2, stacked: 0 });
+    expect(countOpenPrsForRepo('we', { exec: execFor([fork, draft]), git: noLocalHistory, env: {}, scope })).toMatchObject({ count: 2, stacked: 0 });
     // fail-closed: a row that does not say where its head lives is never a base either
     const { isCrossRepository: _omit, ...unknown } = fork;
-    expect(countOpenPrsForRepo('we', { exec: execFor([unknown, draft]), env: {}, scope })).toMatchObject({ count: 2, stacked: 0 });
+    expect(countOpenPrsForRepo('we', { exec: execFor([unknown, draft]), git: noLocalHistory, env: {}, scope })).toMatchObject({ count: 2, stacked: 0 });
     // the same base name owned by an upstream PR does stack (a fork CHILD is fine — only the base must be upstream)
     const upstream = { ...fork, number: 10, isCrossRepository: false };
-    expect(countOpenPrsForRepo('we', { exec: execFor([fork, upstream, { ...draft, isCrossRepository: true }]), env: {}, scope })).toMatchObject({ count: 2, stacked: 1, stackedPrNumbers: [6] });
+    expect(countOpenPrsForRepo('we', { exec: execFor([fork, upstream, { ...draft, isCrossRepository: true }]), git: noLocalHistory, env: {}, scope })).toMatchObject({ count: 2, stacked: 1, stackedPrNumbers: [6] });
   });
 
   it('an unavailable count still reports the resolved excludeCardOnly (so pr-land does not fall back to the default)', () => {
@@ -1291,7 +1293,7 @@ describe('R384 focus regression guarantees', () => {
       }
       throw new Error(`unexpected call: ${JSON.stringify(args)}`);
     };
-    const result = countOpenPrsForRepo('we', { exec, env: {}, scope: scope(extra) });
+    const result = countOpenPrsForRepo('we', { exec, git: noLocalHistory, env: {}, scope: scope(extra) });
     return { result, commitsReads };
   };
 
