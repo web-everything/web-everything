@@ -3569,7 +3569,7 @@ describe('FIX-HOLD-PENDING-JOINED E5', () => {
     for (const [checkRuns, reason] of [[[], /no red-team check run/],
       [[{ ...check, status: 'in_progress' }], /in progress/],
       [[{ ...check, status: 'completed', conclusion: 'failure' }], /failed/]]) {
-      expect(evaluateRedTeamCheckFact({ repo: 'web-everything/web-everything', pr: 7614, headSha: H, appId: 123, checkRuns }))
+      expect(evaluateRedTeamCheckFact({ repo: 'web-everything/web-everything', pr: 7614, headSha: H, appId: check.app.id, checkRuns }))
         .toMatchObject({ ok: false, reason: expect.stringMatching(reason) });
     }
   });
