@@ -10,9 +10,11 @@ import { standDownComments, standDownReason, isStandDownSuperseded, buildStandDo
 import { isAdvisoryMechanismStandDownSuperseded } from './advisory-fix-mark.mjs';
 import { isOperatorAnswerStandDownSuperseded } from './stand-down-answer-core.mjs';
 
+import { EXHAUSTED_RETRY_RECOVERED_MARKER, buildExhaustedRetryRecoveredComment } from './exhausted-retry-recovered-comment.mjs';
+
 export const EXHAUSTED_RETRY_MARKER = '<!-- we:exhausted-retry -->';
 export const EXHAUSTED_RETRY_SPENT_MARKER = '<!-- we:exhausted-retry-spent -->';
-export const EXHAUSTED_RETRY_RECOVERED_MARKER = '<!-- we:exhausted-retry-recovered -->';
+export { EXHAUSTED_RETRY_RECOVERED_MARKER, buildExhaustedRetryRecoveredComment };
 export const EXHAUSTED_RETRY_SPENT_RESOLVED_MARKER = '<!-- we:exhausted-retry-spent-resolved -->';
 export const REVIEW_HOLD_LABELS = Object.freeze(['review:human', 'review:pending']);
 
@@ -82,10 +84,6 @@ export function wrongSpentStandDowns({ comments = [], pr, requiredChecks } = {})
   if (!requiredCompleted(pr, requiredChecks) || realRequiredFailures(pr, requiredChecks).length) return [];
   return trustedRetryMarkerComments(comments, EXHAUSTED_RETRY_SPENT_MARKER).filter(c => isAutomationAuthored(c)
     && !hasExhaustedRetryMarker(c, EXHAUSTED_RETRY_SPENT_RESOLVED_MARKER));
-}
-
-export function buildExhaustedRetryRecoveredComment({ kind, headSha }) {
-  return `${EXHAUSTED_RETRY_RECOVERED_MARKER}\nthe automatic retry after ${kind} went green on ${headSha?.slice(0, 7)}; the exhaustion and automatic retry budgets remain spent\nhead: ${headSha}`;
 }
 
 export function buildResolvedSpentComment(comment, headSha) {

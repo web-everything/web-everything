@@ -60,6 +60,8 @@ const AUDITOR_IMPORTS = Object.freeze(['scripts/lib/protected-path-floor.mjs',
   'scripts/lib/settings-safe-direction.mjs']);
 /** Modules the review authorization family imports directly (the source-scan test pins this list complete). */
 const REVIEW_AUTH_IMPORTS = Object.freeze([
+  'scripts/lib/pr-comment-policy.mjs', 'scripts/conveyor/reconcile-note-comment.mjs',
+  'scripts/conveyor/exhausted-retry-recovered-comment.mjs',
   'scripts/lib/github-app-identity.mjs', 'scripts/lib/approval-prevention-notice.mjs', 'scripts/lib/review-verdict-carried-marker.mjs',
   'scripts/lib/rebase-drop-manifest.mjs', 'scripts/lib/settings-files.mjs', 'scripts/lib/review-label-provider.mjs',
   'scripts/backlog/id.mjs', 'scripts/lib/review-seat-settings.mjs',
@@ -105,6 +107,7 @@ const REVIEW_AUTH_IMPORTS = Object.freeze([
  * form (`'settings/x.json'`, `join(dir, 'settings', 'x.json')`, a file next to the module), onto the floor.
  */
 const FLOOR_SETTINGS = Object.freeze([
+  'scripts/pr-comments-settings.json',
   // The invariant enforcer catalogue is also named by the protected POC registry module.
   'scripts/lib/invariant-catalogue.json',
   'scripts/settings/build-priority-scope.json',
