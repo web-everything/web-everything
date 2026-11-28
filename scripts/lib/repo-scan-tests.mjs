@@ -45,6 +45,13 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
   {
+    test: 'scripts/lib/__tests__/authorized-push.test.mjs',
+    scope: 'files',
+    why: 'joined pending exemption assumes authorized-push has no production importer; importer detection is exercised with an injected fixture tree',
+    matches: (f) => f.startsWith('scripts/') && SOURCE_EXT.test(f) && !skipped(f) && !f.includes('/soak/'),
+    inputs: ['scripts/lib/__tests__/authorized-push.test.mjs'],
+  },
+  {
     test: 'scripts/__tests__/pr-workflows-cancel-superseded.test.mjs',
     scope: 'files',
     why: 'retired runner labels are scoped to changed workflows; existing concurrency prefix invariants retain their whole-workflow check',

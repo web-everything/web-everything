@@ -20,7 +20,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { probeHeldLandAdvanceBatch } from '../soak/breaks/fix-push-hold-repair-starvation.mjs';
 import * as ghThrottle from '../../lib/gh-throttle.mjs';
 import {
-  createFixPassPrReader, fetchPrFilesPaginated, replayFixLaunch, withStaleBase, withPlannedContext, dispatchFix, readLivePushHold, isSmokeDryRunPr, fetchCardScopeAtRef, fetchPrDiffPaths, isDiffTooLargeError, PermanentScopeReadError, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
+  createFixPassPrReader, fetchPrFilesPaginated, replayFixLaunch, withStaleBase, withPlannedContext, dispatchFix, readLivePushHold, pendingExemptRoute, isSmokeDryRunPr, fetchCardScopeAtRef, fetchPrDiffPaths, isDiffTooLargeError, PermanentScopeReadError, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
   findResumeCandidate, buildResumePrompt, tryResumeFix, tryResumeRoundFix, filterFixesByInFlightScope, dropTerminalFixClaims, routeFixExecutor,
 } from '../reconcile-fix-dispatch.mjs';
 import { CONFLICT_LABEL } from '../parked-pr-conflict-watch.mjs';
@@ -3475,5 +3475,115 @@ describe('candidate-side old smoke read isolation', () => {
         .toEqual({ code: 'hold-label', reason: 'review:human' });
       expect(run).toHaveBeenCalledTimes(1);
     } finally { vi.unstubAllEnvs(); }
+  });
+});
+
+// FIX-HOLD-PENDING-JOINED: all fresh evidence and dispatch IO are fixture-owned.
+import { joinedPendingCases } from '../soak/breaks/fix-push-hold-pending-eligible-route.mjs';
+import { evaluateRedTeamCheckFact } from '../../lib/red-team-check-run.mjs';
+import { REVIEW_PR_CHANNEL } from '../../lib/review-escalation.mjs';
+describe('FIX-HOLD-PENDING-JOINED E5', () => {
+  const H = 'a'.repeat(40);
+  const joinedInputs = { head: H, ciFailures: ['x'], reviewFindings: ['y'] };
+  const labels = ['review:changes', 'red-team:pending', 'status:ci-red'];
+  const entry = { kind: 'fix', prNumber: 7614, headRefName: 'lane/3438-wire-reconcile-pass',
+    headRefOid: H, labels, joinedInputs, files: ['scripts/fixture.mjs'] };
+  const live = { state: 'OPEN', headRefOid: H, labels: labels.map(name => ({ name })),
+    mergeable: 'MERGEABLE', baseRefName: 'main' };
+  const read = (repair, view = live) => readLivePushHold({ repo: 'we', pr: 7614, repair },
+    { hermetic: false, run: () => JSON.stringify(view) });
+  let root;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'e5-holds-'));
+    const preferences = join(root, 'preferences.json');
+    writeFileSync(preferences, '{}');
+    vi.stubEnv('WE_PLATFORM_PREFERENCES_FILE', preferences);
+    vi.spyOn(settingsFiles, 'readSettings').mockReturnValue({});
+    vi.spyOn(settingsFiles, 'readDeclaredSettings').mockReturnValue({ settings: {}, errors: [], tainted: [], sources: {} });
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-11-27T22:00:00Z'));
+  });
+  afterEach(() => {
+    vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllEnvs();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const plan = row => planFixesFromReconcile([row], findItemStub, () => [], () => [], 'we', () => ['scripts/fixture.mjs']);
+  const run = (extra = {}, row = entry) => runReconcileFixDispatch({
+    root, repo: 'we', dryRun: false, reconcile: () => ({ dispatch: [row], refusals: [], notes: [], prs: 1, agents: 0 }),
+    findItemFn: findItemStub, loadItems: () => [], pickFreeLanes: () => [4], checkStaleness: FRESH,
+    listBuildClaims: () => [], listFixClaims: () => [], prStack: null, prStackSettings: {}, priorityShadow: null,
+    landingBlockedState: null, fixSettings: { ...FIX_SETTINGS_DEFAULTS, strongerModelFromRound: 0 },
+    readMainRedPriorityRecord: () => null, now: 1000, clock: () => 1000, stepNow: () => 1000, stepLog: () => {},
+    tryResume: () => ({ resumed: false }), tryResumeRound: null,
+    fetchItemlessDiffPaths: () => ['scripts/fixture.mjs'], ...extra,
+  });
+  it.each(joinedPendingCases())('%s', (_name, repair, view, reason) => {
+    expect(read(repair, { state: 'OPEN', ...view, labels: view.labels.map(name => ({ name })) }))
+      .toEqual(reason === null ? null : { code: 'hold-label', reason });
+  });
+  it.each([true, false].flatMap(itemBacked => [null, 0, '', false, undefined].map(value => ({ itemBacked, value }))))(
+    'plan row keeps explicit $value joinedInputs (itemBacked=$itemBacked)', ({ itemBacked, value }) => {
+      const { planned } = plan({ ...entry, headRefName: itemBacked ? entry.headRefName : 'topic', joinedInputs: value });
+      expect(planned).toHaveLength(1);
+      expect(planned[0]).toHaveProperty('joinedInputs', value);
+      expect(read(planned[0])).toEqual({ code: 'hold-label', reason: 'red-team:pending' });
+    });
+  it.each([true, false])('absent joinedInputs stays absent (itemBacked=%s)', itemBacked => {
+    const row = { ...entry, headRefName: itemBacked ? entry.headRefName : 'topic' }; delete row.joinedInputs;
+    expect(plan(row).planned[0]).not.toHaveProperty('joinedInputs');
+  });
+  it('dispatch of a row with joinedInputs:null reports red-team:pending and never spawns', () => {
+    const dispatch = vi.fn();
+    const result = run({ dispatch, readPushHold: context => read(context.repair) }, { ...entry, joinedInputs: null });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'push-hold', why: expect.stringContaining('red-team:pending') }));
+  });
+  it('round-2 joined row keeps joinedInputs and headRefOid into the resume hold read', () => {
+    const readPushHold = vi.fn(context => read(context.repair));
+    const tryResumeRound = vi.fn(() => ({ resumed: true, result: { sessionId: 'fixture-session' } }));
+    const dispatch = vi.fn();
+    const result = run({ dispatch, readPushHold, tryResumeRound }, { ...entry, attempts: 1 });
+    expect(result.refusals).toEqual([]);
+    expect(tryResumeRound).toHaveBeenCalledTimes(1);
+    expect(readPushHold).toHaveBeenCalledTimes(2);
+    expect(readPushHold.mock.calls[1][0].repair).toMatchObject({ joinedInputs, headRefOid: H });
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+  it.each(['reader throws', 'malformed JSON'])('%s fails closed at the dispatch boundary', kind => {
+    const dispatch = vi.fn();
+    const result = run({ dispatch, readPushHold: context => readLivePushHold(context, { hermetic: false,
+      run: () => { if (kind === 'reader throws') throw Error('fixture read failed'); return '{'; } }) });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'push-hold', why: expect.stringContaining('Cannot read push authority') }));
+  });
+  it.each([{ labels: null }, { labels: [{}] }, { state: 'UNKNOWN' }])('parsed incomplete evidence fails closed: %j', patch => {
+    expect(read(entry, { ...live, ...patch })).toMatchObject({ code: 'unreadable' });
+  });
+  it('live blocked defeats E5 itself, including a carried blocked label', () => {
+    expect(pendingExemptRoute({ ...entry, labels: [...labels, 'red-team:blocked'] }, [...labels, 'red-team:blocked'], live)).toBe(false);
+    expect(pendingExemptRoute({ ...entry, staleBase: {} }, labels, live)).toBe(false);
+  });
+  it('E5 launch clearance grants nothing at the landing gate', () => {
+    expect(read(entry)).toBeNull();
+    const check = { id: 1, name: 'red-team', head_sha: H, app: { id: 123 }, external_id: 'web-everything/web-everything#7614' };
+    for (const [checkRuns, reason] of [[[], /no red-team check run/],
+      [[{ ...check, status: 'in_progress' }], /in progress/],
+      [[{ ...check, status: 'completed', conclusion: 'failure' }], /failed/]]) {
+      expect(evaluateRedTeamCheckFact({ repo: 'web-everything/web-everything', pr: 7614, headSha: H, appId: 123, checkRuns }))
+        .toMatchObject({ ok: false, reason: expect.stringMatching(reason) });
+    }
+  });
+  it('7614-shaped reconcile snapshot plans one joined row and launches through a fresh hold read', () => {
+    const pr = { number: 7614, state: 'OPEN', isDraft: false, headRefName: entry.headRefName, headRefOid: H,
+      baseRefName: 'main', labels: live.labels, mergeStateStatus: 'CLEAN', rowsComplete: true, rowsHead: H,
+      statusCheckRollup: [{ name: 'gate', status: 'COMPLETED', conclusion: 'FAILURE' }],
+      files: [{ path: 'scripts/fixture.mjs' }],
+      comments: [{ author: { login: 'web-everything' }, createdAt: '2026-11-27T21:59:00Z', body:
+        `🔁 review — changes requested\n\nRecorded by juror via ${REVIEW_PR_CHANNEL}.\n\nRepair the unit failure.\n\n---\n\nNet basis: \`0000..${H}\` — 1 net changed file(s) vs current main\n\n_Recorded through ${REVIEW_PR_CHANNEL}._` }] };
+    const snapshot = planFreshBounce({ prs: [pr], agents: [], now: Date.parse('2026-11-27T22:00:00Z'), requiredChecks: ['gate'] });
+    expect(snapshot.dispatch).toHaveLength(1);
+    const { planned } = plan(snapshot.dispatch[0]);
+    expect(planned[0]).toMatchObject({ joinedInputs: { head: H, reviewFindings: expect.any(Array) }, headRefOid: H, labels });
+    expect(read(planned[0])).toBeNull();
   });
 });
