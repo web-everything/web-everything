@@ -30,8 +30,9 @@ import { AUTOMATION_LOGINS, isTrustedMarkerAuthor } from '../lib/marker-authorsh
 import { reviewedHeadsOf } from './mechanical-round-cap.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { isHumanOperatorComment } from '../lib/operator-identity.mjs';
-import { parseOperatorAnswer } from './stand-down-answer-core.mjs';
+import { parseOperatorAnswer, parseNoCodeRearmReceipt } from './stand-down-answer-core.mjs';
 import { standDownComments } from './stand-down.mjs';
+import { parseNoCodeOwedStandDown } from './fix-procedure.mjs';
 import { REARM_COMMENT_MARKER, SAME_HEAD_WAKE_TRAILER, isFixRoundRearmComment } from './rearm-round-count.mjs';
 
 // we:scripts/conveyor/rearm-review.mjs — re-export the shared narrowing helper on this module's surface so the
@@ -280,7 +281,36 @@ export function rearmWindow(comments) {
     capBlocked: capBlockedId !== null && capBlockedId === standDownIds.at(-1) };
 }
 
-export function decideEmptyFixRound({ comments, liveHead } = {}) {
+/** Structured evidence supplements the operator's one-use resume; it never creates authorization. */
+export function noCodeOwedAuthorization({ comments, liveHead, labels, reviews } = {}) {
+  const held = reason => ({ allowed: false, reason: `no-code evidence withheld; operator inspection required: ${reason}` });
+  if (typeof liveHead !== 'string' || !/^[0-9a-f]{40}$(?![\s\S])/.test(liveHead)) return held('live head unreadable');
+  if (!Array.isArray(comments) || comments.length > 1000
+    || comments.some(c => typeof c?.body !== 'string' || c.body.length > 65536)) return held('comments unreadable or oversized; inspect the full thread');
+  if (!Array.isArray(labels) || !labels.every(l => typeof l === 'string')) return held('labels unreadable');
+  if (!labels.includes('review:changes') || labels.some(l => ['red-team:blocked', 'red-team:pending'].includes(l))) return held('live review labels do not permit a no-code resume');
+  if (!Array.isArray(reviews) || reviews.length > 1000
+    || reviews.some(r => !['APPROVED', 'COMMENTED', 'DISMISSED'].includes(r?.state))) return held('formal reviews unreadable, oversized or still hold the repair');
+  const thread = comments.map(normaliseComment);
+  const window = rearmWindow(thread);
+  if (window.resumeHead !== liveHead || window.claims?.length !== 0) return held('no current operator-authorized first resume at this head');
+  const answerAt = thread.findLastIndex(c => parseOperatorAnswer(c));
+  const answer = parseOperatorAnswer(thread[answerAt]);
+  if (answer?.noCodeOwed !== true || answer.head?.toLowerCase() !== liveHead) return held('no current head-bound operator no-code ruling');
+  if (thread.slice(answerAt + 1).some(c => isTrustedMarkerAuthor({ ...c, viewerDidAuthor: false })
+    && (parseNoCodeRearmReceipt(c) || [REARM_COMMENT_MARKER, NO_CHANGE_COMMENT_MARKER].some(m => c.body.trimStart().startsWith(m))))) {
+    return held('operator no-code resume already consumed');
+  }
+  return { allowed: true };
+}
+
+export function decideEmptyFixRound({ comments, liveHead, noCodeBinding, labels, reviews } = {}) {
+  if (noCodeBinding !== undefined) {
+    const matches = Array.isArray(comments) ? comments.filter(c => parseNoCodeOwedStandDown(c, noCodeBinding)) : [];
+    if (matches.length !== 1 || liveHead !== noCodeBinding?.head) return { empty: true };
+    const authorization = noCodeOwedAuthorization({ comments, liveHead, labels, reviews });
+    return authorization.allowed ? { empty: false, noCodeResume: true } : { empty: true };
+  }
   const live = String(liveHead ?? '').trim().toLowerCase();
   if (!/^[0-9a-f]{7,40}$/.test(live) || !Array.isArray(comments)) return { empty: false };
   const { claims, reviewedHead, resumeHead } = rearmWindow(comments);
@@ -380,8 +410,8 @@ if (IS_CLI) {
   // we:scripts/conveyor/rearm-review.mjs — the fix-agent re-arm CLI: the shared harness with the three deltas
   // this caller supplies (the comment body, the default --actor, the optional --repo fallback). The re-arm
   // swap + its refusal are the shared pure `decideSetLabel({ to: 'rearm' })` — this file adds no invariant.
-  // #6713 — refuse an EMPTY ordinary fix round before any label write. Fail-open on every READ problem; once an
-  // empty round is PROVEN the refusal is unconditional (a failed note never lets the re-arm through).
+  // #6713 — refuse an EMPTY ordinary fix round before any label write. Real pushes fail open on read problems;
+  // proven empty rounds and unverified no-code candidates refuse even when the best-effort note fails.
   const argOf = (n) => (process.argv.find((a) => a.startsWith(`--${n}=`)) || '').slice(n.length + 3);
   // A stray/extra positional would let the shared CLI act on a PR this guard never inspected: refuse before any write.
   if (hasUnexpectedPositionals(process.argv.slice(2)) || hasInvalidArgs(process.argv.slice(2))) {
@@ -401,8 +431,21 @@ if (IS_CLI) {
       // The FULL paginated thread (a latest fix-begin beyond the first page must not be missed).
       const apiRepo = repoVal || ':owner/:repo';
       const pages = JSON.parse(readGh(['api', `repos/${apiRepo}/issues/${prArg}/comments`, '--paginate', '--slurp'], opts));
-      verdict = decideEmptyFixRound({ comments: pages.flat(), liveHead });
-    } catch { /* fail open: never block a real push on a read error */ }
+      const comments = pages.flat();
+      verdict = decideEmptyFixRound({ comments, liveHead });
+      if (verdict.noCodeResume) {
+        // The CLI has no run/claim binding. A legacy decision is only a candidate: enforce the same
+        // one-use operator authorization as the structured path before handing off to the label writer.
+        // Set the refusal BEFORE the read so an unavailable snapshot cannot resurrect the exemption.
+        verdict = { empty: true, since: liveHead, reason: 'no-code authorization unreadable; operator inspection required' };
+        const snapshot = JSON.parse(readGh(['pr', 'view', prArg, ...repoFlag, '--json', 'headRefOid,labels,reviews'], opts));
+        const authorization = noCodeOwedAuthorization({ comments, liveHead,
+          labels: snapshot?.labels?.map(l => l?.name), reviews: snapshot?.reviews });
+        if (snapshot?.headRefOid !== liveHead) verdict.reason = 'no-code head moved; operator inspection required';
+        else if (!authorization.allowed) verdict.reason = authorization.reason;
+        else verdict = { empty: false, noCodeResume: true };
+      }
+    } catch { /* real pushes fail open on read errors; a proven no-code candidate stays refused */ }
     // Outside the read-error catch: a conflicting pin must refuse before even the no-change note.
     if (liveHead !== undefined || verdict.noCodeResume) {
       try { labelArgv = rearmLabelArgv(labelArgv, verdict, liveHead); }
@@ -416,7 +459,7 @@ if (IS_CLI) {
         readGh(['pr', 'comment', prArg, ...(repoVal ? [`--repo=${repoVal}`] : []), '--body-file', '-'],
           { input: buildNoChangeComment({ actor: argOf('actor') || 'conveyor fix agent', since: verdict.since }), stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
       } catch { /* the note is best-effort; the refusal below is not */ }
-      writeLineSync(1, JSON.stringify({ ok: false, pr: Number(prArg), reason: 'no change made — fix still owed (head unchanged since fix-begin)', head: verdict.since }));
+      writeLineSync(1, JSON.stringify({ ok: false, pr: Number(prArg), reason: verdict.reason ?? 'no change made — fix still owed (head unchanged since fix-begin)', head: verdict.since }));
       process.exit(1);
     }
   }
