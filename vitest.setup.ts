@@ -272,5 +272,6 @@ afterEach(() => {
 });
 
 // unaudited-tip — the audited-only overlay default needs fix-ready evidence that rebuild fixtures do not write.
-// The gate has its own test (daemon-rebuild-audited-tip.test.mjs, explicit env); every other suite keeps tip-following.
-process.env.WE_DAEMON_OVERLAY_FOLLOW_TIP ||= 'follow';
+// OVERLAY-SHA-PIN: env may only tighten overlay.followTip (WE_DAEMON_OVERLAY_FOLLOW_TIP=follow is refused with a
+// policy-cascade stderr line), so a suite that needs legacy tip-following selects it through a prefs file instead
+// (helpers/overlay-audit-off.mjs). The gate has its own test (daemon-rebuild-audited-tip.test.mjs).

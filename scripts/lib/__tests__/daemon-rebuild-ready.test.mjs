@@ -9,7 +9,7 @@
  *   (real temp git fixtures, injected `runSmoke` stubs); helpers copied, never imported.
  */
 import {
-  describe, it, expect, beforeEach, afterEach, vi,
+  describe, it, expect, beforeEach, afterEach, afterAll, vi,
 } from 'vitest';
 import {
   mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync,
@@ -28,7 +28,12 @@ import { overlayRetiredByOperator, readyBuildVerified } from '../daemon-rebuild/
 import * as adoption from '../daemon-rebuild/adopt.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
 import * as preparation from '../daemon-rebuild/prepare.mjs';
-process.env.WE_DAEMON_OVERLAY_FOLLOW_TIP = 'follow'; // legacy tip-following; the audited-tip gate has its own test
+import { withOverlayAuditOff, withShippedPrefs } from './helpers/overlay-audit-off.mjs';
+const AUDIT_OFF_DIR = mkdtempSync(join(tmpdir(), 'overlay-audit-off-'));
+// Legacy tip-following via the prefs-file helper; the audited-tip gate has its own test.
+process.env.WE_PLATFORM_PREFERENCES_FILE = withOverlayAuditOff(process.env, { dir: AUDIT_OFF_DIR }).WE_PLATFORM_PREFERENCES_FILE;
+delete process.env.WE_DAEMON_OVERLAY_FOLLOW_TIP;
+afterAll(() => rmSync(AUDIT_OFF_DIR, { recursive: true, force: true }));
 
 const tempDirs = [];
 function mktemp(prefix) {
@@ -114,6 +119,7 @@ describe('the Git proof of omitted content in the candidate build', () => {
   it('next rebuild with default env removes content carried by a benignly removed ready overlay', async () => {
     const { originDir, cloneDir, env } = makeFixture();
     // Use the shipped defaults, including audited-only and unrelated-change skipping.
+    Object.assign(env, withShippedPrefs({ ...env, WE_PLATFORM_PREFERENCES_FILE: '' }, { dir: AUDIT_OFF_DIR }));
     delete env.WE_DAEMON_OVERLAY_FOLLOW_TIP;
     delete env.WE_DAEMON_REBUILD_SKIP_UNRELATED;
     delete env.WE_DAEMON_OVERLAY_EDGE_RESOLVE;

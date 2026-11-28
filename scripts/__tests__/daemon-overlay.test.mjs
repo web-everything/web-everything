@@ -9,8 +9,8 @@
  *   refuse by default, `--allow-conflict --reason=` overrides and prints what it overrode, `--check` never
  *   mutates the overlay state file either way).
  */
-import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, utimesSync } from 'node:fs';
+import { describe, it, expect, vi, afterAll } from 'vitest';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, utimesSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -18,6 +18,13 @@ import { fileURLToPath } from 'node:url';
 import { withAddGuardLock, stackAwareOverlayCheck, findStackBases, main, replaceRegistration } from '../daemon-overlay.mjs';
 import { overlayFilePath, addOverlay, readOverlays } from '../lib/daemon-overlays.mjs';
 import { admitHotpatchRef, guardedRegister } from '../lib/daemon-load-overlay.mjs';
+import { withOverlayAuditOff } from '../lib/__tests__/helpers/overlay-audit-off.mjs';
+
+// OVERLAY-SHA-PIN: env can no longer select legacy tip-following; the prefs-file helper does (audited-tip gate has its own test).
+const AUDIT_OFF_DIR = mkdtempSync(join(tmpdir(), 'overlay-audit-off-'));
+process.env.WE_PLATFORM_PREFERENCES_FILE = withOverlayAuditOff(process.env, { dir: AUDIT_OFF_DIR }).WE_PLATFORM_PREFERENCES_FILE;
+delete process.env.WE_DAEMON_OVERLAY_FOLLOW_TIP;
+afterAll(() => rmSync(AUDIT_OFF_DIR, { recursive: true, force: true }));
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CLI = resolve(HERE, '..', 'daemon-overlay.mjs');

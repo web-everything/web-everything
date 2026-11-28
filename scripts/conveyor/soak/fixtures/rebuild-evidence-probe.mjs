@@ -17,6 +17,7 @@ import { rebuildClone } from '../../../lib/daemon-rebuild/rebuild.mjs';
 import { acquireRead, releaseRead } from '../../../lib/daemon-clone-lock.mjs';
 import { claimBuildLease, releaseBuildLease } from '../../../lib/daemon-rebuild/lease.mjs';
 import { watchPath, readForceWatch } from '../../../lib/daemon-force-adopt.mjs';
+import { withOverlayAuditOff } from '../../../lib/__tests__/helpers/overlay-audit-off.mjs';
 
 /** Pre-upgrade JSON through strict job admission and the production adoption matcher; no Git writes. */
 export async function probeLegacyReadyAdmission(kind = 'candidate') {
@@ -140,11 +141,12 @@ export async function probeTickCompatibility() {
 export async function probeStalePinnedReady({ auditedOnly = false, fastForward = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'stale-ready-soak-'));
   const root = join(dir, 'clone'), author = join(dir, 'author'), origin = join(dir, 'origin.git');
-  const env = { ...process.env, HOME: dir, WE_DAEMON_STATE_DIR: join(dir, 'state'),
+  // The prefs-file helper selects legacy tip-following for this conflict-pin probe.
+  const env = withOverlayAuditOff({ ...process.env, HOME: dir, WE_DAEMON_STATE_DIR: join(dir, 'state'),
     WE_DAEMON_SMOKE_STATE_DIR: join(dir, 'smoke-slots'),
     WE_DAEMON_OVERLAY_DIR: join(dir, 'overlays'), WE_DAEMON_CLONE_LOCK_ROOT: join(dir, 'locks'),
-    WE_DAEMON_OVERLAY_FOLLOW_TIP: 'follow', WE_DAEMON_REBUILD_SKIP_UNRELATED: '0',
-    WE_DAEMON_OVERLAY_EDGE_RESOLVE: '0', WE_DAEMON_AUTO_REBASE: '0', WE_DAEMON_REBUILD_STRICT_EVIDENCE: '1' };
+    WE_DAEMON_REBUILD_SKIP_UNRELATED: '0',
+    WE_DAEMON_OVERLAY_EDGE_RESOLVE: '0', WE_DAEMON_AUTO_REBASE: '0', WE_DAEMON_REBUILD_STRICT_EVIDENCE: '1' }, { dir });
   const git = (cwd, args) => {
     const r = spawnSync('git', ['-c', 'user.name=soak', '-c', 'user.email=soak@example.invalid', ...args],
       { cwd, encoding: 'utf8', timeout: 20_000, maxBuffer: 65536, env: { ...env, GIT_OPTIONAL_LOCKS: '0' } });

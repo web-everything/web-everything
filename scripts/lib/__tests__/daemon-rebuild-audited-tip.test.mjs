@@ -1,6 +1,7 @@
 /** unaudited-tip — real Git plans and hermetic fix-ready evidence. */
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -16,6 +17,8 @@ import { watchPath } from '../daemon-force-adopt.mjs';
 import { readReadyCandidateStrict, readReadyCandidate, writeReadyCandidate, assertReadyCandidatePins, StaleReadyPinError } from '../daemon-rebuild/state.mjs';
 import { appendEntry, storePath } from '../../operations/ruled-weakened-store.mjs';
 import { readRebuildState } from '../daemon-rebuild/state.mjs';
+import { withOverlayAuditOff, withShippedPrefs } from './helpers/overlay-audit-off.mjs';
+import { LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH } from '../policy-cascade.mjs';
 
 // Same temp/Git helpers as overlay-pin; local tracking refs avoid network IO entirely.
 const temps = [];
@@ -143,9 +146,9 @@ describe('unaudited-tip plans', () => {
     expect(p.applied).toEqual([{ ref, pr: 42, sha: f.b }]);
     expect(p.alerts.some(a => a.kind === 'overlay-unaudited-tip')).toBe(false);
   });
-  it('follow returns a null gate and applies B without evidence', async () => {
+  it('the prefs-file helper returns a null gate and applies B without evidence', async () => {
     const f = await fixture();
-    const gate = makeAuditedTipGate({ ...f.env, WE_DAEMON_OVERLAY_FOLLOW_TIP: 'follow' });
+    const gate = makeAuditedTipGate(withOverlayAuditOff(f.env, { dir: f.dir }));
     expect(gate).toBeNull();
     expect((await f.plan({ auditedTip: gate })).applied).toEqual([{ ref, pr: 42, sha: f.b }]);
   });
@@ -921,7 +924,7 @@ describe('unaudited-tip evidence and policy', () => {
     expect(resolve()).toBe('follow');
     writeFileSync(settingsPath, JSON.stringify({ overlay: { followTip: 'audited-only' } }));
     expect(resolve()).toBe('audited-only');
-    expect(resolve({ ...env, WE_DAEMON_OVERLAY_FOLLOW_TIP: 'follow' })).toBe('follow');
+    expect(resolve({ ...env, WE_DAEMON_OVERLAY_FOLLOW_TIP: 'follow' })).toBe('audited-only'); // OVERLAY-SHA-PIN: env may only tighten
     expect(resolve({ ...env, WE_DAEMON_OVERLAY_FOLLOW_TIP: 'invalid' })).toBe('audited-only');
   });
   it('parses JSONL past bad lines, matches exact ref and case-insensitive sha/audit', () => {
@@ -1140,5 +1143,154 @@ describe('RS-HP-3: rollback skips the revoked-evidence check only for the record
     expect(gitOk(f.root, ['rev-parse', 'HEAD'])).toBe(changeLastGood ? f.base : built.finalSha);
     expect(emitEvent.mock.calls.map(([event]) => event.kind))
       .toContain(changeLastGood ? 'force-adopt-rollback-failed' : 'force-adopt-rolled-back');
+  });
+});
+
+
+describe('OVERLAY-SHA-PIN — the environment cannot loosen the audited-tip gate', () => {
+  let f;
+  const noTool = () => ({ settingsPath: join(f.dir, 'no-tool.json') });
+  beforeEach(() => { f = evidence(); });
+
+  it('env follow is refused over audited-only; a prefs file loosens; env may tighten; equal follow is allowed', () => {
+    const base = { WE_PLATFORM_PREFERENCES_FILE: f.env.WE_PLATFORM_PREFERENCES_FILE };
+    expect(resolveOverlayFollowTip({ ...base, WE_DAEMON_OVERLAY_FOLLOW_TIP: 'follow' }, noTool())).toBe('audited-only');
+    const off = withOverlayAuditOff(base, { dir: f.dir });
+    expect(off.WE_DAEMON_OVERLAY_FOLLOW_TIP).toBeUndefined();
+    expect(resolveOverlayFollowTip(off, noTool())).toBe('follow');
+    expect(resolveOverlayFollowTip({ ...off, WE_DAEMON_OVERLAY_FOLLOW_TIP: 'audited-only' }, noTool())).toBe('audited-only');
+    expect(resolveOverlayFollowTip({ ...off, WE_DAEMON_OVERLAY_FOLLOW_TIP: 'follow' }, noTool())).toBe('follow');
+  });
+
+  it('a rebuild plan asked to follow by env alone keeps adopted A and excludes unaudited B', () => {
+    // Native ESM lets the child inject built-in reads even for dependencies loaded outside Vitest's transform.
+    const moduleUrl = rel => pathToFileURL(join(__dirname, rel)).href;
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import fs from 'node:fs';
+      import os from 'node:os';
+      import { syncBuiltinESMExports } from 'node:module';
+      import { join } from 'node:path';
+      import { fileURLToPath } from 'node:url';
+      import { spawnSync } from 'node:child_process';
+      import { makeGit } from ${JSON.stringify(moduleUrl('../daemon-rebuild/shared.mjs'))};
+      import { planRebuild } from ${JSON.stringify(moduleUrl('../daemon-rebuild/plan.mjs'))};
+      import { makeAuditedTipGate } from ${JSON.stringify(moduleUrl('../daemon-rebuild/audited-tip.mjs'))};
+      const dir = process.cwd(), root = join(dir, 'repo'), ref = process.argv[1];
+      os.userInfo = () => ({ homedir: dir });
+      fs.mkdirSync(root);
+      const read = fs.readFileSync.bind(fs), unexpected = [];
+      const tools = new Set(${JSON.stringify([join(__dirname, '../daemon-rebuild-settings.json'), join(__dirname, '../../settings/prototype-load.json')])});
+      fs.readFileSync = (path, ...args) => {
+        const name = typeof path === 'string' ? path : fileURLToPath(path);
+        if (tools.has(name)) return '{}';
+        if (name.startsWith(dir + '/')) return read(path, ...args);
+        unexpected.push(name);
+        throw new Error('OVERLAY-SHA-PIN: read outside fixture');
+      };
+      syncBuiltinESMExports();
+      Date.now = () => 1000;
+      const git = makeGit({ cwd: root, env: process.env, timeoutMs: 20_000,
+        run: (args, opts) => spawnSync('git', args, { ...opts, encoding: 'utf8', maxBuffer: 65536 }) });
+      const checkedGit = args => {
+        const result = git(args);
+        if (result.status !== 0) throw new Error('fixture git ' + args[0] + ': ' + result.stderr);
+        return result.stdout.trim();
+      };
+      checkedGit(['init', '-q', '-b', 'main']);
+      const commit = content => {
+        fs.writeFileSync(join(root, 'moving.txt'), content);
+        checkedGit(['add', '-A']); checkedGit(['commit', '-qm', content]);
+        return checkedGit(['rev-parse', 'HEAD']);
+      };
+      const base = commit('base'), a = commit('audited A');
+      checkedGit(['update-ref', 'refs/remotes/origin/main', base]);
+      checkedGit(['update-ref', 'refs/remotes/origin/' + ref, a]);
+      fs.writeFileSync(process.env.WE_FIX_READY_PATH, JSON.stringify({ ref, sha: a, tests: 'green', audit: 'NOT WEAKENED' }));
+      const args = { git, mainRef: 'origin/main', overlays: [{ ref, pr: 42 }], edgeResolve: false };
+      const auditedEnv = { ...process.env, WE_DAEMON_OVERLAY_FOLLOW_TIP: 'audited-only' };
+      const adopted = await planRebuild({ ...args, headSha: base, auditedTip: makeAuditedTipGate(auditedEnv) });
+      if (!adopted.ok) throw new Error('fixture adoption failed: ' + JSON.stringify(adopted));
+      const b = commit('clean unaudited B');
+      checkedGit(['update-ref', 'refs/remotes/origin/' + ref, b]);
+      const gate = makeAuditedTipGate(process.env);
+      const allowsB = gate === null ? true : gate(ref, b);
+      const plan = await planRebuild({ ...args, headSha: adopted.finalSha, auditedTip: gate });
+      process.stdout.write(JSON.stringify({ gateType: typeof gate, allowsB, plan, a, b, unexpected }));
+    `, ref], { cwd: f.dir, env: { PATH: process.env.PATH, HOME: f.dir, XDG_CONFIG_HOME: f.dir,
+      GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null',
+      GIT_AUTHOR_DATE: '2000-01-01T00:00:00Z', GIT_COMMITTER_DATE: '2000-01-01T00:00:00Z',
+      ...f.env, WE_DAEMON_OVERLAY_FOLLOW_TIP: 'follow' }, encoding: 'utf8', timeout: 30_000, maxBuffer: 65536 });
+    expect(child.error).toBeUndefined();
+    expect(child.status, child.stderr).toBe(0);
+    const { gateType, allowsB, plan, a, b, unexpected } = JSON.parse(child.stdout);
+    expect(unexpected).toEqual([]);
+    expect(gateType).toBe('function');
+    expect(allowsB).toBe(false);
+    expect(plan.ok).toBe(true);
+    expect(plan.applied).toEqual([{ ref, pr: 42, sha: a, pinnedFrom: b }]);
+    expect(plan.alerts.some(alert => alert.kind === 'overlay-unaudited-tip')).toBe(true);
+    expect(child.stderr).toContain('refused env.followTip="follow"');
+  });
+
+  it('the helper merges nested leaves, never mutates its input, never reads home, and reaches a child process', () => {
+    const home = join(f.dir, 'home');
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    writeFileSync(join(home, '.claude', 'platform-preferences.json'), JSON.stringify({ overlay: { followTip: 'audited-only' }, sentinel: 'HOME-READ' }));
+    writeFileSync(f.env.WE_PLATFORM_PREFERENCES_FILE, JSON.stringify({ overlay: { stackMode: 'tops' }, build: { finalGate: 'related', nested: { keep: 1 } } }));
+    const input = { ...f.env, HOME: home, WE_DAEMON_OVERLAY_FOLLOW_TIP: 'audited-only' };
+    const frozen = JSON.stringify(input);
+    const off = withOverlayAuditOff(input, { dir: f.dir });
+    expect(JSON.stringify(input)).toBe(frozen);
+    expect(off).not.toBe(input);
+    expect(off.WE_DAEMON_OVERLAY_FOLLOW_TIP).toBeUndefined();
+    expect(JSON.parse(readFileSync(off.WE_PLATFORM_PREFERENCES_FILE, 'utf8'))).toEqual({
+      overlay: { stackMode: 'tops', followTip: 'follow' }, build: { finalGate: 'related', nested: { keep: 1 } },
+    });
+    const repoRoot = join(f.dir, 'repo-settings');
+    mkdirSync(repoRoot);
+    const legacy = join(repoRoot, 'legacy.json'), current = join(repoRoot, 'current.json');
+    writeFileSync(legacy, JSON.stringify({ build: { priority: 1, nested: { keep: 1, replace: 1 } } }));
+    writeFileSync(current, JSON.stringify({ build: { finalGate: 'related', nested: { replace: 2 } } }));
+    const paths = new Map([...LEGACY_PLATFORM_PREFERENCES_PATHS.map(path => [path, legacy]), [PLATFORM_PREFERENCES_PATH, current]]);
+    const reads = [];
+    const readFile = (path, encoding) => {
+      reads.push(path);
+      if (!paths.has(path)) throw new Error('OVERLAY-SHA-PIN: unexpected base path');
+      return readFileSync(paths.get(path), encoding);
+    };
+    const shipped = withShippedPrefs({ HOME: home, WE_DAEMON_OVERLAY_FOLLOW_TIP: 'follow' }, { dir: f.dir, readFile });
+    expect(shipped.WE_DAEMON_OVERLAY_FOLLOW_TIP).toBeUndefined();
+    expect(JSON.parse(readFileSync(shipped.WE_PLATFORM_PREFERENCES_FILE, 'utf8'))).toEqual({
+      build: { priority: 1, finalGate: 'related', nested: { keep: 1, replace: 2 } },
+    });
+    const other = join(f.dir, 'other');
+    mkdirSync(other);
+    const noOwn = withOverlayAuditOff({ HOME: home }, { dir: other, readFile });
+    expect(readFileSync(noOwn.WE_PLATFORM_PREFERENCES_FILE, 'utf8')).not.toContain('HOME-READ');
+    expect(reads).toEqual([...paths.keys(), ...paths.keys()]);
+    expect(() => withOverlayAuditOff({})).toThrow(/caller-owned/);
+    expect(() => withShippedPrefs({})).toThrow(/caller-owned/);
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e',
+      `import os from 'node:os'; import { syncBuiltinESMExports } from 'node:module';
+       os.userInfo = () => ({ homedir: process.env.HOME }); syncBuiltinESMExports();
+       const m = await import(${JSON.stringify(pathToFileURL(join(__dirname, '../daemon-overlays.mjs')).href)});
+       process.stdout.write(m.resolveOverlayFollowTip(process.env, ${JSON.stringify(noTool())}));`],
+      { cwd: f.dir, env: { PATH: process.env.PATH, HOME: home, WE_PLATFORM_PREFERENCES_FILE: off.WE_PLATFORM_PREFERENCES_FILE },
+        encoding: 'utf8', timeout: 30_000, maxBuffer: 65536 });
+    expect(child.error).toBeUndefined();
+    expect(child.status, child.stderr).toBe(0);
+    expect(child.stdout, child.stderr).toBe('follow');
+  });
+
+  it.each(['missing', 'malformed', 'non-object', 'unreadable'])('shipped prefs stay audited-only for a %s base, refusing env follow', failure => {
+    const path = f.env.WE_PLATFORM_PREFERENCES_FILE;
+    if (failure === 'missing') rmSync(path);
+    if (failure === 'malformed') writeFileSync(path, '{broken');
+    if (failure === 'non-object') writeFileSync(path, '[]');
+    if (failure === 'unreadable') { rmSync(path); mkdirSync(path); }
+    const shipped = withShippedPrefs({ WE_PLATFORM_PREFERENCES_FILE: path, WE_DAEMON_OVERLAY_FOLLOW_TIP: 'follow' }, { dir: f.dir });
+    expect(JSON.parse(readFileSync(shipped.WE_PLATFORM_PREFERENCES_FILE, 'utf8'))).toEqual({});
+    expect(shipped.WE_DAEMON_OVERLAY_FOLLOW_TIP).toBeUndefined();
+    expect(resolveOverlayFollowTip({ ...shipped, WE_DAEMON_OVERLAY_FOLLOW_TIP: 'follow' }, noTool())).toBe('audited-only');
   });
 });
