@@ -10,7 +10,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
+import { openPrPageFixture, prCommitsPageFixture } from './fixtures/open-pr-page-fixture.mjs';
 import { completeCheckReadFixture } from './fixtures/complete-check-read-fixture.mjs';
 import { fixtureOid, pinnedPrDiffFixture } from './fixtures/pinned-pr-diff-fixture.mjs';
 
@@ -33,6 +33,8 @@ if (checkPages !== undefined) out(checkPages);
 if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('main'); process.exit(0); }
 if (a[0] === 'pr' && a[1] === 'list') out(prs.filter(p => !landed(p.number)));
 if (a[0] === 'api' && a[1] === 'graphql') {
+  const history = (${prCommitsPageFixture})(prs, a);
+  if (history !== undefined) out(history);
   const query = a.find(v => v.startsWith('query=')) || '';
   if (query.includes('comments{totalCount}')) {
     const p = prs.find(p => 'n=' + p.number === a.find(v => v.startsWith('n=')));
@@ -126,7 +128,7 @@ function runCli({ capabilityOff = false, hookOn, seedRefreshed = null, ages = [[
     // #3001: pass 5 min old (fresh). #3002: pass 120 min old (stale). Main moved only on a backlog card (non-code).
     writeFileSync(fixture, JSON.stringify(ages.map(([number, age]) => ({
       number, title: `leaf ${number}`, body: 'A real summary.', headRefName: `lane/leaf-${number}`,
-      baseRefName: 'main', headRefOid: head(number), mergeable: 'MERGEABLE', mergeStateStatus,
+      baseRefName: 'main', baseRefOid: 'b'.repeat(40), headRefOid: head(number), mergeable: 'MERGEABLE', mergeStateStatus,
       statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' },
         ...(approvedHeadPlan && extraEnv.MQ_QUEUE_EVIDENCE !== 'missing-secondary'
           ? [{ name: 'smoke', conclusion: 'SUCCESS', status: 'COMPLETED' }] : [])],
@@ -322,6 +324,9 @@ if (checkPages !== undefined) out(checkPages);
 if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('main'); process.exit(0); }
 if (a[0] === 'pr' && a[1] === 'list') { const s = slugOf(); out(prsOf(s).filter(p => !fs.existsSync(mark(s, p.number)))); }
 if (a[0] === 'api' && a[1] === 'graphql') {
+  const historyRepo = ['owner', 'name'].map(key => a.find(v => v.startsWith(key + '='))?.slice(key.length + 1)).join('/');
+  const history = (${prCommitsPageFixture})(prsOf(historyRepo), a);
+  if (history !== undefined) out(history);
   const s = slugOf();
   out(openPrPageFixture(prsOf(s).filter(p => !fs.existsSync(mark(s, p.number))), a.find(v => v.startsWith('query=')) || ''));
 }
@@ -384,7 +389,7 @@ function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null, e
     const accepted = (number) => ({ labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }],
       comments: [{ body: `Reviewed.\n<!-- reviewed-sha: ${sha(number)} -->`, viewerDidAuthor: true, author: { login: 'web-everything' }, createdAt: iso(60) }] });
     const pr = (number, headRefName, ages, extra = {}) => ({
-      number, title: `couple ${number}`, body: 'A real summary.', headRefName, baseRefName: 'main', headRefOid: sha(number),
+      number, title: `couple ${number}`, body: 'A real summary.', headRefName, baseRefName: 'main', baseRefOid: 'b'.repeat(40), headRefOid: sha(number),
       mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }],
       labels: [{ name: 'ready-to-merge' }], comments: [], passAtSeq: ages.map(iso),
       commits: [{ oid: sha(number), authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],

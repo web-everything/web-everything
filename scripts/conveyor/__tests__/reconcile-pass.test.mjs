@@ -1,4 +1,5 @@
 import { vi, it, expect, describe } from 'vitest';
+import { prCommitsPageFixture } from '../../__tests__/fixtures/open-pr-page-fixture.mjs';
 
 
 
@@ -173,7 +174,7 @@ describe('mechanical round enrichment port (#5948)', () => {
 prFileContract({
   name: 'reconcile-pass', load: () => import('../reconcile-pass.mjs'),
   reader: 'defaultReadPrs', run: 'runReconcilePass',
-  fields: 'number,title,headRefName,headRefOid,baseRefName,labels,statusCheckRollup,mergeStateStatus,comments,body,files,isDraft,createdAt', reconcile: true,
+  fields: 'number,title,headRefName,headRefOid,baseRefName,baseRefOid,labels,statusCheckRollup,mergeStateStatus,comments,body,files,isDraft,createdAt', reconcile: true,
 });
 
 
@@ -1496,13 +1497,16 @@ it('xe8y12n real PR read shell enriches the reported missing-family shape from c
   const { defaultReadPrs } = await import('../reconcile-pass.mjs');
   const { planReconcile } = await import('../reconcile-core.mjs');
   const calls = [], steps = [];
+  const row = { number: 3239, labels: [], comments: [], statusCheckRollup: [], headRefOid: 'a'.repeat(40),
+    baseRefOid: 'b'.repeat(40), headRefName: 'lane/repair', baseRefName: 'lane/base',
+    commits: [{ oid: 'a'.repeat(40), messageHeadline: 'repair', authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }] };
   const prs = defaultReadPrs({ step: (name, fn) => { steps.push(name); return fn(); }, repo: 'o/r', exec: (_bin, args) => {
     calls.push(args);
-    return JSON.stringify(args[1] === 'list' ? [{ number: 3239, labels: [], comments: [], statusCheckRollup: [] }]
-      : { data: { repository: { pullRequest: { commits: { nodes: [{ commit: { messageHeadline: 'repair', authors: { nodes: [{ name: 'Claude' }] } } }] } } } } });
+    return JSON.stringify(args[1] === 'list' ? [row] : prCommitsPageFixture([row], args));
   } });
   expect(steps).toContain('planner-cache-diff');
   expect(calls.some(args => args.some(arg => arg.includes('commits(first:')))).toBe(true);
+  expect(prs[0].commits).toEqual(row.commits);
   expect(planReconcile({ prs }).notes).toContainEqual(expect.objectContaining({ kind: 'review-label-missing' }));
 });
 

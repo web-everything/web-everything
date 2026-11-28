@@ -6,6 +6,7 @@ import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SNAPSHOT_FIELDS } from '../pr-snapshot.mjs';
 import { PR_SNAPSHOT_VERSION } from '../pr-snapshot-store.mjs';
+import { prCommitsPageFixture } from '../../__tests__/fixtures/open-pr-page-fixture.mjs';
 import { buildManifest, embedManifestInBody, extractManifestFromBody } from '../../readiness/lane-manifest.mjs';
 import { fetchPrReadsCached, prReadCacheIdentity, reduceOpenPrContext, planDrainPass } from '../../merge-ai-prs.mjs';
 import {
@@ -243,7 +244,7 @@ describe('snapshot fast drain CLI dependency context', () => {
   const repo = 'fixture/repo';
   const pr = (number, item, blockedBy = []) => ({
     number, title: `fixture ${number}`, state: 'OPEN', headRefName: `lane/${item}`, headRefOid: number.toString(16).padStart(40, '0'),
-    updatedAt: '2026-10-14T00:00:00Z', baseRefName: 'main', isDraft: false,
+    updatedAt: '2026-10-14T00:00:00Z', baseRefName: 'main', baseRefOid: 'a'.repeat(40), isDraft: false, commits: [],
     mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', reviewDecision: 'APPROVED',
     labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }], files: [],
     statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
@@ -276,6 +277,8 @@ const a = process.argv.slice(2);
 const f = JSON.parse(fs.readFileSync(process.env.CONTEXT_FIXTURE, 'utf8'));
 fs.appendFileSync(process.env.CONTEXT_LOG, JSON.stringify(a) + '\\n');
 const output = value => { fs.writeSync(1, JSON.stringify(value)); process.exit(0); };
+const history = (${prCommitsPageFixture})([...f.live, ...Object.values(f.extraLive).flat()], a);
+if (history !== undefined) output(history);
 if (a[0] === 'repo' && a[1] === 'view') { fs.writeSync(1, 'main'); process.exit(0); }
 if (a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequests(states:OPEN'))) {
   if (f.failPage === true || f.failPage === process.env.GH_REPO) { fs.writeSync(2, 'fixture listing unreadable'); process.exit(1); }
@@ -436,6 +439,8 @@ output({});
     expect(r.status, r.stderr).toBe(0);
     expect(r.payload.deferred).toEqual([]);
     expect(r.payload.toMerge).toEqual(expect.arrayContaining([expect.objectContaining({ num: 7 })]));
+    expect(r.stderr).not.toContain('commits-degraded');
+    expect(r.calls.some(a => a.includes('--paginate') && a.includes('--slurp') && a.includes('number=7'))).toBe(true);
     const heavyReads = r.calls.filter(a => a[0] === 'pr' && a[1] === 'view'
       && a[a.indexOf('--json') + 1] === 'body,files');
     expect(heavyReads).toEqual([]);

@@ -99,6 +99,7 @@ describe('real drain pre-stage path', () => {
         }
         pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
         const next = (await run(path === 'prestage', { shadowMode }));
+        expect(next.stderr).not.toContain('commits-degraded');
         calls.push(...next.calls);
         if (path === 'dependency-held') {
           expect(next.report.deferred, next.stderr).toEqual(expect.arrayContaining([

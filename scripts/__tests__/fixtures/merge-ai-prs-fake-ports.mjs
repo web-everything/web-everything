@@ -1,9 +1,9 @@
 // Function ports and executable shims share the same response code and call logs.
 import * as fs from 'node:fs';
 import { drainScoredGit } from './drain-scored-git.mjs';
-import { openPrPageFixture } from './open-pr-page-fixture.mjs';
+import { openPrPageFixture, prCommitsPageFixture } from './open-pr-page-fixture.mjs';
 
-function prestageGh(process, fs, page) {
+function prestageGh(process, fs, page, scoredGit, commitsPage) {
 const a = process.argv.slice(2), primary = JSON.parse(fs.readFileSync(process.env.PRESTAGE_PR, 'utf8'));
 const prs = [primary, ...(primary.peers || [])];
 const query = a.find(x => x.startsWith('query=')) || '';
@@ -42,6 +42,8 @@ if (a[0] === 'api') {
   if (path.includes('/status?')) out([{total_count:statusRows.length,statuses:statusRows}]);
   if (a[1] === 'graphql') {
     const q = a.find(x => x.startsWith('query=')) || '';
+    const history = commitsPage(prs, a);
+    if (history !== undefined) out(history);
     if (q.includes('timelineItems(') && pr.mqTimelineErrors) out({ errors:[{message:'fixture timeline unreadable'}] });
     if (q.includes('timelineItems(')) out({ data: { repository: { pullRequest: { timelineItems: {
       nodes:pr.mqTimeline || [], pageInfo:{hasPreviousPage:false}
@@ -112,7 +114,7 @@ function capture(port, args, env) {
     if (fd === 2) { stderr += String(value); return Buffer.byteLength(value); }
     if (fd !== 1) throw new Error(`Unexpected fixture fd ${fd}`);
     write(value); return Buffer.byteLength(value);
-  } }, openPrPageFixture, drainScoredGit); } catch (error) { if (error !== stopped) throw error; }
+  } }, openPrPageFixture, drainScoredGit, prCommitsPageFixture); } catch (error) { if (error !== stopped) throw error; }
   return { status, stdout, stderr };
 }
 const port = fn => (args, env) => capture(fn, args, env);
@@ -122,7 +124,7 @@ export const listingPorts = { gh: port(listingGh), git: args => {
   return { status: 128, stdout: '', stderr: 'fatal: no origin or revision' };
 } };
 const scriptFor = fn => `#!/usr/bin/env node
-(${fn.toString()})(process, require('node:fs'), ${openPrPageFixture.toString()}, ${drainScoredGit.toString()});
+(${fn.toString()})(process, require('node:fs'), ${openPrPageFixture.toString()}, ${drainScoredGit.toString()}, ${prCommitsPageFixture.toString()});
 `;
 export const fakeGh = scriptFor(prestageGh);
 export const fakeGit = scriptFor(prestageGit);

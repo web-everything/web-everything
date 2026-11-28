@@ -28,6 +28,13 @@ import {
 import { SNAPSHOT_FIELDS } from '../pr-snapshot.mjs';
 import * as settingsFiles from '../settings-files.mjs';
 import * as policyCascade from '../policy-cascade.mjs';
+import { prCommitsPageFixture } from '../../__tests__/fixtures/open-pr-page-fixture.mjs';
+
+const headOid = number => number.toString(16).padStart(40, '0');
+const noGit = () => { throw new Error('fixture git unavailable'); };
+const apiPr = number => ({ number, headRefOid: headOid(number), baseRefOid: 'b'.repeat(40) });
+const commitsPage = (commits, pr = apiPr(42)) => JSON.stringify(prCommitsPageFixture([{ ...pr, commits }],
+  ['api', 'graphql', 'query=pullRequest(number:$number){commits(first:100)}', `number=${pr.number}`]));
 
 describe('resolvePrLimit', () => {
   const layers = { platform: {}, tool: {} };
@@ -171,7 +178,6 @@ describe('isExemptPath / isExemptChangeset', () => {
 describe('countBackpressurePrs', () => {
   const aiCommit = { authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }], messageBody: '' };
   const humanCommit = { authors: [{ name: 'A Human', email: 'human@example.com' }], messageBody: '' };
-  const commitsPage = (c) => JSON.stringify([{ data: { repository: { pullRequest: { commits: { nodes: c.map((commit) => ({ commit: { ...commit, authors: { nodes: commit.authors } } })) } } } } }]);
 
   it('counts an AI-generated, not-yet-accepted PR', () => {
     const prs = [{ number: 1, commits: [aiCommit], labels: [] }];
@@ -271,12 +277,11 @@ describe('decideOpenPr — the five required behaviours', () => {
 });
 
 describe('fetchOpenPrs / fetchPrCommits / countOpenPrsForRepo — the IO shell', () => {
-  const aiCommit = { authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }], messageBody: '' };
-  const humanCommit = { authors: [{ name: 'A Human', email: 'human@example.com' }], messageBody: '' };
-  const commitsPage = (c) => JSON.stringify([{ data: { repository: { pullRequest: { commits: { nodes: c.map((commit) => ({ commit: { ...commit, authors: { nodes: commit.authors } } })) } } } } }]);
+  const aiCommit = { oid: 'c'.repeat(40), authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }], messageBody: '' };
+  const humanCommit = { ...aiCommit, authors: [{ name: 'A Human', email: 'human@example.com' }] };
 
-  it('fetchOpenPrs asks for number,labels,headRefName,headRefOid,baseRefName,isCrossRepository,files — deliberately NOT commits (the GraphQL node-limit footgun)', () => {
-    const exec = (args) => { expect(args).toEqual(expect.arrayContaining(['--json', 'number,labels,headRefName,headRefOid,baseRefName,isCrossRepository,files'])); expect(args).not.toContain('commits'); return '[]'; };
+  it('fetchOpenPrs asks for number,labels,headRefName,headRefOid,baseRefName,baseRefOid,isCrossRepository,files — deliberately NOT commits (the GraphQL node-limit footgun)', () => {
+    const exec = (args) => { expect(args).toEqual(expect.arrayContaining(['--json', 'number,labels,headRefName,headRefOid,baseRefName,baseRefOid,isCrossRepository,files'])); expect(args).not.toContain('commits'); return '[]'; };
     expect(fetchOpenPrs('o/n', { exec })).toEqual([]);
   });
 
@@ -286,24 +291,37 @@ describe('fetchOpenPrs / fetchPrCommits / countOpenPrsForRepo — the IO shell',
   });
 
   it('fetchPrCommits fetches ONE PR at a time via the metered GraphQL read', () => {
-    const exec = (args) => { expect(args.slice(0, 2)).toEqual(['api', 'graphql']); expect(args).toContain('number=42'); return commitsPage([aiCommit]); };
-    expect(fetchPrCommits('o/n', 42, { exec })).toEqual([aiCommit]);
+    const exec = vi.fn((args) => { expect(args.slice(0, 2)).toEqual(['api', 'graphql']); expect(args).toContain('number=42'); return commitsPage([aiCommit]); });
+    expect(fetchPrCommits('o/n', 42, { exec, ...apiPr(42) })).toEqual([aiCommit]);
+    expect(exec).toHaveBeenCalledOnce();
+    expect(exec.mock.calls[0][0]).toEqual(expect.arrayContaining(['--paginate', '--slurp']));
   });
 
   it('fetchPrCommits degrades to null (never []) on failure — unknown authorship is never assumed empty', () => {
-    expect(fetchPrCommits('o/n', 42, { exec: () => { throw new Error('boom'); } })).toBeNull();
-    expect(fetchPrCommits('o/n', 42, { exec: () => '{}' })).toBeNull();
+    for (const response of [() => { throw new Error('boom'); }, () => '{}']) {
+      const exec = vi.fn(response);
+      expect(fetchPrCommits('o/n', 42, { exec, ...apiPr(42) })).toBeNull();
+      expect(exec).toHaveBeenCalledOnce();
+    }
+  });
+
+  it('fetchPrCommits refuses an incomplete paged history after executing the read', () => {
+    const pages = JSON.parse(commitsPage([aiCommit]));
+    pages[0].data.repository.pullRequest.commits.totalCount = 2;
+    const exec = vi.fn(() => JSON.stringify(pages));
+    expect(fetchPrCommits('o/n', 42, { exec, ...apiPr(42) })).toBeNull();
+    expect(exec).toHaveBeenCalledOnce();
   });
 
   it('countOpenPrsForRepo: one list call + one commits call per not-yet-accepted PR, then applies the AI/label rubric', () => {
     const calls = [];
     const exec = (args) => {
       calls.push(args);
-      if (args[1] === 'list') return JSON.stringify([{ number: 1, labels: [] }, { number: 2, labels: [{ name: 'review:accepted' }] }, { number: 3, labels: [] }]);
+      if (args[1] === 'list') return JSON.stringify([{ ...apiPr(1), labels: [] }, { ...apiPr(2), labels: [{ name: 'review:accepted' }] }, { ...apiPr(3), labels: [] }]);
       if (args[0] === 'api' && args[1] === 'graphql') {
         const num = args.find((a) => a.startsWith('number='));
-        if (num === 'number=1') return commitsPage([aiCommit]);
-        if (num === 'number=3') return commitsPage([humanCommit]);
+        if (num === 'number=1') return commitsPage([aiCommit], apiPr(1));
+        if (num === 'number=3') return commitsPage([humanCommit], apiPr(3));
       }
       throw new Error(`unexpected call: ${JSON.stringify(args)}`);
     };
@@ -316,8 +334,8 @@ describe('fetchOpenPrs / fetchPrCommits / countOpenPrsForRepo — the IO shell',
 
   it('countOpenPrsForRepo reports PRs whose commits could not be read as unresolved — an undercount is never silent', () => {
     const exec = (args) => {
-      if (args[1] === 'list') return JSON.stringify([{ number: 1, labels: [] }, { number: 3, labels: [] }]);
-      if (args[0] === 'api' && args[1] === 'graphql' && args.includes('number=1')) return commitsPage([aiCommit]);
+      if (args[1] === 'list') return JSON.stringify([{ ...apiPr(1), labels: [] }, { ...apiPr(3), labels: [] }]);
+      if (args[0] === 'api' && args[1] === 'graphql' && args.includes('number=1')) return commitsPage([aiCommit], apiPr(1));
       throw new Error('commits unreadable');
     };
     expect(countOpenPrsForRepo('we', { exec, env: {} })).toMatchObject({ count: 1, prNumbers: [1], unavailable: false, unresolved: 1 });
@@ -330,14 +348,13 @@ describe('fetchOpenPrs / fetchPrCommits / countOpenPrsForRepo — the IO shell',
 });
 
 describe('card-only exclusion (operator ruling 2026-10-09 ~17:05 ET)', () => {
-  const aiCommit = { authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }], messageBody: '' };
-  const commitsPage = (c) => JSON.stringify([{ data: { repository: { pullRequest: { commits: { nodes: c.map((commit) => ({ commit: { ...commit, authors: { nodes: commit.authors } } })) } } } } }]);
-  const card = (n) => ({ number: n, labels: [], isCrossRepository: false, files: [{ path: `backlog/${n}-card.md` }] });
-  const code = (n) => ({ number: n, labels: [], isCrossRepository: false, files: [{ path: 'scripts/x.mjs' }, { path: 'backlog/x.md' }] });
+  const aiCommit = { oid: 'c'.repeat(40), authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }], messageBody: '' };
+  const card = (n) => ({ ...apiPr(n), labels: [], isCrossRepository: false, files: [{ path: `backlog/${n}-card.md` }] });
+  const code = (n) => ({ ...apiPr(n), labels: [], isCrossRepository: false, files: [{ path: 'scripts/x.mjs' }, { path: 'backlog/x.md' }] });
   const execFor = (rows, calls = []) => (args) => {
     calls.push(args);
     if (args[1] === 'list') return JSON.stringify(rows);
-    if (args[0] === 'api' && args[1] === 'graphql') return commitsPage([aiCommit]);
+    if (args[0] === 'api' && args[1] === 'graphql') return commitsPage([aiCommit], rows.find(p => args.includes(`number=${p.number}`)));
     throw new Error(`unexpected call: ${JSON.stringify(args)}`);
   };
 
@@ -365,16 +382,16 @@ describe('card-only exclusion (operator ruling 2026-10-09 ~17:05 ET)', () => {
     const awaiting = (n, base) => ({ ...code(n), baseRefName: base, labels: [{ name: 'review-status:awaiting-base' }] });
     const baseRow = { ...code(9), headRefName: 'lane/settings-cascade-audit' };
     const rows = [awaiting(6, 'lane/settings-cascade-audit'), { ...code(7), baseRefName: 'lane/x' }, awaiting(8, 'main'), code(3), baseRow];
-    const r = countOpenPrsForRepo('we', { exec: execFor(rows), env: {}, scope: { excludeCardOnly: true, excludeStackedAwaitingBase: true } });
+    const r = countOpenPrsForRepo('we', { git: noGit, exec: execFor(rows), env: {}, scope: { excludeCardOnly: true, excludeStackedAwaitingBase: true } });
     expect(r).toMatchObject({ count: 4, stacked: 1, stackedPrNumbers: [6] });
-    const off = countOpenPrsForRepo('we', { exec: execFor(rows), env: {}, scope: { excludeCardOnly: true, excludeStackedAwaitingBase: false } });
+    const off = countOpenPrsForRepo('we', { git: noGit, exec: execFor(rows), env: {}, scope: { excludeCardOnly: true, excludeStackedAwaitingBase: false } });
     expect(off).toMatchObject({ count: 5, stacked: 0 });
   });
 
   it('a labelled draft whose base is NOT the head of another open PR still counts (the label and a scratch base are not enough)', () => {
     const awaiting = (n, base) => ({ ...code(n), baseRefName: base, labels: [{ name: 'review-status:awaiting-base' }] });
     const rows = [awaiting(6, 'scratch/not-a-pr'), awaiting(7, 'lane/real-base'), { ...code(9), headRefName: 'lane/real-base' }];
-    const r = countOpenPrsForRepo('we', { exec: execFor(rows), env: {}, scope: { excludeCardOnly: true, excludeStackedAwaitingBase: true } });
+    const r = countOpenPrsForRepo('we', { git: noGit, exec: execFor(rows), env: {}, scope: { excludeCardOnly: true, excludeStackedAwaitingBase: true } });
     expect(r).toMatchObject({ count: 2, stacked: 1, stackedPrNumbers: [7] });
     expect(isStackedAwaitingBasePr(awaiting(6, 'scratch/not-a-pr'), new Set(['lane/real-base']))).toBe(false);
     expect(isStackedAwaitingBasePr(awaiting(7, 'lane/real-base'), new Set(['lane/real-base']))).toBe(true);
@@ -385,7 +402,7 @@ describe('card-only exclusion (operator ruling 2026-10-09 ~17:05 ET)', () => {
   it('a labelled draft whose base PR is itself excluded (card-only / accepted) or part of a cycle still counts; a chain that ends at a counted PR does not', () => {
     const awaiting = (n, base, head) => ({ ...code(n), headRefName: head ?? `lane/d${n}`, baseRefName: base, labels: [{ name: 'review-status:awaiting-base' }] });
     const scope = { excludeCardOnly: true, excludeStackedAwaitingBase: true };
-    const count = (rows) => countOpenPrsForRepo('we', { exec: execFor(rows), env: {}, scope });
+    const count = (rows) => countOpenPrsForRepo('we', { git: noGit, exec: execFor(rows), env: {}, scope });
     const cardBase = { number: 50, labels: [], headRefName: 'lane/card-base', headRefOid: 'o50', baseRefName: 'main', isCrossRepository: false, files: [{ path: 'backlog/x.md' }] };
     // a card-only base shields nobody: both drafts hang off an uncounted PR and are counted
     expect(count([cardBase, awaiting(6, 'lane/card-base'), awaiting(7, 'lane/card-base')])).toMatchObject({ count: 2, stacked: 0, cardOnly: 1 });
@@ -409,28 +426,28 @@ describe('card-only exclusion (operator ruling 2026-10-09 ~17:05 ET)', () => {
     const humanBase = { ...code(9), headRefName: 'lane/base', headRefOid: 'o9', baseRefName: 'main' };
     const child = { ...code(6), headRefName: 'lane/child', headRefOid: 'o6', baseRefName: 'lane/base', labels: [{ name: 'review-status:awaiting-base' }] };
     const calls = [];
-    const r = countOpenPrsForRepo('we', { exec: execFor([humanBase, child], calls), env: {}, scope, authorshipCache });
+    const r = countOpenPrsForRepo('we', { git: noGit, exec: execFor([humanBase, child], calls), env: {}, scope, authorshipCache });
     expect(r).toMatchObject({ count: 1, prNumbers: [6], stacked: 0, stackedPrNumbers: [], unresolved: 0 });
     expect(calls.filter((a) => a[0] === 'api')).toHaveLength(0); // both verdicts came from the cache
     // a chain d8 → d6 → human root: neither draft is shielded
     const grandchild = { ...code(8), headRefName: 'lane/gc', headRefOid: 'o8', baseRefName: 'lane/child', labels: [{ name: 'review-status:awaiting-base' }] };
     verdicts['web-everything/web-everything#8@o8'] = true;
-    expect(countOpenPrsForRepo('we', { exec: execFor([humanBase, child, grandchild]), env: {}, scope, authorshipCache })).toMatchObject({ count: 2, stacked: 0 });
+    expect(countOpenPrsForRepo('we', { git: noGit, exec: execFor([humanBase, child, grandchild]), env: {}, scope, authorshipCache })).toMatchObject({ count: 2, stacked: 0 });
     // positive control: an agent-authored base still shields its child, and the child costs no lookup
     verdicts['web-everything/web-everything#9@o9'] = true;
-    expect(countOpenPrsForRepo('we', { exec: execFor([humanBase, child]), env: {}, scope, authorshipCache })).toMatchObject({ count: 1, prNumbers: [9], stacked: 1, stackedPrNumbers: [6] });
+    expect(countOpenPrsForRepo('we', { git: noGit, exec: execFor([humanBase, child]), env: {}, scope, authorshipCache })).toMatchObject({ count: 1, prNumbers: [9], stacked: 1, stackedPrNumbers: [6] });
   });
 
   it('a base whose authorship is unresolved (budget spent / read failed) shields nobody, and is looked up only once', () => {
     const scope = { excludeCardOnly: true, excludeStackedAwaitingBase: true };
-    const base = { ...code(9), headRefName: 'lane/base', headRefOid: 'o9', baseRefName: 'main' };
-    const child = { ...code(6), headRefName: 'lane/child', headRefOid: 'o6', baseRefName: 'lane/base', labels: [{ name: 'review-status:awaiting-base' }] };
+    const base = { ...code(9), headRefName: 'lane/base', baseRefName: 'main' };
+    const child = { ...code(6), headRefName: 'lane/child', baseRefName: 'lane/base', labels: [{ name: 'review-status:awaiting-base' }] };
     const calls = [];
     const exec = (args) => {
       calls.push(args);
       if (args[1] === 'list') return JSON.stringify([base, child]);
       if (args[0] === 'api' && args.includes('number=9')) throw new Error('gh: rate limited');
-      if (args[0] === 'api') return commitsPage([aiCommit]);
+      if (args[0] === 'api') return commitsPage([aiCommit], child);
       throw new Error(`unexpected call: ${JSON.stringify(args)}`);
     };
     // the base row names `main` + an oid, so the real git transport would run (and fetch, in a checkout whose origin is the repo)
@@ -445,13 +462,13 @@ describe('card-only exclusion (operator ruling 2026-10-09 ~17:05 ET)', () => {
     const scope = { excludeCardOnly: true, excludeStackedAwaitingBase: true };
     const fork = { ...code(9), headRefName: 'release', baseRefName: 'main', isCrossRepository: true };
     const draft = { ...code(6), headRefName: 'lane/d6', baseRefName: 'release', labels: [{ name: 'review-status:awaiting-base' }] };
-    expect(countOpenPrsForRepo('we', { exec: execFor([fork, draft]), env: {}, scope })).toMatchObject({ count: 2, stacked: 0 });
+    expect(countOpenPrsForRepo('we', { git: noGit, exec: execFor([fork, draft]), env: {}, scope })).toMatchObject({ count: 2, stacked: 0 });
     // fail-closed: a row that does not say where its head lives is never a base either
     const { isCrossRepository: _omit, ...unknown } = fork;
-    expect(countOpenPrsForRepo('we', { exec: execFor([unknown, draft]), env: {}, scope })).toMatchObject({ count: 2, stacked: 0 });
+    expect(countOpenPrsForRepo('we', { git: noGit, exec: execFor([unknown, draft]), env: {}, scope })).toMatchObject({ count: 2, stacked: 0 });
     // the same base name owned by an upstream PR does stack (a fork CHILD is fine — only the base must be upstream)
     const upstream = { ...fork, number: 10, isCrossRepository: false };
-    expect(countOpenPrsForRepo('we', { exec: execFor([fork, upstream, { ...draft, isCrossRepository: true }]), env: {}, scope })).toMatchObject({ count: 2, stacked: 1, stackedPrNumbers: [6] });
+    expect(countOpenPrsForRepo('we', { git: noGit, exec: execFor([fork, upstream, { ...draft, isCrossRepository: true }]), env: {}, scope })).toMatchObject({ count: 2, stacked: 1, stackedPrNumbers: [6] });
   });
 
   it('an unavailable count still reports the resolved excludeCardOnly (so pr-land does not fall back to the default)', () => {
@@ -477,18 +494,18 @@ describe('card-only exclusion (operator ruling 2026-10-09 ~17:05 ET)', () => {
   it('countOpenPrsForRepo excludes card-only PRs, never spends a commits read on them, and reports the split', () => {
     const calls = [];
     const rows = [card(1), card(2), code(3), { ...code(4), labels: [{ name: 'review:accepted' }] }];
-    const r = countOpenPrsForRepo('we', { exec: execFor(rows, calls), env: {} });
+    const r = countOpenPrsForRepo('we', { git: noGit, exec: execFor(rows, calls), env: {} });
     expect(r).toMatchObject({ count: 1, prNumbers: [3], cardOnly: 2, cardOnlyPrNumbers: [1, 2], accepted: 1, acceptedPrNumbers: [4] });
     expect(calls.filter((a) => a[0] === 'api')).toHaveLength(1);
   });
 
   it('a PR with no file list is never card-only (fail-closed: it counts)', () => {
-    const r = countOpenPrsForRepo('we', { exec: execFor([{ number: 5, labels: [] }]), env: {} });
+    const r = countOpenPrsForRepo('we', { git: noGit, exec: execFor([{ ...apiPr(5), labels: [] }]), env: {} });
     expect(r).toMatchObject({ count: 1, cardOnly: 0 });
   });
 
   it('the setting OFF counts card-only PRs again', () => {
-    const r = countOpenPrsForRepo('we', { exec: execFor([card(1), code(3)]), env: {}, scope: { excludeCardOnly: false } });
+    const r = countOpenPrsForRepo('we', { git: noGit, exec: execFor([card(1), code(3)]), env: {}, scope: { excludeCardOnly: false } });
     expect(r).toMatchObject({ count: 2, cardOnly: 0, excludeCardOnly: false });
     // wiring: pr-land feeds this resolved value into decideOpenPr, so the open exemption follows the same toggle
     expect(decideOpenPr({ repoKey: 'we', limit: 2, openCount: r.count, excludeCardOnly: r.excludeCardOnly, changedFiles: ['backlog/x.md'] }).allowed).toBe(false);
@@ -577,10 +594,9 @@ describe('branch allow-list matching', () => {
 });
 
 describe('bounded networked count (dispatch round) — the GitHub-call budget the fallback may spend', () => {
-  const aiCommit = { authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }], messageBody: '' };
-  const commitsPage = (c) => JSON.stringify([{ data: { repository: { pullRequest: { commits: { nodes: c.map((commit) => ({ commit: { ...commit, authors: { nodes: commit.authors } } })) } } } } }]);
+  const aiCommit = { oid: 'c'.repeat(40), authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }], messageBody: '' };
   // Stacked PRs (base is not `main`) are never resolvable from local git, so each needs a GraphQL read the first time.
-  const rows = (n) => Array.from({ length: n }, (_, i) => ({ number: i + 1, labels: [], headRefName: `lane/p${i + 1}`, headRefOid: `oid${i + 1}`, baseRefName: 'lane/base' }));
+  const rows = (n) => Array.from({ length: n }, (_, i) => ({ ...apiPr(i + 1), labels: [], headRefName: `lane/p${i + 1}`, baseRefName: 'lane/base' }));
   const harness = (open, failing = new Set()) => {
     const calls = [];
     const exec = (args) => {
@@ -589,7 +605,7 @@ describe('bounded networked count (dispatch round) — the GitHub-call budget th
       if (args[0] === 'api' && args[1] === 'graphql') {
         const number = Number(args.find((a) => a.startsWith('number=')).slice(7));
         if (failing.has(number)) throw new Error('commits unreadable');
-        return commitsPage([aiCommit]);
+        return commitsPage([aiCommit], open.find(p => p.number === number));
       }
       throw new Error(`unexpected call: ${JSON.stringify(args)}`);
     };
@@ -616,7 +632,7 @@ describe('bounded networked count (dispatch round) — the GitHub-call budget th
     expect(spent).toEqual([3, 3, 1, 0]);
     for (const number of [1, 2, 3]) {
       expect(h.calls.filter((args) => args.includes(`number=${number}`))).toHaveLength(1);
-      expect(createAuthorshipCache({ path }).get(`web-everything/web-everything#${number}@oid${number}`)).toEqual({ failedAt: now });
+      expect(createAuthorshipCache({ path }).get(`web-everything/web-everything#${number}@${headOid(number)}`)).toEqual({ failedAt: now });
     }
   });
 
@@ -630,7 +646,7 @@ describe('bounded networked count (dispatch round) — the GitHub-call budget th
       const r = countOpenPrsForDispatch('we', { ...h, authorshipCache, now: now + offset });
       expect(h.graphql()).toBe(expected);
       expect(r).toMatchObject({ count: 0, unresolved: 1, apiFetches: expected });
-      expect(authorshipCache.get('web-everything/web-everything#1@oid1')).toEqual({ failedAt: now + (expected ? offset : 0) });
+      expect(authorshipCache.get(`web-everything/web-everything#1@${headOid(1)}`)).toEqual({ failedAt: now + (expected ? offset : 0) });
     }
   });
 
@@ -639,7 +655,7 @@ describe('bounded networked count (dispatch round) — the GitHub-call budget th
     const authorshipCache = tmpCache();
     const o = { ...h, authorshipCache, now: 1_000_000 };
     expect(countOpenPrsForRepo('we', { ...o, maxApiFetches: 2 })).toMatchObject({ count: 2, unresolved: 4 });
-    for (const number of [3, 4, 5, 6]) expect(authorshipCache.get(`web-everything/web-everything#${number}@oid${number}`)).toBeUndefined();
+    for (const number of [3, 4, 5, 6]) expect(authorshipCache.get(`web-everything/web-everything#${number}@${headOid(number)}`)).toBeUndefined();
     h.calls.length = 0;
     expect(countOpenPrsForRepo('we', { ...o, maxApiFetches: Infinity })).toMatchObject({ count: 6, unresolved: 0 });
     expect(h.graphql()).toBe(4);
@@ -650,12 +666,12 @@ describe('bounded networked count (dispatch round) — the GitHub-call budget th
     const h = harness(open, new Set([1]));
     const authorshipCache = tmpCache();
     countOpenPrsForDispatch('we', { ...h, authorshipCache, now: 1_000_000 });
-    open[0].headRefOid = 'moved';
+    open[0].headRefOid = 'f'.repeat(40);
     h.calls.length = 0;
     countOpenPrsForDispatch('we', { ...h, authorshipCache, now: 1_001_000 });
     expect(h.graphql()).toBe(1);
-    expect(authorshipCache.get('web-everything/web-everything#1@oid1')).toBeUndefined();
-    expect(authorshipCache.get('web-everything/web-everything#1@moved')).toEqual({ failedAt: 1_001_000 });
+    expect(authorshipCache.get(`web-everything/web-everything#1@${headOid(1)}`)).toBeUndefined();
+    expect(authorshipCache.get(`web-everything/web-everything#1@${'f'.repeat(40)}`)).toEqual({ failedAt: 1_001_000 });
   });
 
   it('local git can resolve a PR during its failure cooldown', () => {
@@ -668,20 +684,20 @@ describe('bounded networked count (dispatch round) — the GitHub-call budget th
     const git = (_command, args) => {
       if (args[0] === 'remote') return 'https://github.com/web-everything/web-everything.git';
       if (args[0] === 'check-ref-format') return '';
-      if (args[0] === 'rev-parse') return args[1] === '--is-shallow-repository' ? 'false' : 'oid1';
-      if (args[0] === 'log') return ['oid1', 'Claude', 'noreply@anthropic.com', 'Implement feature', '', ''].join('\0');
+      if (args[0] === 'rev-parse') return args[1] === '--is-shallow-repository' ? 'false' : headOid(1);
+      if (args[0] === 'log') return [headOid(1), 'Claude', 'noreply@anthropic.com', 'Implement feature', '', ''].join('\0');
       throw new Error(`unexpected git call: ${args}`);
     };
     expect(countOpenPrsForDispatch('we', { ...h, git, authorshipCache, now: 1_001_000 })).toMatchObject({ count: 1, unresolved: 0, apiFetches: 0, fallback: false });
     expect(h.graphql()).toBe(0);
-    expect(authorshipCache.get('web-everything/web-everything#1@oid1')).toBe(true);
+    expect(authorshipCache.get(`web-everything/web-everything#1@${headOid(1)}`)).toBe(true);
   });
 
   it('local-only unresolved PRs are not negative-cached', () => {
     const h = harness(rows(1));
     const authorshipCache = tmpCache();
     expect(countOpenPrsForRepo('we', { ...h, authorshipCache, localOnly: true, now: 1_000_000 })).toMatchObject({ unresolved: 1, apiFetches: 0 });
-    expect(authorshipCache.get('web-everything/web-everything#1@oid1')).toBeUndefined();
+    expect(authorshipCache.get(`web-everything/web-everything#1@${headOid(1)}`)).toBeUndefined();
     expect(h.graphql()).toBe(0);
     expect(countOpenPrsForRepo('we', { ...h, authorshipCache, now: 1_001_000 })).toMatchObject({ count: 1, unresolved: 0, apiFetches: 1 });
   });
@@ -709,7 +725,7 @@ describe('bounded networked count (dispatch round) — the GitHub-call budget th
     const h = harness(open);
     const cache = tmpCache();
     countOpenPrsForRepo('we', { exec: h.exec, readShared: h.readShared, env: {}, authorshipCache: cache });
-    open[0] = { ...open[0], headRefOid: 'moved' };
+    open[0] = { ...open[0], headRefOid: 'f'.repeat(40) };
     h.calls.length = 0;
     countOpenPrsForRepo('we', { exec: h.exec, readShared: h.readShared, env: {}, authorshipCache: cache });
     expect(h.graphql()).toBe(1);
@@ -1209,12 +1225,11 @@ describe('non-implementing retry branch grants', () => {
 });
 
 describe('excludeFocus — operator R384: focus PRs are exempt from the cap (explicit ref list or `focus` label, never the title)', () => {
-  const row = (n, extra = {}) => ({ number: n, labels: [], isCrossRepository: false, headRefName: `lane/p${n}`, files: [{ path: 'scripts/x.mjs' }], ...extra });
-  const commitsPage = (commits) => JSON.stringify({ data: { repository: { pullRequest: { commits: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: commits.map((commit) => ({ commit })) } } } } });
-  const aiCommit = { messageHeadline: 'Implement feature', messageBody: 'Co-Authored-By: Claude <noreply@anthropic.com>', authors: { nodes: [] } };
+  const row = (n, extra = {}) => ({ ...apiPr(n), labels: [], isCrossRepository: false, headRefName: `lane/p${n}`, files: [{ path: 'scripts/x.mjs' }], ...extra });
+  const aiCommit = { oid: 'c'.repeat(40), messageHeadline: 'Implement feature', messageBody: 'Co-Authored-By: Claude <noreply@anthropic.com>', authors: { nodes: [] } };
   const execFor = (rows) => (args) => {
     if (args[1] === 'list') return JSON.stringify(rows);
-    if (args[0] === 'api' && args[1] === 'graphql') return commitsPage([aiCommit]);
+    if (args[0] === 'api' && args[1] === 'graphql') return commitsPage([aiCommit], rows.find(p => args.includes(`number=${p.number}`)));
     throw new Error(`unexpected call: ${JSON.stringify(args)}`);
   };
   const scope = (o = {}) => ({ excludeCardOnly: true, excludeStackedAwaitingBase: true, excludeFocus: true, focusRefs: [], ...o });
@@ -1233,25 +1248,25 @@ describe('excludeFocus — operator R384: focus PRs are exempt from the cap (exp
 
   it('a PR whose head ref is listed, or that carries the `focus` label, is not counted; the rest still are', () => {
     const rows = [row(1), row(2), row(3, { labels: [{ name: 'focus' }] }), row(4, { labels: [{ name: 'not-focus' }] })];
-    const r = countOpenPrsForRepo('we', { exec: execFor(rows), env: {}, scope: scope({ focusRefs: ['lane/p2'] }) });
+    const r = countOpenPrsForRepo('we', { git: noGit, exec: execFor(rows), env: {}, scope: scope({ focusRefs: ['lane/p2'] }) });
     expect(r).toMatchObject({ count: 2, prNumbers: [1, 4], focus: 2, focusPrNumbers: [2, 3] });
   });
 
   it('never infers focus from the title or a ref that merely contains a listed one', () => {
     const rows = [row(1, { title: 'focus: fix the thing' }), row(2, { headRefName: 'lane/p5-extra' })];
-    const r = countOpenPrsForRepo('we', { exec: execFor(rows), env: {}, scope: scope({ focusRefs: ['lane/p5'] }) });
+    const r = countOpenPrsForRepo('we', { git: noGit, exec: execFor(rows), env: {}, scope: scope({ focusRefs: ['lane/p5'] }) });
     expect(r).toMatchObject({ count: 2, focus: 0, focusPrNumbers: [] });
   });
 
   it('excludeFocus off counts them all again (the 25 cap holds for everything else)', () => {
     const rows = [row(1), row(3, { labels: [{ name: 'focus' }] })];
-    const r = countOpenPrsForRepo('we', { exec: execFor(rows), env: {}, scope: scope({ excludeFocus: false, focusRefs: ['lane/p1'] }) });
+    const r = countOpenPrsForRepo('we', { git: noGit, exec: execFor(rows), env: {}, scope: scope({ excludeFocus: false, focusRefs: ['lane/p1'] }) });
     expect(r).toMatchObject({ count: 2, focus: 0 });
   });
 
   it('a fork PR carrying a listed head ref name or label from outside is still counted only if upstream-listed: fork refs never match the list', () => {
     const rows = [row(1, { isCrossRepository: true, headRefName: 'lane/p9' })];
-    const r = countOpenPrsForRepo('we', { exec: execFor(rows), env: {}, scope: scope({ focusRefs: ['lane/p9'] }) });
+    const r = countOpenPrsForRepo('we', { git: noGit, exec: execFor(rows), env: {}, scope: scope({ focusRefs: ['lane/p9'] }) });
     expect(r).toMatchObject({ count: 1, focus: 0 });
   });
 
@@ -1268,7 +1283,7 @@ describe('excludeFocus — operator R384: focus PRs are exempt from the cap (exp
 
 
 describe('R384 focus regression guarantees', () => {
-  const row = (number, extra = {}) => ({ number, labels: [], isCrossRepository: false,
+  const row = (number, extra = {}) => ({ ...apiPr(number), labels: [], isCrossRepository: false,
     headRefName: `lane/r384-${number}`, baseRefName: 'main', files: [{ path: 'scripts/x.mjs' }], ...extra });
   const scope = (extra = {}) => ({ excludeCardOnly: true, excludeStackedAwaitingBase: true,
     excludeFocus: true, focusRefs: ['lane/r384-1'], ...extra });
@@ -1278,15 +1293,13 @@ describe('R384 focus regression guarantees', () => {
       if (args[1] === 'list') return JSON.stringify(rows);
       if (args[0] === 'api' && args[1] === 'graphql') {
         commitsReads.push(Number(args.find((arg) => arg.startsWith('number=')).slice(7)));
-        return JSON.stringify({ data: { repository: { pullRequest: { commits: {
-          pageInfo: { hasNextPage: false, endCursor: null },
-          nodes: [{ commit: { messageHeadline: 'Implement feature',
-            messageBody: 'Co-Authored-By: Claude <noreply@anthropic.com>', authors: { nodes: [] } } }],
-        } } } } });
+        return commitsPage([{ oid: 'c'.repeat(40), messageHeadline: 'Implement feature',
+          messageBody: 'Co-Authored-By: Claude <noreply@anthropic.com>', authors: { nodes: [] } }],
+        rows.find(p => args.includes(`number=${p.number}`)));
       }
       throw new Error(`unexpected call: ${JSON.stringify(args)}`);
     };
-    const result = countOpenPrsForRepo('we', { exec, env: {}, scope: scope(extra) });
+    const result = countOpenPrsForRepo('we', { git: noGit, exec, env: {}, scope: scope(extra) });
     return { result, commitsReads };
   };
 

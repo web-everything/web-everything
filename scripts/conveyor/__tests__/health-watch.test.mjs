@@ -9,6 +9,7 @@ import { mkdtempSync, rmSync, writeFileSync, appendFileSync, mkdirSync, readdirS
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { EventEmitter } from 'node:events';
+import { prCommitsPageFixture } from '../../__tests__/fixtures/open-pr-page-fixture.mjs';
 
 import {
   probeDaemonLogs, probeLeases, probeSelfSync, probeLanePools, tick, healthSectionLines, healthDir,
@@ -1421,6 +1422,21 @@ it('xe8y12n probe preserves fresh raw evidence independently of cached/normalise
   expect(rows[0]).toMatchObject({ labelsValid: false, reviewObservation: { state: 'OPEN', labels: [], commits, observedAt: 123 } });
   const failed = probePrs({ exec: (_bin, args) => { if (args[1] === 'view') throw new Error('unavailable'); return JSON.stringify([{ number: 3239, labels: [] }]); }, readCommits: () => commits });
   expect(failed[0].reviewObservation).toBeNull();
+});
+
+it('probePrs passes the fresh head and base identity to the paged authorship reader', () => {
+  const pr = { number: 3239, state: 'OPEN', labels: [], headRefOid: 'a'.repeat(40), baseRefOid: 'b'.repeat(40),
+    headRefName: 'lane/repair', baseRefName: 'lane/base',
+    commits: [{ oid: 'a'.repeat(40), messageHeadline: 'repair', authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }] };
+  const exec = vi.fn((_bin, args) => JSON.stringify(args[1] === 'list' ? [pr]
+    : args[1] === 'view' ? pr : prCommitsPageFixture([pr], args)));
+  const rows = probePrs({ exec, now: 123 });
+  expect(rows).toHaveLength(3);
+  for (const row of rows) expect(row.reviewObservation.commits).toEqual(pr.commits);
+  const views = exec.mock.calls.filter(([_bin, args]) => args[1] === 'view');
+  expect(views).toHaveLength(3);
+  expect(views.every(([_bin, args]) => args[args.indexOf('--json') + 1].split(',').includes('baseRefOid'))).toBe(true);
+  expect(exec.mock.calls.filter(([_bin, args]) => args.includes('--paginate') && args.includes('--slurp'))).toHaveLength(3);
 });
 
 it('xe8y12n probe re-observes only PRs whose cached labels could hide a missing review label', async () => {

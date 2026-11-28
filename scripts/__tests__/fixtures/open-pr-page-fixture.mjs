@@ -23,3 +23,22 @@ export function openPrPageFixture(prs, query) {
     pageInfo: { hasNextPage: end < prs.length, endCursor: end < prs.length ? String(end) : null }, nodes,
   } } } };
 }
+
+/** Complete, slurped commit-history pages; identities and commits come from the selected PR. */
+export function prCommitsPageFixture(prs, args) {
+  if (args[0] !== 'api' || args[1] !== 'graphql'
+    || !args.some(a => a.includes('pullRequest(number:') && a.includes('commits(first:100'))) return undefined;
+  const number = Number(args.find(a => a.startsWith('number='))?.slice(7));
+  const pr = prs.find(p => p.number === number);
+  if (!pr) throw new Error(`Unknown commit-history fixture PR #${number}`);
+  const commits = pr.commits;
+  return Array.from({ length: Math.max(1, Math.ceil(commits.length / 100)) }, (_, index) => {
+    const end = Math.min((index + 1) * 100, commits.length);
+    const hasNextPage = end < commits.length;
+    return { data: { repository: { pullRequest: { headRefOid: pr.headRefOid, baseRefOid: pr.baseRefOid,
+      commits: { totalCount: commits.length, pageInfo: { hasNextPage, endCursor: hasNextPage ? String(end) : null },
+        nodes: commits.slice(index * 100, end).map(commit => ({ commit: { ...commit,
+          authors: Array.isArray(commit.authors) ? { nodes: commit.authors } : commit.authors } })) },
+    } } } };
+  });
+}
