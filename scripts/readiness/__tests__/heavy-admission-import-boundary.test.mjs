@@ -33,9 +33,14 @@ function cliFixture(source) {
   const runner = `
     import { main, loadAdmissionPolicy, createRemoteExec } from ${JSON.stringify(admissionUrl.href)};
     import { easternTimestamp } from ${JSON.stringify(new URL('../forge-exec-run.mjs', import.meta.url).href)};
+    import { deepStrictEqual } from 'node:assert';
     const policy = loadAdmissionPolicy({ home: ${JSON.stringify(root)}, env: { ...process.env, WE_PLATFORM_PREFERENCES: '' } });
     await main(process.argv.slice(1), {
       home: ${JSON.stringify(root)},
+      targetExec: async ({ file, args }) => {
+        deepStrictEqual({ file, args }, { file: 'ssh', args: ['--', 'mesa-01', 'test -x /usr/local/libexec/forge-exec-run.mjs'] });
+        return { code: 0 };
+      },
       readTelemetry: async () => ({ sampledAtET: easternTimestamp(Date.now()),
         cores: 8, loadPerCore: 0.1, memFreePct: 90, activeRuns: 0, recent: [] }),
       remoteExec: createRemoteExec({

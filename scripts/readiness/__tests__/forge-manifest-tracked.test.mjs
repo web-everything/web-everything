@@ -221,7 +221,7 @@ it.each(['legacy','tracked','no key'])('explicit remote CLI still forces enabled
   await write('pure.test.mjs','// pure test\n'); commit();
   const remoteExec = vi.fn(async()=>({mode:'remote',code:0})), local = vi.fn(), output = vi.fn();
   const now = Date.now();
-  expect(await main({argv:['npx','vitest','run','pure.test.mjs'],cwd,home,env:{...env,WE_PLATFORM_PREFERENCES:undefined},lockRoot:join(root,'heavy'),remoteExec,local,log:output,
+  expect(await main({targetExec:async()=>({code:0}),argv:['npx','vitest','run','pure.test.mjs'],cwd,home,env:{...env,WE_PLATFORM_PREFERENCES:undefined},lockRoot:join(root,'heavy'),remoteExec,local,log:output,
     clock:()=>now,readTelemetry:async()=>({sampledAtET:easternTimestamp(now),cores:8,loadPerCore:0.1,memFreePct:96,activeRuns:0,recent:[]})})).toBe(0);
   expect(local).not.toHaveBeenCalled();
   expect(remoteExec).toHaveBeenCalledWith(expect.objectContaining({manifestMode:manifest,transport:manifest === 'tracked' ? 'rsync' : 'git-bundle'}));

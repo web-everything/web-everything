@@ -1838,7 +1838,7 @@ export async function main(options = {}) {
   const remoteExecutor=options.remoteExec ?? (async decisionOptions=>adaptLegacyRemoteResult(await runRemote({...options,...decisionOptions})));
   const result = await runWithRemoteDecision({
     argv:options.argv, cwd:options.cwd, env:options.env, policy,
-    timeoutMs:options.timeoutMs, log:options.log,
+    timeoutMs:options.timeoutMs, log:options.log, targetExec:options.targetExec,
     host:options.host, readTelemetry:options.readTelemetry, lockRoot:options.lockRoot, clock:options.clock,
     remoteExec:async decisionOptions=>{const value=await remoteExecutor({...decisionOptions,argv:remoteArgv});capturedTimings=value?.timings;return value;},
   });

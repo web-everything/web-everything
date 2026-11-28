@@ -178,6 +178,6 @@ export function peekRemoteBreaker({root,host,clock=Date.now}) {
   let state;
   try { state=readState(remoteHealthFile(root,host),()=>seedLegacyBackoff(root,host)); }
   catch(error) { if(!error.salvage)return {open:false};state=error.salvage; }
-  return clock()<state.backoffUntil && state.trigger!=='forge-unreachable'
+  return state.backoffUntil>0 && state.trigger!=='forge-unreachable' && clock()<state.backoffUntil
     ? {open:true,reason:`backoff-${state.trigger}`} : {open:false};
 }

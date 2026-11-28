@@ -62,7 +62,7 @@ describe('R501 remote success record', () => {
       WE_VERIFY_REMOTE_REPORT: join(root, 'report.jsonl') })) vi.stubEnv(k, v);
     const resources={cpuUsec:120,memoryPeakBytes:300,throttledUsec:12,nrThrottled:2,oomKills:0};
     const remoteExec = vi.fn(async () => ({ mode: 'remote', code: 0, receiptId: 'rcpt-1',...(measured?{resources:{...resources,slotCpus:5},runMs:25}: {}) }));
-    await expect(main(['run', `--repo=${root}`, '--', 'npm', 'run', 'test:unit', '--', 'plain.test.mjs'], { home: root, remoteExec, readTelemetry: healthy })).rejects.toBe(exited);
+    await expect(main(['run', `--repo=${root}`, '--', 'npm', 'run', 'test:unit', '--', 'plain.test.mjs'], { home: root, remoteExec, targetExec:async()=>({code:0}), readTelemetry: healthy })).rejects.toBe(exited);
     const file = join(pool, '.admission', 'heavy', 'remote-runs.jsonl');
     expect(JSON.parse(readFileSync(file, 'utf8').trim())).toEqual({ ts:expect.any(String),ms:expect.any(Number),receiptId:'rcpt-1',kind:expect.any(String) });
     const usage=join(pool,'.admission','heavy','remote-usage.jsonl');

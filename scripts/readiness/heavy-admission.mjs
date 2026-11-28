@@ -104,7 +104,7 @@
  * Settings: heavyAdmission.remote.clientPath selects an external remote-exec.mjs outside all lane pools.
  * Remove the setting to revert to the bundled client; no environment mapping.
  *
- * REMOTE ROUTING CONTRACT — remote stays disabled by default (heavyAdmission.remote.enabled=false).
+ * REMOTE ROUTING CONTRACT — remote is enabled by default (heavyAdmission.remote.enabled=true).
  * Only { mode: 'remote', code: <integer 0..254> } exits with that code. Local admission may follow only
  * { mode: 'not-started', terminated: true } or { mode: 'cancelled', terminated: true }. After a timeout,
  * confirmed cancellation or fresh finished telemetry permits local admission. R989 also accepts a late
@@ -252,7 +252,7 @@ export const ADMISSION_POLICY_STANDARD = Object.freeze({
   // main-fix-queue-priority — a red-main repair waiter (P0) is admitted to the next free slot ahead of all others.
   priority: Object.freeze({ mode: 'enforce', repairPatterns: DEFAULT_REPAIR_PATTERNS }),
   // transport (R593): 'rsync' (default, rollback value) | 'git-bundle' (ship a verified git bundle; needs a runner advertising gitBundle:1).
-  remote: Object.freeze({ hosts: DEFAULT_REMOTE_HOSTS, enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null, transport: 'rsync', manifest: 'legacy',
+  remote: Object.freeze({ hosts: DEFAULT_REMOTE_HOSTS, enabled: true, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null, transport: 'rsync', manifest: 'legacy',
     // R559: bundle mode needs the Forge mirror's public main fetched within this many minutes (else it falls back to rsync).
     bundle: Object.freeze({ mainMaxAgeMin: 10 }),
     maxConcurrent: 8, slotUnitsByKind: Object.freeze({ FULL: 'auto', soak: 'auto', standards: 'auto' }),
@@ -1317,7 +1317,7 @@ export async function runWithRemoteDecision({
   };
   let root = '/srv/forge-exec';
   const hosts = policy.settings.remote.hosts ?? DEFAULT_REMOTE_HOSTS;
-  const customTargets = !isDefaultRemoteHosts(hosts);
+  const defaultTargets = isDefaultRemoteHosts(hosts);
   const externalClient = policy.settings.remote.clientPath != null || remoteClientOverride != null;
   const remoteRoot = join(dirname(lockRoot), 'remote');
   const localFallback = (reason, detail = null) => {
@@ -1346,29 +1346,28 @@ export async function runWithRemoteDecision({
   let targetMissing = false;
   const skipped = [];
   let decision;
-  if (customTargets) {
-    decision = route(true);
-    if (decision.remote) {
-      const denied = confinement();
-      if (denied) {
-        onDecision?.(decision);
-        log(`heavy-admission: remote (${decision.reason})\n`);
-        return localFallback('confined-local', `${denied} ${oneLine(basename(remoteRoot))}`);
-      }
-      const {peekRemoteBreaker,checkRemoteHealth} = await import('./forge-remote-health.mjs');
-      const target = await pickRemoteTarget({hosts,exec:targetExec,cwd,sshOptions,onSkip:entry=>skipped.push(entry),
-        breaker:alias=>peekRemoteBreaker({root:remoteRoot,host:alias,clock}),
-        admit:({alias})=>checkRemoteHealth({root:remoteRoot,settings:policy.settings.remote,clock,readTelemetry,host:alias})});
-      targetMissing = !target;
-      if (target) {
-        host = target.alias; root = target.root;
-        log(`heavy-admission: remote.hosts=${JSON.stringify(hosts)} (${policy.sources['remote.hosts'] ?? 'standard'}); selected=${host} skipped=${JSON.stringify(target.skipped)}\n`);
-        decision = route(readCapability({root:remoteRoot,host,clock,unknownOk:!externalClient}));
-      } else decision = {remote:false,reason:'no-healthy-remote'};
+  // Check eligibility before target IO; read capability only after breaker and probe selection.
+  decision = route(true);
+  if (decision.remote) {
+    const denied = confinement();
+    if (denied) {
+      onDecision?.(decision);
+      log(`heavy-admission: remote (${decision.reason})\n`);
+      return localFallback('confined-local', `${denied} ${oneLine(basename(remoteRoot))}`);
     }
-  } else {
-    host ??= hosts[0].alias; root = hosts[0].root;
-    decision = route(readCapability({root:remoteRoot,host,clock,unknownOk:!externalClient}));
+    const targetHealth = await import('./forge-remote-health.mjs');
+    const targetHosts = defaultTargets ? [{...hosts[0],alias:host ?? hosts[0].alias}] : hosts;
+    const target = await pickRemoteTarget({hosts:targetHosts,exec:targetExec,cwd,sshOptions,onSkip:entry=>skipped.push(entry),
+      breaker:alias=>targetHealth.peekRemoteBreaker({root:remoteRoot,host:alias,clock}),
+      ...(!defaultTargets ? {
+        admit:({alias})=>targetHealth.checkRemoteHealth({root:remoteRoot,settings:policy.settings.remote,clock,readTelemetry,host:alias}),
+      } : {})});
+    targetMissing = !target;
+    if (target) {
+      host = target.alias; root = target.root;
+      if (!defaultTargets) log(`heavy-admission: remote.hosts=${JSON.stringify(hosts)} (${policy.sources['remote.hosts'] ?? 'standard'}); selected=${host} skipped=${JSON.stringify(target.skipped)}\n`);
+      decision = route(readCapability({root:remoteRoot,host,clock,unknownOk:!externalClient}));
+    } else decision = {remote:false,reason:'no-healthy-remote'};
   }
   onDecision?.(decision);
   log(`heavy-admission: ${decision.remote ? 'remote' : 'local'} (${decision.reason})\n`);
@@ -1379,7 +1378,7 @@ export async function runWithRemoteDecision({
   }
   if (targetMissing) {
     recordRemoteFallback({lockRoot,reason:'no-healthy-remote',detail:JSON.stringify(skipped),cwd,argv,env,clock});
-    log('location=local reason=no-healthy-remote\n');
+    log(`location=local reason=no-healthy-remote skipped=${JSON.stringify(skipped)}\n`);
   }
   if (!decision.remote) return { handled: false };
   // Caller confinement is local evidence, not a Forge health failure. Exercise writes before
@@ -1622,6 +1621,7 @@ export async function runWithRemoteDecision({
         if (recordMarkerRun(executionMarker, {owner, run, nonce:metadata?.nonce, slot:metadata?.slot})) executionRun = run;
       } }));
     };
+    log(`heavy-admission: location=remote host=${host}\n`);
     let remote = dispatch();
     let result = await Promise.race([remote, timeout, signalPromise]);
     // forge-busy-wait: an explicit, confirmed non-start (never 'unconfirmed') waits and retries Forge within a total
@@ -3285,7 +3285,7 @@ function parseFlags(argv) {
 }
 
 // @test-only-export-ok: exercise CLI routing through the real decision before slot acquisition.
-export async function main(argv, { remoteExec, readTelemetry, hostAdmission, home } = {}) {
+export async function main(argv, { remoteExec, readTelemetry, targetExec, hostAdmission, home } = {}) {
   // `run`'s command tail lives after a literal `--` and must never be parsed as this CLI's OWN flags (a
   // `--coverage` meant for the wrapped command would otherwise be read as a flag of THIS script).
   const dashDashIdx = argv.indexOf('--');
@@ -3501,7 +3501,7 @@ export async function main(argv, { remoteExec, readTelemetry, hostAdmission, hom
       const remoteStartedAt = Date.now();
       const result = await runWithRemoteDecision({
         argv: remoteArgv, policy, cwd: repo ?? process.cwd(),
-        env: process.env, remoteExec, readTelemetry, lockRoot, remoteClientOverride,
+        env: process.env, remoteExec, readTelemetry, targetExec, lockRoot, remoteClientOverride,
         onDecision: decision => { reportLocalExecution ||= decision.remote; remoteDecided = decision.remote; localDecisionReason = decision.reason; },
         timeoutMs: runCeilingMs > 0 ? runCeilingMs : classifyAdmissionCommandKind(command, process.env) === 'files' ? resolveFastRunTimeoutMs(process.env) : ceilingMs,
       });

@@ -274,7 +274,7 @@ describe('remote controls', () => {
   });
   function fixture(remote={}) {
     const root=scratch(),lockRoot=join(root,'heavy');
-    return {argv:command,policy:policy(remote),cwd:root,env:{},lockRoot,clock:()=>now,
+    return {host:'forge',targetExec:async()=>({code:0}),argv:command,policy:policy(remote),cwd:root,env:{},lockRoot,clock:()=>now,
       readTelemetry:vi.fn(async()=>sample()),remoteExec:vi.fn(async()=>({mode:'remote',code:0})),log:vi.fn()};
   }
   describe('forge-slots-stuck coroner signal through runWithRemoteDecision',()=>{
@@ -385,7 +385,7 @@ describe('remote controls', () => {
       import {spawn} from 'node:child_process';
       import {runWithRemoteDecision,resolveAdmissionPolicy} from ${JSON.stringify(admissionURL)};
       import {easternTimestamp} from ${JSON.stringify(runnerURL)};
-      await runWithRemoteDecision({
+      await runWithRemoteDecision({targetExec:async()=>({code:0}),
         argv:${JSON.stringify(command)},cwd:${JSON.stringify(f.cwd)},env:{},lockRoot:${JSON.stringify(f.lockRoot)},
         clock:()=>${now},log:()=>{},
         policy:resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always',maxConcurrent:1}}}),
