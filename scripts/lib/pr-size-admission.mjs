@@ -185,7 +185,8 @@ export function checkSiblingBase({ git, ref, sha, base = 'main', now = () => per
     const landed = commits(main, `^${fork}`);
     const patchId = patch => {
       if (!patch) return null;
-      const output = read(['patch-id', '--stable'], { input: patch }).trim();
+      // Whitespace can change strings or indentation: landed evidence must preserve it.
+      const output = read(['patch-id', '--verbatim'], { input: patch }).trim();
       if (!/^[a-f0-9]{40} [a-f0-9]{40}$/.test(output)) throw new Error('unreadable patch identity');
       return output.split(' ')[0];
     };

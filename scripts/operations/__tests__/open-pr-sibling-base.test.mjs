@@ -15,8 +15,8 @@ function fixture() {
   git(['init', '-q', '-b', 'main']);
   git(['config', 'user.email', 'fixture@example.test']);
   git(['config', 'user.name', 'Fixture']);
-  const commit = (file, message) => {
-    writeFileSync(join(cwd, file), `${message}\n`);
+  const commit = (file, message, content = message) => {
+    writeFileSync(join(cwd, file), `${content}\n`);
     git(['add', '--', file]);
     git(['commit', '-qm', message]);
   };
@@ -345,6 +345,39 @@ describe('open-pr sibling base: evidence bounds', () => {
 });
 
 describe('open-pr sibling base: landed-sibling evidence', () => {
+  describe.each(['squash', 'per-commit'])('whitespace-sensitive %s evidence', mode => {
+    it.each([
+      ['string space', 'export default "a b";', 'export default "ab";'],
+      ['string tab', 'export default "a\tb";', 'export default "ab";'],
+      ['template newline', 'export default `a\nb`;', 'export default `ab`;'],
+      ['carriage return', 'export default `a\rb`;', 'export default `ab`;'],
+      ['indentation', 'if ready:\n    run()', 'if ready:\nrun()'],
+      ['exact content', 'export default "a b";', 'export default "a b";'],
+    ])('%s must match without discarding whitespace', (_name, sibling, landed) => {
+      const f = fixture();
+      f.git(['checkout', '-qb', 'lane/message-sibling', 'main']);
+      f.commit('message.js', 'sibling message', sibling);
+      if (mode === 'per-commit') f.commit('extra', 'another sibling change');
+      f.git(['branch', '-f', 'lane/own', 'HEAD']);
+      f.git(['checkout', 'lane/own']);
+      f.commit('own', 'own change');
+      f.git(['checkout', 'main']);
+      f.commit('message.js', 'independent main message', landed);
+      if (mode === 'per-commit') f.commit('extra', 'another sibling change');
+      f.git(['update-ref', 'refs/remotes/origin/main', 'HEAD']);
+      f.git(['checkout', 'lane/own']);
+      const result = f.run();
+      if (sibling === landed) {
+        expect(result).toMatchObject({ outcome: 'opened' });
+      } else {
+        expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base' });
+        expect(result.detail).toContain('lane/message-sibling');
+        expect(f.calls).toHaveLength(1);
+        expect(f.calls[0]).toContain('--check');
+      }
+    });
+  });
+
   const landSquashed = f => {
     f.git(['checkout', 'main']);
     f.git(['merge', '--squash', 'lane/7357']);
