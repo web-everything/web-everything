@@ -17,6 +17,29 @@ import {
 import { decideDrainReviewGate } from '../../merge-ai-prs.mjs';
 import { assertMandatoryReferralsCleared } from '../../review-set-label.mjs';
 
+import { A as chainA, C as chainC, D as chainD, chain, trusted as chainTrusted } from './fixtures/accepted-never-started.mjs';
+
+describe('accepted never started numbering chain context', () => {
+  const restamp = () => chainTrusted(buildNumberingRestampBody({ fromSha: chainA, toSha: chainD, human: false,
+    headDiffText: 'diff --git a/x b/x\n+fixture', proofReason: 'fixture numbering proof', writer: 'fixture' }));
+  it('second-hop envelope does not block numbering carry', () => {
+    expect(planNumberingRestamp({ labels: ['review:pending'], headSha: chainD, comments: chain(), reviews: [] }))
+      .toMatchObject({ candidate: true, from: chainA, to: chainD, human: false });
+  });
+  it('valid restamp following a second-hop envelope is retained, not classified stranded', () => {
+    const comments = [...chain(), restamp()];
+    expect(strandedNumberingRecords(comments, [])).toEqual([]);
+    expect(planNumberingRestamp({ labels: ['review:pending'], headSha: chainD, comments, reviews: [] }))
+      .toMatchObject({ candidate: true, labelsOnly: true, from: chainA, to: chainD });
+  });
+  it('a stranded record over a human hold remains stranded with no label carry', () => {
+    const record = restamp(), comments = [...chain(), { body: 'Do not merge', author: { login: 'human' } }, record];
+    expect(strandedNumberingRecords(comments, [])).toEqual([record]);
+    expect(planNumberingRestamp({ labels: ['review:pending'], headSha: chainD, comments, reviews: [] }))
+      .toMatchObject({ candidate: false, hold: true, reason: 'later verdict or unknown comment stands', stranded: [record] });
+  });
+});
+
 // The writer supplies the referral guard (numbering-carry does not import the label writer: that would close an
 // import cycle through the drain). These tests supply the same real guard the sweep does, unless a test overrides it.
 const restampAfterNumbering = (o) => restampWithoutGuard({ guardReferrals: assertMandatoryReferralsCleared, ...o });

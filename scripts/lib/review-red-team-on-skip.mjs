@@ -578,7 +578,9 @@ export function planRedTeamOnSkip({ repo, refusals = [], rawPrs, readEvidence, r
       return { ...skip('red-team result already on head'), ...(pendingEscalation() ?? {}) };
     };
     const guardedSkip = why => ({ ...skip(why),
-      ...(why === 'conflicting label prevents policy-clear' ? { escalate: true } : {}) });
+      ...((why === 'conflicting label prevents policy-clear'
+        || (why === 'later verdict or hold supersedes acceptance'
+          && rawPr.labels?.some(label => (typeof label === 'string' ? label : label?.name) === 'review:accepted'))) ? { escalate: true } : {}) });
     const dispatchDecision = decision => {
       const last = lastDispatch.get(`${repo}#${pr}@${head}`);
       if (last != null && now - last < setting.retryCooldownMin * 60_000) return skip('retry cooldown active');

@@ -565,12 +565,18 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
     const held = new Set((plan?.refusals ?? []).filter(row => row.kind === 'already-reviewed-head'
       && (managed.has(Number(row.prNumber)) || isRealHead(row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid))
       && !allowed.has(Number(row.prNumber)) && !bypassed.has(Number(row.prNumber))).map(row => Number(row.prNumber)));
-    const causes = queue.holdCauses();
     for (const pr of held) {
-      const cause = causes.get(`${repo}#${pr}`) ?? 'capacity';
-      const detail = NON_RUNNABLE_REASONS.has(cause)
-        ? ` (${readableCapacity(capacity) ? 'waiting for a probe turn' : 'probes disabled'})` : '';
-      note(log, `hold ${repo}#${pr}: ${cause}${detail}; waiting for a later tick`);
+      const key = `${repo}#${pr}`;
+      const entry = queue.entries().find(entry => entry.key === key);
+      // A persisted block and unreadable current evidence are independent barriers.
+      // Report both: neither the recorded block nor the failed read should hide the other.
+      const causes = new Set([entry?.blocked, queue.holdCauses().get(key)].filter(Boolean));
+      if (!causes.size) causes.add(entry ? 'capacity' : 'not-queued');
+      for (const cause of causes) {
+        const detail = NON_RUNNABLE_REASONS.has(cause)
+          ? ` (${readableCapacity(capacity) ? 'waiting for a probe turn' : 'probes disabled'})` : '';
+        note(log, `hold ${repo}#${pr}: ${cause}${detail}; waiting for a later tick`);
+      }
     }
     // Bypassed card-only rows go last so queued code PRs claim the runner's capacity first.
     const kept = (plan?.refusals ?? []).filter(row => !held.has(Number(row.prNumber)));

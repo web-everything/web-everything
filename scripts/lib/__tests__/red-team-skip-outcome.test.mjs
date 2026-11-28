@@ -8,6 +8,7 @@ import { classifyRedTeamSkip, settleRedTeamSkip } from '../red-team-skip-outcome
 import { parseRedTeamComment, redTeamForHead, redTeamMarker } from '../red-team-gate.mjs';
 import { readRecoveryWitness as witness, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { planRedTeamStatusLabels } from '../red-team-status-labels.mjs';
+import { publishAttention, replay } from '../../operations/needs-you-feed.mjs';
 import { writeJsonAtomic } from '../atomic-json-file.mjs';
 
 vi.mock('../drain-red-team-evidence.mjs', async importOriginal => {
@@ -83,6 +84,26 @@ describe('classifyRedTeamSkip — structured policy only, fail closed', () => {
 });
 
 describe('settleRedTeamSkip', () => {
+  it('crash-after-publish-before-skip-receipt retries with exactly one feed event', async () => {
+    const f = fixture(), path = join(roots.at(-1), 'events.jsonl');
+    const actual = await vi.importActual('../atomic-json-file.mjs');
+    f.io.publishNeedsYou.mockImplementation(item => publishAttention(item, { path, now: '2026-11-27T12:00:00Z' }));
+    writeJsonAtomic.mockImplementation((file, data) => {
+      if (file.includes('skip-published')) throw Error('simulated receipt crash');
+      return actual.writeJsonAtomic(file, data);
+    });
+    try {
+      await f.settle({ status: 'error', reason: 'genuine hold' });
+      expect(f.markers()).toEqual([]);
+      expect(replay({ path })).toHaveLength(1);
+      writeJsonAtomic.mockImplementation(actual.writeJsonAtomic);
+      await f.settle({ status: 'error', reason: 'genuine hold' });
+      await f.settle({ status: 'error', reason: 'genuine hold' });
+      expect(replay({ path })).toHaveLength(1);
+      expect(f.markers()).toHaveLength(1);
+    } finally { writeJsonAtomic.mockImplementation(actual.writeJsonAtomic); }
+  });
+
   it('policy skip posts exactly one marker comment parseable by redTeamForHead, with the visible reason; a second call posts nothing', async () => {
     const f = fixture();
     expect(await f.settle()).toMatchObject({ outcome: 'policy-clear' });
