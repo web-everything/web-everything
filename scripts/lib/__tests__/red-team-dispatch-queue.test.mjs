@@ -2020,7 +2020,7 @@ describe('REDTEAM-STUCK-PENDING', () => {
     ['capacity', undefined, true, false, 'capacity'],
     ['planner-skip', 'planner-skip', true, false, 'planner-skip (waiting for a probe turn)'],
     ['review-unfinished', 'review-unfinished', false, false, 'review-unfinished (probes disabled)'],
-    ['evidence-unreadable', 'planner-skip', true, true, 'evidence-unreadable'],
+    ['evidence-unreadable', undefined, true, true, 'evidence-unreadable'],
   ])('hold cause table: %s', (cause, blocked, readable, unreadable, text) => {
     const f = fixture(); f.queue.sync(repo, candidates([8001, 8002]));
     if (blocked) {
@@ -2032,9 +2032,30 @@ describe('REDTEAM-STUCK-PENDING', () => {
     runWithRedTeamQueue({ queue: f.queue, ...inputs([8001, 8002]),
       capacity: readable ? capacity(1) : null, floor: { maxProbesPerTick: 0 },
       readLivePr: ({ pr }) => ({ state: 'OPEN', headRefOid: head(pr), comments: unreadable && pr === 8002 ? null : [] }),
+      readSkipCardOnly: () => false, readNetFiles: () => ({ ok: false }),
       run: () => ({}), log: f.log });
     expect(f.logs).toContain(`${prefix}hold ${repo}#8002: ${text}; waiting for a later tick`);
     expect(f.queue.holdCauses().get(`${repo}#8002`)).toBe(cause === 'capacity' ? undefined : cause);
+  });
+
+  it('retains a stored planner-skip hold when live verdict evidence is unreadable', () => {
+    const f = fixture();
+    f.queue.sync(repo, candidates([8002]));
+    f.queue.admit(repo, 1);
+    f.queue.settle(repo, { rows: [{ prNumber: 8002, action: 'skip', why: 'later verdict supersedes' }] });
+    const before = f.queue.entries();
+    runWithRedTeamQueue({ queue: f.queue, ...inputs([8002]),
+      capacity: capacity(1), floor: { maxProbesPerTick: 0 },
+      readLivePr: ({ pr }) => ({ state: 'OPEN', headRefOid: head(pr), comments: null }),
+      readSkipCardOnly: () => false, readNetFiles: () => ({ ok: false }),
+      run: options => {
+        expect(options.plan.refusals).toEqual([]);
+        expect(options.rawPrs).toEqual([]);
+        return {};
+      }, log: f.log });
+    expect(f.logs).toContain(`${prefix}hold ${repo}#8002: planner-skip (waiting for a probe turn); waiting for a later tick`);
+    expect(f.queue.holdCauses().get(`${repo}#8002`)).toBe('evidence-unreadable');
+    expect(f.queue.entries()).toEqual(before);
   });
 });
 
