@@ -26,7 +26,7 @@ export default {
       const record = { ...newRunRecord({ id, op: 'review-pr', input: { repo, pr } }),
         findings: { read: { netBasis: { rev: head } } }, pending: { kind: 'judge', step: 'judgeAdvisory', stepIndex: 0 } };
       writeFileSync(join(runs, `${id}.json`), JSON.stringify(record));
-      utimesSync(join(runs, `${id}.json`), new Date(now - 3600000), new Date(now - 3600000));
+      utimesSync(join(runs, `${id}.json`), new Date(now - 6 * 3600000), new Date(now - 6 * 3600000));
       const env = { HOME: root, WE_PLATFORM_PREFERENCES_FILE: join(root, 'prefs.json'),
         OPERATION_REVIEW_JOBS_DIR: jobs, WE_SHARED_RUNS_DIR: runs, WE_COORDINATION_ROOT: join(root, 'coordination') };
       const args = { repo, pr, head, env, runsDir: runs, now, host: 'fixture-host', namespace: 'fixture-namespace', isAlive: () => false, readPidStart: () => 'start', readScorecards: () => [] };

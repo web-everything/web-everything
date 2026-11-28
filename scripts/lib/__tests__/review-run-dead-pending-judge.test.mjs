@@ -29,7 +29,7 @@ beforeEach(() => {
   probes = { reviewJobs: () => [], pidIdentity: () => ({ alive: false }), leases: () => '[]', sessions: () => '[]' };
 });
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllEnvs(); fs.rmSync(root, { recursive: true, force: true }); });
-function record(extra = {}, id = 'review-pr-pr7603-dead', age = HOUR) {
+function record(extra = {}, id = 'review-pr-pr7603-dead', age = 6 * HOUR) {
   const r = { ...newRunRecord({ id, op: 'review-pr', input: { repo, pr } }),
     pending: { kind: 'judge', step: 'judgeAdvisory', stepIndex: 0 },
     findings: { read: { netBasis: { rev: head } } }, ...extra };
@@ -59,7 +59,7 @@ it('integrated-7603-fresh-dispatch', async () => {
     readReviewRuns: () => [], setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(), now });
   expect(rows[0].action).toBe('review');
 });
-it('reap-at-1h-boundary', async () => { const r = record(); expect((await sweep()).reaped).toEqual([r.id]); });
+it('reap-at-1h-boundary', async () => { const r = record({}, undefined, HOUR); expect((await sweep({ tool: { abandonAfterHours: 1 } })).reaped).toEqual([r.id]); });
 it('kept-young-at-59min', async () => { const r = record({}, undefined, 59 * 60000); expect((await sweep()).kept.young).toEqual([r.id]); });
 it.each(['resumeOf', 'resumedAt'])('writer-rejects-%s', async field => {
   const r = record({ [field]: 'previous' }); expect((await sweep()).kept['resumed-run']).toEqual([r.id]);
@@ -152,6 +152,32 @@ it.each(['queued','launching','running','retrying'])('%s-job-blocks-enqueue', as
   const r = enqueueJob({ store, codeSha: 'a'.repeat(40), kindDef: REVIEW_RUN_REAP_KIND, input: input(), now });
   const stub = { list: () => ({ records: [{ ...r, job: { ...r.job, status } }], corrupt: [] }), create: vi.fn() };
   expect(ensureReviewRunReapJob({ codeSha: 'a'.repeat(40), store: stub, now, input: input() }).enqueued).toBe(false); expect(stub.create).not.toHaveBeenCalled();
+});
+it('reaper fails visibly after three attempts, including persisted oversized retry caps', async () => {
+  const { ensureReviewRunReapJob, REVIEW_RUN_REAP_KIND, tickReviewRunReap } = await jobModule();
+  const store = jobStore();
+  const first = ensureReviewRunReapJob({ store, codeSha: 'a'.repeat(40), now, input: input() }).record;
+  expect(first.job.maxAttempts).toBe(3);
+  const launch = vi.fn(() => { throw Error('must not launch during backoff or after exhaustion'); });
+  const tick = () => tickReviewRunReap({ dir: store.dir, codeSha: 'a'.repeat(40), now, input: input(), env,
+    log: () => {}, observation: { now, slept: false, gapMs: 0 }, probe: () => 'dead', launch });
+  for (const attempts of [1, 2, 3, 40]) {
+    store.update(first.id, r => {
+      const launching = markLaunching(r, { at: new Date(now - HOUR).toISOString() });
+      return { ...launching, job: { ...launching.job, attempts, maxAttempts: attempts === 40 ? 1000 : 3, finishedAt: null } };
+    });
+    await tick();
+    const job = store.read(first.id).job;
+    expect(job.maxAttempts).toBe(3); expect(job.attempts).toBe(attempts);
+    if (attempts < 3) {
+      expect(job.status).toBe('queued'); expect(Date.parse(job.nextAttemptAt)).toBeGreaterThan(now);
+      expect(Number.isFinite(Date.parse(job.nextAttemptAt))).toBe(true);
+    } else {
+      expect(job.status).toBe('failed'); expect(job.nextAttemptAt).toBeNull();
+      expect(job.error).toContain(`${attempts}/3 attempts`);
+    }
+  }
+  expect(launch).not.toHaveBeenCalled();
 });
 it('no-record-enqueues', async () => {
   const { ensureReviewRunReapJob } = await jobModule();

@@ -11,7 +11,7 @@ import { reapDeadReviewRuns } from './reap-dead-review-runs.mjs';
 
 export const REVIEW_RUN_REAP_KIND = defineJobKind({ kind: 'review-run-reap',
   entry: 'scripts/lib/review-run-reap-job.mjs', codeMode: 'readonly-tree', serial: true,
-  nodeModules: true, maxAttempts: 1000 });
+  nodeModules: true });
 export const REAP_INTERVAL_MS = 15 * 60000;
 
 /** Caller holds the ensure lock across the fresh read and enqueue. Unknown cadence refuses. */
@@ -20,6 +20,17 @@ export function ensureReviewRunReapJob({ store, codeSha, input, now }) {
   const { records, corrupt } = store.list();
   if (corrupt.length) throw Error('review-run-reap: corrupt job records; repair job store');
   const jobs = records.filter(r => r.job.kind === REVIEW_RUN_REAP_KIND.kind);
+  // Old records persist the former oversized cap. Tighten it before reattachment can
+  // schedule exponential backoff; preserve attempts, ownership and terminal history.
+  for (const record of jobs) {
+    if (!TERMINAL_JOB_STATUSES.includes(record.job.status) && record.job.maxAttempts > REVIEW_RUN_REAP_KIND.maxAttempts) {
+      store.update(record.id, fresh => {
+        if (fresh.job.kind !== REVIEW_RUN_REAP_KIND.kind || TERMINAL_JOB_STATUSES.includes(fresh.job.status)
+          || fresh.job.maxAttempts <= REVIEW_RUN_REAP_KIND.maxAttempts) return null;
+        return { ...fresh, job: { ...fresh.job, maxAttempts: REVIEW_RUN_REAP_KIND.maxAttempts } };
+      });
+    }
+  }
   if (jobs.some(r => !TERMINAL_JOB_STATUSES.includes(r.job.status))) return { enqueued: false, reason: 'live-job' };
   const finishes = jobs.map(r => Date.parse(r.job.finishedAt));
   if (finishes.some(t => !Number.isFinite(t) || t > now)) throw Error('review-run-reap: unreadable terminal cadence; repair job record');

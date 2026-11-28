@@ -187,9 +187,24 @@ it.each([['2', 2, 'env'], ['0', 6, 'standard'], ['NaN', 6, 'standard'], ['Infini
   expect(r.thresholdMs).toBe(hours * HOUR); expect(r.thresholdSource).toBe(source);
   expect(log.mock.calls.flat().join('\n')).toContain(`abandonAfterHours=${hours} (${source})`);
 });
-it('uses the current tool policy when no tool override is supplied', async () => {
-  const result = await sweep({ tool: undefined });
+it('honors an explicit one-hour tool policy', async () => {
+  const result = await sweep({ tool: { abandonAfterHours: 1 } });
   expect(result.thresholdMs).toBe(HOUR); expect(result.thresholdSource).toBe('tool');
+});
+it('shipped policy preserves six-hour protection and longer platform preferences', async () => {
+  const r = record(undefined, {}, 2 * HOUR);
+  const before = readFileSync(runPath(r.id, dir));
+  let result = await sweep({ tool: undefined });
+  expect(result.thresholdMs).toBe(6 * HOUR); expect(result.thresholdSource).toBe('standard');
+  expect(result.kept.young).toEqual([r.id]); expect(result.reaped).toEqual([]);
+  writeFileSync(env.WE_PLATFORM_PREFERENCES_FILE, JSON.stringify({ reviewRunReaper: { abandonAfterHours: 9 } }));
+  utimesSync(runPath(r.id, dir), new Date(now - 8 * HOUR), new Date(now - 8 * HOUR));
+  result = await sweep({ tool: undefined });
+  expect(result.thresholdMs).toBe(9 * HOUR); expect(result.thresholdSource).toBe('platform');
+  expect(result.kept.young).toEqual([r.id]); expect(result.reaped).toEqual([]);
+  expect(readFileSync(runPath(r.id, dir))).toEqual(before);
+  expect(readdirSync(dir).some(f => f.endsWith('.abandoned.json'))).toBe(false);
+  expect(probes.reviewJobs).not.toHaveBeenCalled();
 });
 it('resolves platform and tool layers and records explicit threshold provenance', async () => {
   writeFileSync(env.WE_PLATFORM_PREFERENCES_FILE, JSON.stringify({ reviewRunReaper: { abandonAfterHours: 9 } }));

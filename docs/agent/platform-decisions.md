@@ -5878,7 +5878,10 @@ explicitly; it never mistakes the runtime's `OPERATION_RUNS_DIR` for the review 
 pass `--repo`, `--name` and `LANE_POOL_ROOT`, validating returned repo and root. Only that repository
 is swept; other repositories remain held. Missing authority holds every candidate as `missing-context`,
 including manual/session-reaper apply calls; unavailable probes/stores hold as `probe-unreadable`.
-The tool setting is 1 hour: standard 6 h < platform < tool < environment < explicit `thresholdMs`.
+The shipped tool settings leave the six-hour standard intact and allow longer platform preferences.
+Explicit overrides follow standard < platform < tool < environment < explicit `thresholdMs`.
+The job uses the standard three-attempt cap; existing nonterminal reaper jobs with a larger cap
+are tightened before reattachment, preserving attempts and ownership. Exhaustion fails visibly.
 Invalid cascade values are reported and ignored; unreadable preferences and invalid arguments throw.
 Red-team readers honor only version-bound tombstones by `reap-dead-review-runs`, using a single
 stat/payload/tombstone/stat snapshot. The complete `validateRunRecord` must pass; no verdict or refused
