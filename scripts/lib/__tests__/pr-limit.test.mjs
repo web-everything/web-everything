@@ -29,6 +29,17 @@ import { SNAPSHOT_FIELDS } from '../pr-snapshot.mjs';
 import * as settingsFiles from '../settings-files.mjs';
 import * as policyCascade from '../policy-cascade.mjs';
 
+// Network fixtures carry the same pinned identities and complete pages as the production reader.
+const fixtureIdentity = { headRefOid: 'a'.repeat(40), baseRefOid: 'b'.repeat(40) };
+const fixtureOid = n => n.toString(16).padStart(40, '0');
+// API fixtures must not fall through to the checkout's Git transport for main-based PRs.
+const noLocalHistory = () => { throw new Error('no local history in API fixture'); };
+const commitsPage = (commits, identity = fixtureIdentity) => JSON.stringify([{ data: { repository: {
+  pullRequest: { ...identity, commits: { totalCount: commits.length, pageInfo: { hasNextPage: false, endCursor: null },
+    nodes: commits.map((commit, i) => ({ commit: { oid: fixtureOid(i + 100), ...commit,
+      authors: { nodes: Array.isArray(commit.authors) ? commit.authors : commit.authors.nodes } } })) } },
+} } }]);
+
 describe('resolvePrLimit', () => {
   const layers = { platform: {}, tool: {} };
   const cap = (we) => ({ limits: { we } });
@@ -171,7 +182,6 @@ describe('isExemptPath / isExemptChangeset', () => {
 describe('countBackpressurePrs', () => {
   const aiCommit = { authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }], messageBody: '' };
   const humanCommit = { authors: [{ name: 'A Human', email: 'human@example.com' }], messageBody: '' };
-  const commitsPage = (c) => JSON.stringify([{ data: { repository: { pullRequest: { commits: { nodes: c.map((commit) => ({ commit: { ...commit, authors: { nodes: commit.authors } } })) } } } } }]);
 
   it('counts an AI-generated, not-yet-accepted PR', () => {
     const prs = [{ number: 1, commits: [aiCommit], labels: [] }];
@@ -271,12 +281,11 @@ describe('decideOpenPr — the five required behaviours', () => {
 });
 
 describe('fetchOpenPrs / fetchPrCommits / countOpenPrsForRepo — the IO shell', () => {
-  const aiCommit = { authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }], messageBody: '' };
-  const humanCommit = { authors: [{ name: 'A Human', email: 'human@example.com' }], messageBody: '' };
-  const commitsPage = (c) => JSON.stringify([{ data: { repository: { pullRequest: { commits: { nodes: c.map((commit) => ({ commit: { ...commit, authors: { nodes: commit.authors } } })) } } } } }]);
+  const aiCommit = { oid: fixtureOid(100), authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }], messageBody: '' };
+  const humanCommit = { oid: fixtureOid(100), authors: [{ name: 'A Human', email: 'human@example.com' }], messageBody: '' };
 
-  it('fetchOpenPrs asks for number,labels,headRefName,headRefOid,baseRefName,isCrossRepository,files — deliberately NOT commits (the GraphQL node-limit footgun)', () => {
-    const exec = (args) => { expect(args).toEqual(expect.arrayContaining(['--json', 'number,labels,headRefName,headRefOid,baseRefName,isCrossRepository,files'])); expect(args).not.toContain('commits'); return '[]'; };
+  it('fetchOpenPrs asks for number,labels,headRefName,headRefOid,baseRefName,baseRefOid,isCrossRepository,files — deliberately NOT commits (the GraphQL node-limit footgun)', () => {
+    const exec = (args) => { expect(args).toEqual(expect.arrayContaining(['--json', 'number,labels,headRefName,headRefOid,baseRefName,baseRefOid,isCrossRepository,files'])); expect(args).not.toContain('commits'); return '[]'; };
     expect(fetchOpenPrs('o/n', { exec })).toEqual([]);
   });
 
@@ -286,20 +295,24 @@ describe('fetchOpenPrs / fetchPrCommits / countOpenPrsForRepo — the IO shell',
   });
 
   it('fetchPrCommits fetches ONE PR at a time via the metered GraphQL read', () => {
-    const exec = (args) => { expect(args.slice(0, 2)).toEqual(['api', 'graphql']); expect(args).toContain('number=42'); return commitsPage([aiCommit]); };
-    expect(fetchPrCommits('o/n', 42, { exec })).toEqual([aiCommit]);
+    const exec = (args) => { expect(args.slice(0, 2)).toEqual(['api', 'graphql']); expect(args).toContain('number=42'); expect(args).toEqual(expect.arrayContaining(['--paginate', '--slurp'])); return commitsPage([aiCommit]); };
+    expect(fetchPrCommits('o/n', 42, { exec, ...fixtureIdentity, git: () => { throw new Error('no local history'); } })).toEqual([aiCommit]);
   });
 
   it('fetchPrCommits degrades to null (never []) on failure — unknown authorship is never assumed empty', () => {
-    expect(fetchPrCommits('o/n', 42, { exec: () => { throw new Error('boom'); } })).toBeNull();
-    expect(fetchPrCommits('o/n', 42, { exec: () => '{}' })).toBeNull();
+    const failedRead = vi.fn(() => { throw new Error('boom'); });
+    const malformedRead = vi.fn(() => '{}');
+    expect(fetchPrCommits('o/n', 42, { ...fixtureIdentity, exec: failedRead })).toBeNull();
+    expect(fetchPrCommits('o/n', 42, { ...fixtureIdentity, exec: malformedRead })).toBeNull();
+    expect(failedRead).toHaveBeenCalledOnce();
+    expect(malformedRead).toHaveBeenCalledOnce();
   });
 
   it('countOpenPrsForRepo: one list call + one commits call per not-yet-accepted PR, then applies the AI/label rubric', () => {
     const calls = [];
     const exec = (args) => {
       calls.push(args);
-      if (args[1] === 'list') return JSON.stringify([{ number: 1, labels: [] }, { number: 2, labels: [{ name: 'review:accepted' }] }, { number: 3, labels: [] }]);
+      if (args[1] === 'list') return JSON.stringify([{ ...fixtureIdentity, number: 1, labels: [] }, { ...fixtureIdentity, number: 2, labels: [{ name: 'review:accepted' }] }, { ...fixtureIdentity, number: 3, labels: [] }]);
       if (args[0] === 'api' && args[1] === 'graphql') {
         const num = args.find((a) => a.startsWith('number='));
         if (num === 'number=1') return commitsPage([aiCommit]);
@@ -316,7 +329,7 @@ describe('fetchOpenPrs / fetchPrCommits / countOpenPrsForRepo — the IO shell',
 
   it('countOpenPrsForRepo reports PRs whose commits could not be read as unresolved — an undercount is never silent', () => {
     const exec = (args) => {
-      if (args[1] === 'list') return JSON.stringify([{ number: 1, labels: [] }, { number: 3, labels: [] }]);
+      if (args[1] === 'list') return JSON.stringify([{ ...fixtureIdentity, number: 1, labels: [] }, { ...fixtureIdentity, number: 3, labels: [] }]);
       if (args[0] === 'api' && args[1] === 'graphql' && args.includes('number=1')) return commitsPage([aiCommit]);
       throw new Error('commits unreadable');
     };
@@ -330,13 +343,12 @@ describe('fetchOpenPrs / fetchPrCommits / countOpenPrsForRepo — the IO shell',
 });
 
 describe('card-only exclusion (operator ruling 2026-10-09 ~17:05 ET)', () => {
-  const aiCommit = { authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }], messageBody: '' };
-  const commitsPage = (c) => JSON.stringify([{ data: { repository: { pullRequest: { commits: { nodes: c.map((commit) => ({ commit: { ...commit, authors: { nodes: commit.authors } } })) } } } } }]);
-  const card = (n) => ({ number: n, labels: [], isCrossRepository: false, files: [{ path: `backlog/${n}-card.md` }] });
-  const code = (n) => ({ number: n, labels: [], isCrossRepository: false, files: [{ path: 'scripts/x.mjs' }, { path: 'backlog/x.md' }] });
+  const aiCommit = { oid: fixtureOid(100), authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }], messageBody: '' };
+  const card = (n) => ({ ...fixtureIdentity, number: n, labels: [], isCrossRepository: false, files: [{ path: `backlog/${n}-card.md` }] });
+  const code = (n) => ({ ...fixtureIdentity, number: n, labels: [], isCrossRepository: false, files: [{ path: 'scripts/x.mjs' }, { path: 'backlog/x.md' }] });
   const execFor = (rows, calls = []) => (args) => {
     calls.push(args);
-    if (args[1] === 'list') return JSON.stringify(rows);
+    if (args[1] === 'list') return JSON.stringify(rows.map(row => ({ ...fixtureIdentity, ...row })));
     if (args[0] === 'api' && args[1] === 'graphql') return commitsPage([aiCommit]);
     throw new Error(`unexpected call: ${JSON.stringify(args)}`);
   };
@@ -423,8 +435,8 @@ describe('card-only exclusion (operator ruling 2026-10-09 ~17:05 ET)', () => {
 
   it('a base whose authorship is unresolved (budget spent / read failed) shields nobody, and is looked up only once', () => {
     const scope = { excludeCardOnly: true, excludeStackedAwaitingBase: true };
-    const base = { ...code(9), headRefName: 'lane/base', headRefOid: 'o9', baseRefName: 'main' };
-    const child = { ...code(6), headRefName: 'lane/child', headRefOid: 'o6', baseRefName: 'lane/base', labels: [{ name: 'review-status:awaiting-base' }] };
+    const base = { ...code(9), headRefName: 'lane/base', baseRefName: 'main' };
+    const child = { ...code(6), headRefName: 'lane/child', baseRefName: 'lane/base', labels: [{ name: 'review-status:awaiting-base' }] };
     const calls = [];
     const exec = (args) => {
       calls.push(args);
@@ -445,13 +457,13 @@ describe('card-only exclusion (operator ruling 2026-10-09 ~17:05 ET)', () => {
     const scope = { excludeCardOnly: true, excludeStackedAwaitingBase: true };
     const fork = { ...code(9), headRefName: 'release', baseRefName: 'main', isCrossRepository: true };
     const draft = { ...code(6), headRefName: 'lane/d6', baseRefName: 'release', labels: [{ name: 'review-status:awaiting-base' }] };
-    expect(countOpenPrsForRepo('we', { exec: execFor([fork, draft]), env: {}, scope })).toMatchObject({ count: 2, stacked: 0 });
+    expect(countOpenPrsForRepo('we', { exec: execFor([fork, draft]), git: noLocalHistory, env: {}, scope })).toMatchObject({ count: 2, stacked: 0 });
     // fail-closed: a row that does not say where its head lives is never a base either
     const { isCrossRepository: _omit, ...unknown } = fork;
-    expect(countOpenPrsForRepo('we', { exec: execFor([unknown, draft]), env: {}, scope })).toMatchObject({ count: 2, stacked: 0 });
+    expect(countOpenPrsForRepo('we', { exec: execFor([unknown, draft]), git: noLocalHistory, env: {}, scope })).toMatchObject({ count: 2, stacked: 0 });
     // the same base name owned by an upstream PR does stack (a fork CHILD is fine — only the base must be upstream)
     const upstream = { ...fork, number: 10, isCrossRepository: false };
-    expect(countOpenPrsForRepo('we', { exec: execFor([fork, upstream, { ...draft, isCrossRepository: true }]), env: {}, scope })).toMatchObject({ count: 2, stacked: 1, stackedPrNumbers: [6] });
+    expect(countOpenPrsForRepo('we', { exec: execFor([fork, upstream, { ...draft, isCrossRepository: true }]), git: noLocalHistory, env: {}, scope })).toMatchObject({ count: 2, stacked: 1, stackedPrNumbers: [6] });
   });
 
   it('an unavailable count still reports the resolved excludeCardOnly (so pr-land does not fall back to the default)', () => {
@@ -577,10 +589,9 @@ describe('branch allow-list matching', () => {
 });
 
 describe('bounded networked count (dispatch round) — the GitHub-call budget the fallback may spend', () => {
-  const aiCommit = { authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }], messageBody: '' };
-  const commitsPage = (c) => JSON.stringify([{ data: { repository: { pullRequest: { commits: { nodes: c.map((commit) => ({ commit: { ...commit, authors: { nodes: commit.authors } } })) } } } } }]);
+  const aiCommit = { oid: fixtureOid(100), authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }], messageBody: '' };
   // Stacked PRs (base is not `main`) are never resolvable from local git, so each needs a GraphQL read the first time.
-  const rows = (n) => Array.from({ length: n }, (_, i) => ({ number: i + 1, labels: [], headRefName: `lane/p${i + 1}`, headRefOid: `oid${i + 1}`, baseRefName: 'lane/base' }));
+  const rows = (n) => Array.from({ length: n }, (_, i) => ({ number: i + 1, labels: [], headRefName: `lane/p${i + 1}`, headRefOid: fixtureOid(i + 1), baseRefName: 'lane/base', baseRefOid: fixtureIdentity.baseRefOid }));
   const harness = (open, failing = new Set()) => {
     const calls = [];
     const exec = (args) => {
@@ -589,7 +600,7 @@ describe('bounded networked count (dispatch round) — the GitHub-call budget th
       if (args[0] === 'api' && args[1] === 'graphql') {
         const number = Number(args.find((a) => a.startsWith('number=')).slice(7));
         if (failing.has(number)) throw new Error('commits unreadable');
-        return commitsPage([aiCommit]);
+        return commitsPage([aiCommit], open.find(pr => pr.number === number));
       }
       throw new Error(`unexpected call: ${JSON.stringify(args)}`);
     };
@@ -616,7 +627,7 @@ describe('bounded networked count (dispatch round) — the GitHub-call budget th
     expect(spent).toEqual([3, 3, 1, 0]);
     for (const number of [1, 2, 3]) {
       expect(h.calls.filter((args) => args.includes(`number=${number}`))).toHaveLength(1);
-      expect(createAuthorshipCache({ path }).get(`web-everything/web-everything#${number}@oid${number}`)).toEqual({ failedAt: now });
+      expect(createAuthorshipCache({ path }).get(`web-everything/web-everything#${number}@${fixtureOid(number)}`)).toEqual({ failedAt: now });
     }
   });
 
@@ -630,7 +641,7 @@ describe('bounded networked count (dispatch round) — the GitHub-call budget th
       const r = countOpenPrsForDispatch('we', { ...h, authorshipCache, now: now + offset });
       expect(h.graphql()).toBe(expected);
       expect(r).toMatchObject({ count: 0, unresolved: 1, apiFetches: expected });
-      expect(authorshipCache.get('web-everything/web-everything#1@oid1')).toEqual({ failedAt: now + (expected ? offset : 0) });
+      expect(authorshipCache.get(`web-everything/web-everything#1@${fixtureOid(1)}`)).toEqual({ failedAt: now + (expected ? offset : 0) });
     }
   });
 
@@ -639,7 +650,7 @@ describe('bounded networked count (dispatch round) — the GitHub-call budget th
     const authorshipCache = tmpCache();
     const o = { ...h, authorshipCache, now: 1_000_000 };
     expect(countOpenPrsForRepo('we', { ...o, maxApiFetches: 2 })).toMatchObject({ count: 2, unresolved: 4 });
-    for (const number of [3, 4, 5, 6]) expect(authorshipCache.get(`web-everything/web-everything#${number}@oid${number}`)).toBeUndefined();
+    for (const number of [3, 4, 5, 6]) expect(authorshipCache.get(`web-everything/web-everything#${number}@${fixtureOid(number)}`)).toBeUndefined();
     h.calls.length = 0;
     expect(countOpenPrsForRepo('we', { ...o, maxApiFetches: Infinity })).toMatchObject({ count: 6, unresolved: 0 });
     expect(h.graphql()).toBe(4);
@@ -650,12 +661,12 @@ describe('bounded networked count (dispatch round) — the GitHub-call budget th
     const h = harness(open, new Set([1]));
     const authorshipCache = tmpCache();
     countOpenPrsForDispatch('we', { ...h, authorshipCache, now: 1_000_000 });
-    open[0].headRefOid = 'moved';
+    open[0].headRefOid = 'd'.repeat(40);
     h.calls.length = 0;
     countOpenPrsForDispatch('we', { ...h, authorshipCache, now: 1_001_000 });
     expect(h.graphql()).toBe(1);
-    expect(authorshipCache.get('web-everything/web-everything#1@oid1')).toBeUndefined();
-    expect(authorshipCache.get('web-everything/web-everything#1@moved')).toEqual({ failedAt: 1_001_000 });
+    expect(authorshipCache.get(`web-everything/web-everything#1@${fixtureOid(1)}`)).toBeUndefined();
+    expect(authorshipCache.get(`web-everything/web-everything#1@${'d'.repeat(40)}`)).toEqual({ failedAt: 1_001_000 });
   });
 
   it('local git can resolve a PR during its failure cooldown', () => {
@@ -668,20 +679,20 @@ describe('bounded networked count (dispatch round) — the GitHub-call budget th
     const git = (_command, args) => {
       if (args[0] === 'remote') return 'https://github.com/web-everything/web-everything.git';
       if (args[0] === 'check-ref-format') return '';
-      if (args[0] === 'rev-parse') return args[1] === '--is-shallow-repository' ? 'false' : 'oid1';
-      if (args[0] === 'log') return ['oid1', 'Claude', 'noreply@anthropic.com', 'Implement feature', '', ''].join('\0');
+      if (args[0] === 'rev-parse') return args[1] === '--is-shallow-repository' ? 'false' : fixtureOid(1);
+      if (args[0] === 'log') return [fixtureOid(1), 'Claude', 'noreply@anthropic.com', 'Implement feature', '', ''].join('\0');
       throw new Error(`unexpected git call: ${args}`);
     };
     expect(countOpenPrsForDispatch('we', { ...h, git, authorshipCache, now: 1_001_000 })).toMatchObject({ count: 1, unresolved: 0, apiFetches: 0, fallback: false });
     expect(h.graphql()).toBe(0);
-    expect(authorshipCache.get('web-everything/web-everything#1@oid1')).toBe(true);
+    expect(authorshipCache.get(`web-everything/web-everything#1@${fixtureOid(1)}`)).toBe(true);
   });
 
   it('local-only unresolved PRs are not negative-cached', () => {
     const h = harness(rows(1));
     const authorshipCache = tmpCache();
     expect(countOpenPrsForRepo('we', { ...h, authorshipCache, localOnly: true, now: 1_000_000 })).toMatchObject({ unresolved: 1, apiFetches: 0 });
-    expect(authorshipCache.get('web-everything/web-everything#1@oid1')).toBeUndefined();
+    expect(authorshipCache.get(`web-everything/web-everything#1@${fixtureOid(1)}`)).toBeUndefined();
     expect(h.graphql()).toBe(0);
     expect(countOpenPrsForRepo('we', { ...h, authorshipCache, now: 1_001_000 })).toMatchObject({ count: 1, unresolved: 0, apiFetches: 1 });
   });
@@ -709,7 +720,7 @@ describe('bounded networked count (dispatch round) — the GitHub-call budget th
     const h = harness(open);
     const cache = tmpCache();
     countOpenPrsForRepo('we', { exec: h.exec, readShared: h.readShared, env: {}, authorshipCache: cache });
-    open[0] = { ...open[0], headRefOid: 'moved' };
+    open[0] = { ...open[0], headRefOid: 'd'.repeat(40) };
     h.calls.length = 0;
     countOpenPrsForRepo('we', { exec: h.exec, readShared: h.readShared, env: {}, authorshipCache: cache });
     expect(h.graphql()).toBe(1);
@@ -1209,11 +1220,10 @@ describe('non-implementing retry branch grants', () => {
 });
 
 describe('excludeFocus — operator R384: focus PRs are exempt from the cap (explicit ref list or `focus` label, never the title)', () => {
-  const row = (n, extra = {}) => ({ number: n, labels: [], isCrossRepository: false, headRefName: `lane/p${n}`, files: [{ path: 'scripts/x.mjs' }], ...extra });
-  const commitsPage = (commits) => JSON.stringify({ data: { repository: { pullRequest: { commits: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: commits.map((commit) => ({ commit })) } } } } });
+  const row = (n, extra = {}) => ({ ...fixtureIdentity, number: n, labels: [], isCrossRepository: false, headRefName: `lane/p${n}`, files: [{ path: 'scripts/x.mjs' }], ...extra });
   const aiCommit = { messageHeadline: 'Implement feature', messageBody: 'Co-Authored-By: Claude <noreply@anthropic.com>', authors: { nodes: [] } };
   const execFor = (rows) => (args) => {
-    if (args[1] === 'list') return JSON.stringify(rows);
+    if (args[1] === 'list') return JSON.stringify(rows.map(row => ({ ...fixtureIdentity, ...row })));
     if (args[0] === 'api' && args[1] === 'graphql') return commitsPage([aiCommit]);
     throw new Error(`unexpected call: ${JSON.stringify(args)}`);
   };
@@ -1268,25 +1278,22 @@ describe('excludeFocus — operator R384: focus PRs are exempt from the cap (exp
 
 
 describe('R384 focus regression guarantees', () => {
-  const row = (number, extra = {}) => ({ number, labels: [], isCrossRepository: false,
+  const row = (number, extra = {}) => ({ ...fixtureIdentity, number, labels: [], isCrossRepository: false,
     headRefName: `lane/r384-${number}`, baseRefName: 'main', files: [{ path: 'scripts/x.mjs' }], ...extra });
   const scope = (extra = {}) => ({ excludeCardOnly: true, excludeStackedAwaitingBase: true,
     excludeFocus: true, focusRefs: ['lane/r384-1'], ...extra });
   const count = (rows, extra = {}) => {
     const commitsReads = [];
     const exec = (args) => {
-      if (args[1] === 'list') return JSON.stringify(rows);
+      if (args[1] === 'list') return JSON.stringify(rows.map(row => ({ ...fixtureIdentity, ...row })));
       if (args[0] === 'api' && args[1] === 'graphql') {
         commitsReads.push(Number(args.find((arg) => arg.startsWith('number=')).slice(7)));
-        return JSON.stringify({ data: { repository: { pullRequest: { commits: {
-          pageInfo: { hasNextPage: false, endCursor: null },
-          nodes: [{ commit: { messageHeadline: 'Implement feature',
-            messageBody: 'Co-Authored-By: Claude <noreply@anthropic.com>', authors: { nodes: [] } } }],
-        } } } } });
+        return commitsPage([{ messageHeadline: 'Implement feature',
+          messageBody: 'Co-Authored-By: Claude <noreply@anthropic.com>', authors: [] }]);
       }
       throw new Error(`unexpected call: ${JSON.stringify(args)}`);
     };
-    const result = countOpenPrsForRepo('we', { exec, env: {}, scope: scope(extra) });
+    const result = countOpenPrsForRepo('we', { exec, git: noLocalHistory, env: {}, scope: scope(extra) });
     return { result, commitsReads };
   };
 

@@ -1,4 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { stripGhDebug, rateLimitRecords } from '../gh-throttle.mjs';
 import { meteredPrCommits, meteredAlreadyDone } from '../gh-metered-reads.mjs';
 import { attributeSpend } from '../gh-spend.mjs';
@@ -53,11 +56,18 @@ describe('git paths', () => {
     expect(git.mock.calls.findIndex(([, a]) => a[0] === 'fetch')).toBeLessThan(git.mock.calls.findIndex(([, a]) => a[0] === 'log'));
     expect(gh).not.toHaveBeenCalled();
   });
-  it('falls back when fetch fails', () => {
+  it.each([true, false])('falls back when fetch fails: complete=%s', complete => {
+    const cwd = mkdtempSync(join(tmpdir(), 'cap-commits-'));
     const git = vi.fn(() => { throw new Error('offline'); });
-    const gh = vi.fn(() => JSON.stringify([{ data: { repository: { pullRequest: { commits: { nodes: [] } } } } }]));
-    expect(fetchPrCommits('web-everything/web-everything', 3084, { headRefName: 'lane/4386', headRefOid: OID, baseRefName: 'main', git, exec: gh })).toEqual([]);
-    expect(gh).toHaveBeenCalledTimes(1);
+    const gh = vi.fn(() => JSON.stringify([{ data: { repository: { pullRequest: {
+      headRefOid: OID, baseRefOid: 'b'.repeat(40), commits: { totalCount: 0, nodes: [],
+        pageInfo: { hasNextPage: !complete, endCursor: complete ? null : 'more' } },
+    } } } }]));
+    try {
+      expect(fetchPrCommits('web-everything/web-everything', 3084, { cwd, headRefName: 'lane/4386',
+        headRefOid: OID, baseRefOid: 'b'.repeat(40), baseRefName: 'main', git, exec: gh })).toEqual(complete ? [] : null);
+      expect(gh).toHaveBeenCalledTimes(1);
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
   });
 });
 
@@ -67,12 +77,18 @@ describe('metered fallback query shapes', () => {
     const rows = [{ number: 42, title: 'WE #4386: build' }];
     const exec = vi.fn(() => JSON.stringify(rows));
     expect(meteredAlreadyDone('web-everything/web-everything', '4386', { exec })).toEqual(rows);
-    const pages = [
-      { data: { repository: { pullRequest: { commits: { nodes: [{ commit: { oid: 'a', authors: { nodes: [{ name: 'N', email: 'e' }] } } }] } } } } },
-      { data: { repository: { pullRequest: { commits: { nodes: [{ commit: { oid: 'b', authors: { nodes: [] } } }] } } } } },
-    ];
+    const projection = [{ oid: 'a'.repeat(40), authors: [{ name: 'N', email: 'e' }] }, { oid: 'b'.repeat(40), authors: [] }];
+    const pages = projection.map((commit, i) => ({ data: { repository: { pullRequest: {
+      headRefOid: OID, baseRefOid: 'b'.repeat(40), commits: { totalCount: 2,
+        pageInfo: { hasNextPage: i === 0, endCursor: `page-${i}` },
+        nodes: [{ commit: { ...commit, authors: { nodes: commit.authors } } }],
+      },
+    } } } }));
     const execPages = vi.fn(() => JSON.stringify(pages));
-    expect(meteredPrCommits('web-everything/web-everything', 42, { exec: execPages })).toEqual([{ oid: 'a', authors: [{ name: 'N', email: 'e' }] }, { oid: 'b', authors: [] }]);
+    const result = meteredPrCommits('web-everything/web-everything', 42, { exec: execPages, headRefOid: OID, baseRefOid: 'b'.repeat(40) });
+    expect(execPages).toHaveBeenCalled();
+    expect(result.commits).toEqual(projection);
+    expect(result.complete).toBe(true);
     for (const [argv] of [...exec.mock.calls, ...execPages.mock.calls]) expect(argv.find((arg) => arg.startsWith('query='))).toContain('rateLimit { cost }');
     const argv = execPages.mock.calls[0][0];
     expect(argv).toEqual(expect.arrayContaining(['--paginate', '--slurp']));
@@ -130,7 +146,8 @@ describe('read-only graphql is not a write', () => {
   });
   it('the real metered argv is classified as a read', () => {
     const exec = vi.fn(() => '[]');
-    meteredPrCommits('o/n', 1, { exec });
+    meteredPrCommits('o/n', 1, { exec, headRefOid: OID, baseRefOid: 'b'.repeat(40) });
+    expect(exec).toHaveBeenCalled();
     meteredAlreadyDone('o/n', '1', { exec });
     for (const [argv] of exec.mock.calls) expect(classifyGhWrite(argv)).toBe(false);
   });

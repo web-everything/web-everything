@@ -243,7 +243,7 @@ describe('snapshot fast drain CLI dependency context', () => {
   const repo = 'fixture/repo';
   const pr = (number, item, blockedBy = []) => ({
     number, title: `fixture ${number}`, state: 'OPEN', headRefName: `lane/${item}`, headRefOid: number.toString(16).padStart(40, '0'),
-    updatedAt: '2026-10-14T00:00:00Z', baseRefName: 'main', isDraft: false,
+    updatedAt: '2026-10-14T00:00:00Z', baseRefName: 'main', baseRefOid: 'a'.repeat(40), isDraft: false,
     mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', reviewDecision: 'APPROVED',
     labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }], files: [],
     statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
@@ -277,6 +277,13 @@ const f = JSON.parse(fs.readFileSync(process.env.CONTEXT_FIXTURE, 'utf8'));
 fs.appendFileSync(process.env.CONTEXT_LOG, JSON.stringify(a) + '\\n');
 const output = value => { fs.writeSync(1, JSON.stringify(value)); process.exit(0); };
 if (a[0] === 'repo' && a[1] === 'view') { fs.writeSync(1, 'main'); process.exit(0); }
+if (a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequest(number:') && v.includes('commits(first:100'))) {
+  const number = Number(a.find(v => v.startsWith('number='))?.slice(7));
+  const p = f.live.find(p => p.number === number);
+  if (!p) { fs.writeSync(2, 'unknown commit-history PR'); process.exit(1); }
+  output([{data:{repository:{pullRequest:{headRefOid:p.headRefOid,baseRefOid:p.baseRefOid,
+    commits:{totalCount:0,pageInfo:{hasNextPage:false,endCursor:null},nodes:[]}}}}}]);
+}
 if (a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequests(states:OPEN'))) {
   if (f.failPage === true || f.failPage === process.env.GH_REPO) { fs.writeSync(2, 'fixture listing unreadable'); process.exit(1); }
   const rows = process.env.GH_REPO === 'fixture/repo' ? f.live : (f.extraLive[process.env.GH_REPO] || []);
@@ -434,6 +441,9 @@ output({});
     const b = pr(7, 'xbbbbbb', ['xaaaaaa']);
     const r = run({ snapshot: [b, pr(8, 'xaaaaaa')], live: [b] });
     expect(r.status, r.stderr).toBe(0);
+    expect(r.stderr).not.toContain('commits-degraded');
+    expect(r.calls.some(a => a.includes('--paginate') && a.includes('--slurp')
+      && a.some(v => v.includes('commits(first:100')))).toBe(true);
     expect(r.payload.deferred).toEqual([]);
     expect(r.payload.toMerge).toEqual(expect.arrayContaining([expect.objectContaining({ num: 7 })]));
     const heavyReads = r.calls.filter(a => a[0] === 'pr' && a[1] === 'view'

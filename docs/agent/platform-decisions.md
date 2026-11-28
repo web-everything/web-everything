@@ -6155,6 +6155,8 @@ extends [state-lives-where-its-nature-dictates](#state-lives-where-its-nature-di
 ledger's home) and builds on [delivery-decider-under-fixed-settings](#delivery-decider-under-fixed-settings)
 (safety fields are tighten-only).
 
+The drain's AI-authorship input is only the paged commits read bound to the listing's exact head and base oids, complete only when every page, count and oid check passes, and anything less is degraded (not AI, not cached, named reason); a 100-capped commit read is never an authorship input.
+
 **The rule:**
 1. **F1: what the ledger holds.** Every judgment-bearing event: `verdict`, `referral`, `ruling`, `review-run`,
    `hold` / `release`, `approval`, `send-back`, `author`, `label-input` and `merge-intent` (D3: the drain's

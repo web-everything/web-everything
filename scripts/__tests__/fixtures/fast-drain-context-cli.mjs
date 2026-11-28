@@ -18,7 +18,7 @@ export function runFastDrainContextCli({ root = resolve(dirname(fileURLToPath(im
     mkdirSync(bin); mkdirSync(snapshots); mkdirSync(join(dir, 'backlog'));
     const rows = Array.from({ length: rowCount }, (_, i) => {
       const number = i + 7, headRefOid = number.toString(16).padStart(40, '0');
-      return { number, headRefOid, headRefName: `lane/${number}`, title: `Fixture ${number}`, state: 'OPEN',
+      return { number, headRefOid, baseRefOid: 'a'.repeat(40), headRefName: `lane/${number}`, title: `Fixture ${number}`, state: 'OPEN',
         updatedAt: '2026-11-18T00:00:00Z', baseRefName: number === 7 ? targetBaseRefName : 'main', isDraft: false,
         mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', reviewDecision: 'APPROVED',
         labels: number === 7 && targetLabels ? targetLabels : [{ name: 'ready-to-merge' }, { name: 'review:accepted' }], files: [{ path: `src/${number}.mjs` }],
@@ -86,12 +86,20 @@ if (a[0] === 'pr' && a[1] === 'list') {
 }
 if (a[0] === 'pr' && a[1] === 'view') {
   const fields = (a[a.indexOf('--json') + 1] || '').split(',');
-  const realFields = new Set('number,headRefOid,headRefName,title,state,updatedAt,baseRefName,isDraft,mergeable,mergeStateStatus,reviewDecision,labels,files,body,statusCheckRollup,commits,comments'.split(','));
+  const realFields = new Set('number,headRefOid,headRefName,title,state,updatedAt,baseRefName,baseRefOid,isDraft,mergeable,mergeStateStatus,reviewDecision,labels,files,body,statusCheckRollup,commits,comments'.split(','));
   if (fields.some(f => !realFields.has(f))) process.exit(1);
   const p = selected.find(p => p.number === Number(a[2]));
   const view = p ? Object.fromEntries(fields.map(f => [f, f === 'commits' ? [] : p[f]])) : {};
   fs.appendFileSync(process.env.CONTEXT_CALLS + '.views', JSON.stringify({fields,view}) + '\\n');
   out(view);
+}
+// Preserve the fixture's empty history through the complete, identity-bound paged reader.
+if (a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequest(number:') && v.includes('commits(first:100'))) {
+  const number = Number(a.find(v => v.startsWith('number='))?.slice('number='.length));
+  const p = a.includes('name=web-everything') && rows.find(p => p.number === number);
+  if (!p) { fs.writeSync(2, 'unknown commit-history PR'); process.exit(1); }
+  out([{data:{repository:{pullRequest:{headRefOid:p.headRefOid,baseRefOid:p.baseRefOid,
+    commits:{totalCount:0,pageInfo:{hasNextPage:false,endCursor:null},nodes:[]}}}}}]);
 }
 if (a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequests(states:OPEN'))) {
   const query = a.find(v => v.includes('pullRequests(states:OPEN'));

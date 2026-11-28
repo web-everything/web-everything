@@ -25,7 +25,7 @@ export function createPrestageWorld(runCommand) {
       mkdirSync(join(dir, 'scripts'));
       writeFileSync(join(dir, 'scripts', 'drain-overlap-yield-config.json'), JSON.stringify({ enabled:true, windowMinutes:45 }));
       const pr = { number: 42, id: 'PR_NODE', title: 'Update readme', body: 'Update the readme.', state: 'OPEN', isDraft: false,
-        headRefOid: sha, headRefName: 'lane/readme', baseRefName: 'main', mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED',
+        headRefOid: sha, headRefName: 'lane/readme', baseRefName: 'main', baseRefOid: 'b'.repeat(40), mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED',
         labels: [{name:'review:accepted'},{name:'ready-to-merge'}], files: [{path:'README.md',changeType:'MODIFIED'}],
         commits: [{oid:sha,messageHeadline:'Update readme',authors:[{name:'Claude',email:'noreply@anthropic.com'}]}],
         statusCheckRollup: [{name:'test',status:'IN_PROGRESS',conclusion:null,head_sha:sha}],

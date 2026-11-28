@@ -228,7 +228,7 @@ export function countBackpressurePrs(prs) {
 /** The open-PR fields this limit reads. `isCrossRepository` tells an upstream head from a fork's same-named one (a
  *  stacked PR's base is always an upstream branch); every field must also be in the shared snapshot's field list
  *  (we:scripts/lib/pr-snapshot.mjs#SNAPSHOT_FIELDS), or the snapshot never serves this reader. */
-const OPEN_PR_FIELDS = 'number,labels,headRefName,headRefOid,baseRefName,isCrossRepository,files';
+const OPEN_PR_FIELDS = 'number,labels,headRefName,headRefOid,baseRefName,baseRefOid,isCrossRepository,files';
 
 /** Fetch a repo's open PRs ({@link OPEN_PR_FIELDS} — deliberately NOT `commits`, see {@link fetchPrCommits})
  *  through the shared throttle. Fail-SOFT: any gh/auth/network hiccup returns `null` (never throws), so a
@@ -262,15 +262,15 @@ export function fetchOpenPrs(repoSlug, { exec = runGhSync, localOnly = false, re
  *  re-discovering the limit the hard way twice. Fail-SOFT: returns `null` (never `[]`, which would read as
  *  "zero commits" / mechanical-only) on any failure, so the caller can tell "unknown" apart from "empty".
  *  @returns {Array|null} */
-export function fetchPrCommits(repoSlug, number, { exec = runGhSync, headRefName, headRefOid, baseRefName, cwd, git, localOnly = false, allowApi = true, onApi } = {}) {
+export function fetchPrCommits(repoSlug, number, { exec = runGhSync, headRefName, headRefOid, baseRefName, baseRefOid, cwd, git, localOnly = false, allowApi = true, onApi } = {}) {
   const local = readGitPrCommits(repoSlug, headRefName, { cwd, git, headRefOid, baseRefName, localOnly });
   if (local !== null) return local;
   // `allowApi:false` is a caller's spent GitHub budget: git was still tried, the metered read is not.
   if (localOnly || !allowApi) return null;
   onApi?.();
   try {
-    const commits = meteredPrCommits(repoSlug, number, { exec });
-    return Array.isArray(commits) ? commits : null;
+    const result = meteredPrCommits(repoSlug, number, { exec, headRefOid, baseRefOid });
+    return result.complete && result.headOid === headRefOid && result.baseOid === baseRefOid ? result.commits : null;
   } catch {
     return null;
   }
@@ -328,7 +328,7 @@ export function countOpenPrsForRepo(repoKey, { exec, env = process.env, reposTab
     const coolingDown = Number.isFinite(hit?.failedAt) && now - hit.failedAt < AUTHORSHIP_FAILURE_COOLDOWN_MS;
     let spent = false;
     const commits = fetchPrCommits(meta.slug, pr.number, {
-      exec, headRefName: pr.headRefName, headRefOid: pr.headRefOid, baseRefName: pr.baseRefName, git, localOnly, cwd: repoCwd,
+      exec, headRefName: pr.headRefName, headRefOid: pr.headRefOid, baseRefName: pr.baseRefName, baseRefOid: pr.baseRefOid, git, localOnly, cwd: repoCwd,
       allowApi: !coolingDown && apiFetches < maxApiFetches, onApi: () => { apiFetches++; spent = true; },
     });
     if (!Array.isArray(commits)) {

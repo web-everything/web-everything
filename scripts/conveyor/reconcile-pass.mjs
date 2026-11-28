@@ -302,7 +302,7 @@ import { classifyPr as classifyPrLifecycle } from './pr-watch.mjs';
 // straight off each row (`pr.isDraft`) to gate review dispatch off drafts and to plan the `promote-draft`
 // effect once a draft's required checks are green. Costs nothing extra beyond this one query, same as `files`
 // above.
-export const PR_LIST_JSON_FIELDS = 'number,title,headRefName,headRefOid,baseRefName,labels,statusCheckRollup,mergeStateStatus,comments,body,files,isDraft,createdAt';
+export const PR_LIST_JSON_FIELDS = 'number,title,headRefName,headRefOid,baseRefName,baseRefOid,labels,statusCheckRollup,mergeStateStatus,comments,body,files,isDraft,createdAt';
 
 /** How many open PRs one pass reads. The board's own `OPEN_LIMIT` is 30; a reconciler that silently stopped at
  *  the default page would leave the overflow unowned, which is this item's defect wearing a smaller hat. */
@@ -315,7 +315,7 @@ export function enrichPrsWithReviewEvidence(prs, { repo, readCommits = fetchPrCo
     const labels = pr.labels.map(l => typeof l === 'string' ? l : l?.name);
     if (!labels.includes('review:human') && labels.some(label => label?.startsWith('review:'))) return pr;
     return { ...pr, state: pr.state ?? 'OPEN',
-      commits: readCommits(repo, pr.number, { headRefName: pr.headRefName, headRefOid: pr.headRefOid, baseRefName: pr.baseRefName }) };
+      commits: readCommits(repo, pr.number, { headRefName: pr.headRefName, headRefOid: pr.headRefOid, baseRefName: pr.baseRefName, baseRefOid: pr.baseRefOid }) };
   });
 }
 

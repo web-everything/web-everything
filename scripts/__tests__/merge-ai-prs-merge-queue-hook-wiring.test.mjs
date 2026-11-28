@@ -34,6 +34,13 @@ if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('main'); process.
 if (a[0] === 'pr' && a[1] === 'list') out(prs.filter(p => !landed(p.number)));
 if (a[0] === 'api' && a[1] === 'graphql') {
   const query = a.find(v => v.startsWith('query=')) || '';
+  if (query.includes('pullRequest(number:') && query.includes('commits(first:100')) {
+    const p = prs.find(p => a.includes('number=' + p.number));
+    if (!p || !a.includes('--paginate') || !a.includes('--slurp')) process.exit(1);
+    out([{data:{repository:{pullRequest:{headRefOid:p.headRefOid,baseRefOid:p.baseRefOid,
+      commits:{totalCount:p.commits.length,pageInfo:{hasNextPage:false,endCursor:null},
+        nodes:p.commits.map(commit => ({commit:{...commit,authors:{nodes:commit.authors}}}))}}}}}]);
+  }
   if (query.includes('comments{totalCount}')) {
     const p = prs.find(p => 'n=' + p.number === a.find(v => v.startsWith('n=')));
     if (!p || !(a.includes('owner=web-everything') && a.includes('name=web-everything'))) process.exit(1);
@@ -126,7 +133,7 @@ function runCli({ capabilityOff = false, hookOn, seedRefreshed = null, ages = [[
     // #3001: pass 5 min old (fresh). #3002: pass 120 min old (stale). Main moved only on a backlog card (non-code).
     writeFileSync(fixture, JSON.stringify(ages.map(([number, age]) => ({
       number, title: `leaf ${number}`, body: 'A real summary.', headRefName: `lane/leaf-${number}`,
-      baseRefName: 'main', headRefOid: head(number), mergeable: 'MERGEABLE', mergeStateStatus,
+      baseRefName: 'main', baseRefOid: 'b'.repeat(40), headRefOid: head(number), mergeable: 'MERGEABLE', mergeStateStatus,
       statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' },
         ...(approvedHeadPlan && extraEnv.MQ_QUEUE_EVIDENCE !== 'missing-secondary'
           ? [{ name: 'smoke', conclusion: 'SUCCESS', status: 'COMPLETED' }] : [])],
@@ -322,6 +329,17 @@ if (checkPages !== undefined) out(checkPages);
 if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('main'); process.exit(0); }
 if (a[0] === 'pr' && a[1] === 'list') { const s = slugOf(); out(prsOf(s).filter(p => !fs.existsSync(mark(s, p.number)))); }
 if (a[0] === 'api' && a[1] === 'graphql') {
+  const query = a.find(v => v.startsWith('query=')) || '';
+  if (query.includes('pullRequest(number:') && query.includes('commits(first:100')) {
+    const owner = a.find(v => v.startsWith('owner='))?.slice(6);
+    const name = a.find(v => v.startsWith('name='))?.slice(5);
+    const p = prsOf(owner + '/' + name).find(p => a.includes('number=' + p.number));
+    if (!p || !a.includes('--paginate') || !a.includes('--slurp')) process.exit(1);
+    fs.appendFileSync(F + '.commit-reads', JSON.stringify(a) + '\\n');
+    out([{data:{repository:{pullRequest:{headRefOid:p.headRefOid,baseRefOid:p.baseRefOid,
+      commits:{totalCount:p.commits.length,pageInfo:{hasNextPage:false,endCursor:null},
+        nodes:p.commits.map(commit => ({commit:{...commit,authors:{nodes:commit.authors}}}))}}}}}]);
+  }
   const s = slugOf();
   out(openPrPageFixture(prsOf(s).filter(p => !fs.existsSync(mark(s, p.number))), a.find(v => v.startsWith('query=')) || ''));
 }
@@ -384,7 +402,7 @@ function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null, e
     const accepted = (number) => ({ labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }],
       comments: [{ body: `Reviewed.\n<!-- reviewed-sha: ${sha(number)} -->`, viewerDidAuthor: true, author: { login: 'web-everything' }, createdAt: iso(60) }] });
     const pr = (number, headRefName, ages, extra = {}) => ({
-      number, title: `couple ${number}`, body: 'A real summary.', headRefName, baseRefName: 'main', headRefOid: sha(number),
+      number, title: `couple ${number}`, body: 'A real summary.', headRefName, baseRefName: 'main', baseRefOid: 'b'.repeat(40), headRefOid: sha(number),
       mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }],
       labels: [{ name: 'ready-to-merge' }], comments: [], passAtSeq: ages.map(iso),
       commits: [{ oid: sha(number), authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
@@ -410,7 +428,8 @@ function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null, e
     expect(r.error, r.stderr).toBeUndefined();
     expect(r.status, r.stderr).toBe(0);
     const read = (s) => (existsSync(fixture + s) ? readFileSync(fixture + s, 'utf8').trim().split('\n').filter(Boolean) : []);
-    return { stdout: r.stdout, stderr: r.stderr, attempts: read('.attempts'), api: read('.api') };
+    expect(r.stderr).not.toContain('commits-degraded');
+    return { stdout: r.stdout, stderr: r.stderr, attempts: read('.attempts'), api: read('.api'), commitReads: read('.commit-reads').map(JSON.parse) };
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
@@ -424,7 +443,13 @@ describe('review of #4619 — the WE-carrier pre-check keeps a couple together',
   }, COUPLE_TEST_TIMEOUT_MS);
 
   it('both halves fresh: the impl half lands, then its carrier (control — the gate does not block a healthy couple)', () => {
-    const { attempts, stderr } = runCouple({ implPassAges: [5], carrierPassAges: [5] });
+    const { attempts, commitReads } = runCouple({ implPassAges: [5], carrierPassAges: [5] });
+    for (const [repo, number] of [[LOCAL, 4001], [FUI, 501]]) {
+      const [owner, name] = repo.split('/');
+      expect(commitReads).toEqual(expect.arrayContaining([expect.arrayContaining([
+        'owner=' + owner, 'name=' + name, 'number=' + number, '--paginate', '--slurp',
+      ])]));
+    }
     expect(attempts).toEqual([`${FUI}#501`, `${LOCAL}#4001`]);
   }, COUPLE_TEST_TIMEOUT_MS);
 

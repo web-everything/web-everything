@@ -298,10 +298,14 @@ test('real CLI uses lean context for all repos and no full listing; live kill sw
   assert.equal(fast.fullListings, 0, fast.stderr);
   assert.equal(fast.heavyListings, 0);
   assert.equal(fast.leanListings, 3);
+  assert.ok(fast.calls.some(a => a[0] === 'api' && a[1] === 'graphql' && a.includes('--paginate') && a.includes('--slurp')
+    && a.some(v => v.includes('pullRequest(number:') && v.includes('commits(first:100'))));
+  assert.doesNotMatch(fast.stderr, /commits-degraded/);
   const live = runFastDrainContextCli({ killSwitch: true });
   assert.equal(live.status, 0, live.stderr);
   assert.ok(live.fullListings > 0);
   assert.equal(live.leanListings, 0);
+  assert.doesNotMatch(live.stderr, /commits-degraded/);
 });
 
 const leanPage = (rows, totalCount, hasNextPage = false, endCursor = null) => JSON.stringify({

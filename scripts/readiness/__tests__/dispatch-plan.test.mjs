@@ -1324,16 +1324,24 @@ describe('dispatchPlan — open-PR backpressure limit (we:xniq7xs): a deliberate
 // builder round, so it must stay local in the common case and bound any GitHub fallback — spending GitHub calls
 // here would work against the change that shortened the round.
 describe('readPrLimitHeld — the per-round PR count stays local and bounded (xbrndtm)', () => {
-  const aiCommit = { authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }], messageBody: '' };
-  const commitsPage = (c) => JSON.stringify([{ data: { repository: { pullRequest: { commits: { nodes: c.map((commit) => ({ commit: { ...commit, authors: { nodes: commit.authors } } })) } } } } }]);
+  const aiCommit = { oid: 'c'.repeat(40), authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }], messageBody: '' };
+  const commitsPage = (c, { headRefOid, baseRefOid }) => JSON.stringify([{ data: { repository: { pullRequest: {
+    headRefOid, baseRefOid, commits: { totalCount: c.length, pageInfo: { hasNextPage: false, endCursor: null },
+      nodes: c.map((commit) => ({ commit: { ...commit, authors: { nodes: commit.authors } } })) },
+  } } } }]);
   // Lane PRs stacked on another lane (base ≠ main) are the case local git cannot resolve.
-  const open = Array.from({ length: 8 }, (_, i) => ({ number: i + 1, labels: [], headRefName: `lane/p${i + 1}`, headRefOid: `oid${i + 1}`, baseRefName: 'lane/base' }));
+  const open = Array.from({ length: 8 }, (_, i) => ({ number: i + 1, labels: [], headRefName: `lane/p${i + 1}`,
+    headRefOid: (i + 1).toString(16).padStart(40, '0'), baseRefName: 'lane/base', baseRefOid: 'b'.repeat(40) }));
   const setup = () => {
     const calls = [];
     const exec = (args) => {
       calls.push(args);
       if (args[1] === 'list') return JSON.stringify(open);
-      if (args[0] === 'api' && args[1] === 'graphql') return commitsPage([aiCommit]);
+      if (args[0] === 'api' && args[1] === 'graphql') {
+        expect(args).toEqual(expect.arrayContaining(['--paginate', '--slurp']));
+        const number = Number(args.find(arg => arg.startsWith('number=')).slice(7));
+        return commitsPage([aiCommit], open.find(pr => pr.number === number));
+      }
       throw new Error(`unexpected call: ${JSON.stringify(args)}`);
     };
     const dir = mkdtempSync(join(tmpdir(), 'dispatch-plan-prlimit-'));

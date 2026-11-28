@@ -1412,13 +1412,32 @@ describe('xyx5mea isolated shell replay', () => {
   });
 });
 
-it('xe8y12n probe preserves fresh raw evidence independently of cached/normalised labels', () => {
+it.each(['complete', 'incomplete', 'base-moved', 'missing-base'])('xe8y12n probe preserves fresh raw evidence from %s commit pages independently of cached/normalised labels', mode => {
+  const headRefOid = 'a'.repeat(40), baseRefOid = 'b'.repeat(40);
+  const expectedCommits = [{ oid: 'c'.repeat(40), messageHeadline: 'repair',
+    authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }];
+  const exec = (_bin, args) => {
+    if (args[1] === 'list') return JSON.stringify([{ number: 3239, labels: null }]);
+    if (args[1] === 'view') {
+      expect(args[args.indexOf('--json') + 1].split(',')).toContain('baseRefOid');
+      return JSON.stringify({ state: 'OPEN', labels: [], headRefOid, baseRefName: 'lane/base',
+        ...(mode === 'missing-base' ? {} : { baseRefOid }) });
+    }
+    expect(args).toEqual(expect.arrayContaining(['api', 'graphql', '--paginate', '--slurp']));
+    return JSON.stringify([{ data: { repository: { pullRequest: {
+      headRefOid, baseRefOid: mode === 'base-moved' ? 'd'.repeat(40) : baseRefOid,
+      commits: { totalCount: mode === 'incomplete' ? 2 : 1,
+        pageInfo: { hasNextPage: mode === 'incomplete', endCursor: 'page-1' },
+        nodes: expectedCommits.map(commit => ({ commit: { ...commit, authors: { nodes: commit.authors } } })) },
+    } } } }]);
+  };
+  const rows = probePrs({ exec, now: 123 });
+  expect(rows[0]).toMatchObject({ labelsValid: false,
+    reviewObservation: { state: 'OPEN', labels: [], commits: mode === 'complete' ? expectedCommits : null, observedAt: 123 } });
+});
+
+it('xe8y12n probe keeps an unreadable fresh observation unknown', () => {
   const commits = [{ authors: [{ name: 'Claude' }] }];
-  const exec = (_bin, args) => JSON.stringify(args[1] === 'list'
-    ? [{ number: 3239, labels: null }]
-    : { state: 'OPEN', labels: [], headRefOid: 'a'.repeat(40) });
-  const rows = probePrs({ exec, readCommits: () => commits, now: 123 });
-  expect(rows[0]).toMatchObject({ labelsValid: false, reviewObservation: { state: 'OPEN', labels: [], commits, observedAt: 123 } });
   const failed = probePrs({ exec: (_bin, args) => { if (args[1] === 'view') throw new Error('unavailable'); return JSON.stringify([{ number: 3239, labels: [] }]); }, readCommits: () => commits });
   expect(failed[0].reviewObservation).toBeNull();
 });
