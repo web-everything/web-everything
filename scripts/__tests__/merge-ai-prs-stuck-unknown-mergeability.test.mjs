@@ -36,6 +36,7 @@ const HEAD = 'a'.repeat(40);
 const MINUTE = 60_000;
 const opts = { requiredCheck: 'test', defaultBranch: 'main', expectedHeadSha: HEAD };
 const pr = (extra = {}) => ({
+  baseRefOid: 'b'.repeat(40), updatedAt: '2026-10-09T00:00:00Z',
   number: 42, title: 'Approved change', body: 'A concrete change summary.',
   headRefName: 'lane/approved', headRefOid: HEAD, baseRefName: 'main', state: 'OPEN',
   mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',

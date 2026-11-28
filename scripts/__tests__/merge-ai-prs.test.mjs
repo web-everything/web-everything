@@ -19,8 +19,46 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
 import { pinnedLeafDiffFixture } from './fixtures/pinned-leaf-diff-fixture.mjs';
+import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
 import { buildManifest, manifestBodyBlock } from '../readiness/lane-manifest.mjs';
 import { deriveResolutionBasis, graduatedToFromBody } from '../lib/review-render.mjs';
+import { hydrateDeltaAsync } from '../lib/pr-list-paged.mjs';
+
+describe('deferred heavy reads never admit branch preparation', () => {
+  it.each([
+    ['CONFLICTING', 'DIRTY', 'updatedAt'],
+    ['CONFLICTING', 'CLEAN', 'headRefOid'],
+    ['MERGEABLE', 'BEHIND', 'updatedAt'],
+    ['MERGEABLE', 'DIRTY', 'baseRefOid'],
+  ])('%s/%s with unreadable %s stays untouched until a successful heavy read', async (mergeable, state, field) => {
+    const repo = 'fixture/repo';
+    const row = { number: 42, labelsComplete: true, labels: [{ name: 'ready-to-merge' }],
+      headRefOid: 'a'.repeat(40), baseRefOid: 'b'.repeat(40), baseRefName: 'main',
+      updatedAt: '2026-11-25T12:00:00Z', headRefName: 'lane/42', mergeable, mergeStateStatus: state,
+      statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
+    if (field === 'baseRefOid') row.baseRefOid = null;
+    const hydrate = (moved) => hydrateDeltaAsync({ repo, rows: [row], nowMs: Date.parse(row.updatedAt),
+      bounds: null, isCandidate: () => true, execAsync: async () => ({ stdout: JSON.stringify({
+        ...row, body: 'Current summary', files: [{ path: 'src/current.mjs' }],
+        ...(moved ? { [field]: field === 'updatedAt' ? '2026-11-25T12:00:01Z' : 'f'.repeat(40) } : {}),
+      }) }) });
+    const verdictOf = (p) => buildDrainVerdicts({ repos: [repo], prsByRepo: new Map([[repo, [p]]]),
+      readOf: () => ({ manifest: null }), defaultBranchOf: () => 'main' })[0];
+    const deferred = (await hydrate(true)).rows[0];
+    expect(deferred.heavyReadError).toMatch(/heavy PR evidence (moved|row-invalid)/);
+    const verdict = verdictOf(deferred);
+    // Exercise the real admission predicate before checking propagation so the red proof shows the unsafe path.
+    expect(isRebaseDropCandidate(verdict)).toBe(false);
+    expect(verdict).toMatchObject({ decision: 'skip', testGreen: true, heavyReadError: deferred.heavyReadError });
+    expect(isBehindButClean(verdict)).toBe(false);
+    const plan = planLabelDrain([verdict]);
+    expect(plan.ready).toEqual([]);
+    if (field === 'baseRefOid') row.baseRefOid = 'b'.repeat(40);
+    const recovered = (await hydrate(false)).rows[0];
+    expect(recovered.heavyReadError).toBeUndefined();
+    expect(isRebaseDropCandidate(verdictOf(recovered))).toBe(true);
+  });
+});
 
 describe('incomplete round targets retain live dependency ordering', () => {
   it.each([true, false])('keeps incomplete checks skipped when the live blocker is open=%s', open => {
@@ -570,9 +608,9 @@ describe('round listing freshness at the CLI boundary', () => {
     const dir = mkdtempSync(join(tmpdir(), 'drain-round-cli-'));
     try {
       const row = (number, item, blockedBy = []) => ({ number, title: `PR ${number}`, state: 'OPEN',
-        headRefName: `lane/leaf-${number}`, headRefOid: number.toString(16).padStart(40, '0'), baseRefName: 'main', updatedAt: '2026-01-01T00:00:00Z',
+        headRefName: `lane/leaf-${number}`, headRefOid: number.toString(16).padStart(40, '0'), baseRefName: 'main', baseRefOid: 'b'.repeat(40), updatedAt: '2026-01-01T00:00:00Z',
         isDraft: false, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', files: [],
-        labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', checkSuite: { workflowRun: { workflow: { name: 'test' } } } }],
+        labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'test' }],
         body: manifestBodyBlock(buildManifest({ item, blockedBy, repos: [{ repo: 'we', ref: `lane/leaf-${number}` }] })) });
       const target = row(42, 42, ['43']);
       const sibling = row(43, 43);
@@ -588,6 +626,7 @@ describe('round listing freshness at the CLI boundary', () => {
       writeFileSync(join(dir, 'merge-settings.json'), JSON.stringify({ mergeDelivery: { strategy: 'github-merge-queue' } }));
       writeFileSync(join(dir, 'gh'), `#!/usr/bin/env node
 const fs = require('node:fs');
+const openPrPageFixture = ${openPrPageFixture};
 const a = process.argv.slice(2);
 fs.appendFileSync(process.env.CALL_LOG, JSON.stringify(a) + '\\n');
 const rows = JSON.parse(fs.readFileSync(process.env.ROWS_FILE, 'utf8'));
@@ -606,8 +645,7 @@ else if (a[0] === 'api' && a[1] === 'graphql') {
   } else {
     if (process.env.FAIL_LISTING === '1') { fs.writeSync(2, 'fixture live listing unavailable'); process.exit(1); }
     const local = a.some(v => v.includes('repository(owner:"web-everything",name:"web-everything")'));
-    const nodes = (local ? rows : []).map(r => ({ ...r, labels: { nodes: r.labels }, commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: r.statusCheckRollup } } } }] } }));
-    out = { data: { repository: { pullRequests: { nodes, totalCount: nodes.length, pageInfo: { hasNextPage: false, endCursor: null } } } } };
+    out = openPrPageFixture(local ? rows : [], q);
   }
 }
 if (a[0] === 'pr' && a[1] === 'view' && a.includes('id')) out = { id: 'PR_43' };

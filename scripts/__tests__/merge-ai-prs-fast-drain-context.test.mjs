@@ -14,7 +14,8 @@ import { OPEN_PR_LIST_LIMIT } from '../lib/no-search-backed-pr-list.mjs';
 import { runFastDrainContextCli } from './fixtures/fast-drain-context-cli.mjs';
 
 process.env.WE_UNDER_TEST = '1';
-const { planLabelDrain, revalidateForMerge, classifyPr, buildDrainVerdicts, prepareDrainVerdicts, planDrainPass } = await import('../merge-ai-prs.mjs');
+const { planLabelDrain, revalidateForMerge, classifyPr, buildDrainVerdicts, prepareDrainVerdicts, planDrainPass,
+  reduceOpenPrContext, prReadCacheIdentity } = await import('../merge-ai-prs.mjs');
 const repo = 'fixture/repo', other = 'fixture/frontierui';
 const manifest = (item, blockedBy = [], stackParents = []) => ({ item, blockedBy, stackParents, repos: [] });
 const pr = (number, extra = {}) => ({
@@ -473,14 +474,81 @@ test('a completely absent target base field fails closed', () => {
   assert.match(v.reason, /PR base branch unreadable/);
 });
 
-test('real fast drain with a null target base defers after both snapshot and live listing paths', () => {
+test('real fast drain with a null target base defers that PR after both snapshot and live paths', () => {
   for (const killSwitch of [false, true]) {
     const run = runFastDrainContextCli({ targetBaseRefName: null, killSwitch });
     assert.equal(run.status, 0, run.stderr);
     const result = JSON.parse(run.stdout);
+    assert.equal(result.ok, true);
     assert.deepEqual(result.toMerge, []);
-    assert.deepEqual(result.enqueueOutcomes ?? [], []);
-    assert.ok(result.skipped.some(v => v.num === 7 && /PR base branch unreadable.*deferring merge\/enqueue/.test(v.reason)), run.stdout);
+    assert.equal(run.calls.some(a => a[0] === 'pr' && a[1] === 'merge'), false);
     if (!killSwitch) assert.match(run.stderr, /fast-drain: context fell back to full listing.*base branch unreadable/);
   }
+});
+
+for (const cacheWriteFailure of [true,'frontierui']) test(`cache persistence failure at ${cacheWriteFailure} preserves candidate and extra-context classification`, () => {
+  const result = runFastDrainContextCli({killSwitch:true,rowCount:2,cacheWriteFailure,extraContextRows:true});
+  assert.equal(result.status,0,result.stderr);
+  assert.equal(JSON.parse(result.stdout).ok,true);
+  assert.equal(JSON.parse(result.stdout).considered,1);
+  assert.match(result.stderr,/heavy-cache .*persistence failed/);
+  assert.ok(result.fullListings > 0);
+});
+
+test('moved heavy evidence cannot authorize merge or complete dependency context', () => {
+  const result=runFastDrainContextCli({killSwitch:true,rowCount:2,pinnedPatches:{7:{headRefOid:'f'.repeat(40)}}});
+  assert.equal(result.status,0,result.stderr);
+  const output=JSON.parse(result.stdout);
+  assert.equal(output.ok,true);
+  assert.deepEqual(output.toMerge,[]);
+  assert.match(JSON.stringify(output),/heavy PR evidence moved/);
+  assert.equal(result.calls.some(a=>a[0]==='pr' && a[1]==='merge'),false);
+});
+
+test('deferred heavy evidence stays blocked after fresh checks and cannot certify dependency context', () => {
+  const target=pr(7,{heavyReadError:'heavy PR evidence moved — deferring until the next pass',rowsComplete:true});
+  assert.equal(classifyPr(target,{defaultBranch:'main'}).decision,'skip');
+  assert.equal(revalidateForMerge(target,{defaultBranch:'main'}).decision,'skip');
+  assert.equal(prReadCacheIdentity(target),null);
+  const context=reduceOpenPrContext({listings:[{repo,prs:[target]}],
+    reads:new Map([[`${repo}::7`,{manifest:manifest(107),degraded:false}]])});
+  assert.equal(context.contextComplete,false);
+  assert.equal(context.degradedByPr.get(`${repo}::7`),true);
+  assert.equal(context.prsByRepo.get(repo).length,1);
+});
+
+for (const rebaseDrop of [true, false]) test(`real CLI leaves conflicting deferred heavy evidence untouched (rebaseDrop=${rebaseDrop})`, () => {
+  const result = runFastDrainContextCli({ killSwitch: true, rowCount: 2, rebaseDrop, outputAsJson: false,
+    livePatches: { 7: { mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY' } },
+    pinnedPatches: { 7: { body: 'Changed after listing', updatedAt: '2026-11-25T12:00:00Z' } } });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /heavy PR evidence moved/);
+  assert.doesNotMatch(result.stderr, /would rebase-drop/);
+  assert.equal(result.gitCalls.some(a => a[0] === 'fetch' && a.includes('lane/7')), false,
+    'deferred PR must not enter standalone collision healing');
+  assert.equal(result.calls.some(a => a[0] === 'pr' && a[1] === 'merge'
+    || a.some(v => v.includes('enqueuePullRequest'))), false);
+});
+
+test('watch reloads heavy evidence after a dirty marker between two passes', () => {
+  const result = runFastDrainContextCli({killSwitch:true,rowCount:2,watchDirty:true,
+    targetLabels:[],livePatches:{8:{labels:[]}}});
+  assert.equal(result.status,0,result.stderr);
+  assert.equal(JSON.parse(result.stdout).passes,2);
+  const pinned = result.prViews.filter(({fields})=>fields.includes('baseRefOid') && fields.includes('body') && fields.includes('files'));
+  assert.equal(pinned.length,4,JSON.stringify(result.prViews));
+  assert.match(result.stderr,/heavy-cache .*dropped=2/);
+});
+
+
+test('async drain entry executes delta at candidate and extra RECONCILE context call sites with body and files for every row', () => {
+  const result = runFastDrainContextCli({killSwitch:true,extraContextRows:true,rowCount:2,
+    livePatches:{8:{labels:[]}}});
+  assert.equal(result.status,0,result.stderr);
+  assert.equal(result.fullListings,3,result.stderr);
+  assert.deepEqual(result.heavyStores.sort(),['frontierui','plateau-app','web-everything']);
+  const pinned = result.prViews.filter(({fields}) => fields.includes('baseRefOid') && fields.includes('body') && fields.includes('files'));
+  assert.equal(pinned.length,6,JSON.stringify(result.prViews));
+  for (const {view} of pinned) { assert.equal(typeof view.body,'string'); assert.ok(view.files.length > 0); }
+  assert.match(result.stderr,/listing.pages.light=.*listing.pages.hydrate=.*hydrate=/);
 });

@@ -13,6 +13,7 @@
  *   → env WE_PR_LIST_PAGE_SIZE (pageSize only). resolvePrListPaging returns each leaf's source; policy-cascade
  *   logs those sources in daemons. All GitHub execution is injected so pure transforms and tests need no network.
  */
+import { HEAVY, IDENTITY, identityOf, HeavyReadError, loadBounds, whyNotReuse, readHeavyPinned } from './heavy-cache.mjs';
 import { mapWithConcurrency } from './drain-concurrency.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
@@ -27,7 +28,7 @@ import { isUnderTest } from './under-test.mjs';
 
 export const HEAVY_FIELDS = Object.freeze(['comments', 'body', 'files']);
 export const PAGED_LIGHT_FIELDS = Object.freeze(['number', 'title', 'url', 'isDraft', 'createdAt', 'updatedAt', 'headRefName',
-  'headRefOid', 'baseRefName', 'isCrossRepository', 'mergeable', 'mergeStateStatus', 'reviewDecision', 'labels', 'statusCheckRollup']);
+  'headRefOid', 'baseRefName', 'baseRefOid', 'isCrossRepository', 'mergeable', 'mergeStateStatus', 'reviewDecision', 'labels', 'labelsComplete', 'statusCheckRollup']);
 export const PR_LIST_PAGING_DEFAULTS = Object.freeze({ pageSize: 20, pageRetries: 1, heavyMaxAgeSeconds: 600 });
 export const PR_LIST_PAGE_SIZE_ENV = 'WE_PR_LIST_PAGE_SIZE';
 
@@ -58,12 +59,24 @@ export function resolvePrListPaging({ env = process.env, file } = {}) {
     const src = file === undefined ? readDeclaredSettings().settings : file;
     const raw = env?.[PR_LIST_PAGE_SIZE_ENV];
     const pageSize = raw != null && String(raw).trim() !== '' ? Number(raw) : undefined;
+    const deltaValid = {
+      heavyBackstopSeconds: n => Number.isInteger(n) && n >= 0 && n <= 604800,
+      heavySettleSeconds: n => Number.isInteger(n) && n >= 1 && n <= 300,
+    };
     const c = cascadePolicy('prListPaging', isObj(src?.prListPaging) ? src.prListPaging : undefined, {
       env, standard: PR_LIST_PAGING_DEFAULTS, envValues: { pageSize },
       valid: { pageSize: n => Number.isInteger(n) && n >= 1 && n <= 100,
         pageRetries: n => Number.isInteger(n) && n >= 0 && n <= 3,
-        heavyMaxAgeSeconds: n => Number.isInteger(n) && n >= 0 && n <= 86400 },
+        heavyMaxAgeSeconds: n => Number.isInteger(n) && n >= 0 && n <= 86400,
+        ...deltaValid },
     });
+    // Invalid explicit delta bounds disable reuse instead of falling through to platform values.
+    for (const key of ['heavyBackstopSeconds', 'heavySettleSeconds']) {
+      if (Object.hasOwn(src?.prListPaging ?? {}, key) && !deltaValid[key](src.prListPaging[key])) {
+        c.value[key] = undefined;
+        c.sources[key] = 'tool';
+      }
+    }
     return { ...PR_LIST_PAGING_DEFAULTS, ...c.value, source: c.sources };
   } catch {
     return { ...PR_LIST_PAGING_DEFAULTS,
@@ -79,7 +92,7 @@ export function buildOpenPrPageQuery({ repo, pageSize, after = null, inventoryOn
   if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100) throw new TypeError('pageSize must be an integer from 1 to 100');
   const [owner, name] = repo.split('/');
   const cursor = after === null ? '' : `,after:${JSON.stringify(after)}`;
-  const fields = inventoryOnly ? 'number headRefOid updatedAt baseRefName isDraft state' : 'number title url isDraft createdAt updatedAt headRefName headRefOid baseRefName isCrossRepository mergeable mergeStateStatus reviewDecision labels(first:100){nodes{id name description color}} commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} totalCount nodes{__typename ...on CheckRun{name status conclusion startedAt completedAt detailsUrl databaseId checkSuite{app{slug databaseId} workflowRun{databaseId workflow{name}}}} ...on StatusContext{context state targetUrl createdAt}}}}}}}';
+  const fields = inventoryOnly ? 'number headRefOid updatedAt baseRefName isDraft state' : 'number title url isDraft createdAt updatedAt headRefName headRefOid baseRefName baseRefOid isCrossRepository mergeable mergeStateStatus reviewDecision labels(first:100){totalCount nodes{id name description color}} commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} totalCount nodes{__typename ...on CheckRun{name status conclusion startedAt completedAt detailsUrl databaseId checkSuite{app{slug databaseId} workflowRun{databaseId workflow{name}}}} ...on StatusContext{context state targetUrl createdAt}}}}}}}';
   return `query{repository(owner:"${owner}",name:"${name}"){pullRequests(states:OPEN,first:${pageSize}${cursor},orderBy:{field:CREATED_AT,direction:DESC}){totalCount pageInfo{hasNextPage endCursor} nodes{${fields}}}}}`;
 }
 
@@ -236,9 +249,10 @@ export function rollupEvidence(commit) {
 /** PURE: exactly gh pr list --json's labels and flattened statusCheckRollup shape, plus evidence metadata. */
 export function mapGraphqlPr(n) {
   return { ...rollupEvidence(n.commits?.nodes?.[0]?.commit), number: n.number, title: n.title, url: n.url, isDraft: n.isDraft, createdAt: n.createdAt, updatedAt: n.updatedAt,
-    headRefName: n.headRefName, headRefOid: n.headRefOid, baseRefName: n.baseRefName, isCrossRepository: n.isCrossRepository,
+    headRefName: n.headRefName, headRefOid: n.headRefOid, baseRefName: n.baseRefName, baseRefOid: n.baseRefOid, isCrossRepository: n.isCrossRepository,
     mergeable: n.mergeable, mergeStateStatus: n.mergeStateStatus, reviewDecision: n.reviewDecision ?? '',
     labels: n.labels?.nodes ?? [],
+    labelsComplete: Array.isArray(n.labels?.nodes) && n.labels.nodes.length === n.labels.totalCount,
     statusCheckRollup: (n.commits?.nodes?.[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? []).map(mapCtx) };
 }
 
@@ -358,14 +372,78 @@ export async function hydrateHeavyFieldsAsync({ repo, rows, execAsync, cache = {
     exec: (_cmd, args) => byNumber.get(Number(args[2])) });
 }
 
+/** Pinned reads join before publishing; retry a moved read once, then defer that row. */
+export async function hydrateDeltaAsync({ repo, rows, execAsync, store = new Map(), nowMs, bounds, isCandidate, execOpts = {} }) {
+  if (typeof isCandidate !== 'function') throw new TypeError('delta requires isCandidate');
+  const incomplete = rows.find(row => row.labelsComplete !== true);
+  if (incomplete) throw new PrListUnreadableError({ repo, stage: 'page', page: `PR #${incomplete.number}`,
+    cause: new Error(`incomplete labels for PR #${incomplete.number} — refusing partial candidacy evidence`) });
+  const stats = { fetched: 0, reused: 0, candidates: 0, byReason: {} };
+  const reasons = rows.map(row => {
+    const candidate = !!isCandidate(row);
+    if (candidate) stats.candidates++;
+    const reason = candidate ? 'candidate' : whyNotReuse(store.get(row.number), row, nowMs, bounds);
+    if (reason !== null) { stats.fetched++; stats.byReason[reason] = (stats.byReason[reason] ?? 0) + 1; }
+    else stats.reused++;
+    return reason;
+  });
+  const reads = await mapWithConcurrency(rows.filter((_row, i) => reasons[i] !== null), 6, async row => {
+    if (!identityOf(row)) return { number: row.number, deferred: 'row-invalid' };
+    try {
+      const read = async () => {
+        const { stdout } = await execAsync('gh', heavyArgs(repo, row, [...IDENTITY, ...HEAVY]), execOptions(execOpts));
+        return readHeavyPinned(row, stdout, nowMs);
+      };
+      let entry;
+      try { entry = await read(); }
+      catch (cause) {
+        if (!(cause instanceof HeavyReadError) || cause.reason !== 'moved') throw cause;
+        entry = await read();
+      }
+      return { number: row.number, entry };
+    } catch (cause) {
+      if (cause instanceof HeavyReadError && cause.reason === 'moved') return { number: row.number, deferred: 'moved' };
+      return { error: new PrListUnreadableError({ repo, stage: 'hydrate', number: row.number, cause }) };
+    }
+  });
+  const failed = reads.find(read => read.error);
+  if (failed) throw failed.error;
+  const fetched = new Map(reads.map(read => [read.number, read.entry]));
+  const deferred = new Map(reads.filter(read => read.deferred).map(read => [read.number, read.deferred]));
+  if (deferred.size) stats.deferred = deferred.size;
+  const next = new Map();
+  const hydrated = rows.map(row => {
+    if (deferred.has(row.number)) return { ...row, body: '', files: [], rowsComplete: false,
+      heavyReadError: `heavy PR evidence ${deferred.get(row.number)} — deferring until the next pass` };
+    const entry = fetched.get(row.number) ?? store.get(row.number);
+    next.set(row.number, entry);
+    return { ...row, body: entry.body, files: entry.files.map(file => ({ ...file })) };
+  });
+  return { rows: hydrated, store: next, stats };
+}
+
 /** Share seed preparation and final row/cache assembly between sync and async hydration. */
 function* pagedHydration({ repo, exec, paging, heavyFields, needsHeavy = () => true,
-  cache = {}, seed = [], nowMs = Date.now(), maxRows = 500, execOpts = {} }) {
+  cache = {}, seed = [], nowMs = Date.now(), maxRows = 500, execOpts = {}, delta, store = new Map(), maxAgeMs: deltaMaxAgeMs }) {
+  if (delta) {
+    if (seed.length || deltaMaxAgeMs !== undefined || Object.hasOwn(delta, 'maxAgeMs')
+      || !Array.isArray(heavyFields) || heavyFields.length !== HEAVY.length || heavyFields.some((field, i) => field !== HEAVY[i])) {
+      throw new TypeError('delta requires body,files without seed or maxAgeMs');
+    }
+    if (typeof delta.isCandidate !== 'function') throw new TypeError('delta requires isCandidate');
+  }
   const light = listOpenPrsLightPaged({ repo, exec, pageSize: paging.pageSize,
     pageRetries: paging.pageRetries, maxRows, execOpts });
   if (light.deferred) throw new PrListUnreadableError({ repo, stage: 'page', page: 1,
     cause: new Error('gh deferred the page (low budget)') });
   assertInventoryComplete({ repo, rows: light.rows, totalCount: light.totalCount, truncated: light.truncated });
+  if (delta) {
+    const started = Date.now();
+    const result = yield { delta: true, repo, rows: light.rows, store, nowMs, bounds: loadBounds(paging),
+      isCandidate: delta.isCandidate, execOpts };
+    return { ...result, truncated: light.truncated, totalCount: light.totalCount, pages: light.pages,
+      ms: light.ms, timing: { lightMs: light.ms, hydrateMs: Date.now() - started } };
+  }
   const working = { ...cache };
   const byNumber = new Map(light.rows.map(row => [row.number, row]));
   const maxAgeMs = paging.heavyMaxAgeSeconds * 1000;
@@ -400,6 +478,7 @@ function* pagedHydration({ repo, exec, paging, heavyFields, needsHeavy = () => t
 
 /** SYNC: page the live set, then hydrate selected rows; unreadable never means partial or empty. */
 export function listOpenPrsPagedHydrated(options) {
+  if (options.delta) throw new TypeError('delta hydration requires the async entry');
   const listing = pagedHydration(options);
   const step = listing.next();
   return step.done ? step.value : listing.next(hydrateHeavyFields(step.value)).value;
@@ -407,8 +486,12 @@ export function listOpenPrsPagedHydrated(options) {
 
 /** Same live pages and freshness rules, with at most six asynchronous heavy reads in flight. */
 export async function listOpenPrsPagedHydratedAsync(options) {
+  if (options.delta && Object.hasOwn(options, 'maxAgeMs')) throw new TypeError('delta forbids maxAgeMs');
   const listing = pagedHydration(options);
   const step = listing.next();
+  if (!step.done && step.value.delta) {
+    return listing.next(await hydrateDeltaAsync({ ...step.value, execAsync: options.execAsync })).value;
+  }
   return step.done ? step.value
     : listing.next(await hydrateHeavyFieldsAsync({ ...step.value, execAsync: options.execAsync })).value;
 }
