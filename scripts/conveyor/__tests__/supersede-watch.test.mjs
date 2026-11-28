@@ -4,16 +4,28 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildSupersededStandDownComment } from '../stand-down.mjs';
 import { setMarkdownLoader } from '../supersede-rule.mjs';
-import { runSupersedeWatch, formatSupersedeLines, defaultReadMergedPrs, defaultReadOpenNumbers, defaultReadBodyEdit } from '../supersede-watch.mjs';
+import { runSupersedeWatch, formatSupersedeLines, defaultReadMergedPrs, defaultReadOpenNumbers, defaultReadBodyEdit, validateSnapshot } from '../supersede-watch.mjs';
 import { runTickAllRepos, runSupersedeAllRepos } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
 
 const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/supersede/pr4522-2026-10-09.json'), 'utf8'));
 const repo = 'web-everything/web-everything';
+const legacyNow = Date.parse('2026-10-10T00:00:00Z');
+const sourceSnapshot = (m = fixture.merged) => ({ ...m, id: `PR_${m.number}`,
+  author: { login: 'web-everything' }, headRefOid: 'a'.repeat(40), updatedAt: '2026-10-09T06:00:00Z',
+  lastEditedAt: null, editor: null });
+const targetSnapshot = (p = fixture.open) => ({ ...p, id: `PR_${p.number}`, headRefOid: 'b'.repeat(40) });
 const hold = { pr: 4522, by: 4532, mergedAt: '2026-10-09T01:52:13Z' };
-const fakes = () => ({ repo, settings: { hold: true, lookbackDays: 14 },
+const fakes = () => { const options = ({ repo, now: legacyNow, settings: { hold: true, lookbackDays: 14 },
   readMergedPrs: vi.fn(() => [fixture.merged]), readOpenNumbers: vi.fn(() => [4522, 1]),
-  readPr: vi.fn(() => ({ ...fixture.open, state: 'OPEN' })), postHold: vi.fn(() => ({ ok: true, labeled: true })),
-  readBodyEdit: vi.fn(() => ({ lastEditedAt: null, editor: null })) });
+  readPr: vi.fn(() => ({ ...targetSnapshot(), state: 'OPEN' })), postHold: vi.fn(() => ({ ok: true, labeled: true })),
+  readBodyEdit: vi.fn(() => sourceSnapshot()) });
+  options.postHold.mockImplementation(({ hold: h }) => {
+    options.readPr.mockReturnValue({ ...targetSnapshot({ number: h.pr, state: 'OPEN', labels: [], comments: [] }),
+      comments: [{ author: { login: 'web-everything' }, body: buildSupersededStandDownComment(h) }] });
+    return { ok: true, labeled: true };
+  });
+  return options;
+};
 
 describe('runSupersedeWatch', () => {
   it.each([true, false])('plans the real incident with apply=%s', (apply) => {
@@ -27,7 +39,7 @@ describe('runSupersedeWatch', () => {
   });
   it('rechecks whether the candidate is still open', () => {
     const opts = fakes();
-    opts.readPr.mockReturnValue({ ...fixture.open, state: 'CLOSED' });
+    opts.readPr.mockReturnValue({ ...targetSnapshot(), state: 'CLOSED' });
     const result = runSupersedeWatch(opts);
     expect(result).toMatchObject({ holds: [], applied: [] });
     expect(opts.postHold).not.toHaveBeenCalled();
@@ -56,7 +68,7 @@ describe('runSupersedeWatch', () => {
     const outsider = { ...fixture.merged, number: 8, author: { login: 'rando' } };
     opts.readMergedPrs.mockReturnValue([fixture.merged, noMarker, outsider]);
     runSupersedeWatch(opts);
-    expect(opts.readBodyEdit).toHaveBeenCalledTimes(1);
+    expect(opts.readBodyEdit).toHaveBeenCalledTimes(2);
     expect(opts.readBodyEdit).toHaveBeenCalledWith({ repo, pr: 4532 });
   });
   it('does not read a body edit when no target of the marker is open', () => {
@@ -76,7 +88,7 @@ describe('runSupersedeWatch', () => {
   });
   it('a body rewritten after the merge by an outsider plans no hold, reads no candidate and posts nothing', () => {
     const opts = fakes();
-    opts.readBodyEdit.mockReturnValue({ lastEditedAt: '2026-10-09T05:00:00Z', editor: { login: 'rando' } });
+    opts.readBodyEdit.mockReturnValue({ ...sourceSnapshot(), lastEditedAt: '2026-10-09T05:00:00Z', editor: { login: 'rando' } });
     const result = runSupersedeWatch({ ...opts, apply: true });
     expect(result.holds).toEqual([]);
     expect(opts.readPr).not.toHaveBeenCalled();
@@ -84,15 +96,15 @@ describe('runSupersedeWatch', () => {
   });
   it('a body edited after the merge by the operator still holds', () => {
     const opts = fakes();
-    opts.readBodyEdit.mockReturnValue({ lastEditedAt: '2026-10-09T05:00:00Z', editor: { login: 'chalbert' } });
+    opts.readBodyEdit.mockReturnValue({ ...sourceSnapshot(), lastEditedAt: '2026-10-09T05:00:00Z', editor: { login: 'chalbert' } });
     expect(runSupersedeWatch(opts).holds).toEqual([hold]);
   });
   it('a failed edit read ignores only that PR and does not fail the pass', () => {
     const opts = fakes();
     const other = { ...fixture.merged, number: 4533, body: 'Supersedes: #1', mergedAt: '2026-10-09T03:00:00Z' };
     opts.readMergedPrs.mockReturnValue([fixture.merged, other]);
-    opts.readBodyEdit.mockImplementation(({ pr }) => { if (pr === 4532) throw new Error('graphql down'); return { lastEditedAt: null, editor: null }; });
-    opts.readPr.mockImplementation(({ pr }) => ({ number: pr, state: 'OPEN', labels: [], comments: [] }));
+    opts.readBodyEdit.mockImplementation(({ pr }) => { if (pr === 4532) throw new Error('graphql down'); return sourceSnapshot(other); });
+    opts.readPr.mockImplementation(({ pr }) => targetSnapshot({ number: pr, state: 'OPEN', labels: [], comments: [] }));
     const result = runSupersedeWatch(opts);
     expect(result.error).toBeUndefined();
     expect(result.holds).toEqual([{ pr: 1, by: 4533, mergedAt: '2026-10-09T03:00:00Z' }]);
@@ -123,17 +135,24 @@ describe('runSupersedeWatch', () => {
       state: 'MERGED', mergedAt: all[0].merged_at });
     expect(exec).toHaveBeenCalledTimes(6);
   });
-  it('stops merged pagination at an old updated page, not an old merge updated recently', () => {
+  it.each([false, true])('stops merged pagination at an old updated page, not an old merge updated recently (requireComplete=%s)', requireComplete => {
     const recent = '2026-10-09T00:00:00Z', old = '2026-01-01T00:00:00Z';
-    const exec = vi.fn().mockReturnValueOnce(JSON.stringify(Array.from({ length: 100 }, (_, i) => ({
+    const first = Array.from({ length: 100 }, (_, i) => ({
       number: i + 1, body: null, state: 'closed', merged_at: i === 0 ? old : recent, updated_at: recent, user: { login: 'bot' },
-    })))).mockReturnValueOnce(JSON.stringify(Array.from({ length: 100 }, (_, i) => ({
+    }));
+    const second = Array.from({ length: 100 }, (_, i) => ({
       number: i + 101, body: '', state: 'closed', merged_at: old, updated_at: old, user: { login: 'bot' },
-    }))));
+    }));
+    const exec = vi.fn((_cmd, args) => {
+      if (args[1] === 'graphql') return JSON.stringify({ data: { search: { issueCount: 99 } } });
+      const page = Number(new URL(args[1], 'https://fixture.invalid').searchParams.get('page'));
+      return JSON.stringify(page === 1 ? first : second);
+    });
     const rows = defaultReadMergedPrs({ repo, lookbackDays: 14,
-      now: Date.parse('2026-10-10T00:00:00Z'), exec });
+      now: Date.parse('2026-10-10T00:00:00Z'), exec, requireComplete });
     expect(rows).toHaveLength(99);
-    expect(exec).toHaveBeenCalledTimes(2);
+    // Complete: two scans of two pages, each followed by one search lower-bound read.
+    expect(exec).toHaveBeenCalledTimes(requireComplete ? 6 : 2);
   });
   it.each([defaultReadOpenNumbers, defaultReadMergedPrs])('refuses incomplete lists at the page cap with an operator fallback (%s)', read => {
     const exec = vi.fn(() => JSON.stringify(Array.from({ length: 100 }, (_, i) => ({
@@ -182,7 +201,7 @@ describe('runSupersedeWatch', () => {
   it('posts nothing on a second pass when the thread already holds', () => {
     const opts = fakes();
     expect(runSupersedeWatch(opts).applied).toHaveLength(1);
-    opts.readPr.mockReturnValue({ ...fixture.open, state: 'OPEN', comments: [
+    opts.readPr.mockReturnValue({ ...targetSnapshot(), state: 'OPEN', comments: [
       ...fixture.open.comments, { author: { login: 'web-everything' },
         body: buildSupersededStandDownComment(hold) },
     ] });
@@ -258,5 +277,426 @@ describe('supersede daemon wiring', () => {
     expect(runSupersedeAllRepos({ repos: ['bad', repo], tick }).repos).toEqual([
       { repo: 'bad', holds: [], applied: [], error: 'offline' }, { repo, holds: [hold], applied: [] },
     ]);
+  });
+});
+
+// All hardening evidence is synthetic; no host, checkout discovery or subprocess reads.
+const hardNow = Date.parse('2026-11-26T12:00:00Z');
+const hardSource = () => ({ number: 20, id: 'PR_20', body: 'Supersedes: #10', state: 'MERGED',
+  author: { login: 'web-everything' }, mergedAt: '2026-11-25T10:00:00Z',
+  updatedAt: '2026-11-25T11:00:00Z', lastEditedAt: null, editor: null, headRefOid: 'a'.repeat(40) });
+const hardTarget = () => ({ number: 10, id: 'PR_10', state: 'OPEN', headRefOid: 'b'.repeat(40), labels: [], comments: [] });
+const hardOptions = () => ({ repo: 'fixture/project', now: hardNow, settings: { hold: true, lookbackDays: 14 },
+  readMergedPrs: vi.fn(() => [hardSource()]), readOpenNumbers: vi.fn(() => [10]),
+  readBodyEdit: vi.fn(() => hardSource()), readPr: vi.fn(() => hardTarget()),
+  postHold: vi.fn(() => ({ ok: true, labeled: true })) });
+
+describe('bound supersede evidence', () => {
+  it.each([
+    [{ login: 'web-everything[bot]' }, { login: 'web-everything' }],
+    [{ login: 'web-everything' }, { login: 'web-everything[bot]' }],
+    [{ login: 'Web-Everything[bot]' }, { login: 'WEB-EVERYTHING' }],
+    [{ login: 'app/web-everything', is_bot: true }, { login: 'web-everything[bot]' }],
+    [{ login: 'web-everything[bot]' }, { login: 'app/web-everything', is_bot: true }],
+    [{ login: 'Chalbert' }, { login: 'chalbert' }],
+  ])('holds across equivalent trusted author shapes: %j -> %j', (listedAuthor, snapshotAuthor) => {
+    const opts = hardOptions();
+    opts.readMergedPrs.mockReturnValue([{ ...hardSource(), author: listedAuthor }]);
+    // Revalidation may encounter the other API shape too; it is still the same version.
+    opts.readBodyEdit.mockReturnValueOnce({ ...hardSource(), author: snapshotAuthor })
+      .mockReturnValue({ ...hardSource(), author: listedAuthor });
+    opts.postHold.mockImplementation(({ hold: h }) => {
+      opts.readPr.mockReturnValue({ ...hardTarget(), comments: [{ author: { login: 'web-everything' },
+        body: buildSupersededStandDownComment(h) }] });
+      return { ok: true, labeled: true };
+    });
+    const result = runSupersedeWatch(opts);
+    expect(result.bodyEditFailures).toBeUndefined();
+    expect(result.holds).toEqual([{ pr: 10, by: 20, mergedAt: hardSource().mergedAt }]);
+    expect(result.applied).toEqual([expect.objectContaining({ ok: true })]);
+    expect(opts.postHold).toHaveBeenCalledTimes(1);
+  });
+  it.each([
+    { login: 'chalbert' }, { login: 'rando[bot]' }, { login: 'app/web-everything' },
+    { login: 'APP/web-everything', is_bot: true }, { login: 'app/app/web-everything', is_bot: true },
+    { login: ' web-everything[bot]' }, { login: 'web-everything[bot][bot]' },
+  ])('does not equate different principals or bypass author trust: %j', author => {
+    const opts = hardOptions();
+    opts.readBodyEdit.mockReturnValue({ ...hardSource(), author });
+    expect(runSupersedeWatch(opts)).toMatchObject({ holds: [], bodyEditFailures: 1 });
+    expect(opts.postHold).not.toHaveBeenCalled();
+  });
+  it('199 unique candidates from a claimed 200-item mutable listing reports incomplete and supersedes nothing', () => {
+    const rows = Array.from({ length: 200 }, (_, i) => ({ number: i + 1, state: 'open' }));
+    rows[100] = rows[99];
+    const exec = vi.fn((_cmd, args) => {
+      if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequests: { totalCount: 200 } } } });
+      const page = Number(new URL(args[1], 'https://fixture.invalid').searchParams.get('page'));
+      return JSON.stringify(rows.slice((page - 1) * 100, page * 100));
+    });
+    const opts = hardOptions();
+    opts.readOpenNumbers = () => defaultReadOpenNumbers({ repo: opts.repo, exec, requireComplete: true });
+    const result = runSupersedeWatch(opts);
+    expect(result).toMatchObject({ blocked: true, holds: [], applied: [], error: expect.stringMatching(/incomplete.*retry/i) });
+    expect(opts.postHold).not.toHaveBeenCalled();
+  });
+  it.each(['UNKNOWN', '', 'open-ish'])('unknown candidate state refuses: %j', state => {
+    const opts = hardOptions();
+    opts.readPr.mockReturnValue({ ...hardTarget(), state });
+    expect(runSupersedeWatch(opts)).toMatchObject({ blocked: true, holds: [] });
+    expect(opts.postHold).not.toHaveBeenCalled();
+  });
+  it.each(['', 'yesterday', '2026-02-30T00:00:00Z', '2027-01-01T00:00:00Z', 42])('invalid lastEditedAt refuses: %j', lastEditedAt => {
+    const opts = hardOptions();
+    opts.readBodyEdit.mockReturnValue({ ...hardSource(), lastEditedAt, editor: { login: 'web-everything' } });
+    expect(runSupersedeWatch(opts).holds).toEqual([]);
+    expect(opts.postHold).not.toHaveBeenCalled();
+  });
+  it.each([
+    { body: 'Supersedes: #99' }, { updatedAt: '2026-11-25T11:01:00Z' },
+    { number: 21 }, { id: 'OTHER' }, { state: 'CLOSED' }, { headRefOid: 'c'.repeat(40) },
+    { author: { login: 'rando' } }, { lastEditedAt: undefined },
+  ])('mismatched body version, identity, state or author refuses: %j', fields => {
+    const opts = hardOptions();
+    opts.readBodyEdit.mockReturnValue({ ...hardSource(), ...fields });
+    expect(runSupersedeWatch(opts).holds).toEqual([]);
+    expect(opts.postHold).not.toHaveBeenCalled();
+  });
+  it('evidence-changes-before-write refuses a concurrent edit', () => {
+    const opts = hardOptions();
+    opts.readBodyEdit.mockReturnValueOnce(hardSource()).mockReturnValue({ ...hardSource(), body: 'withdrawn' });
+    expect(runSupersedeWatch(opts).applied.every(a => a.ok === false)).toBe(true);
+    expect(opts.postHold).not.toHaveBeenCalled();
+  });
+  it.each([{ number: 99 }, { headRefOid: 'c'.repeat(40) }, { state: 'CLOSED' }, { id: 'OTHER' }])('moved candidate refuses: %j', fields => {
+    const opts = hardOptions();
+    opts.readPr.mockReturnValueOnce(hardTarget()).mockReturnValue({ ...hardTarget(), ...fields });
+    runSupersedeWatch(opts);
+    expect(opts.postHold).not.toHaveBeenCalled();
+  });
+  it('candidate ID changes before write refuses', () => {
+    const opts = hardOptions();
+    opts.readPr.mockReturnValueOnce(hardTarget()).mockReturnValue({ ...hardTarget(), id: 'PR_REPLACED' });
+    const result = runSupersedeWatch(opts);
+    expect(result.applied).toEqual([expect.objectContaining({ ok: false, error: expect.stringMatching(/candidate moved/) })]);
+    expect(opts.postHold).not.toHaveBeenCalled();
+    expect(result.evidence).toBeUndefined();
+  });
+  it('candidate ID changes during read-back refuses completion', () => {
+    const opts = hardOptions();
+    opts.postHold.mockImplementation(({ hold: h }) => {
+      opts.readPr.mockReturnValue({ ...hardTarget(), id: 'PR_REPLACED', comments: [{ author: { login: 'web-everything' },
+        body: buildSupersededStandDownComment(h) }] });
+      return { ok: true, labeled: true };
+    });
+    const result = runSupersedeWatch(opts);
+    expect(result.applied).toEqual([expect.objectContaining({ ok: false, error: expect.stringMatching(/read-back.*retry/i) })]);
+    expect(result.evidence).toBeUndefined();
+  });
+  it('effect read-back must observe the trusted hold before recording completion', () => {
+    const opts = hardOptions();
+    const result = runSupersedeWatch(opts);
+    expect(opts.postHold).toHaveBeenCalledTimes(1);
+    expect(result.applied).toEqual([expect.objectContaining({ ok: false, error: expect.stringMatching(/read-back.*retry/i) })]);
+    expect(result.evidence).toBeUndefined();
+  });
+  it('a post that is not ok records no evidence', () => {
+    const opts = hardOptions();
+    opts.postHold.mockReturnValue({ ok: false, error: 'label failed' });
+    const result = runSupersedeWatch(opts);
+    expect(result.applied).toEqual([expect.objectContaining({ ok: false })]);
+    expect(result.evidence).toBeUndefined();
+  });
+  it('stable bound snapshot stores candidate identity and version after trusted read-back', () => {
+    const opts = hardOptions();
+    opts.postHold.mockImplementation(() => {
+      opts.readPr.mockReturnValue({ ...hardTarget(), comments: [{ author: { login: 'web-everything' },
+        body: buildSupersededStandDownComment({ pr: 10, by: 20, mergedAt: hardSource().mergedAt }) }] });
+      return { ok: true, labeled: true };
+    });
+    const result = runSupersedeWatch(opts);
+    expect(result.applied).toEqual([expect.objectContaining({ ok: true })]);
+    expect(result.evidence).toEqual([expect.objectContaining({ candidateId: 'PR_10', sourceId: 'PR_20', version: hardSource().updatedAt })]);
+  });
+});
+
+describe('complete listing replay', () => {
+  const replay = ({ count = 200, change = false, omit = false } = {}) => {
+    const rows = Array.from({ length: 200 }, (_, i) => ({ number: i + 1, state: 'open',
+      updated_at: new Date(hardNow - i * 1000).toISOString() }));
+    let reads = 0;
+    const exec = vi.fn((_cmd, args) => {
+      if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequests: { totalCount: count } } } });
+      const page = Number(new URL(args[1], 'https://fixture.invalid').searchParams.get('page'));
+      reads++;
+      const data = omit ? rows.slice(0, 199) : rows;
+      const batch = data.slice((page - 1) * 100, page * 100).map(r => ({ ...r }));
+      if (change && page === 2) batch[0] = { ...rows[0], updated_at: new Date(hardNow).toISOString() };
+      return JSON.stringify(batch);
+    });
+    return { exec, rows, get reads() { return reads; } };
+  };
+  it('missing unique row against the claimed total refuses with operator retry', () => {
+    const { exec } = replay({ omit: true });
+    expect(() => defaultReadOpenNumbers({ repo: 'fixture/project', exec, requireComplete: true })).toThrow(/incomplete.*retry/i);
+  });
+  it('two pages with an update between reads report incomplete and zero writes', () => {
+    const { exec } = replay({ change: true });
+    const opts = hardOptions();
+    opts.readOpenNumbers = () => defaultReadOpenNumbers({ repo: opts.repo, exec, requireComplete: true });
+    const result = runSupersedeWatch(opts);
+    expect(result).toMatchObject({ blocked: true, holds: [], applied: [] });
+    expect(formatSupersedeLines({ repos: [result] }).join('')).toMatch(/incomplete/);
+    expect(opts.postHold).not.toHaveBeenCalled();
+  });
+  it('stable complete two-page snapshot returns all expected candidates', () => {
+    const { exec, rows } = replay();
+    expect(defaultReadOpenNumbers({ repo: 'fixture/project', exec, requireComplete: true })).toEqual(rows.map(r => r.number));
+  });
+  it('bound snapshot producer requests body, identity, state and edit version together', () => {
+    const exec = vi.fn(() => JSON.stringify({ data: { repository: { pullRequest: hardSource() } } }));
+    expect(defaultReadBodyEdit({ repo: 'fixture/project', pr: 20, exec })).toEqual(hardSource());
+    const query = exec.mock.calls[0][1].find(arg => arg.startsWith('query='));
+    for (const field of ['id', 'number', 'body', 'state', 'author', 'mergedAt', 'updatedAt', 'headRefOid', 'lastEditedAt', 'editor']) {
+      expect(query).toMatch(new RegExp('\\b' + field + '\\b'));
+    }
+  });
+  it('untrusted read-back marker never records a completed effect', () => {
+    const opts = hardOptions();
+    opts.postHold.mockImplementation(() => {
+      opts.readPr.mockReturnValue({ ...hardTarget(), comments: [{ author: { login: 'rando' },
+        body: buildSupersededStandDownComment({ pr: 10, by: 20, mergedAt: hardSource().mergedAt }) }] });
+      return { ok: true, labeled: true };
+    });
+    const result = runSupersedeWatch(opts);
+    expect(result.applied).toEqual([expect.objectContaining({ ok: false })]);
+    expect(result.evidence).toBeUndefined();
+  });
+});
+
+describe('closed completeness paths', () => {
+  const openRows = (mutate = () => ({})) => Array.from({ length: 3 }, (_, i) => ({ number: i + 1, state: 'open',
+    body: `body ${i}`, user: { login: 'someone' }, updated_at: '2026-11-25T11:00:00Z', ...mutate(i) }));
+  /** An exec whose second full scan of the list differs by `mutate`; counts are always consistent. */
+  const driftingExec = (first, second) => {
+    let scans = 0;
+    return (_cmd, args) => {
+      if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequests: { totalCount: first.length } } } });
+      const page = Number(new URL(args[1], 'https://fixture.invalid').searchParams.get('page'));
+      if (page === 1) scans += 1;
+      return JSON.stringify(page === 1 ? (scans <= 1 ? first : second) : []);
+    };
+  };
+  it('unrelated open PR activity between scans still yields the complete open numbers', () => {
+    const exec = driftingExec(openRows(), openRows(i => ({ updated_at: '2026-11-25T12:00:00Z', body: `edited ${i}` })));
+    expect(defaultReadOpenNumbers({ repo, exec, requireComplete: true })).toEqual([1, 2, 3]);
+  });
+  it('the open list is read in creation order so activity cannot shift its pages', () => {
+    const urls = [];
+    defaultReadOpenNumbers({ repo, requireComplete: false, exec: (_cmd, args) => { urls.push(args[1]); return '[]'; } });
+    expect(urls[0]).toMatch(/state=open&sort=created&direction=desc/);
+  });
+  const mergedRows = (mutate = () => ({})) => [{ number: 20, state: 'closed', body: 'Supersedes: #10',
+    user: { login: 'web-everything' }, merged_at: hardSource().mergedAt, updated_at: hardSource().updatedAt, ...mutate() }];
+  const mergedExec = (first, second, issueCount = 1) => {
+    let scans = 0;
+    return (_cmd, args) => {
+      if (args[1] === 'graphql') return JSON.stringify({ data: { search: { issueCount } } });
+      scans += 1;
+      return JSON.stringify(scans <= 1 ? first : second);
+    };
+  };
+  const readMerged = exec => defaultReadMergedPrs({ repo, exec, now: hardNow, lookbackDays: 14, requireComplete: true });
+  it.each([{ body: 'Supersedes: #99' }, { user: { login: 'someone-else' } }, { merged_at: '2026-11-25T10:00:01Z' }])(
+    'same-membership version drift in a planner field refuses the merged inventory: %j', fields => {
+      expect(() => readMerged(mergedExec(mergedRows(), mergedRows(() => fields)))).toThrow(/inventory changed.*retry/);
+    });
+  it('a merged PR updated only by comment or label between scans does not refuse', () => {
+    const rows = readMerged(mergedExec(mergedRows(), mergedRows(() => ({ updated_at: '2026-11-25T11:30:00Z' }))));
+    expect(rows.map(r => r.number)).toEqual([20]);
+  });
+  it.each([0, 1])('a lagging search index (issueCount %i below the REST rows) still returns them', issueCount => {
+    const rows = mergedRows();
+    const second = [...rows, { ...rows[0], number: 21, body: '' }];
+    expect(readMerged(mergedExec(second, second, issueCount)).map(r => r.number)).toEqual([20, 21]);
+  });
+  it('a search index claiming more merges than REST returned refuses', () => {
+    expect(() => readMerged(mergedExec(mergedRows(), mergedRows(), 2))).toThrow(/incomplete closed PR list.*retry/);
+  });
+  it('search index lag does not stop the daemon tick from dispatching the fix half', async () => {
+    const opts = hardOptions();
+    const rows = mergedRows();
+    const exec = vi.fn((_cmd, args) => {
+      if (args[1] === 'graphql') {
+        if (args.some(a => a.startsWith('q='))) return JSON.stringify({ data: { search: { issueCount: 0 } } });
+        return JSON.stringify({ data: { repository: { pullRequests: { totalCount: 1 } } } });
+      }
+      return JSON.stringify(new URL(args[1], 'https://fixture.invalid').searchParams.get('state') === 'open'
+        ? [{ number: 10, state: 'open' }] : rows);
+    });
+    opts.postHold.mockImplementation(({ hold: h }) => {
+      opts.readPr.mockReturnValue({ ...hardTarget(), comments: [{ author: { login: 'web-everything' },
+        body: buildSupersededStandDownComment(h) }] });
+      return { ok: true, labeled: true };
+    });
+    const tick = () => runSupersedeWatch({ ...opts, readMergedPrs: undefined, readOpenNumbers: undefined, exec });
+    const fixTick = vi.fn(noopDispatch);
+    await runTickAllRepos({ ...tickFakes(), repos: [opts.repo], fixTick, supersedeTick: tick });
+    expect(fixTick).toHaveBeenCalledTimes(1);
+    expect(opts.postHold).toHaveBeenCalledTimes(1);
+  });
+  it('processes recent supersedes when historical closed inventory exceeds the cap', async () => {
+    const opts = hardOptions();
+    const source = hardSource();
+    const old = '2020-01-01T00:00:00Z';
+    const history = Array.from({ length: 12000 }, (_, i) => ({ number: i + 100,
+      state: 'closed', body: '', user: source.author, merged_at: old, updated_at: old }));
+    const closed = [{ number: source.number, state: 'closed', body: source.body,
+      user: source.author, merged_at: source.mergedAt, updated_at: source.updatedAt }, ...history];
+    let closedPages = 0;
+    const exec = vi.fn((_cmd, args) => {
+      if (args[1] === 'graphql') {
+        if (args.some(a => a.startsWith('q='))) {
+          expect(args).toContain('q=repo:fixture/project is:pr is:merged merged:>=2026-11-12T12:00:00.000Z');
+          return JSON.stringify({ data: { search: { issueCount: 1 } } });
+        }
+        const totalCount = args.includes('s[]=OPEN') ? 1 : closed.length;
+        return JSON.stringify({ data: { repository: { pullRequests: { totalCount } } } });
+      }
+      const url = new URL(args[1], 'https://fixture.invalid');
+      if (url.searchParams.get('state') === 'open') return JSON.stringify([{ number: 10, state: 'open' }]);
+      closedPages++;
+      const page = Number(url.searchParams.get('page'));
+      return JSON.stringify(closed.slice((page - 1) * 100, page * 100));
+    });
+    opts.postHold.mockImplementation(({ hold: h }) => {
+      opts.readPr.mockReturnValue({ ...hardTarget(), comments: [{ author: source.author,
+        body: buildSupersededStandDownComment(h) }] });
+      return { ok: true, labeled: true };
+    });
+    const tick = () => runSupersedeWatch({ ...opts, readMergedPrs: undefined, readOpenNumbers: undefined, exec });
+    const result = tick();
+    expect(result.blocked, result.error).not.toBe(true);
+    expect(result.applied).toEqual([expect.objectContaining({ pr: 10, by: 20, ok: true })]);
+    expect(closedPages).toBeLessThanOrEqual(3);
+    const fixTick = vi.fn(noopDispatch);
+    await runTickAllRepos({ ...tickFakes(), repos: [opts.repo], fixTick, supersedeTick: tick });
+    expect(fixTick).toHaveBeenCalledTimes(1);
+    expect(closedPages).toBeLessThanOrEqual(6);
+  });
+  it('balanced membership replacement cannot establish complete inventory', () => {
+    const initial = Array.from({ length: 200 }, (_, i) => ({ number: i + 1, state: 'open' }));
+    const current = [{ number: 201, state: 'open' }, ...initial.slice(1)];
+    let reads = 0;
+    const exec = vi.fn((_cmd, args) => {
+      if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequests: { totalCount: 200 } } } });
+      const page = Number(new URL(args[1], 'https://fixture.invalid').searchParams.get('page'));
+      const rows = reads++ === 0 ? initial : current;
+      return JSON.stringify(rows.slice((page - 1) * 100, page * 100));
+    });
+    const opts = hardOptions();
+    opts.readOpenNumbers = () => defaultReadOpenNumbers({ repo: opts.repo, exec, requireComplete: true });
+    expect(runSupersedeWatch(opts)).toMatchObject({ blocked: true, error: expect.stringMatching(/inventory changed.*retry/) });
+    expect(opts.postHold).not.toHaveBeenCalled();
+    expect(runSupersedeWatch(opts).blocked).not.toBe(true);
+    expect(opts.postHold).toHaveBeenCalledTimes(1);
+  });
+  it.each(['missing', 'errors', 'changed', 'omitted'])('default merged window count proof refuses %s evidence', mode => {
+    let counts = 0;
+    const exec = (_cmd, args) => {
+      if (args[1] === 'graphql') {
+        const issueCount = mode === 'missing' ? null : (mode === 'changed' ? ++counts : 1);
+        return JSON.stringify({ data: { search: { issueCount } }, ...(mode === 'errors' ? { errors: [{ message: 'partial' }] } : {}) });
+      }
+      return JSON.stringify(mode === 'omitted' ? [] : [{ number: 20, body: '', state: 'closed',
+        merged_at: hardSource().mergedAt, updated_at: hardSource().updatedAt, user: hardSource().author }]);
+    };
+    const opts = hardOptions();
+    opts.readMergedPrs = () => defaultReadMergedPrs({ repo: opts.repo, exec, now: hardNow, lookbackDays: 14, requireComplete: true });
+    expect(runSupersedeWatch(opts)).toMatchObject({ blocked: true, holds: [], applied: [], error: expect.stringMatching(/incomplete closed PR list.*retry/) });
+    expect(opts.postHold).not.toHaveBeenCalled();
+  });
+  it('duplicate identity refuses even when the unique count matches', () => {
+    const rows = Array.from({ length: 200 }, (_, i) => ({ number: i + 1, state: 'open' }));
+    rows.splice(100, 0, rows[99]);
+    const exec = (_cmd, args) => {
+      if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequests: { totalCount: 200 } } } });
+      const page = Number(new URL(args[1], 'https://fixture.invalid').searchParams.get('page'));
+      return JSON.stringify(rows.slice((page - 1) * 100, page * 100));
+    };
+    expect(() => defaultReadOpenNumbers({ repo, exec, requireComplete: true })).toThrow(/duplicate #100/);
+  });
+  it('updatedAt-only concurrent edit refuses with source version changed', () => {
+    const opts = hardOptions();
+    opts.readBodyEdit.mockReturnValueOnce(hardSource()).mockReturnValue({ ...hardSource(), updatedAt: '2026-11-25T11:01:00Z' });
+    expect(runSupersedeWatch(opts).applied).toEqual([expect.objectContaining({ ok: false, error: 'source version changed; retry next tick' })]);
+    expect(opts.postHold).not.toHaveBeenCalled();
+  });
+  it.each(['updatedAt', 'mergedAt'])('future %s refuses with null lastEditedAt', field => {
+    const opts = hardOptions();
+    const future = '2027-01-01T00:00:00Z';
+    const source = { ...hardSource(), [field]: future, ...(field === 'mergedAt' ? { updatedAt: future } : {}) };
+    expect(() => validateSnapshot(source, source, hardNow)).toThrow(/unreadable or changed merged PR #20 snapshot; operator.*retry/);
+    opts.readMergedPrs.mockReturnValue([source]);
+    opts.readBodyEdit.mockReturnValue(source);
+    expect(runSupersedeWatch(opts)).toMatchObject({ holds: [], bodyEditFailures: 1 });
+    expect(opts.postHold).not.toHaveBeenCalled();
+  });
+  it('edit metadata-only concurrent edit is rejected by the source version bind', () => {
+    const opts = hardOptions();
+    const fresh = { ...hardSource(), lastEditedAt: '2026-11-25T10:30:00Z', editor: { login: 'web-everything' } };
+    // Shape validation and trusted-editor planning accept these facts; only version drift refuses.
+    expect(validateSnapshot(fresh, hardSource(), hardNow)).toEqual(fresh);
+    opts.readBodyEdit.mockReturnValueOnce(hardSource()).mockReturnValue(fresh);
+    expect(runSupersedeWatch(opts).applied).toEqual([expect.objectContaining({ ok: false, error: 'source version changed; retry next tick' })]);
+    expect(opts.postHold).not.toHaveBeenCalled();
+  });
+  it('evidence call cap blocks with operator retry', () => {
+    const open = Array.from({ length: 9900 }, (_, i) => ({ number: i + 1, state: 'open' }));
+    const closed = Array.from({ length: 3000 }, (_, i) => ({ number: i + 10000, state: 'closed',
+      body: '', user: { login: 'web-everything' }, merged_at: hardSource().mergedAt, updated_at: hardSource().updatedAt }));
+    const exec = vi.fn((_cmd, args) => {
+      if (args[1] === 'graphql') {
+        if (args.some(a => a.startsWith('q='))) return JSON.stringify({ data: { search: { issueCount: closed.length } } });
+        return JSON.stringify({ data: { repository: { pullRequests: { totalCount: args.includes('s[]=OPEN') ? open.length : closed.length } } } });
+      }
+      const url = new URL(args[1], 'https://fixture.invalid');
+      const rows = url.searchParams.get('state') === 'open' ? open : closed;
+      const page = Number(url.searchParams.get('page'));
+      return JSON.stringify(rows.slice((page - 1) * 100, page * 100));
+    });
+    const postHold = vi.fn();
+    expect(runSupersedeWatch({ repo, now: hardNow, settings: { hold: true, lookbackDays: 14 }, exec, postHold }))
+      .toMatchObject({ blocked: true, error: expect.stringMatching(/call cap.*operator.*retry/) });
+    expect(exec).toHaveBeenCalledTimes(256);
+    expect(postHold).not.toHaveBeenCalled();
+  });
+  it.each([null, undefined, -1, '200', 1.5])('missing or unreadable inventory count blocks the default authority: %j', totalCount => {
+    const postHold = vi.fn();
+    const exec = vi.fn(() => JSON.stringify({ data: { repository: { pullRequests: { totalCount } } } }));
+    const result = runSupersedeWatch({ repo: 'fixture/project', now: hardNow,
+      settings: { hold: true, lookbackDays: 14 }, exec, postHold });
+    expect(result).toMatchObject({ blocked: true, holds: [], applied: [], error: expect.stringMatching(/incomplete.*retry/) });
+    expect(postHold).not.toHaveBeenCalled();
+    expect(exec).toHaveBeenCalledTimes(1);
+  });
+  it('oversized proved inventory refuses with operator inspection and retry', () => {
+    const exec = vi.fn(() => JSON.stringify({ data: { repository: { pullRequests: { totalCount: 10001 } } } }));
+    expect(() => defaultReadOpenNumbers({ repo: 'fixture/project', exec, requireComplete: true }))
+      .toThrow(/page cap.*operator.*retry/);
+    expect(exec).toHaveBeenCalledTimes(1);
+  });
+  it('changed count across pages refuses even when every returned identity is unique', () => {
+    let counts = 0;
+    const exec = vi.fn((_cmd, args) => args[1] === 'graphql'
+      ? JSON.stringify({ data: { repository: { pullRequests: { totalCount: ++counts } } } })
+      : JSON.stringify([{ number: 10, state: 'open' }]));
+    expect(() => defaultReadOpenNumbers({ repo: 'fixture/project', exec, requireComplete: true })).toThrow(/incomplete.*retry/);
+  });
+  it('a read throwing before the write refuses the effect', () => {
+    const opts = hardOptions();
+    opts.readBodyEdit.mockReturnValueOnce(hardSource()).mockImplementation(() => { throw Error('read unavailable'); });
+    expect(runSupersedeWatch(opts).applied).toEqual([expect.objectContaining({ ok: false, error: 'read unavailable' })]);
+    expect(opts.postHold).not.toHaveBeenCalled();
   });
 });

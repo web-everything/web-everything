@@ -51,7 +51,7 @@
  *       `repos/{o}/{r}/commits/{sha}/check-runs` and `…/status` (only for an open PR's current head sha;
  *       `…/status` always lists no legacy statuses)
  *   - `api graphql -f query=…` for pr-list-paged.mjs's light open-PR query (paged, CREATED_AT DESC)
- *       and the issue-comment totalCount proof (explicit owner/name/n variables)
+ *       and the issue-comment and supersede-watch PR-list totalCount proofs (explicit variables)
  *   - Fields produced with GitHub's real shape (camelCase for `--json`, snake_case for `api`'s REST JSON) —
  *     see `fake-gh.mjs`'s `buildPrGraphqlView` / `restEvent` / `listChangedFilesRest`.
  *
@@ -462,6 +462,33 @@ function handleLabelCreate(store, rest) {
 function handleOpenPrPage(store, rest) {
   const fields = [...flagValues(rest, '-f'), ...flagValues(rest, '-F')];
   const query = fields.find(v => v?.startsWith('query='))?.slice(6);
+  if (query === 'query($q:String!){search(query:$q,type:ISSUE){issueCount}}') {
+    const search = fields.find(v => v.startsWith('q='))?.slice(2);
+    const match = search?.match(/^repo:([^\s]+) is:pr is:merged merged:>=(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)$/);
+    if (!match || !Number.isFinite(Date.parse(match[2]))) {
+      return { stderr: 'fake-gh: unsupported merged inventory search\n', exitCode: 1 };
+    }
+    const repoState = requireRepo(store, match[1]);
+    // Real GitHub search is eventually consistent: `repoState.searchIndexMissing` lists PR numbers
+    // the index has not (or never) caught up on, so the count can sit below the authoritative REST list.
+    const lagging = new Set(repoState.searchIndexMissing ?? []);
+    const issueCount = Object.values(repoState.prs).filter(pr => pr.state === 'MERGED'
+      && !lagging.has(pr.number) && Date.parse(pr.mergedAt) >= Date.parse(match[2])).length;
+    return jsonResult({ data: { search: { issueCount } } });
+  }
+  const inventoryQuery = 'query($o:String!,$n:String!,$s:[PullRequestState!]!){repository(owner:$o,name:$n){pullRequests(states:$s){totalCount}}}';
+  if (query === inventoryQuery) {
+    const value = key => fields.find(v => v.startsWith(`${key}=`))?.slice(key.length + 1);
+    const states = fields.filter(v => v.startsWith('s[]=')).map(v => v.slice(4));
+    if (!states.length || states.some(state => !['OPEN', 'CLOSED', 'MERGED'].includes(state))) {
+      return { stderr: 'fake-gh: unsupported pull request states\n', exitCode: 1 };
+    }
+    const repoState = requireRepo(store, `${value('o')}/${value('n')}`);
+    // GraphQL CLOSED excludes MERGED; REST state=closed includes both. Count the
+    // requested union from the same store the paginated REST reader uses.
+    const totalCount = Object.values(repoState.prs).filter(pr => states.includes(pr.state)).length;
+    return jsonResult({ data: { repository: { pullRequests: { totalCount } } } });
+  }
   const countQuery = GH_ARGV.readCommentsTotalCount('owner/repo', 1).find(v => v.startsWith('query=')).slice(6);
   if (query === countQuery) {
     const value = key => fields.find(v => v.startsWith(`${key}=`))?.slice(key.length + 1);
