@@ -12,6 +12,7 @@ import { QUESTION_HASH } from '../codex-audit.mjs';
 import { blocker } from '../../lib/open-pr-preflight.mjs';
 
 const sha = 'a'.repeat(40);
+// Isolate canonical audit evidence; sibling history has its own default-checker integration coverage.
 const base = 'b'.repeat(40);
 const message = `no canonical codex-audit record for ${sha}. Run node scripts/operations/run.mjs codex-audit --base=origin/main --head=${sha}`;
 
@@ -19,7 +20,7 @@ describe('combined open-pr preflight', () => {
   it('merges an audit refusal with all child blockers through exactly one --check spawn', () => {
     const blockers = [blocker('verify', 'verify-red', 'red'), blocker('soak-declaration', 'soak-declaration', 'missing')];
     const spawn = vi.fn(() => ({ status: 3, stdout: JSON.stringify({ reason: 'verify-red', blockers }) }));
-    const run = createPrLandRunner({ env: {}, spawn, prepGate: () => ({ ok: true }),
+    const run = createPrLandRunner({ siblingBase: () => ({ ok: true }), env: {}, spawn, prepGate: () => ({ ok: true }),
       prePrReview: () => ({ action: 'pass' }), canonicalAudit: () => ({ ok: false, reason: 'canonical-audit-weakened', sha, message }) });
     const result = run({ argv: ['--ref=lane/audit'] });
     expect(result.blockers.map(b => b.reason)).toEqual(['canonical-audit-weakened', 'verify-red', 'soak-declaration']);
@@ -30,7 +31,7 @@ describe('combined open-pr preflight', () => {
     const spawn = vi.fn(() => ({ status: 0, stdout: '{"reason":"check-ok"}' }));
     const review = vi.fn(() => ({ action: 'pass', bypass: { actor: 'operator', reason: 'approved', operatorInstruction: 'approved' } }));
     const audit = vi.fn(() => ({ ok: true, sha }));
-    const run = createPrLandRunner({ env: {}, spawn, canonicalAudit: audit, prePrReview: review,
+    const run = createPrLandRunner({ siblingBase: () => ({ ok: true }), env: {}, spawn, canonicalAudit: audit, prePrReview: review,
       prepGate: () => ({ ok: true }) });
     expect(run({ argv: ['--ref=lane/audit', '--check'] }).outcome).toBe('checked');
     expect(review.mock.calls[0][0].readOnly).toBe(true);
@@ -43,7 +44,7 @@ describe('combined open-pr preflight', () => {
   it('fails closed if the check child dies or returns an opened payload', () => {
     for (const child of [{ error: new Error('spawn failed') }, { status: 0, stdout: '{"pr":7}' },
       { status: 0, stdout: '{"reason":"opened","pr":7,"blockers":[]}' }]) {
-      const run = createPrLandRunner({ env: {}, spawn: () => child, canonicalAudit: () => ({ ok: true }),
+      const run = createPrLandRunner({ siblingBase: () => ({ ok: true }), env: {}, spawn: () => child, canonicalAudit: () => ({ ok: true }),
         prePrReview: () => ({ action: 'pass' }), prepGate: () => ({ ok: true }) });
       expect(run({ argv: ['--ref=lane/audit', '--check'] })).toMatchObject({ outcome: 'refused', reason: 'preflight-unconfirmed' });
     }
@@ -52,7 +53,7 @@ describe('combined open-pr preflight', () => {
 function runner(canonicalAudit) {
   const spawn = vi.fn((_cmd, args) => ({ status: 0, stdout: args.includes('--check') ? '{"reason":"check-ok"}' : '{"pr":7}' }));
   const review = vi.fn(() => ({ action: 'pass' }));
-  const run = createPrLandRunner({ canonicalAudit, prePrReview: review, spawn, env: {}, prepGate: () => ({ ok: true }), readPrepBody: () => '' });
+  const run = createPrLandRunner({ siblingBase: () => ({ ok: true }), canonicalAudit, prePrReview: review, spawn, env: {}, prepGate: () => ({ ok: true }), readPrepBody: () => '' });
   return { run, spawn, review };
 }
 
@@ -106,7 +107,7 @@ function defaultProducer({ direct = false, dry = false, check = false, failMain 
     writeFileSync(entry, `
       import { createPrLandRunner } from ${JSON.stringify(pathToFileURL(join(root, 'scripts/operations/open-pr-io.mjs')).href)};
       import { appendFileSync } from 'node:fs';
-      const run = createPrLandRunner({ cwd: ${JSON.stringify(dir)}, env: process.env,
+      const run = createPrLandRunner({ siblingBase: () => ({ ok: true }), cwd: ${JSON.stringify(dir)}, env: process.env,
         prePrReview: () => ({ action: 'pass' }), prepGate: () => ({ ok: true }),
         spawn: (_cmd, args) => {
           appendFileSync(${JSON.stringify(trace)}, JSON.stringify([args.includes('--check') ? 'preflight' : 'publication', args]) + '\\n');

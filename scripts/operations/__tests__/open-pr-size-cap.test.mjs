@@ -17,10 +17,11 @@ const request = { ref: 'lane/size-admission', pr: 5854, base: 'main', sha: '1'.r
 const card = { verdict: { num: 9001, id: 'xsplit1', rel: 'backlog/xsplit1-split.md' } };
 
 function wrapper(overrides = {}) {
+  // Isolate size delegation; the default history gate is covered in open-pr-sibling-base*.test.mjs.
   const diffStat = vi.fn(() => text);
   const fileItem = vi.fn(() => card);
   const spawn = vi.fn(() => ({ status: 0, stdout: JSON.stringify(opened) }));
-  const run = openPrIo.createPrLandRunner({ canonicalAudit: () => ({ ok: true }), prepGate: () => ({ ok: true }), readPrepBody: () => '', prePrReview: () => ({ action: 'pass' }),
+  const run = openPrIo.createPrLandRunner({ siblingBase: () => ({ ok: true }), canonicalAudit: () => ({ ok: true }), prepGate: () => ({ ok: true }), readPrepBody: () => '', prePrReview: () => ({ action: 'pass' }),
     diffStat, fileItem, spawn, dupBornAs: () => [], env: {}, ...overrides });
   return { run, diffStat, fileItem, spawn };
 }
