@@ -151,13 +151,16 @@ describe('forge key structure: bounded unclosed object scans fail closed',()=>{
       expect(small).toBeGreaterThan(0);
       expect(large/small).toBeLessThanOrEqual(5);
     } finally {spy.mockRestore();}
-    // Keep the original 500ms runtime bound (it also catches costly work inside each regex execution), but measure
-    // this process's CPU time: it never exceeds wall time and ignores the runner descheduling that made the
-    // wall-clock cap flake at 501ms. Linear takes ~30ms locally.
+    // The original 500ms wall-clock bound stays unchanged. It flaked at 501ms on CI because the single timed run
+    // also paid cold regex-compile and JIT cost, so an untimed warm-up on a smaller input runs first (linear takes
+    // ~30ms warm). The CPU-time check is an extra: it rejects heavy work even when the wall clock is flattered.
+    keyStructureFinding(Buffer.from('[a]'.repeat(10000)));
     const bytes=Buffer.from('[a]'.repeat(40000));
-    const before=process.cpuUsage();
+    const cpuBefore=process.cpuUsage();
+    const started=Date.now();
     expect(keyStructureFinding(bytes)).toBeNull();
-    const used=process.cpuUsage(before);
+    expect(Date.now()-started).toBeLessThan(500);
+    const used=process.cpuUsage(cpuBefore);
     expect((used.user+used.system)/1000).toBeLessThan(500);
   });
   it('still blocks a PEM private key inside a large doc',()=>{
