@@ -952,15 +952,19 @@ describe('secrets, result precedence and live admission', () => {
     await fs.mkdir(root);
     const config = join(root, 'vitest.config.mjs');
     await fs.writeFile(config, `export default { test: { environment: 'node', include: ['contract.test.mjs'] } };`);
-    const contract = `
-      import { describe, it, expect, beforeAll } from ${JSON.stringify(join(lane, 'node_modules/vitest/dist/index.js'))};
-      describe('reporter contract', () => {
-        HOOK
-        it('[contract] assertion failure', () => expect(1).toBe(2));
-        it('passing control', () => expect(1).toBe(1));
-        it.skip(${JSON.stringify(matrixTitle)}, () => {});
-      });
-    `;
+    // Explicit string lines keep generated test data distinct from this suite's
+    // executable tests for the merge gate's per-line source scanner.
+    const contract = [
+      '',
+      `      import { describe, it, expect, beforeAll } from ${JSON.stringify(join(lane, 'node_modules/vitest/dist/index.js'))};`,
+      "      describe('reporter contract', () => {",
+      '        HOOK',
+      "        it('[contract] assertion failure', () => expect(1).toBe(2));",
+      "        it('passing control', () => expect(1).toBe(1));",
+      '        it.skip(' + JSON.stringify(matrixTitle) + ', () => {});',
+      '      });',
+      '    ',
+    ].join('\n');
     for (const mode of ['assertion', 'hook', 'collection']) {
       await fs.writeFile(join(root, 'contract.test.mjs'), mode === 'collection'
         ? `throw new Error('collection failure');`

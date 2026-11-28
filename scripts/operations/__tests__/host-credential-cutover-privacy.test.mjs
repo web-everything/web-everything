@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path';
 import inventoryTestSource from './host-credential-cutover-inventory.test.mjs?raw';
 import privacyPolicySource from '../../settings/privacy-terms-allowlist.json?raw';
 import { loadAllowlist, scanText } from '../../lib/privacy-terms.mjs';
+import { scanTestTampering } from '../../lib/pr-merge-gate.mjs';
 
 const fixturePath = 'scripts/operations/__tests__/host-credential-cutover-inventory.test.mjs';
 let root;
@@ -30,6 +31,24 @@ beforeEach(async () => { root = await createFixtureRoot(); });
 afterEach(async () => {
   vi.unstubAllEnvs();
   await rm(root, { recursive: true, force: true });
+});
+
+describe('inventory fixture merge-gate conformance', () => {
+  it('treats the generated reporter contract as data while still detecting a live skipped test', () => {
+    const scan = source => {
+      const lines = source.trimEnd().split('\n');
+      return scanTestTampering({ diffText: [
+        `diff --git a/${fixturePath} b/${fixturePath}`,
+        'new file mode 100644', '--- /dev/null', `+++ b/${fixturePath}`,
+        `@@ -0,0 +1,${lines.length} @@`, ...lines.map(line => `+${line}`), '',
+      ].join('\n') });
+    };
+    expect(scan(inventoryTestSource)).toMatchObject({ tampered: false, evidenceIncomplete: false });
+    const liveSkip = scan(inventoryTestSource + "\nit.skip('live skipped test', () => {});\n");
+    expect(liveSkip).toMatchObject({ tampered: true, evidenceIncomplete: false });
+    expect(liveSkip.findings).toContainEqual({ path: fixturePath, kind: 'test-skipped',
+      detail: '1 skip/only marker(s) added' });
+  });
 });
 
 describe('R972 inventory fixture privacy', () => {
