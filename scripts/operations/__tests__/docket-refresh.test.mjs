@@ -389,5 +389,5 @@ describe('docket-refresh (real git, real reader and sink)', () => {
   it('is registered on the command line under its name', async () => {
     const { resolveOperation } = await import('../run.mjs');
     expect(resolveOperation(DOCKET_REFRESH_OP).declaration.name).toBe(DOCKET_REFRESH_OP);
-  });
+  }, 60_000); // the first dynamic import of the whole operations registry can exceed the 5s default on a loaded coverage shard
 });
