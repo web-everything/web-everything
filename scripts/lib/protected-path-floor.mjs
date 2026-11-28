@@ -249,7 +249,9 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   // The runtime build-priority writer serializes installs with an exclusive `wx` lock file.
   'scripts/operations/build-priority-set-io.mjs',
   // The freeze last-good cache writer reserves its temp file with an exclusive `wx` create before the rename.
-  'scripts/lib/freeze-last-good.mjs']);
+  'scripts/lib/freeze-last-good.mjs',
+  // The host credential-cutover inventory writer (an exclusive create and a lock directory over its evidence sinks).
+  'scripts/operations/host-credential-cutover.mjs']);
 /** The imported names that take, renew or give up a hold (`withFileLock`, `withAddGuardLock`, `acquireFixDispatchClaim`,
  *  `tryLease`, …). */
 export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|reserve|try)\w*(?:Claim|Lease|Lock|Hold|Slot|Mutex|Reservation)\w*)$/;
