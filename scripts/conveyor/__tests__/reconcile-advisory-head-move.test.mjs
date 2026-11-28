@@ -36,7 +36,7 @@ describe('production commit hydration for moved review:human heads', () => {
     ...advisory(hex.repeat(40)), createdAt: `2026-11-20T10:0${index}:00Z`,
   }));
   it.each(['direct', 'shared', 'paged'])('%s listing hydrates the live tip and dispatches once beyond the round cap', source => {
-    const row = pr({ author, baseRefName: 'main', commits: undefined,
+    const row = pr({ author, baseRefName: 'main', baseRefOid: 'c'.repeat(40), commits: undefined,
       labels: [{ name: 'review:human' }], comments: staleComments() });
     const readCommits = vi.fn(() => [mainMerge(HEAD), own(OLD)]);
     const prs = defaultReadPrs({ repo: 'web-everything/web-everything', readOnly: true, readCommits,
@@ -52,7 +52,7 @@ describe('production commit hydration for moved review:human heads', () => {
       advisoryReview: { head: HEAD, reason: 'head-moved-advisory' } })]);
     expect(readCommits).toHaveBeenCalledTimes(1);
     expect(readCommits).toHaveBeenCalledWith('web-everything/web-everything', row.number,
-      expect.objectContaining({ headRefName: 'lane/x', headRefOid: HEAD, baseRefName: 'main' }));
+      expect.objectContaining({ headRefName: 'lane/x', headRefOid: HEAD, baseRefName: 'main', baseRefOid: row.baseRefOid }));
   });
   it.each([['review:human'], [{ name: 'review:human' }, { name: 'review:pending' }]])(
     'hydrates human review evidence with labels %j', (...labels) => {

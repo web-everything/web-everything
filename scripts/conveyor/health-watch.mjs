@@ -868,9 +868,9 @@ export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.
       const cachedReviewLabelled = Array.isArray(pr.labels) && pr.labels.some(l => typeof l?.name === 'string' && l.name.startsWith('review:'));
       if (cachedReviewLabelled) reviewObservation = { state: 'OPEN', labels: pr.labels.map(l => ({ name: l?.name })), commits: [], observedAt: now, cached: true };
       else try {
-        const live = JSON.parse(exec('gh', ['pr', 'view', String(pr.number), '--repo', slug, '--json', 'state,labels,headRefOid,headRefName,baseRefName']));
+        const live = JSON.parse(exec('gh', ['pr', 'view', String(pr.number), '--repo', slug, '--json', 'state,labels,headRefOid,headRefName,baseRefName,baseRefOid']));
         if (live && !Array.isArray(live)) reviewObservation = { ...live, observedAt: now,
-          commits: readCommits(slug, pr.number, { headRefName: live.headRefName, headRefOid: live.headRefOid, baseRefName: live.baseRefName,
+          commits: readCommits(slug, pr.number, { headRefName: live.headRefName, headRefOid: live.headRefOid, baseRefName: live.baseRefName, baseRefOid: live.baseRefOid,
             ...(exec !== run ? { exec: args => exec('gh', args) } : {}) }) };
       } catch { /* Unknown, not a clean observation. */ }
       out.push({

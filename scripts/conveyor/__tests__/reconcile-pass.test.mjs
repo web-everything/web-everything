@@ -173,7 +173,7 @@ describe('mechanical round enrichment port (#5948)', () => {
 prFileContract({
   name: 'reconcile-pass', load: () => import('../reconcile-pass.mjs'),
   reader: 'defaultReadPrs', run: 'runReconcilePass',
-  fields: 'number,title,headRefName,headRefOid,baseRefName,labels,statusCheckRollup,mergeStateStatus,comments,body,files,isDraft,createdAt', reconcile: true,
+  fields: 'number,title,headRefName,headRefOid,baseRefName,baseRefOid,labels,statusCheckRollup,mergeStateStatus,comments,body,files,isDraft,createdAt', reconcile: true,
 });
 
 
@@ -1492,18 +1492,36 @@ it('xxh4zw8 malformed paged JSON read is refused and failed identical-head reads
   expect(plan.refusals.filter(r => r.kind === 'check-read-failed')).toHaveLength(2);
 });
 
-it('xe8y12n real PR read shell enriches the reported missing-family shape from commit evidence', async () => {
+it.each(['complete', 'incomplete', 'base-moved', 'missing-base'])('xe8y12n real PR read shell enriches the reported missing-family shape from %s commit evidence', async mode => {
   const { defaultReadPrs } = await import('../reconcile-pass.mjs');
   const { planReconcile } = await import('../reconcile-core.mjs');
   const calls = [], steps = [];
+  const headRefOid = 'a'.repeat(40), baseRefOid = 'b'.repeat(40);
   const prs = defaultReadPrs({ step: (name, fn) => { steps.push(name); return fn(); }, repo: 'o/r', exec: (_bin, args) => {
     calls.push(args);
-    return JSON.stringify(args[1] === 'list' ? [{ number: 3239, labels: [], comments: [], statusCheckRollup: [] }]
-      : { data: { repository: { pullRequest: { commits: { nodes: [{ commit: { messageHeadline: 'repair', authors: { nodes: [{ name: 'Claude' }] } } }] } } } } });
+    if (args[1] === 'list') {
+      expect(args[args.indexOf('--json') + 1].split(',')).toContain('baseRefOid');
+      return JSON.stringify([{ number: 3239, headRefOid, baseRefName: 'lane/base',
+        ...(mode === 'missing-base' ? {} : { baseRefOid }), labels: [], comments: [], statusCheckRollup: [] }]);
+    }
+    expect(args).toEqual(expect.arrayContaining(['--paginate', '--slurp']));
+    return JSON.stringify([{ data: { repository: { pullRequest: {
+      headRefOid, baseRefOid: mode === 'base-moved' ? 'd'.repeat(40) : baseRefOid,
+      commits: { totalCount: mode === 'incomplete' ? 2 : 1,
+        pageInfo: { hasNextPage: mode === 'incomplete', endCursor: 'page-1' },
+        nodes: [{ commit: { oid: 'c'.repeat(40), messageHeadline: 'repair',
+          authors: { nodes: [{ name: 'Claude', email: 'noreply@anthropic.com' }] } } }] },
+    } } } }]);
   } });
   expect(steps).toContain('planner-cache-diff');
-  expect(calls.some(args => args.some(arg => arg.includes('commits(first:')))).toBe(true);
-  expect(planReconcile({ prs }).notes).toContainEqual(expect.objectContaining({ kind: 'review-label-missing' }));
+  expect(calls.some(args => args.some(arg => arg.includes('commits(first:')))).toBe(mode !== 'missing-base');
+  if (mode === 'complete') {
+    expect(prs[0].commits).toHaveLength(1);
+    expect(planReconcile({ prs }).notes).toContainEqual(expect.objectContaining({ kind: 'review-label-missing' }));
+  } else {
+    expect(prs[0].commits).toBeNull();
+    expect(planReconcile({ prs }).notes).not.toContainEqual(expect.objectContaining({ kind: 'review-label-missing' }));
+  }
 });
 
 // ── Live deadlock shape, PR #3771 (2026-10-03): a CONFLICTING head never gets pull_request CI ────────────────────
