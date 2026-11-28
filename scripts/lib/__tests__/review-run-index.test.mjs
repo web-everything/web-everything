@@ -730,6 +730,43 @@ it.each([readDrainRedTeamEvidence, readRecoveryWitness])('index identity change 
     expect(reads).toBeLessThanOrEqual(maxParses);
   }
 });
+it.each([readDrainRedTeamEvidence, readRecoveryWitness])('a stable accepting replacement is reread within the shared budget (%#)', reader => {
+  const f = fixture(); completeIndex(f);
+  const path = join(f.runsDir, `${f.run.id}.json`);
+  const accepted = { ...f.run, stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(50_000).toISOString() }] };
+  let reads = 0;
+  const result = reader({ ...f, warn: () => {},
+    scanSettings: { file: { runs: { scan: { maxParses: 2 } } }, platform: {}, env: {} },
+    read: id => {
+      const payload = readRun(id, f.runsDir);
+      if (++reads === 1) {
+        const replacement = join(f.runsDir, 'replacement');
+        writeFileSync(replacement, JSON.stringify(accepted));
+        utimesSync(replacement, 2, 2); // inode changes, while mtime stays the same
+        renameSync(replacement, path);
+      }
+      return payload;
+    },
+  });
+  expect(result.loopPayload ?? result.newest).toEqual(accepted);
+  expect(reads).toBe(2);
+});
+it.each([readDrainRedTeamEvidence, readRecoveryWitness])('repeated snapshot churn holds after one retry even with spare budget (%#)', reader => {
+  const f = fixture(); completeIndex(f);
+  const path = join(f.runsDir, `${f.run.id}.json`);
+  let reads = 0;
+  const result = reader({ ...f, warn: () => {},
+    scanSettings: { file: { runs: { scan: { maxParses: 5 } } }, platform: {}, env: {} },
+    read: id => {
+      const payload = readRun(id, f.runsDir);
+      writeFileSync(path, JSON.stringify({ ...f.run, verdict: { verdict: 'changes' } }));
+      utimesSync(path, 100 + ++reads, 100 + reads);
+      return payload;
+    },
+  });
+  expect(result).toMatchObject({ ok: false, reason: 'scan-capped' });
+  expect(reads).toBe(2);
+});
 it('an unreadable unknown id retains the fallback unreadable-record refusal', () => {
   const f = fixture(); completeIndex(f);
   const unknown = 'review-pr-unreadable'; let attempts = 0;

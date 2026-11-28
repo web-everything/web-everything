@@ -2559,41 +2559,44 @@ export function runSessionReaperCli(argv, io = {}) {
   const retentionResult = runRetention ? runRetentionSweepPass({ dryRun }) : null;
   const deadReviewRuns = runDeadReviewRuns
     ? (io.reapDeadReviewRuns ?? reapDeadReviewRuns)({ apply: flags.apply === true && !dryRun, log }) : null;
-  if (deadReviewRuns) log(`session-reaper dead-review-runs: ${deadReviewRuns.scanned} scanned · ${deadReviewRuns.reaped.length} reaped · ${deadReviewRuns.wouldReap.length} would reap`);
-  const dispatchScratchResult = runDispatchScratchSweep ? runDispatchScratchSweepPass({ dryRun }) : null;
+  const finish = deadReviewRuns => {
+    if (deadReviewRuns) log(`session-reaper dead-review-runs: ${deadReviewRuns.scanned} scanned · ${deadReviewRuns.reaped.length} reaped · ${deadReviewRuns.wouldReap.length} would reap`);
+    const dispatchScratchResult = runDispatchScratchSweep ? runDispatchScratchSweepPass({ dryRun }) : null;
 
-  if (result.unreadable) {
-    // Matches the pre-#3383 CLI exactly: an unreadable listing means nothing safe to act on — exit clean, no
-    // stdout report (the warning already went to stderr inside `runSessionReaperPass`).
-    return 0;
-  }
+    if (result.unreadable) {
+      // Matches the pre-#3383 CLI exactly: an unreadable listing means nothing safe to act on — exit clean, no
+      // stdout report (the warning already went to stderr inside `runSessionReaperPass`).
+      return 0;
+    }
 
-  if (flags.json) {
-    writeOut(JSON.stringify({ ...result, retention: retentionResult, dispatchScratch: dispatchScratchResult, deadReviewRuns }, null, 2) + '\n');
-  } else {
-    const { scanned, stopped, alreadyGone, failures, anomalies, backstopWritten, wouldStop, wouldWriteBackstop, kept } = result;
-    log(
-      `session-reaper: ${scanned} session(s) listed · ` +
-        `${dryRun ? `${(wouldStop ?? []).length} would stop${(wouldWriteBackstop ?? []).length ? `, ${(wouldWriteBackstop ?? []).length} would get a backstop completion record` : ''}` : `${stopped} stopped${alreadyGone ? `, ${alreadyGone} already gone` : ''}${failures ? `, ${failures} failed` : ''}${anomalies ? `, ${anomalies} anomal${anomalies === 1 ? 'y' : 'ies'}` : ''}${backstopWritten ? `, ${backstopWritten} backstop completion record(s) written` : ''}`} · ${kept} kept`,
-    );
-    if (retentionResult) {
+    if (flags.json) {
+      writeOut(JSON.stringify({ ...result, retention: retentionResult, dispatchScratch: dispatchScratchResult, deadReviewRuns }, null, 2) + '\n');
+    } else {
+      const { scanned, stopped, alreadyGone, failures, anomalies, backstopWritten, wouldStop, wouldWriteBackstop, kept } = result;
       log(
-        `session-reaper retention: ${retentionResult.scanned} session record set(s) scanned · ` +
-          `${dryRun ? `${(retentionResult.wouldDelete ?? []).length} would be deleted, ${(retentionResult.wouldPruneRuns ?? []).length} run record(s) would be pruned` : `${retentionResult.deleted} deleted, ${retentionResult.runsPruned} run record(s) pruned`} · ${retentionResult.kept} kept`,
+        `session-reaper: ${scanned} session(s) listed · ` +
+          `${dryRun ? `${(wouldStop ?? []).length} would stop${(wouldWriteBackstop ?? []).length ? `, ${(wouldWriteBackstop ?? []).length} would get a backstop completion record` : ''}` : `${stopped} stopped${alreadyGone ? `, ${alreadyGone} already gone` : ''}${failures ? `, ${failures} failed` : ''}${anomalies ? `, ${anomalies} anomal${anomalies === 1 ? 'y' : 'ies'}` : ''}${backstopWritten ? `, ${backstopWritten} backstop completion record(s) written` : ''}`} · ${kept} kept`,
       );
+      if (retentionResult) {
+        log(
+          `session-reaper retention: ${retentionResult.scanned} session record set(s) scanned · ` +
+            `${dryRun ? `${(retentionResult.wouldDelete ?? []).length} would be deleted, ${(retentionResult.wouldPruneRuns ?? []).length} run record(s) would be pruned` : `${retentionResult.deleted} deleted, ${retentionResult.runsPruned} run record(s) pruned`} · ${retentionResult.kept} kept`,
+        );
+      }
+      if (dispatchScratchResult) {
+        log(
+          `session-reaper dispatch-scratch: ${dispatchScratchResult.scanned} folder(s) scanned · ` +
+            `${dryRun ? `${(dispatchScratchResult.wouldDelete ?? []).length} would be removed` : `${dispatchScratchResult.deleted} removed, ${dispatchScratchResult.trustRevoked} trust entr${dispatchScratchResult.trustRevoked === 1 ? 'y' : 'ies'} revoked`} · ${dispatchScratchResult.kept} kept`,
+        );
+      }
     }
-    if (dispatchScratchResult) {
-      log(
-        `session-reaper dispatch-scratch: ${dispatchScratchResult.scanned} folder(s) scanned · ` +
-          `${dryRun ? `${(dispatchScratchResult.wouldDelete ?? []).length} would be removed` : `${dispatchScratchResult.deleted} removed, ${dispatchScratchResult.trustRevoked} trust entr${dispatchScratchResult.trustRevoked === 1 ? 'y' : 'ies'} revoked`} · ${dispatchScratchResult.kept} kept`,
-      );
-    }
-  }
-  // Non-zero exit when a stop we ATTEMPTED actually failed, OR a reap candidate turned out to be missing its
-  // `id` (the anomaly case — see the loop above) — mirrors lease-reaper.mjs's own convention, so a cron/loop
-  // wrapper can tell a clean sweep from a partial one. `runQuiet` (the runner's own caller) swallows this
-  // either way — it is surfaced for anyone invoking the CLI directly.
-  return result.failures > 0 || result.anomalies > 0 ? 1 : 0;
+    // Non-zero exit when a stop we ATTEMPTED actually failed, OR a reap candidate turned out to be missing its
+    // `id` (the anomaly case — see the loop above) — mirrors lease-reaper.mjs's own convention, so a cron/loop
+    // wrapper can tell a clean sweep from a partial one. `runQuiet` (the runner's own caller) swallows this
+    // either way — it is surfaced for anyone invoking the CLI directly.
+    return result.failures > 0 || result.anomalies > 0 ? 1 : 0;
+  };
+  return deadReviewRuns && typeof deadReviewRuns.then === 'function' ? deadReviewRuns.then(finish) : finish(deadReviewRuns);
 }
 
 /**
@@ -2639,5 +2642,5 @@ if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
   const [sub] = process.argv.slice(2);
   if (sub === 'stamp-chat-spawn') runStampChatSpawnHook();
   else if (sub === 'mark-chat-ended') runMarkChatEndedHook();
-  else process.exitCode = runSessionReaperCli(process.argv.slice(2));
+  else process.exitCode = await runSessionReaperCli(process.argv.slice(2));
 }

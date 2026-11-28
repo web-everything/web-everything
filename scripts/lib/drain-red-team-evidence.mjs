@@ -15,6 +15,7 @@ import { NAME_RE, isRunRecordTerminal, listRunIds, readRun, resolveRunsDir, shar
 import { createNewestRunFinder, resolveRunScanSettings, RUN_SCAN_CAPPED } from './stream-filter-runs.mjs';
 import { assertReviewRunEvidence, readNamedCandidates, readReviewRunIndex } from './review-run-index.mjs';
 import { readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
+import { isReaperTombstone, isReapedReviewSnapshot, reaperReviewShape, runRecordVersion } from './run-abandoned.mjs';
 import { pidNamespace, pidStartTime } from './pid-alive.mjs';
 
 /** Three-valued existence shared by the evidence reader and the recovery probe, so they cannot disagree:
@@ -327,6 +328,8 @@ const settleKind = run => {
 // size it was read at, so a settle attempt that keeps holding does not re-parse the whole store every tick; a rewrite
 // changes mtime or size and replaces the entry (bounded by the number of records, not by the number of rewrites).
 const summaryCache = new WeakMap();
+const summaryIdentity = st => JSON.stringify([st.dev, st.ino, st.size, st.mtimeMs, st.ctimeMs]);
+const scanIdentity = st => JSON.stringify([st.mtimeMs, st.dev, st.ino, st.size, st.ctimeMs, st.birthtimeMs]);
 // Identity fields are normalised strictly: a PR number is a positive integer or a digit string (never null, '' or
 // false, which Number() turns into 0); a head that is not a clean 40-hex sha reads as unknown (null), which matches
 // every head, so a blocking record with a damaged head still holds; repo names compare case-insensitively.
@@ -335,7 +338,7 @@ const cleanRev = value => (typeof value === 'string' && /^[a-f0-9]{40}$/i.test(v
 const summarizeRun = run => ({ review: run?.op === 'review-pr', repo: typeof run?.input?.repo === 'string' ? run.input.repo.trim().toLowerCase() : undefined,
   pr: strictPr(run?.input?.pr), rev: cleanRev(run?.findings?.read?.netBasis?.rev), kind: settleKind(run),
   // Order key: the read start, or the resume stamp when later (a rewound run finishes after it resumes); NaN when unreadable.
-  orderAt: unfinishedSince(run), resumed: run?.resumeOf != null || run?.resumedAt != null, abandonable: abandonableReview(run) });
+  orderAt: unfinishedSince(run), resumed: run?.resumeOf != null || run?.resumedAt != null, abandonable: abandonableReview(run), reaperEligible: reaperReviewShape(run) });
 // R622: settlement needs a COMPLETE same-PR, same-head read. Run ids carry no PR, so this parses every review-pr
 // record (no parse cap: the bounded scan cannot vouch for what it did not read) and keeps only the summary. Over the
 // records of this PR whose head is this head (or whose head cannot be read):
@@ -362,15 +365,21 @@ function completeSameHeadRead({ repo, pr, head, runsDir, list, read, stat, now, 
       if (!Number.isFinite(st?.mtimeMs)) return incomplete;
       const key = `${runsDir}|${id}`; // one entry per record: a rewrite replaces it, so the cache never outgrows the store
       let hit = cache.get(key);
-      if (!hit || hit.mtimeMs !== st.mtimeMs || hit.size !== st.size) {
-        hit = { mtimeMs: st.mtimeMs, size: st.size, summary: summarizeRun(read(id, runsDir)) };
+      const recordIdentity = summaryIdentity(st);
+      if (!hit || hit.identity !== recordIdentity) {
+        hit = { identity: recordIdentity, summary: summarizeRun(read(id, runsDir)) };
         cache.set(key, hit);
       }
+      if (summaryIdentity(stat(join(runsDir, `${id}.json`))) !== recordIdentity) return incomplete;
       const s = hit.summary;
       if (!s.review) continue;
       if (typeof s.repo !== 'string' || !s.repo || !Number.isFinite(s.pr)) return incomplete;
       if (s.repo !== wantRepo || s.pr !== Number(pr)) continue;
       if (s.rev !== null && s.rev !== want) continue;
+      if (s.reaperEligible && isReaperTombstone(id, runsDir, { recordStat: st })) {
+        if (runRecordVersion(stat(join(runsDir, `${id}.json`))) !== runRecordVersion(st)) return incomplete;
+        continue;
+      }
       if (s.kind === 'hard') return { complete: true, blocked: true };
       if (s.kind === 'undecided') {
         const quiet = now - st.mtimeMs >= ABANDONED_REVIEW_AFTER_MS;
@@ -453,7 +462,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
   const indexIdentities = new Map();
   const currentIdentity = (id, metadataReader = stat) => {
     const metadata = metadataReader(join(runsDir, `${id}.json`));
-    return JSON.stringify([metadata.mtimeMs, metadata.dev, metadata.ino, metadata.size, metadata.ctimeMs, metadata.birthtimeMs]);
+    return scanIdentity(metadata);
   };
   const discardChangedRead = (id, identity) => {
     if (indexIdentities.get(id) !== identity) {
@@ -466,11 +475,13 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
   const maxParses = setting.value.scan.maxParses;
   let parsed = 0;
   const budgetExhausted = Symbol('shared review parse budget exhausted');
+  const snapshotChanged = Symbol('review snapshot changed during read');
   let hardHold = false;
   const runScan = (indexedIds, allCandidates = false) => {
     const slots = Object.fromEntries(TIE_ORDERS.map(order => [order, { newer: newerBy(order), newest: null, exact: null, unfinished: null, unfinishedExact: null, since: -Infinity, active: -Infinity, undecided: true }]));
     const startless = []; // ids and mtimes only, never payloads
     const mtimes = new Map();
+    const recordStats = new Map();
     let count = 0, newestSettled = false, boundary = -Infinity;
     // The read window is fixed in one order (equal mtimes by ascending id) for every caller: the tie
     // order only ranks matches in the slots. Otherwise equal mtimes straddling the cap would put
@@ -480,6 +491,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
         // Metadata orders the same liveness bounds as the ordinary scan.
         const metadata = stat(join(runsDir, `${id}.json`));
         mtimes.set(id, metadata.mtimeMs);
+        recordStats.set(id, metadata);
         return metadata;
       }, read: id => {
         const identity = indexedIds || indexReads.has(id) ? currentIdentity(id) : undefined;
@@ -496,6 +508,15 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
         else {
           parsed++; // Failed reads also consume the shared budget.
           run = read(id, runsDir);
+        }
+        if (currentIdentity(id) !== scanIdentity(recordStats.get(id))) {
+          indexReads.delete(id);
+          indexReadErrors.delete(id);
+          indexIdentities.delete(id);
+          // The complete filename scan can retry once with fresh metadata, using
+          // the same parse budget. Other scans retain their fail-closed refusal.
+          if (!allCandidates) hardHold = true;
+          throw snapshotChanged;
         }
         if (indexedIds) {
           indexReads.set(id, run);
@@ -522,7 +543,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
     try { end = find((run, id, at, nextAt) => {
       if (run?.op === 'review-pr' && run.input?.repo === repo && Number(run.input?.pr) === Number(pr)) {
         const hit = { run, id, at };
-        if (!abandonedReview(hit, now)) {
+        if (!isReapedReviewSnapshot(run, id, runsDir, recordStats.get(id), { stat }) && !abandonedReview(hit, now)) {
           count++;
           if (!Number.isFinite(reviewStartedAt(hit))) startless.push({ id, at });
           for (const slot of Object.values(slots)) {
@@ -581,6 +602,8 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
   };
   return (exactHead = true, order = tieBreak, { writtenAfter, newestHead } = {}) => {
     if (!TIE_ORDERS.includes(order)) throw new TypeError('unknown run tieBreak');
+    // Recovery's carry fallback shares this lookup; a hard hold must not start another scan.
+    if (hardHold) return { ok: false, reason: 'scan-capped' };
     if (!scan) {
       // Injected listing fixtures retain the index/fallback seam; production uses names.
       if (list === listRunIds) {
@@ -593,7 +616,12 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
             break;
           }
           try { runScan(before.ids, true); }
-          catch { hardHold = true; scan = null; break; }
+          catch (error) {
+            scan = null;
+            if (error === snapshotChanged && attempt === 0) continue;
+            hardHold = true;
+            break;
+          }
           const after = readNamedCandidates(runsDir, repo, pr, { list });
           let unchanged = true;
           try {
@@ -606,6 +634,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
           if (attempt === 1) hardHold = true;
         }
       }
+      if (hardHold) return { ok: false, reason: 'scan-capped' };
       if (!scan) {
         try {
           const ids = readReviewRunIndex(runsDir, repo, pr, { list, stat: id => stat(join(runsDir, `${id}.json`)),

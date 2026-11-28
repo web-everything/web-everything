@@ -8,6 +8,7 @@
 import * as nodeFs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { runPath, resolveRunsDir } from '../operations/run-store.mjs';
+import { validateRunRecord } from '../operations/run-record.mjs';
 
 export function abandonedPath(id, dir = resolveRunsDir()) {
   return runPath(id, dir).replace(/\.json$/, '.abandoned.json');
@@ -26,7 +27,7 @@ export function markRunAbandoned({ id, dir, reason, probes, by, now = Date.now()
   try { fd = fs.openSync(path, 'wx'); }
   catch (e) {
     if (e.code !== 'EEXIST') throw e;
-    if (isRunAbandoned(id, dir, { fs })) return { written: false, alreadyAbandoned: true };
+    if ((by === 'reap-dead-review-runs' ? isReaperTombstone : isRunAbandoned)(id, dir, { fs })) return { written: false, alreadyAbandoned: true };
     // A poisoned sidecar (a directory, EACCES, ENOSPC) must not abort a whole sweep: report it so the caller keeps this id.
     try { replaceStaleTombstone(fs, path, body); }
     catch (err) { return { written: false, alreadyAbandoned: false, staleUnreplaceable: String(err?.code ?? err?.message ?? 'unknown') }; }
@@ -78,4 +79,35 @@ export function isRunAbandoned(id, dir, { fs = nodeFs } = {}) {
 
 export function isRunTerminalOrAbandoned(record, id, dir, isTerminal) {
   return !!isTerminal(record) || isRunAbandoned(id, dir);
+}
+
+/** Strict R755 evidence. The caller may supply the stat belonging to its payload snapshot. */
+export function isReaperTombstone(id, dir, { fs = nodeFs, recordStat } = {}) {
+  try {
+    const t = JSON.parse(fs.readFileSync(abandonedPath(id, dir), 'utf8'));
+    const st = recordStat ?? fs.statSync(runPath(id, dir));
+    return t?.by === 'reap-dead-review-runs' && typeof t.at === 'string' && Number.isFinite(Date.parse(t.at))
+      && typeof t.reason === 'string' && !!t.reason && typeof t.probes?.recordVersion === 'string'
+      && t.probes.recordVersion === runRecordVersion(st)
+      && isAbandonedGivenStats(fs.statSync(abandonedPath(id, dir)).mtimeMs, st.mtimeMs);
+  } catch { return false; }
+}
+
+/** Structural and semantic permission to ignore evidence; a tombstone never erases a verdict/effect. */
+export function reaperReviewShape(record) {
+  if (!validateRunRecord(record).ok || record.op !== 'review-pr' || record.verdict != null
+    || record.outcome === 'refused' || record.resumeOf != null || record.resumedAt != null) return false;
+  const p = record.pending;
+  return (p == null || p.kind === 'judge')
+    && !(p && (Array.isArray(p.options) || Object.hasOwn(p, 'asks') || Object.hasOwn(p, 'of')))
+    && p?.step !== 'mandatoryReferrals'
+    && record.effects.every(e => e.status === 'applied' && e.step !== 'mandatoryReferrals');
+}
+
+export function isReapedReviewSnapshot(record, id, dir, recordStat, { stat = nodeFs.statSync, fs = nodeFs } = {}) {
+  try {
+    return reaperReviewShape(record) && record.id === id
+      && isReaperTombstone(id, dir, { fs, recordStat })
+      && runRecordVersion(stat(runPath(id, dir))) === runRecordVersion(recordStat);
+  } catch { return false; }
 }

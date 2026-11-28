@@ -188,6 +188,7 @@ export const REPO_SCAN_TESTS = Object.freeze([
  * @type {Readonly<Record<string, string>>}
  */
 export const DEFERRED_SCAN_TESTS = Object.freeze({
+  'scripts/lib/__tests__/review-run-dead-pending-judge.test.mjs': 'fixed-source contract: reads only review-daemon.mjs to pin main wiring; directory listings inspect mkdtemp fixtures; imports the daemon, reaper and readers, so vitest related selects it when those implementations change',
   'scripts/conveyor/__tests__/stand-down.test.mjs': 'fixed-source contract test: reads the named fix-agent brief and stand-down module, never enumerates the repo; shell execution uses temporary fixture roots; CI runs it on every PR and verify runs it when the test itself changes',
   'scripts/operations/__tests__/direct-exec-tripwire.test.mjs': 'static tripwire: reads three named dispatch modules and walks scripts/ once for launch call sites; small and hermetic; CI runs it on every PR and verify runs it when the test file itself changes',
   'scripts/lib/__tests__/file-class-policy.test.mjs': 'one record-only check walks scripts/ to assert no other script imports the file-class engine; it loads the engine so vitest related selects it when the engine changes, and CI runs it on every PR',

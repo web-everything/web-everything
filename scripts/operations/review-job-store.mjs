@@ -52,6 +52,11 @@ export function readJobRecord(slug, dir = reviewJobsDir()) {
   try { return JSON.parse(readFileSync(jobRecordPath(slug, dir), 'utf8')); } catch { return null; }
 }
 
+/** Authority-sensitive readers must distinguish an unreadable claim from an absent owner. */
+export function readJobRecordStrict(slug, dir) {
+  return JSON.parse(readFileSync(jobRecordPath(slug, dir), 'utf8'));
+}
+
 /** Atomic write (temp + rename). */
 export function writeJobRecord(record, dir = reviewJobsDir()) {
   const path = jobRecordPath(record.slug, dir);

@@ -1,0 +1,6 @@
+{
+  "description": "Age in hours before a review run with proven dead owners may receive a version-bound abandonment tombstone.",
+  "owner": "scripts/settings/review-run-reaper.json",
+  "changeVia": "operator-prefs",
+  "instant": false
+}
