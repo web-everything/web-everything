@@ -54,7 +54,7 @@ import {
  *  comments/body/files come from cached per-PR hydration. */
 export const SNAPSHOT_FIELDS = Object.freeze([
   'number', 'title', 'body', 'url', 'isDraft', 'createdAt', 'updatedAt',
-  'headRefName', 'headRefOid', 'baseRefName', 'isCrossRepository', 'mergeable', 'mergeStateStatus', 'reviewDecision',
+  'headRefName', 'headRefOid', 'baseRefName', 'baseRefOid', 'isCrossRepository', 'mergeable', 'mergeStateStatus', 'reviewDecision',
   'labels', 'files', 'comments', 'statusCheckRollup', 'rowsHead', 'rowsComplete',
 ]);
 
@@ -308,7 +308,7 @@ const SHA_CACHE_MAX_AGE_MS = 3 * 24 * 60 * 60_000;
 
 function shaCachePath(root, { repo, num, sha, kind }) {
   const key = snapshotKey(repo);
-  if (!key || !Number.isInteger(Number(num)) || !SHA_RE.test(String(sha || '')) || !/^[a-z-]+$/.test(kind)) return null;
+  if (!key || !Number.isInteger(Number(num)) || !SHA_RE.test(String(sha || '')) || !/^[a-z][a-z0-9-]*$/.test(kind)) return null;
   return join(root, 'by-sha', `${key}-${Number(num)}-${String(sha).toLowerCase()}-${kind}.json`);
 }
 
