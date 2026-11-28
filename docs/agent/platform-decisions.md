@@ -3830,7 +3830,9 @@ order and has no notion of an open PR still in review.
    `review:accepted`, and does not itself depend on X. Blockers, hard dependencies, and a PR whose file list
    is unknown (hit a listing cap) are exempt and never yield. Full mechanical shape (the exact fields, the
    drain plumbing, the idle-accounting treatment): `we:scripts/conveyor/land-overlap-yield.mjs` per the
-   #4308 build card.
+   #4308 build card. A PR the drain has refused this pass as `mq-same-head-failed` with the typed cause
+   `head-failed` (a complete merge-queue timeline with a failed removal bound to its exact current head)
+   is not a yield target for the rest of that pass; any other or missing cause leaves the yield unchanged.
 2. **This is a conflict-COST strategy, not a conflict-reduction one.** It decides **who pays** for reconciling
    an overlap that already exists (the smaller PR re-lands with less to re-review than the larger one would),
    and stops the repeated knock-back of one large PR — it does not shrink the underlying edit collision.
