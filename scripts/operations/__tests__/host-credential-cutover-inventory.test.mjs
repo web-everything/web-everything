@@ -5,15 +5,15 @@ import { constants } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { EventEmitter } from 'node:events';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import productionSource from '../host-credential-cutover.mjs?raw';
 import * as production from '../host-credential-cutover.mjs';
 import { VARIANTS } from './__fixtures__/inventory-unsafe.mjs';
 
 // Model the supported writer on every CI host, without changing the worker's platform.
-const persistencePlatform = vi.hoisted(() => ({ value: 'darwin' }));
-vi.mock('node:os', async importOriginal => ({
-  ...await importOriginal(), platform: () => persistencePlatform.value,
-}));
+const persistencePlatform = { value: 'darwin' };
 const nativePlatform = process.platform;
 const NOFOLLOW_ANY = 0x20000000;
 
@@ -30,8 +30,9 @@ vi.mock('node:child_process', async importOriginal => {
 import { spawn } from 'node:child_process';
 
 const lane = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
-const subject = process.env.INVENTORY_MODULE
+const unsafeSubject = process.env.INVENTORY_MODULE
   ? await import(/* @vite-ignore */ join(lane, process.env.INVENTORY_MODULE)) : production;
+let subject = production;
 const ORGS = ['web-everything', 'plateauapp', 'frontier-ui', 'longshoreai'];
 const O = ORGS[0];
 const SHA = 'a'.repeat(40);
@@ -41,7 +42,12 @@ const titles = [];
 const test = (variant, title, body) => {
   const name = `[${variant}] ${title}`;
   titles.push(name);
-  it(name, body);
+  it(name, async () => {
+    // Isolate each deliberate regression to its named witnesses; all other tests
+    // must still pass in the same child run.
+    subject = process.env.INVENTORY_UNSAFE === variant ? unsafeSubject : production;
+    try { await body(); } finally { subject = production; }
+  });
 };
 const roots = ['user', 'memberships', ...ORGS.flatMap(o =>
   ['membership', 'org', 'installations', 'orgRulesets', 'repos'].map(kind => `${kind}:${o}`))];
@@ -97,30 +103,33 @@ beforeEach(async () => {
       return target[key](...args);
     };
   } });
-  options = { root: temp, home, fs: io, now: () => new Date(NOW), randomBytes: () => Buffer.from('12345678', 'hex'),
+  options = { root: temp, home, fs: io, platform: () => persistencePlatform.value,
+    now: () => new Date(NOW), randomBytes: () => Buffer.from('12345678', 'hex'),
     commit: SHA, run: runner(), stdout: s => lines.stdout.push(s), stderr: s => lines.stderr.push(s) };
   spawnControl.adapter = false;
   vi.mocked(spawn).mockClear();
 });
 async function fixtureOpen(path, flags, mode) {
+  // Every open must reject symlinks in all components, including aggregate reads.
+  expect(flags).toBe(flags & constants.O_CREAT
+    ? constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | NOFOLLOW_ANY
+    : constants.O_RDONLY | NOFOLLOW_ANY);
   if (flags & constants.O_CREAT) {
-    // Assert the production syscall contract even when the host cannot execute it.
-    expect(flags).toBe(constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | NOFOLLOW_ANY);
     expect(mode).toBe(0o600);
-    if (nativePlatform !== 'darwin') {
-      // Test-only model: injected ancestor swaps happen before this open boundary.
-      // This walk is NOT atomic and must never be used as a production fallback.
-      let component = path;
-      while (component !== temp) {
-        try {
-          if ((await fs.lstat(component)).isSymbolicLink()) {
-            throw Object.assign(new Error('fixture symlink'), { code: 'ELOOP' });
-          }
-        } catch (error) { if (error.code !== 'ENOENT') throw error; }
-        component = dirname(component);
-      }
-      flags = (flags & ~NOFOLLOW_ANY) | constants.O_NOFOLLOW;
+  }
+  if (nativePlatform !== 'darwin') {
+    // Test-only model: injected ancestor swaps happen before this open boundary.
+    // This walk is NOT atomic and must never be used as a production fallback.
+    let component = path;
+    while (component !== temp) {
+      try {
+        if ((await fs.lstat(component)).isSymbolicLink()) {
+          throw Object.assign(new Error('fixture symlink'), { code: 'ELOOP' });
+        }
+      } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      component = dirname(component);
     }
+    flags = (flags & ~NOFOLLOW_ANY) | constants.O_NOFOLLOW;
   }
   return fs.open(path, flags, mode);
 }
@@ -158,6 +167,40 @@ describe('pinned transport and bounded adapter', () => {
     expect(ioCalls.some(([operation]) => operation === 'open')).toBe(false);
     expect(lines.stdout.join('')).toContain('reason=COHORT action=RERUN');
     expect(await fs.readdir(join(temp, 'state/credential-cutover/runs/20261127T110000-12345678'))).toEqual([]);
+  });
+  it.each(['linux', 'win32'])('unsupported %s aggregate refuses before opening evidence', async platform => {
+    const { record } = await collect();
+    persistencePlatform.value = platform;
+    ioCalls.length = 0;
+    expect(await subject.aggregate({ ...options, runId: record.runId }))
+      .toEqual({ exitCode: 1, result: 'ERROR', reasons: ['COHORT'] });
+    expect(ioCalls.some(([operation]) => operation === 'open')).toBe(false);
+  });
+  test('combined-output', 'spawnBounded kills and reaps on combined stdout/stderr overflow', async () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+    child.kill = vi.fn(() => true);
+    const spawnChild = vi.fn(() => child);
+    let settled = false;
+    const pending = subject.spawnBounded('/fixture/noisy', [], {
+      env: subject.childEnvironment(home), timeoutMs: 10000, spawn: spawnChild,
+    }).then(out => { settled = true; return out; });
+    const half = Buffer.alloc(2 * 1024 * 1024, 'x');
+    // Each stream remains below 4 MiB; only their combined count overflows.
+    try {
+      child.stdout.emit('data', half); child.stderr.emit('data', half);
+      expect(child.kill).not.toHaveBeenCalled();
+      child.stdout.emit('data', Buffer.from('x'));
+      expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+      child.stderr.emit('data', Buffer.from('late output'));
+      await Promise.resolve();
+      expect(settled).toBe(false);
+    } finally { child.emit('close', null); }
+    const out = await pending;
+    expect(out).toMatchObject({ code: null, failed: true, timedOut: false });
+    expect(Buffer.byteLength(out.stdout) + Buffer.byteLength(out.stderr)).toBe(4 * 1024 * 1024);
+    expect(out.stdout).toBe(half.toString()); expect(out.stderr).toBe(half.toString());
+    expect(spawnChild).toHaveBeenCalledWith('/fixture/noisy', [], expect.objectContaining({ shell: false }));
   });
   test('shell-true', 'spawn uses argv literally and shell false', async () => {
     spawnControl.adapter = true;
@@ -232,6 +275,15 @@ describe('pinned transport and bounded adapter', () => {
     expect(imports.every(s => s.startsWith('node:'))).toBe(true);
     expect(text).not.toMatch(/marker-authorship\.mjs|operator-identity\.mjs/);
   });
+  it('every production evidence open pins NOFOLLOW_ANY', () => {
+    // Pin the two syscall sites; a new or reformatted open needs an explicit review.
+    const opens = productionSource.match(/\b(?:c\.)?fs\.open\s*\([^\n;]*/g) ?? [];
+    expect(opens).toHaveLength(2);
+    for (const call of opens) {
+      expect(call).toContain('NOFOLLOW_ANY');
+      expect(call).not.toMatch(/constants\.O_NOFOLLOW\b/);
+    }
+  });
 });
 
 describe('evidence and cohort', () => {
@@ -297,6 +349,25 @@ describe('evidence and cohort', () => {
   for (const [name, change] of Object.entries(invalids)) it(`COHORT: ${name}`, async () => {
     const { record } = await collect(); change(record);
     const out = await decide(record); expect(out.exitCode).toBe(20); expect(out.reasons).toContain('COHORT');
+  });
+  const nestedShapes = [
+    ...['user', 'memberships', ...['membership', 'org', 'installations', 'orgRulesets', 'orgRuleset', 'repos']
+      .map(kind => `${kind}:${O}${kind === 'orgRuleset' ? ':7' : ''}`),
+    `repoRulesets:${O}/repo`, `repoRuleset:${O}/repo:7`].map(id => [id, id, []]),
+    ['installation entry', `installations:${O}`, ['installations', 0]],
+    ['org bypass actor', `orgRuleset:${O}:7`, ['bypass_actors', 0]],
+    ['repo bypass actor', `repoRuleset:${O}/repo:7`, ['bypass_actors', 0]],
+  ];
+  for (const [name, id, keys] of nestedShapes) test('extra-nested-keys', `COHORT: extra nested evidence keys at ${name}`, async () => {
+    const { record } = await collect();
+    for (const rule of [`orgRuleset:${O}:7`, `repoRuleset:${O}/repo:7`]) {
+      source(record, rule).data.bypass_actors = [{ actor_type: 'OrganizationAdmin', actor_id: null, bypass_mode: 'always' }];
+    }
+    expect(subject.validateRecord(record)).toBe(true);
+    const target = keys.reduce((value, key) => value[key], source(record, id).data);
+    target.unexpected = true;
+    expect(subject.validateRecord(record)).toBe(false);
+    expect(await decide(record)).toMatchObject({ result: 'INCOMPLETE', exitCode: 20, reasons: ['COHORT'] });
   });
   test('mix-runs', 'a directory cannot borrow another run identity', async () => {
     const { record } = await collect();
@@ -392,6 +463,60 @@ describe('evidence and cohort', () => {
     const { record } = await collect();
     const results = await Promise.all([subject.aggregate({ ...options, runId: record.runId }), subject.aggregate({ ...options, runId: record.runId })]);
     expect(results.map(r => r.exitCode).sort()).toEqual([0, 1]);
+  });
+  it.each(['state', 'state/credential-cutover', 'state/credential-cutover/runs', 'run', 'leaf'])(
+    'aggregate rejects a %s symlink swapped inside the evidence read open', async ancestor => {
+      const { record } = await collect();
+      const runDir = join(temp, 'state/credential-cutover/runs', record.runId);
+      const evidence = join(runDir, 'inventory.json');
+      let readFlags, readOpened = false, reads = 0;
+      const io = { ...options.fs, open: async (path, flags, ...args) => {
+        if (path === evidence) {
+          readFlags = flags;
+          const checked = ancestor === 'leaf' ? evidence : ancestor === 'run' ? runDir : join(temp, ancestor);
+          await fs.rename(checked, `${checked}-original`);
+          // Preserve the original inode via the symlink: inode matching alone
+          // cannot defend this swap; the kernel open must reject the link.
+          await fs.symlink(`${checked}-original`, checked);
+          const h = await options.fs.open(path, flags, ...args);
+          readOpened = true;
+          return { stat: () => h.stat(), close: () => h.close(), read: (...args) => { reads++; return h.read(...args); } };
+        }
+        return options.fs.open(path, flags, ...args);
+      } };
+      expect(await subject.aggregate({ ...options, fs: io, runId: record.runId }))
+        .toMatchObject({ result: 'ERROR', exitCode: 1, reasons: ['COHORT'] });
+      expect(readFlags).toBe(constants.O_RDONLY | NOFOLLOW_ANY);
+      expect(readOpened).toBe(false); expect(reads).toBe(0);
+      await expect(fs.lstat(join(runDir, 'result.txt'))).rejects.toMatchObject({ code: 'ENOENT' });
+    },
+  );
+  it.each(['inode', 'device'])('aggregate rejects changed evidence %s and closes before reading', async changed => {
+    const { record } = await collect();
+    const evidence = join(temp, 'state/credential-cutover/runs', record.runId, 'inventory.json');
+    let closed = false, reads = 0, readFlags;
+    const io = { ...options.fs, open: async (path, flags, ...args) => {
+      if (path !== evidence) return options.fs.open(path, flags, ...args);
+      readFlags = flags;
+      if (changed === 'inode') {
+        await fs.rename(path, `${path}-original`);
+        await fs.writeFile(path, JSON.stringify(record));
+      }
+      const h = await options.fs.open(path, flags, ...args);
+      return {
+        stat: async () => {
+          const st = await h.stat();
+          return changed === 'device' ? Object.assign(Object.create(st), { dev: st.dev + 1 }) : st;
+        },
+        read: (...args) => { reads++; return h.read(...args); },
+        close: async () => { await h.close(); closed = true; },
+      };
+    } };
+    expect(await subject.aggregate({ ...options, fs: io, runId: record.runId }))
+      .toMatchObject({ result: 'ERROR', exitCode: 1, reasons: ['COHORT'] });
+    expect(readFlags).toBe(constants.O_RDONLY | NOFOLLOW_ANY);
+    expect(reads).toBe(0); expect(closed).toBe(true);
+    await expect(fs.lstat(join(dirname(evidence), 'result.txt'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
   it('unreadable and non-JSON evidence are incomplete cohorts', async () => {
     const { record } = await collect();
@@ -588,6 +713,14 @@ describe('secrets, result precedence and live admission', () => {
       for (const file of await fs.readdir(dir)) expect(await fs.readFile(join(dir, file), 'utf8')).not.toMatch(production.SECRET_RE);
       expect(JSON.stringify(lines)).not.toMatch(production.SECRET_RE);
     }
+    // Exercise the final serialization boundary as well as transport projection.
+    options.randomBytes = () => Buffer.from('ffffffff', 'hex');
+    const { record } = await collect();
+    const path = join(temp, 'state/credential-cutover/runs', record.runId, 'inventory.json');
+    await fs.unlink(path);
+    const poisoned = Object.assign(Object.create({ toJSON: () => ({ leak: SECRET }) }), record);
+    expect((await subject.emit(options, 'inventory', poisoned, path)).fatal).toBe('SECRET-DETECTED');
+    expect(await fs.readFile(path, 'utf8')).not.toMatch(production.SECRET_RE);
   });
   it('fixed emitted vocabulary never collides with SECRET_RE', () => {
     expect(production.FIXED_STRINGS.length).toBeGreaterThan(30);
@@ -683,4 +816,44 @@ describe('secrets, result precedence and live admission', () => {
     const bracketed = titles.map(t => t.match(/^\[([^\]]+)\]/)[1]);
     expect([...new Set(bracketed)].sort()).toEqual([...VARIANTS].sort());
   });
+  // Normal CI/verify selection of this suite executes the fixture, not just its
+  // title roster. Children cannot recurse, and run one at a time under this gate's slot.
+  it.skipIf(Boolean(process.env.INVENTORY_UNSAFE))('every unsafe variant fails all its named tests and leaves the rest passing', async () => {
+    const execute = promisify(execFile);
+    const deadline = performance.now() + 420000;
+    const testFile = 'scripts/operations/__tests__/host-credential-cutover-inventory.test.mjs';
+    const fixture = 'scripts/operations/__tests__/__fixtures__/inventory-unsafe.mjs';
+    for (const variant of VARIANTS) {
+      const remaining = Math.floor(deadline - performance.now());
+      expect(remaining, 'mutation matrix deadline').toBeGreaterThan(0);
+      const report = join(temp, `${variant}.json`);
+      let exitCode = 0;
+      try {
+        await execute(process.execPath, [join(lane, 'node_modules/vitest/vitest.mjs'), 'run', testFile,
+          '--reporter=json', `--outputFile=${report}`, '--maxWorkers=1', '--minWorkers=1'], {
+          cwd: lane, env: { ...process.env, INVENTORY_MODULE: fixture, INVENTORY_UNSAFE: variant, WE_TEST_CACHE: '0' },
+          timeout: Math.min(60000, remaining), maxBuffer: 1024 * 1024,
+        });
+      } catch (error) {
+        // Timeouts, signals, startup failures and missing reports are not mutation evidence.
+        expect(error.killed, variant).not.toBe(true);
+        expect(error.signal, variant).toBeNull();
+        expect(error.code, variant).toBe(1);
+        exitCode = error.code;
+      }
+      expect(exitCode, variant).toBe(1);
+      const results = JSON.parse(await fs.readFile(report, 'utf8'));
+      expect(results.numFailedTestSuites, `${variant}: suite errors`).toBe(0);
+      expect(results.testResults, variant).toHaveLength(1);
+      expect(results.testResults[0].message, `${variant}: suite error`).toBe('');
+      const assertions = results.testResults[0].assertionResults;
+      const targets = assertions.filter(t => t.title.startsWith(`[${variant}] `));
+      expect(targets.length, variant).toBeGreaterThan(0);
+      for (const target of targets) expect(target.status, `${variant}: ${target.fullName}`).toBe('failed');
+      for (const other of assertions.filter(t => !targets.includes(t))) {
+        expect(other.status, `${variant}: unrelated ${other.fullName}`).toBe(
+          other.title === 'every unsafe variant fails all its named tests and leaves the rest passing' ? 'skipped' : 'passed');
+      }
+    }
+  }, 450000);
 });

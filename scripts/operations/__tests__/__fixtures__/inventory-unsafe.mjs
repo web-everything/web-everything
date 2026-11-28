@@ -9,7 +9,8 @@ export const VARIANTS = Object.freeze(['shell-true', 'inherit-env', 'no-timeout'
   'sample-repos', 'skip-detail', 'numeric-actor-only', 'ignore-org-admin', 'ignore-admin-level',
   'mix-runs', 'accept-stale', 'follow-symlink', 'trust-persisted-result', 'skip-counts',
   'skip-second-pass', 'repo-only-rulesets', 'fatal-needs-login', 'page-two-unread',
-  'redact-and-pass', 'leak-stderr', 'leak-field', 'complete-with-findings-as-complete']);
+  'redact-and-pass', 'leak-stderr', 'leak-field', 'complete-with-findings-as-complete',
+  'combined-output', 'extra-nested-keys']);
 const variant = process.env.INVENTORY_UNSAFE;
 const complete = out => ({ ...out, result: 'COMPLETE', exitCode: 0, reasons: [], findings: [] });
 function rewrite(out, transform) {
@@ -87,6 +88,19 @@ export function childEnvironment(home) {
   return variant === 'inherit-env' ? { ...safe.childEnvironment(home), GH_TOKEN: process.env.GH_TOKEN, WE_OPERATOR_LOGINS: process.env.WE_OPERATOR_LOGINS } : safe.childEnvironment(home);
 }
 export async function spawnBounded(exe, argv, opts) {
+  if (variant === 'combined-output') return new Promise(done => {
+    // Deliberate regression: each stream has a separate cap instead of a combined one.
+    const child = opts.spawn(exe, argv, { env: opts.env, shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '', failed = false;
+    const timer = setTimeout(() => child.kill('SIGKILL'), opts.timeoutMs);
+    const read = stream => chunk => {
+      const retained = stream === 'stdout' ? stdout : stderr;
+      if (Buffer.byteLength(retained) + chunk.length > 4 * 1024 * 1024) { failed = true; child.kill('SIGKILL'); return; }
+      if (stream === 'stdout') stdout += chunk.toString(); else stderr += chunk.toString();
+    };
+    child.stdout.on('data', read('stdout')); child.stderr.on('data', read('stderr'));
+    child.on('close', code => { clearTimeout(timer); done({ code, stdout, stderr, failed, timedOut: false }); });
+  });
   if (variant === 'shell-true') return new Promise(done => {
     const child = spawn(exe, argv, { env: opts.env, shell: true, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = ''; child.stdout.on('data', b => { stdout += b; });
@@ -98,6 +112,10 @@ export async function spawnBounded(exe, argv, opts) {
 }
 export const defaultRunner = spawnBounded;
 export function validateRecord(record) {
+  if (variant === 'extra-nested-keys') {
+    // Deliberate regression: silently project away unexpected persisted fields.
+    return safe.validateRecord(JSON.parse(JSON.stringify(record), (key, value) => key === 'unexpected' ? undefined : value));
+  }
   if (variant === 'fatal-needs-login' && record.fatal && record.readerLogin === null) return false;
   return safe.validateRecord(record);
 }

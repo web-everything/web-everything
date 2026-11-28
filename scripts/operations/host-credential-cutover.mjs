@@ -171,10 +171,10 @@ export function validateRecord(r) {
 export const childEnvironment = home => ({ HOME: home, PATH: '/usr/bin:/bin', LANG: 'C', NO_COLOR: '1',
   GH_NO_UPDATE_NOTIFIER: '1', GH_PROMPT_DISABLED: '1', GH_PAGER: 'cat' });
 /** Hard kill deadline, bounded combined output, and close awaited for child reaping. */
-export function spawnBounded(executable, argv, { env, timeoutMs }) {
+export function spawnBounded(executable, argv, { env, timeoutMs, spawn = childProcess.spawn }) {
   return new Promise(done => {
     let child;
-    try { child = childProcess.spawn(executable, argv, { shell: false, stdio: ['ignore', 'pipe', 'pipe'], env }); }
+    try { child = spawn(executable, argv, { shell: false, stdio: ['ignore', 'pipe', 'pipe'], env }); }
     catch { done({ code: null, stdout: '', stderr: '', timedOut: false, failed: true }); return; }
     let stdout = '', stderr = '', bytes = 0, timedOut = false, failed = false;
     const timer = setTimeout(() => { timedOut = true; if (!child.kill('SIGKILL')) failed = true; }, timeoutMs);
@@ -200,6 +200,7 @@ function et(date) {
 }
 function context(o) {
   return { ...o, root: resolve(o.root ?? ROOT), fs: o.fs ?? fs, home: o.home ?? process.env.HOME, run: o.run ?? defaultRunner,
+    platform: o.platform ?? platform,
     stdout: o.stdout ?? (s => process.stdout.write(s)), stderr: o.stderr ?? (s => process.stderr.write(s)) };
 }
 const fatalRecord = (r, fatal) => ({ ...r, readerLogin: null, fatal, sources: [] });
@@ -233,7 +234,7 @@ export async function emit(c, kind, value, path) {
     text = JSON.stringify(value) + '\n';
   }
   if (path) {
-    if (platform() !== 'darwin') refuse('COHORT');
+    if ((c.platform ?? platform)() !== 'darwin') refuse('COHORT');
     await containment(c, false);
     const directory = dirname(path), st = await c.fs.lstat(directory);
     if (st.isSymbolicLink() || !st.isDirectory() || await c.fs.realpath(directory) !== directory) refuse('COHORT');
@@ -473,11 +474,12 @@ async function persistDecision(c, directory, decision) {
 export async function aggregate(options = {}) {
   const c = context(options);
   try {
+    if (c.platform() !== 'darwin') refuse('COHORT');
     string(c.runId, RUN_RE); const directory = await locate(c, c.runId), path = join(directory, 'inventory.json'); let r;
     try {
       const st = await c.fs.lstat(path); if (st.isSymbolicLink() || !st.isFile()) refuse('COHORT');
       if (st.size > MAX_EVIDENCE) return await persistDecision(c, directory, evaluate(null, c.runId, clock(c)));
-      const h = await c.fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW); let text;
+      const h = await c.fs.open(path, constants.O_RDONLY | NOFOLLOW_ANY); let text;
       try {
         const live = await h.stat(); if (!live.isFile() || live.size > MAX_EVIDENCE || live.ino !== st.ino || live.dev !== st.dev) refuse('COHORT');
         const buffer = Buffer.alloc(MAX_EVIDENCE + 1), { bytesRead } = await h.read(buffer, 0, buffer.length, 0);
