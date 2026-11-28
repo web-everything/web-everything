@@ -24,7 +24,7 @@ import { defaultPrState } from './edge-fetch.mjs';
 import {
   REBUILD_LOCK_WAIT_ENV, DEFAULT_REBUILD_LOCK_WAIT_MS, readRebuildStarvation, rebuildLockWaitMs,
   FINALIZE_LOCK_WAIT_ENV, DEFAULT_FINALIZE_LOCK_WAIT_MS, writeRebuildStarvation, releaseBuildLease,
-  ACTIVE_BUILD_TOKENS, processStartMs,
+  ACTIVE_BUILD_TOKENS, processStartMs, BUILD_HEARTBEAT_INTERVAL_MS, startBuildHeartbeat,
 } from './lease.mjs';
 import { alertsFilePath, readReadyCandidate, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
@@ -304,6 +304,7 @@ async function rebuildCloneInternal({
   now = () => Date.now(), sleep, versions, skipCheck, entries, dispatchSmoke, readyOnly = false, adoptOnly = false,
   asJob, urgent = false, launchOnly = false, launchedBy = 'tick-start', waitInFlightTickMs = 0, admissionWaitMs,
   spawnerOwners = defaultSpawnerOwners, readerStartTimeOf = processStartMs, admissionEvidence,
+  buildHeartbeatMs = BUILD_HEARTBEAT_INTERVAL_MS,
   stEnv = { ...env, ...(stateOpts?.env || {}) },
 } = {}) {
   if (readyOnly && adoptOnly && !admissionEvidence && launchedBy !== 'early' && launchedBy !== 'recovery') {
@@ -500,13 +501,32 @@ async function rebuildCloneInternal({
         } catch { /* the owner's next call takes an unreleased lease back anyway */ }
         return { waitInFlightTickMs: readerWaitMs, waitSmokeSlotMs, moved: false, adopted: false, reason: 'smoke-queue-timeout', plan, alerts: prepAlerts };
       }
-      const result = await smokeAndAdopt({
-        root, env, stEnv, log, run, runSmoke,
-        stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,
-        finalLockOpts, finalizeLockOpts, dispatchSmoke, readyOnly,
-      });
-      // Preserve the smoke result's identity; the public wrapper hides these transport fields.
-      return Object.assign(result ?? {}, { waitInFlightTickMs: readerWaitMs, waitSmokeSlotMs });
+      // Queue renewal moves startedAt. Re-read and bind the writer to the claimed owner under the same
+      // lock as its first write; never create or remove a successor's token-scoped evidence.
+      let hb;
+      try {
+        const checked = await withWriteLock(root, () => {
+          const current = readRebuildState(root, stEnv).building;
+          if (current?.token !== lease.token || current.pid !== lease.pid || current.host !== lease.host) return;
+          hb = startBuildHeartbeat({ root, env: stEnv, lease: current, now, intervalMs: buildHeartbeatMs });
+        }, { ...finalLockOpts, waitMs: 0 });
+        if (!checked.ok) { hb?.stop(); hb = undefined; }
+        if (!hb) log.error?.('build-heartbeat-owner-unconfirmed: no writer; existing holding bounds apply — inspect the current build lease');
+      } catch {
+        hb?.stop(); hb = undefined;
+        log.error?.('build-heartbeat-owner-unconfirmed: lease read or lock failed; no writer — inspect the current build lease');
+      }
+      try {
+        const result = await smokeAndAdopt({
+          root, env, stEnv, log, run, runSmoke,
+          stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,
+          finalLockOpts, finalizeLockOpts, dispatchSmoke, readyOnly,
+        });
+        // Preserve the smoke result's identity; the public wrapper hides these transport fields.
+        return Object.assign(result ?? {}, { waitInFlightTickMs: readerWaitMs, waitSmokeSlotMs });
+      } finally {
+        hb?.stop();
+      }
     } finally {
       await slot.release();
     }
