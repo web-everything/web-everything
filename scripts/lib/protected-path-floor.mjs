@@ -98,7 +98,11 @@ const REVIEW_AUTH_IMPORTS = Object.freeze([
   'scripts/lib/finding-class-policy.mjs', 'scripts/lib/review-care-exempt-paths.mjs',
   // Also added on main since: direct imports of the family (the card dedupe and the citation check).
   'scripts/lib/card-dedupe.mjs', 'scripts/lib/citation-check.mjs',
-  'scripts/lib/human-clearance-mechanical-carry-setting.mjs']);
+  'scripts/lib/human-clearance-mechanical-carry-setting.mjs',
+  // accept-carry-forward recognises the no-ask notes and the exhausted-retry recovered comment by their producers' own
+  // renderers and kind lists, so weakening a producer weakens the carry (redteam-accepted-never-started).
+  'scripts/lib/pr-comment-policy.mjs', 'scripts/conveyor/reconcile-note-comment.mjs',
+  'scripts/conveyor/exhausted-retry-recovered-comment.mjs']);
 /**
  * JSON files the floor modules decide with (PR #6381 self-review: red-team.json was read by red-team-gate.mjs but
  * unprotected). A test reads every floor module and pins each tracked scripts/ JSON file whose NAME it quotes, in any
@@ -147,7 +151,9 @@ const FLOOR_SETTINGS = Object.freeze([
   // Read by the fix dispatch daemon, a lock user (landed on main since).
   'scripts/settings/fix-pass-budget.json',
   // Read by the live-owner watch IO, a lock user (landed on main since).
-  'scripts/conveyor/pr-live-owner-watch.settings.json']);
+  'scripts/conveyor/pr-live-owner-watch.settings.json',
+  // Read by pr-comment-policy.mjs, a direct import of the review authorization family.
+  'scripts/pr-comments-settings.json']);
 /**
  * The lock primitives: the modules that take an exclusive hold (file-locks.mjs reserves a lock entry, with-lock.mjs
  * wraps it, coordination-lock.mjs takes the coordination lease). Any import of one makes a module a lock user (PR #6381
