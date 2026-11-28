@@ -133,8 +133,7 @@ describe('forge key structure: bounded unclosed object scans fail closed',()=>{
     expect(Date.now()-started).toBeLessThan(2000);
   });
   it('keeps the signal scan linear on bracket-heavy input',()=>{
-    // Count regex executions instead of wall-clock: a time cap flaked on loaded CI runners (501ms vs 500ms) while
-    // work counts are deterministic. Quadrupling the input must roughly quadruple the work (linear), not 16x it.
+    // Work counts are deterministic where a wall-clock cap flaked on loaded CI runners (501ms vs 500ms). Quadrupling the input must roughly quadruple the work (linear), not 16x it.
     const exec=RegExp.prototype.exec;
     let calls=0;
     const spy=vi.spyOn(RegExp.prototype,'exec').mockImplementation(function(text) {
@@ -152,6 +151,14 @@ describe('forge key structure: bounded unclosed object scans fail closed',()=>{
       expect(small).toBeGreaterThan(0);
       expect(large/small).toBeLessThanOrEqual(5);
     } finally {spy.mockRestore();}
+    // Keep the original 500ms runtime bound (it also catches costly work inside each regex execution), but measure
+    // this process's CPU time: it never exceeds wall time and ignores the runner descheduling that made the
+    // wall-clock cap flake at 501ms. Linear takes ~30ms locally.
+    const bytes=Buffer.from('[a]'.repeat(40000));
+    const before=process.cpuUsage();
+    expect(keyStructureFinding(bytes)).toBeNull();
+    const used=process.cpuUsage(before);
+    expect((used.user+used.system)/1000).toBeLessThan(500);
   });
   it('still blocks a PEM private key inside a large doc',()=>{
     const pem='-----BEGIN '+['PRIVATE','KEY'].join(' ')+'-----\nQUJD\n-----END '+['PRIVATE','KEY'].join(' ')+'-----';
