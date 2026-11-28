@@ -223,7 +223,8 @@ import { readPrHeads, applyNetScopeToReconcile, markRebaseExemptUsed, rebaseOver
 import micromatch from 'micromatch';
 import { criticalWorkVerdict } from '../lib/critical-work.mjs';
 import { resolveFixCriticalGlobs, resolveFixExecutionMode } from '../lib/fix-executor-chain.mjs';
-import { BORROW_REASON, readRoutedOutcomes, consecutiveUnproductiveOnHead, mergeOntoFor, chooseFixExecutor, claudeOnlyReason, formatFixExecutorLog, stampFixExecutor } from '../lib/fix-slot-borrow.mjs';
+import { BORROW_REASON, readRoutedOutcomes, consecutiveUnproductiveOnHead, mergeOntoFor, chooseFixExecutor, claudeOnlyReason, formatFixExecutorLog, stampAndMarkFixExecutor } from '../lib/fix-slot-borrow.mjs';
+import { postRequiresReviewMark } from '../lib/fix-review-floor.mjs';
 import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
 import { removePromptFile } from '../operations/fix-run.mjs';
 import { listBuildDispatchClaims } from './build-dispatch-claim.mjs';
@@ -1589,7 +1590,7 @@ export function dispatchFix(planned, {
   borrowed = null,
   fixExecutorRoute = null,
   executorDecision = null,
-  stampExecutor = stampFixExecutor,
+  stampExecutor = stampAndMarkFixExecutor,
   spawnBorrowed = (request) => fixDetachedProvider(request),
   // Stamp the runner pid onto the claim so a dead borrowed fix stops counting against the cap (see `stampBorrowedRunnerPid`).
   stampRunner = stampBorrowedRunnerPid,
@@ -1677,7 +1678,8 @@ export function dispatchFix(planned, {
   if (safety.value.resetOnRepeatedFinding) {
     try { repeat = repeatedFindingPlan(readHistoryInputs({ repo, pr: planned.pr })?.comments); } catch { /* launcher re-reads */ }
   }
-  const routed = repeat.action !== 'patch' ? { executor: 'codex', mode: 'direct', source: 'repeated-finding', reason: 'mechanical scope reset or operator stand-down' } : borrowed ? { ...borrowed, source: 'borrow' } : executorDecision ?? fixExecutorRoute?.({
+  const repeatCritical = () => { if (executorDecision?.requiresReview === true) return true; try { return criticalFixEntry(planned); } catch { return true; } };
+  const routed = repeat.action !== 'patch' ? { executor: 'codex', mode: 'direct', source: 'repeated-finding', requiresReview: repeatCritical(), reason: 'mechanical scope reset or operator stand-down' } : borrowed ? { ...borrowed, source: 'borrow' } : executorDecision ?? fixExecutorRoute?.({
     ...planned, round: roundOf(planned), strongerModel: !!roundEscalationFor(planned, { fixSettings, loadLadder }),
   }) ?? chooseFixExecutor({ setting: { value: 'provider-routing', source: 'default' } });
   const decision = {rung:routed.executor,provider:routed.policyRoute?.provider ?? routed.executor,...resolveFixExecutionMode(),...routed};
@@ -2003,6 +2005,7 @@ export function runReconcileFixDispatch({
   loadItems = () => defaultLoadItems(root),
   pickFreeLanes = null,
   tryResume = tryResumeFix,
+  postMark = isUnderTestEnv() ? () => {} : postRequiresReviewMark,
   // Card xrbu1bp — the round resume. Off under a test runner unless injected (it reads the live agent listing).
   tryResumeRound = isUnderTestEnv() ? null : tryResumeRoundFix,
   dispatch = dispatchFix,
@@ -2530,8 +2533,14 @@ export function runReconcileFixDispatch({
       if (resumeHold) { refusals.push(resumeHold); continue; }
     }
     let resumeAttempt = null;
+    const markBeforeResume = () => {
+      if (executorDecision?.requiresReview !== true) return true;
+      try { postMark({ repo: repoKey, pr: entry.pr, kind: 'fix', rung: executorDecision.rung }); return true; }
+      catch (e) { refusals.push({ pr: entry.pr, kind: 'dispatch-failed', why: `requires-review mark not posted: ${describeDispatchFailure(e)}` }); return false; }
+    };
     // A resume continues an existing Claude session and claim; a borrowed fix always starts fresh so its claim records the slot.
     if (entry.isConflict && !borrowed && (!executorDecision || executorDecision.executor === 'claude' || executorDecision.mode === 'wrapped') && !entry.restack) {
+      if (!markBeforeResume()) continue;
       let attempt;
       try {
         attempt = fixStep('resume', () => tryResume(entry, { root, repo: repoKey }), entry.pr);
@@ -2550,6 +2559,7 @@ export function runReconcileFixDispatch({
     // conflict resume above). A declined or failed resume falls through to the cold start with the history brief; a
     // throw here never aborts the pass, it only means a cold start.
     if ((!executorDecision || executorDecision.executor === 'claude' || executorDecision.mode === 'wrapped') && tryResumeRound && !entry.isConflict && !borrowed && !entry.restack && !entry.takeover && roundOf(entry) >= 2) {
+      if (!markBeforeResume()) continue;
       let attempt = null;
       try {
         attempt = fixStep('resume-round', () => tryResumeRound(entry, { root, repo: repoKey }), entry.pr);

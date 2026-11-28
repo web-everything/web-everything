@@ -31,6 +31,8 @@ import { readSettings } from './settings-files.mjs';
 import { readLockEntry, heartbeat } from '../readiness/file-locks.mjs';
 // Keep fix-run's static graph independent of the dispatch wrappers: use the light claim store.
 import { fixDispatchClaimRoot, fixDispatchResource } from '../conveyor/fix-claim-store.mjs';
+import { postRequiresReviewMark } from './fix-review-mark.mjs'; // leaf — fix-review-floor would close an import cycle via ai-routing
+import { isUnderTest } from './under-test.mjs';
 
 const platformPreferences = () => {
   try { return JSON.parse(readFileSync(new URL('./delivery-platform-preferences.json', import.meta.url), 'utf8')); }
@@ -100,6 +102,11 @@ export function stampFixExecutor({ repo, pr, kind = 'fix', owner, lockRoot = fix
   return heartbeat(lockRoot, resource, owner, new Date().toISOString(), claim.pid ?? null,
     { ...claim.meta, fixExecutor: { executor: decision.executor, rung: decision.rung, provider: decision.provider, mode: decision.mode, requiresReview: !!decision.requiresReview, reason: decision.reason } });
 }
+export function stampAndMarkFixExecutor(o, { post = isUnderTest() ? () => {} : postRequiresReviewMark } = {}) {
+  const stamped = stampFixExecutor(o);
+  if (o?.decision?.requiresReview === true) post({ repo: o.repo, pr: o.pr, kind: o.kind ?? 'fix', rung: o.decision.rung });
+  return stamped;
+}
 
 /**
  * Adapt the CI-heal dispatch seam, retaining its claim, filled brief and dispatch sink bookkeeping.
@@ -110,7 +117,7 @@ export function stampFixExecutor({ repo, pr, kind = 'fix', owner, lockRoot = fix
  * worker, injected `spawnAgent`) and `routeAvailableCiHeal` (including the native-Claude quota-hold refusal).
  */
 export function createRoutedCiHealDispatch({ dispatch, route, createSinks, launchCodex, writePrompt, removePrompt,
-  profileFor, stampExecutor = stampFixExecutor, staleBaseGate }) {
+  profileFor, stampExecutor = stampAndMarkFixExecutor, staleBaseGate }) {
   return async (planned, options = {}) => {
     if (staleBaseGate) {
       let gate = null;

@@ -140,6 +140,7 @@ import { decideStackDispatch, fingerprintOf, mainNetDiffText, readBottomLanded, 
 import { UNATTENDED_REVIEW_ACTOR } from './review-loop-cli.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
+import { reviewCareFloor } from '../lib/fix-review-floor.mjs';
 
 const THIS_FILE = fileURLToPath(import.meta.url);
 
@@ -449,6 +450,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
   ], { input: body, cwd: root, env, timeout: 60_000, maxBuffer: 1024 * 1024 });
   return {
     restoreRedTeamAdmission: restoreAdmission,
+    readPrThread: readComments,
     redTeamResultVisible: ({ repo, pr, head }) => Boolean(redTeamForHead(readComments({ repo, pr }), pr, head)),
     settleRedTeamSkip: input => settleRedTeamSkip({ ...input, io: {
       env,
@@ -1646,11 +1648,12 @@ export function dispatchReviewJob({
   ...unsupported
 } = {}) {
   if (Object.keys(unsupported).length) throw Error(`unsupported review job option: ${Object.keys(unsupported).join(', ')}`);
-  const tier = workerTierFor({ kind: 'review', scopePaths,
-    risk: careLevel === 'high' || careLevelFromReasons(escalationReason) === 'high' ? 'high' : undefined }).tier;
   const refusal = expectedHeadRefusal(expectedHead, { pr, repo }, io, { required: true });
   if (refusal) return { pr, repo, ...refusal };
   const planned = planReviewDispatch({ pr, repo, checkoutExists, home });
+  const floored = reviewCareFloor(io.readPrThread ?? (isUnderTest() ? () => [] : null), { repo: planned.repo, pr: planned.pr });
+  const tier = workerTierFor({ kind: 'review', scopePaths,
+    risk: floored || careLevel === 'high' || careLevelFromReasons(escalationReason) === 'high' ? 'high' : undefined }).tier;
   assertNotALaneCheckout(root);
   // The job path is the DEFAULT review dispatch (the daemon calls it), so it must narrow a managed clone's
   // refusal to the review code path exactly like `dispatchReview` does (#4387). Without this the narrowing
@@ -1695,6 +1698,7 @@ export function dispatchReviewJob({
   if (Number.isInteger(jobPid)) {
     writeJobRecord({ slug, pr: planned.pr, repo: planned.repo, pid: jobPid, startedAt: new Date(now).toISOString(), cwd: root }, dir);
   }
+  if (floored && Number.isInteger(jobPid)) writeLineSync(2, `review-floor: ${planned.repo}#${planned.pr} requires-review → tier ${tier} (job pid ${jobPid})`);
   return { ...base, jobPid: Number.isInteger(jobPid) ? jobPid : null };
 }
 
