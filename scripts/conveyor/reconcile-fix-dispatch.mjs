@@ -106,18 +106,34 @@ const PENDING_EXCLUDED_MODES = ['takeover', 'stale-base-rebase', 'stacked-rebase
  * SHIP-WM-278 + FLOW-DMN-080 — red-team:pending blocks merge, not an eligible fix push. The eligible set is closed:
  * the advisory-fix route (E1), a default-base conflict bounce (E2), a plain review:changes send-back (E3), and an
  * operator send-back with a nonempty verdict id/body, live review:changes, MERGEABLE on main and no conflict (E4),
+ * or a joined CI-plus-review repair with valid object evidence bound to the planned/live head, planned/live
+ * review:changes, no accepted verdict, mode, conflict, MQ recovery or open operator send-back, MERGEABLE on main (E5).
+ * These are launch-only exemptions: they grant nothing at merge or any push-side check. Each route is
  * derived from the planned route plus live labels/mergeable/base/head read at this call. Excluded routes win over
  * any label; any missing or unknown read keeps the hold. (The pre-existing `repair.staleBase` shortcut in
  * readLivePushHold is separate and unchanged.)
  */
-function pendingExemptRoute(repair, labels, view) {
+export function pendingExemptRoute(repair, labels, view) {
   if (!repair || labels.includes('red-team:blocked')) return false;
   if (PENDING_EXCLUDED_MODES.includes(repair.mode) || repair.takeover || repair.staleBase || repair.scopeBloat
-    || (repair.operatorSendBack && repair.mode !== 'operator-send-back') || repair.rulingNotAddressed || repair.joinedInputs
+    || (repair.operatorSendBack && repair.mode !== 'operator-send-back') || repair.rulingNotAddressed
     || repair.restack || repair.blockRuledReferrals?.length) return false;
   // Bind to the planned head: a repair planned for an older head cannot waive pending on a replacement head.
   // A missing or unreadable head on either side keeps the hold.
   if (!/^[0-9a-f]{40}$/.test(repair.headRefOid ?? '') || repair.headRefOid !== view.headRefOid) return false;
+  // E5 is presence-based: malformed joined evidence must never fall through to E1-E4.
+  if ('joinedInputs' in repair) {
+    const ji = repair.joinedInputs;
+    return ji !== null && typeof ji === 'object' && !Array.isArray(ji)
+      && typeof ji.head === 'string' && /^[0-9a-f]{40}$/.test(ji.head)
+      && Array.isArray(ji.ciFailures) && Array.isArray(ji.reviewFindings) && ji.reviewFindings.length > 0
+      && ji.head === repair.headRefOid && ji.head === view.headRefOid
+      && !repair.mode && repair.isConflict !== true && !repair.mqFailureRecovery
+      && !(repair.openOperatorSendBacks?.length > 0)
+      && repair.labels?.includes('review:changes') === true && labels.includes('review:changes')
+      && !labels.includes('review:accepted') && !labels.includes('merge-status:conflicting')
+      && view.mergeable === 'MERGEABLE' && view.baseRefName === 'main';
+  }
   if (repair.mode === 'operator-send-back') return typeof repair.operatorSendBack?.verdictId === 'string'
     && repair.operatorSendBack.verdictId.length > 0 && typeof repair.operatorSendBack.body === 'string'
     && repair.operatorSendBack.body.trim().length > 0 && !repair.mqFailureRecovery && repair.isConflict !== true
@@ -461,7 +477,7 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
       }
       const isConflictItemless = entry.isConflict === true || (Array.isArray(entry.labels) && entry.labels.includes(CONFLICT_LABEL));
       planned.push({
-        ...(entry.joinedInputs ? { joinedInputs: entry.joinedInputs } : {}),
+        ...('joinedInputs' in entry ? { joinedInputs: entry.joinedInputs } : {}),
         ...(entry.ciLogEvidenceReason ? { ciLogEvidenceReason: entry.ciLogEvidenceReason } : {}),
         ...(entry.mqFailureRecovery ? { mqFailureRecovery: entry.mqFailureRecovery } : {}),
         ...(entry.waitingSince ? { waitingSince: entry.waitingSince } : {}),
@@ -586,7 +602,7 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
     }
     const isConflict = entry.isConflict === true || (Array.isArray(entry.labels) && entry.labels.includes(CONFLICT_LABEL));
     planned.push({
-      ...(entry.joinedInputs ? { joinedInputs: entry.joinedInputs } : {}),
+      ...('joinedInputs' in entry ? { joinedInputs: entry.joinedInputs } : {}),
       ...(entry.ciLogEvidenceReason ? { ciLogEvidenceReason: entry.ciLogEvidenceReason } : {}),
         ...(entry.mqFailureRecovery ? { mqFailureRecovery: entry.mqFailureRecovery } : {}),
       ...(entry.waitingSince ? { waitingSince: entry.waitingSince } : {}),

@@ -1,13 +1,16 @@
 /** @file Hermetic authorized-push refusals, live reads and lease boundary. */
+// @vitest-environment node
 import { spawnSync, execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { userInfo } from 'node:os';
+import { fileURLToPath } from 'node:url';
+import { userInfo, tmpdir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createAuthorizedPushForTesting, nonTestFactoryImports } from './helpers/authorized-push-factory.mjs';
 const authorizedPush = options => createAuthorizedPushForTesting(options.io).authorizedPush(options);
 const readPushAuthority = options => createAuthorizedPushForTesting(options.io).readPushAuthority(options);
 import { PUSH_HOLD_LABELS } from '../review-hold-model.mjs';
+import { scopedScanFiles } from '../repo-scan-tests.mjs';
 import { runGhSync } from '../gh-throttle.mjs';
 import { pushRefusal } from '../../conveyor/fix-procedure.mjs';
 import { fixDispatchClaimRoot } from '../../conveyor/fix-claim-store.mjs';
@@ -374,5 +377,56 @@ describe('audit negative guarantees', () => {
     const paths = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z'],
       { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 }).split('\0').filter(path => path && existsSync(path));
     expect(nonTestFactoryImports(paths)).toEqual([]);
+  });
+});
+
+// @repo-scanning-test scope=files — scoped source inventory, with throwaway-tree detection cases below.
+function authorizedPushImporters(root, files, env) {
+  // Comments are valid between import tokens; dynamic imports also accept template literals.
+  const trivia = String.raw`(?:\s|\/\*[\s\S]*?\*\/|\/\/[^\r\n]*)*`;
+  const importer = new RegExp(String.raw`(?:\bfrom${trivia}|\bimport${trivia}(?:\(${trivia})?|\brequire${trivia}\(${trivia})`
+    + "['\"`][^'\"`]*authorized-push\\.mjs['\"`]");
+  return scopedScanFiles(files, env).filter(path => !/(?:^|\/)(?:__tests__|soak)(?:\/|$)/.test(path)
+    && /\.[cm]?[jt]sx?$/.test(path)
+    && importer.test(readFileSync(join(root, path), 'utf8')));
+}
+describe('M12a authorized-push production importer tripwire', () => {
+  it('detects production imports with from-comments and dynamic backticks in full and scoped scans', () => {
+    const root = mkdtempSync(join(tmpdir(), 'authorized-push-import-syntax-'));
+    const sources = [
+      "import { authorizedPush } from /* binding */ './authorized-push.mjs';",
+      "export { authorizedPush } from // binding\n './authorized-push.mjs';",
+      'import(`./authorized-push.mjs`);',
+    ];
+    const files = sources.map((_, index) => `consumer-${index}.mjs`);
+    try {
+      sources.forEach((source, index) => writeFileSync(join(root, files[index]), source));
+      expect(authorizedPushImporters(root, files, {})).toEqual(files);
+      for (const file of files) {
+        expect(authorizedPushImporters(root, files, { VERIFY_SCAN_FILES: JSON.stringify([file]) })).toEqual([file]);
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('REPO_SCAN: no tracked production script imports authorized-push', () => {
+    const root = fileURLToPath(new URL('../../../', import.meta.url));
+    const files = execFileSync('git', ['ls-files', '-z', '--', 'scripts/'],
+      { cwd: root, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 }).split('\0').filter(Boolean);
+    expect(authorizedPushImporters(root, scopedScanFiles(files), process.env)).toEqual([]);
+  });
+  it.each([false, true])('fixture tree with production importer=%s detects whether S1b is required', importer => {
+    const root = mkdtempSync(join(tmpdir(), 'e5-imports-'));
+    try {
+      mkdirSync(join(root, '__tests__'));
+      mkdirSync(join(root, 'soak'));
+      writeFileSync(join(root, '__tests__/consumer.mjs'), "import { authorizedPush } from '../authorized-push.mjs';");
+      writeFileSync(join(root, 'soak/consumer.mjs'), "import('../authorized-push.mjs');");
+      writeFileSync(join(root, 'consumer.mjs'), importer
+        ? "import { authorizedPush } from './authorized-push.mjs';" : "// authorized-push.mjs is not wired here");
+      const files = readdirSync(root, { recursive: true }).filter(path => path.endsWith('.mjs'));
+      expect(authorizedPushImporters(root, files, {})).toEqual(importer ? ['consumer.mjs'] : []);
+      expect(authorizedPushImporters(root, files, { VERIFY_SCAN_FILES: '["unrelated.mjs"]' })).toEqual([]);
+      expect(authorizedPushImporters(root, files, { VERIFY_SCAN_FILES: '["consumer.mjs"]' })).toEqual(importer ? ['consumer.mjs'] : []);
+      expect(() => authorizedPushImporters(root, ['unreadable.mjs'], {})).toThrow();
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
