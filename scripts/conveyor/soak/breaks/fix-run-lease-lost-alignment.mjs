@@ -15,7 +15,7 @@ export default {
   async run() {
     const dir = mkdtempSync(join(tmpdir(), 'lease-lost-alignment-'));
     const head = 'a'.repeat(40), build = 'b'.repeat(40), now = Date.parse('2026-10-28T16:45:20Z');
-    const entry = { kind: 'ci-heal', prNumber: 6030, headRefName: 'lane/fix-run-lease-lost', headRefOid: head };
+    const entry = { kind: 'ci-heal', admission: { admitted: true }, prNumber: 6030, headRefName: 'lane/fix-run-lease-lost', headRefOid: head };
     // Historical sessions without outcome rows rely on the log fallback, including reused session names.
     const rows = Array.from({ length: 3 }, () => ({ v: 1, at: new Date(now - 1000).toISOString(),
       repo: 'we', pr: 6030, head, build, kind: 'ci-heal', session: 'fix-6030' }));

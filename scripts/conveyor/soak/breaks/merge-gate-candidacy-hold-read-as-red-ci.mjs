@@ -52,8 +52,14 @@ export default {
       5023: candidacyLog(5023).replace('merge-gate: HOLD — held', 'merge-gate: HOLD — workflow self-check failed — fail closed: cannot compare workflow with main; held'),
       5024: log5008.replaceAll('5008', '5024').replace('main CI (ci.yml@main): green', 'main CI (ci.yml@main): RED since bbbbbbbbb'),
     };
-    const prs = [5008, 5012, 5020, 5022, 5023, 5024].map(number => ({
-      number, state: 'OPEN', headRefOid: sha, headRefName: `lane/${number}-example`, baseRefName: 'main',
+    const unknownMainLog = log5008.replaceAll('5008', '5025').replace('manual freeze: merge-queue switch: ruleset apply (operator go 2026-10-12)', 'main CI red since bbbbbbbbb');
+    // Policy (ci-heal admission): a hold owned only by red-main-freeze is repairable only once main is KNOWN green
+    // (pr.mainGreenNow.red === false); unknown or red main refuses it (main-red). #5022/#5024 model a freeze that
+    // main's own recovery cleared, so they carry that proof; #5025 is the negative twin with NO proof and must be refused.
+    const mainKnownGreen = { red: false, sha: 'c'.repeat(40), at: '2026-10-12T12:50:00Z' };
+    const prs = [5008, 5012, 5020, 5022, 5023, 5024, 5025].map(number => ({
+      number, state: 'OPEN',
+      ...([5022, 5024].includes(number) ? { mainGreenNow: mainKnownGreen } : {}), headRefOid: sha, headRefName: `lane/${number}-example`, baseRefName: 'main',
       rowsComplete: true, rowsHead: sha,
       labels: [{ name: 'review:pending' }], comments: [], isDraft: number !== 5008,
       statusCheckRollup: [
@@ -68,7 +74,7 @@ export default {
       readRequiredChecks: () => ({ checks: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'] }),
       readChecks: () => { throw new Error('complete fixture rollups must not hydrate checks'); },
       readMergeGateVerdict: ({ prNumber }) => ({
-        ...parsePrResultTable(complete(failureLogs[prNumber] ?? (prNumber === 5008 ? log5008 : candidacyLog(prNumber)), GATE_IDS), prNumber),
+        ...parsePrResultTable(complete(failureLogs[prNumber] ?? (prNumber === 5025 ? unknownMainLog :prNumber === 5008 ? log5008 : candidacyLog(prNumber)), GATE_IDS), prNumber),
         head_sha: sha, completed_at: '2026-10-12T11:56:08Z',
       }),
       readFreeze: () => ({ frozen: false, publishedAt: '2026-10-12T12:49:46.432Z' }),
@@ -85,9 +91,22 @@ export default {
     if (!dispatched(5008, 'review')) violations.push('PR #5008 candidacy + cleared manual freeze was not owed review');
     if (!dispatched(5012, 'promote-draft')) violations.push('PR #5012 candidacy-only draft was not owed promote-draft');
     if (!dispatched(5020, 'ci-heal')) violations.push('PR #5020 real test FAILURE was not owed ci-heal');
-    for (const number of Object.keys(failureLogs).map(Number)) {
+    // Policy (ci-heal admission): a job-level merge-gate failure (#5023 workflow self-check, fail closed) is
+    // UNREADABLE evidence, so it is refused (x-merge-gate-unreadable) for a person to inspect: never ci-heal,
+    // never excused into review or promotion.
+    if (!(plan.refusals ?? []).some(r => r.prNumber === 5023 && r.kind === 'x-merge-gate-unreadable'))
+      violations.push('PR #5023 unreadable merge-gate failure was not refused as x-merge-gate-unreadable');
+    for (const kind of ['ci-heal', 'review', 'promote-draft']) {
+      if (dispatched(5023, kind)) violations.push(`PR #5023 unreadable merge-gate failure was admitted as ${kind}`);
+    }
+    for (const number of Object.keys(failureLogs).map(Number).filter(n => n !== 5023)) {
       if (!dispatched(number, 'ci-heal')) violations.push(`PR #${number} real merge-gate failure was incorrectly excused`);
       if (dispatched(number, 'review') || dispatched(number, 'promote-draft')) violations.push(`PR #${number} real merge-gate failure allowed review or promotion`);
+    }
+    if (!(plan.refusals ?? []).some(r => r.prNumber === 5025 && r.kind === 'main-red'))
+      violations.push('PR #5025 main-only hold with unknown main state was not refused as main-red');
+    for (const kind of ['ci-heal', 'review', 'promote-draft']) {
+      if (dispatched(5025, kind)) violations.push(`PR #5025 main-only hold with unknown main state was admitted as ${kind}`);
     }
     return { violations };
   },

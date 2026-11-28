@@ -29,5 +29,5 @@ it('holds a merge-gate proven review-only, but still heals a real merge-gate fai
     statusCheckRollup: [{ name: 'merge-gate', status: 'completed', conclusion: 'failure', mergeGateReviewHold: true }] };
   const plan = checks => planReconcile({ prs: [{ ...pr, statusCheckRollup: checks }], agents: [], requiredChecks: ['merge-gate'], advisoryReviewOnHumanHandoff: 'off' });
   expect(plan(pr.statusCheckRollup).dispatch.some(d => d.kind === 'ci-heal')).toBe(false);
-  expect(plan([{ ...pr.statusCheckRollup[0], mergeGateReviewHold: false }]).dispatch.some(d => d.kind === 'ci-heal')).toBe(true);
+  expect(plan([{ ...pr.statusCheckRollup[0], mergeGateReviewHold: false, mergeGateAdmission: { class: 'real', why: 'real hold', jobId: 1 } }]).dispatch.some(d => d.kind === 'ci-heal')).toBe(true);
 });
