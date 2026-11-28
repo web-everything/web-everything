@@ -95,7 +95,8 @@ if (a[0] === 'pr' && a[1] === 'merge') {
 // The listed head is the commits tip (a later _headRefOid then models a push after the pass-start read); with no
 // tip oid the fixture's _headRefOid, else headOf's stand-in, is the head at listing time too.
 const listedRows = () => fx.prs.map((pr) => {
-  const row = { ...pr, headRefName: pr.headRefName || 'lane/fixture-' + pr.number };
+  const row = { ...pr, headRefName: pr.headRefName || 'lane/fixture-' + pr.number,
+    baseRefOid: pr.baseRefOid || 'b'.repeat(40) };
   const tip = (pr._commits || [])[(pr._commits || []).length - 1];
   // These unrelated gate scenarios use known modifications; unknown/rename metadata
   // and the pinned fallback are exercised by drain-workflow-edit-replay.test.mjs.
@@ -104,7 +105,27 @@ const listedRows = () => fx.prs.map((pr) => {
   return row;
 });
 if (a[0] === 'pr' && a[1] === 'list') out(listedRows());
-if (a[0] === 'api' && a[1] === 'graphql') out(openPrPageFixture(listedRows(), a.find(v => v.startsWith('query=')) || ''));
+if (a[0] === 'api' && a[1] === 'graphql') {
+  const query = a.find(v => v.startsWith('query=')) || '';
+  if (query.includes('pullRequests(')) out(openPrPageFixture(listedRows(), query));
+  // The drain now reads complete, identity-bound commit pages instead of pr view's capped array.
+  // Serve the pass-start history; _headRefOid still models a later push in the fresh pr view read.
+  if (query.includes('pullRequest(number:') && query.includes('commits(first:100')) {
+    const num = a.find(v => v.startsWith('number='));
+    const pr = listedRows().find(p => 'number=' + p.number === num);
+    if (!pr) { process.stderr.write('unknown commit-history PR\\n'); process.exit(1); }
+    const commits = (pr._commits || []).map((c, i, rows) => ({ commit: { ...c,
+      oid: c.oid || (i === rows.length - 1 ? pr.headRefOid : (i + 1).toString(16).padStart(40, '0')),
+      authors: { nodes: c.authors || [] } } }));
+    out(Array.from({ length: Math.max(1, Math.ceil(commits.length / 100)) }, (_, i) => ({
+      data: { repository: { pullRequest: { headRefOid: pr.headRefOid, baseRefOid: pr.baseRefOid,
+        commits: { totalCount: commits.length,
+          pageInfo: { hasNextPage: (i + 1) * 100 < commits.length, endCursor: 'commits-' + i },
+          nodes: commits.slice(i * 100, (i + 1) * 100) } } } },
+    })));
+  }
+  process.stderr.write('unexpected GraphQL query\\n'); process.exit(1);
+}
 if (a[0] === 'pr' && a[1] === 'view') {
   const pr = fx.prs.find((p) => String(p.number) === String(a[2])) || {};
   const fieldList = fields.split(',');
@@ -156,6 +177,7 @@ if (a[0] === 'pr' && a[1] === 'view') {
   if (fields.includes('title')) resp.title = pr.title || '';
   if (fields.includes('headRefName')) resp.headRefName = pr.headRefName || 'lane/fixture-' + pr.number;
   if (fields.includes('baseRefName')) resp.baseRefName = pr.baseRefName;
+  if (fields.includes('baseRefOid')) resp.baseRefOid = pr.baseRefOid || 'b'.repeat(40);
   if (fields.includes('mergeable')) resp.mergeable = pr.mergeable;
   if (fields.includes('mergeStateStatus')) resp.mergeStateStatus = pr.mergeStateStatus;
   if (fields.includes('statusCheckRollup')) resp.statusCheckRollup = pr.statusCheckRollup;

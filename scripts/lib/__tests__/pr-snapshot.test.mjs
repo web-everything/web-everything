@@ -442,3 +442,20 @@ it('snapshot v2 projects check evidence metadata without losing completeness', (
   const pr = { number: 1, rowsHead: 'a'.repeat(40), rowsComplete: true };
   expect(projectPrs([pr], SNAPSHOT_FIELDS)).toEqual([pr]);
 });
+
+
+it('a snapshot written without baseRefOid is not served and refreshes', () => {
+  const { exec, calls } = fakeExec(PRS.map(p => ({ ...p, baseRefOid: 'b'.repeat(40) })));
+  const fields = 'number,baseRefOid';
+  // Legacy persisted schema lists no base identity, even though the TTL remains fresh.
+  writeFileSync(snapshotPath(dir, REPO), JSON.stringify({ v: PR_SNAPSHOT_VERSION, repo: REPO,
+    fields: SNAPSHOT_FIELDS.filter(f => f !== 'baseRefOid'), fetchedAtMs: clock, count: PRS.length, prs: PRS }));
+  const first = readSharedOpenPrs(opts({ fields, exec }));
+  expect(first).toEqual(PRS.map(p => ({ number: p.number, baseRefOid: 'b'.repeat(40) })));
+  expect(pageCalls(calls)).toHaveLength(1);
+  expect(pageCalls(calls)[0][3]).toContain('baseRefOid');
+  expect(readSharedOpenPrs(opts({ fields, exec }))).toEqual(first);
+  expect(pageCalls(calls)).toHaveLength(1);
+  const legacy = { fields: ['number'], fetchedAtMs: clock, prs: PRS };
+  expect(isServable(legacy, { fields: ['number', 'baseRefOid'], nowMs: clock, ttlMs: 75_000 })).toBe(false);
+});
