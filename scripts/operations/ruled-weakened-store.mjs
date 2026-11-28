@@ -26,13 +26,13 @@ export function storePath(env = process.env) {
   return join(env.HOME, 'workspace/.operations/coordination/ruled-weakened.jsonl');
 }
 const nonblank = (v) => typeof v === 'string' && v.trim().length > 0;
-const bareRef = ref => String(ref ?? '').replace(/\s*\(.*\)\s*$/, '').trim();
+const bareRef = ref => String(ref ?? '').replace(/\s*\(.*\)\s*$/, '').trim().replace(/^refs\/heads\//, '');
 const revocationKey = e => JSON.stringify([bareRef(e.ref), String(e.sha ?? '').toLowerCase()]);
 const isoTime = at => typeof at === 'string'
   && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(at) ? Date.parse(at) : NaN;
 
 /** Admission-time revocations for every waiver layer. Unreadable evidence revokes all waivers. */
-export function withdrawnRevocations({ env = process.env, fs = nodeFs, warn = console.warn, scopeRef, warnOther = console.warn } = {}) {
+export function withdrawnRevocations({ env = process.env, fs = nodeFs, warn = console.warn, scopeRef, warnOther = console.warn, relaxUnattributed = false } = {}) {
   // Use the same HOME validation as the store; never fall back to an ambient home.
   storePath(env);
   const path = join(env.HOME, 'workspace/.operations/handoff/waiver-requests.jsonl');
@@ -50,7 +50,26 @@ export function withdrawnRevocations({ env = process.env, fs = nodeFs, warn = co
   // A damaged line only blocks when it names scopeRef or its ref cannot be read (fail closed); others use warnOther.
   const damaged = (i, count, request) => {
     const named = request && typeof request === 'object' && !Array.isArray(request) && nonblank(request.ref) && !/[\r\n]/.test(request.ref);
-    const other = scopeRef !== undefined && named && bareRef(request.ref) !== bareRef(scopeRef);
+    let other = scopeRef !== undefined && named && bareRef(request.ref) !== bareRef(scopeRef);
+    // Unknown attribution blocks. Only a complete JSON ref can establish unrelated damage.
+    // Opt-in only (rewaive-plan, a read-only planner): every other caller keeps the fail-closed default.
+    if (relaxUnattributed && scopeRef !== undefined && !named) {
+      const text = lines.slice(i, i + count).join('\n');
+      const raw = text.toLowerCase()
+        .replace(/\\u([0-9a-f]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16))).toLowerCase()
+        .trimEnd().replace(/\\(?:u[0-9a-f]{0,3})?$/, '').replaceAll('\\', '');
+      // Could be a revocation: names revok/withdrawn, or is cut off inside "withdrawn" (e.g. a truncated "WITH").
+      const hint = /revok|withdraw/.test(raw) || /(?:^|[^a-z])w(?:i(?:t(?:h(?:d(?:r(?:a(?:w(?:n)?)?)?)?)?)?)?)?["'\s]*$/.test(raw);
+      // Narrow compatibility for a truncated object: supply only its missing final value/brace.
+      // Never close a string/key or invent a ref. JSON.parse handles escapes, nesting and duplicate
+      // keys, so an empty, partial, nested or overwritten ref cannot prove unrelatedness.
+      let attributed;
+      try { attributed = JSON.parse(`${text}null}`); } catch { /* incomplete attribution blocks */ }
+      const ref = attributed && typeof attributed === 'object' && !Array.isArray(attributed) && attributed.ref;
+      other = !hint && !raw.includes(bareRef(scopeRef).toLowerCase())
+        && nonblank(ref) && !/[\r\n]/.test(ref) && nonblank(bareRef(ref))
+        && bareRef(ref) !== bareRef(scopeRef);
+    }
     const span = count > 1 ? `lines ${i + 1}-${i + count}` : `line ${i + 1}`;
     (other ? warnOther : warn)(`WARNING: waiver request log ${span}: malformed JSON or invalid request; ignored`);
   };
