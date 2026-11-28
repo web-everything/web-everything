@@ -1,4 +1,5 @@
 ---
+bornAs: xteoojb
 kind: task
 status: active
 scaffoldedBy: "card-7526-sibling-advanced"
@@ -33,7 +34,7 @@ Acceptance:
 
 Severity: not a security finding. main has no checkSiblingBase today; the regression fails closed (a legitimate child is refused with `sibling-base-unknown`), it does not admit anything unsafe.
 
-Evidence: PR #7526 head 65bc0560 judge ruling (context in the handoff-state card-7526-sibling-advanced file), PR #7526 review comment 2026-11-28T00:46:55Z, Steward Opus judge ruling 2026-11-27 (handoff-state judge-7526r6), earlier ruling handoff-state judge-7526-ruling-2026-11-27 file (the --verbatim finding at :189 is fixed and holds). Citation form: we:backlog/xteoojb-open-pr-sibling-gate-an-advanced-sibling-containing-the-subm.md@pr7625.
+Evidence: PR #7526 head 65bc0560 judge ruling (context in the handoff-state card-7526-sibling-advanced file), PR #7526 review comment 2026-11-28T00:46:55Z, Steward Opus judge ruling 2026-11-27 (handoff-state judge-7526r6), earlier ruling handoff-state judge-7526-ruling-2026-11-27 file (the --verbatim finding at :189 is fixed and holds). Citation form: we:backlog/8722-open-pr-sibling-gate-an-advanced-sibling-containing-the-subm.md@pr7625.
 
 ## Acceptance
 
