@@ -129,7 +129,7 @@ const FLOOR_SETTINGS = Object.freeze([
   'scripts/lib/dispatch-size-policy.json', 'scripts/lib/dispatch-supervision-promotions.json', 'scripts/lib/review-fix-policy-settings.json',
   'scripts/settings/delivery-metrics.json', 'scripts/settings/needs-you-feed.json', 'scripts/settings/pr-land-ready.json',
   'scripts/settings/pr-limit.json', 'scripts/settings/pr-stall-sweep.json', 'scripts/settings/review-concurrency.json',
-  'scripts/settings/review-red-team-on-skip.json',
+  'scripts/settings/review-red-team-on-skip.json', 'scripts/settings/review-run-reaper.json',
   // Decides which red-main timeouts the safety net quarantines at once (quarantine-early slice 2).
   'scripts/settings/test-timeout-policy.json',
   // Standalone selector documents named by settings-files.mjs, a protected settings reader.
@@ -268,6 +268,7 @@ export const LOCK_USERS = Object.freeze([
   'scripts/readiness/remote-target.mjs',
   'scripts/operations/ruled-weakened-prune.mjs',
   'scripts/lib/mq-failure-ledger.mjs', 'scripts/lib/operator-override-store.mjs', 'scripts/lib/review-run-index.mjs',
+  'scripts/lib/review-run-reap-job.mjs',
   // Callers of a `with…Lock` helper (withAddGuardLock, withDaemonCloneLock, …) and of a lock user's lock API through a
   // destructured dynamic import.
   'scripts/conveyor/health-watch.mjs', 'scripts/conveyor/liveness-sweep.mjs', 'scripts/conveyor/pass-daemons/pr-postmortem-pass.mjs',

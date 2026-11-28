@@ -475,6 +475,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
   const maxParses = setting.value.scan.maxParses;
   let parsed = 0;
   const budgetExhausted = Symbol('shared review parse budget exhausted');
+  const snapshotChanged = Symbol('review snapshot changed during read');
   let hardHold = false;
   const runScan = (indexedIds, allCandidates = false) => {
     const slots = Object.fromEntries(TIE_ORDERS.map(order => [order, { newer: newerBy(order), newest: null, exact: null, unfinished: null, unfinishedExact: null, since: -Infinity, active: -Infinity, undecided: true }]));
@@ -509,7 +510,13 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
           run = read(id, runsDir);
         }
         if (currentIdentity(id) !== scanIdentity(recordStats.get(id))) {
-          hardHold = true; throw Error('review snapshot changed during read; retry with fresh evidence');
+          indexReads.delete(id);
+          indexReadErrors.delete(id);
+          indexIdentities.delete(id);
+          // The complete filename scan can retry once with fresh metadata, using
+          // the same parse budget. Other scans retain their fail-closed refusal.
+          if (!allCandidates) hardHold = true;
+          throw snapshotChanged;
         }
         if (indexedIds) {
           indexReads.set(id, run);
@@ -607,7 +614,12 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
             break;
           }
           try { runScan(before.ids, true); }
-          catch { hardHold = true; scan = null; break; }
+          catch (error) {
+            scan = null;
+            if (error === snapshotChanged && attempt === 0) continue;
+            hardHold = true;
+            break;
+          }
           const after = readNamedCandidates(runsDir, repo, pr, { list });
           let unchanged = true;
           try {
@@ -620,6 +632,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
           if (attempt === 1) hardHold = true;
         }
       }
+      if (hardHold) return { ok: false, reason: 'scan-capped' };
       if (!scan) {
         try {
           const ids = readReviewRunIndex(runsDir, repo, pr, { list, stat: id => stat(join(runsDir, `${id}.json`)),

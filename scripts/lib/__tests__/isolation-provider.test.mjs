@@ -444,24 +444,33 @@ describe('createNativeDenyWithHistoryStripIsolationProvider — REAL git surgery
   const MARKER = 'PROBE14-CANARY-c9f1a3';
   let realSource, realScratch;
 
-  async function realGit(dir, args) {
-    return execFileAsync('git', args, { cwd: dir, encoding: 'utf8' });
+  async function realGit(dir, args, options = {}) {
+    return execFileAsync('git', args, { cwd: dir, encoding: 'utf8', ...options });
   }
 
   /** Exhaustive scan, mirroring Probe 14e's "0 hits across all 8252 objects" check: decode EVERY
    *  object in the packfile/loose-object database and search blob content directly — never trust
    *  the working tree or a single `git show`. */
   async function scanAllBlobsForMarker(repoDir, needle) {
-    const { stdout } = await realGit(repoDir, ['cat-file', '--batch-all-objects', '--batch-check']);
-    const lines = stdout.trim().length ? stdout.trim().split('\n') : [];
-    let hits = 0;
-    for (const line of lines) {
-      const [sha, type] = line.split(' ');
-      if (type !== 'blob') continue;
-      const { stdout: content } = await realGit(repoDir, ['cat-file', '-p', sha]);
-      if (content.includes(needle)) hits += 1;
+    // One process decodes the entire database, avoiding a process spawn per blob
+    // under shard load. Parse byte lengths: tree objects contain binary data.
+    const { stdout } = await realGit(repoDir, ['cat-file', '--batch-all-objects', '--batch'],
+      { encoding: 'buffer', maxBuffer: 8 << 20 });
+    const marker = Buffer.from(needle);
+    let hits = 0, totalObjects = 0, offset = 0;
+    while (offset < stdout.length) {
+      const headerEnd = stdout.indexOf(10, offset);
+      expect(headerEnd).toBeGreaterThanOrEqual(offset);
+      const header = /^([a-f0-9]+) (blob|tree|commit|tag) (\d+)$/.exec(stdout.toString('ascii', offset, headerEnd));
+      expect(header).not.toBeNull();
+      const contentStart = headerEnd + 1, contentEnd = contentStart + Number(header[3]);
+      expect(contentEnd).toBeLessThan(stdout.length);
+      expect(stdout[contentEnd]).toBe(10);
+      if (header[2] === 'blob' && stdout.subarray(contentStart, contentEnd).includes(marker)) hits++;
+      totalObjects++;
+      offset = contentEnd + 1;
     }
-    return { totalObjects: lines.length, hits };
+    return { totalObjects, hits };
   }
 
   beforeEach(async () => {
@@ -470,7 +479,7 @@ describe('createNativeDenyWithHistoryStripIsolationProvider — REAL git surgery
     await mkdir(realSource);
     await mkdir(realScratch);
     await realGit(realSource, ['init', '--quiet']);
-    await writeFile(join(realSource, 'AGENTS.md'), `# doctrine\n${MARKER}\n`);
+    await writeFile(join(realSource, 'AGENTS.md'), `# doctrine — UTF-8 byte lengths\n${MARKER}\n`);
     await writeFile(join(realSource, 'other.txt'), 'unrelated file, must survive');
     await realGit(realSource, ['add', '-A']);
     await realGit(realSource, [
