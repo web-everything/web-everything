@@ -4,11 +4,12 @@
  * carried a ruling. No push or re-arm was coming. The fixtures are the three live threads (and their review-run
  * projections) as captured at 2026-10-21T17:30Z.
  */
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import { buildClearedFromMarker } from '../../lib/review-escalation.mjs';
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { AUTO_POLICY_ACTOR, buildOperatorRulingComment, readReferralRecords,REFERRAL_SUPERSEDE_REASON } from '../../lib/jury-core.mjs';
@@ -20,6 +21,16 @@ import {
   referralHoldSendBackBody,
 } from '../review-referral-hold.mjs';
 import { planReconcile as planReconcileWithTiming } from '../reconcile-core.mjs';
+import * as holdApi from '../review-referral-hold.mjs';
+import * as coreApi from '../reconcile-core.mjs';
+import * as reviewApi from '../../operations/review-pr.mjs';
+import * as juryApi from '../../lib/jury-core.mjs';
+import { parseAdvisories, latestAdvisory, advisoryCoversHead, trustedAdvisoryComments, planAdvisoryRepairLabels } from '../../lib/advisory-labels.mjs';
+import { buildReviewedShaMarker } from '../../lib/review-escalation.mjs';
+import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
+import { reviewedHeadsOf } from '../mechanical-round-cap.mjs';
+import { HEAD as ESC_HEAD, NOW as ESC_NOW, OLD_HEAD, SETTINGS, CAPTURED_OPTIONS, rawRun, advisory as renderedNote, comment as threadComment,
+  pendingReferral, scenario } from '../soak/breaks/review-human-escalated-head-no-advisory.mjs';
 
 const planReconcile = options => planReconcileWithTiming({ reviewTiming: { startAfter: 'ci-green' }, fixTiming: { joinCiAndReview: false }, ...options });
 const here = dirname(fileURLToPath(import.meta.url));
@@ -352,7 +363,6 @@ describe('same-head holds with no referral finding (#7012)', () => {
     ['malformed referral', [...comments, { ...advisory, body: '<!-- mandatory-referrals-v1: broken -->' }], {}, /malformed/],
     ['pending referral', [...comments, recordComment({ rulings: [], carried: [], superseded: [] })], {}, /no readable ruling/],
     ['referral-kind hold without records', comments, { kind: 'referral' }, /no referral record names/],
-    ['same-head hold with no current advisory', [], {}, /no clean advisory accept/],
     ['same-head hold with a non-accept advisory outcome', [{ ...advisory, body: advisory.body.replace(/^\*\*Advisory outcome:\*\*\s*`?accept`?/im, '**Advisory outcome:** `pending-referral`') }], {}, /no clean advisory accept/],
     ['same-head hold with an advisory that states no outcome', [{ ...advisory, body: advisory.body.replace(/^\*\*Advisory outcome:\*\*.*$/im, '') }], {}, /no clean advisory accept/],
     ['same-head hold with an embedded accept then a real none outcome', [{ ...advisory, body: `${advisory.body}\n**Advisory outcome:** \`none\`` }], {}, /no clean advisory accept/],
@@ -372,8 +382,6 @@ describe('same-head holds with no referral finding (#7012)', () => {
     ['same-head hold whose advisory note carries a fenced example', [{ ...advisory, body: `${advisory.body}\n\`\`\`\n**Advisory outcome:** \`accept\`\n\`\`\`` }], {}, /no clean advisory accept/],
     ['same-head hold whose advisory note carries a tilde-fenced example', [{ ...advisory, body: `${advisory.body}\n~~~\n**Advisory outcome:** \`accept\`\n~~~` }], {}, /no clean advisory accept/],
     ['same-head hold with a short-prefix advisory head', [{ ...advisory, body: advisory.body.replace(/(Net basis: `[a-f0-9]+\.\.)[a-f0-9]+`/i, '$1' + fx.headRefOid.slice(0, 1) + '`') }], {}, /no clean advisory accept/],
-    ['same-head hold with a different full advisory head', [{ ...advisory, body: advisory.body.replace(fx.headRefOid, 'a'.repeat(40)) }], {}, /no clean advisory accept/],
-    ['same-head hold with an untrusted advisory author', [{ ...advisory, author: { login: 'untrusted-contributor' }, authorAssociation: 'NONE' }], {}, /no clean advisory accept/],
     ['failed persistence', comments, { persistenceFailed: true }, /save failed/],
     ['no verdict', comments, { noVerdict: {} }, /no verdict ever landed/],
     ['ledger cause', comments, { cause: 'ledger-unreadable' }, /ledger cannot answer/],
@@ -411,6 +419,206 @@ describe('same-head holds with no referral finding (#7012)', () => {
     const next = resolved({ ...pr, comments: [...comments, recordComment({ rulings: [], carried: [], superseded: [] })] });
     expect(next.referralHoldAutoResolve.outcome).toBe('stay');
     expect(plan(next).refusals.map(r => r.kind)).toEqual(['review-referrals-pending']);
+  });
+});
+
+// Runtime policy reads use declared empty configuration in a private fixture, never checkout/host files.
+const policyFixture = vi.hoisted(() => ({ root: null, file: null, unexpected: [] }));
+vi.mock('node:fs', async original => {
+  const fs = await original();
+  return { ...fs, readFileSync(path, ...args) {
+    if (!policyFixture.root) return fs.readFileSync(path, ...args);
+    const name = String(path);
+    if (name.startsWith(policyFixture.root + '/')) return fs.readFileSync(path, ...args);
+    const configuration = name.includes('/scripts/') && name.endsWith('.json')
+      || /\/\.claude\/(?:platform-preferences|operator-overrides)\.json$/.test(name);
+    if (configuration) return fs.readFileSync(policyFixture.file, ...args);
+    policyFixture.unexpected.push(name);
+    throw Error('undeclared fixture read: ' + name);
+  } };
+});
+
+describe('review:human escalated after its only panel (#7385)', () => {
+  beforeEach(() => {
+    policyFixture.root = mkdtempSync(join(tmpdir(), 'escalated-policy-'));
+    policyFixture.cwd = vi.spyOn(process, 'cwd').mockReturnValue(policyFixture.root);
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(ESC_NOW);
+    policyFixture.file = join(policyFixture.root, 'policy.json');
+    policyFixture.unexpected = [];
+    writeFileSync(policyFixture.file, '{}');
+  });
+  afterEach(() => {
+    const { root, unexpected } = policyFixture;
+    policyFixture.root = null;
+    policyFixture.cwd.mockRestore();
+    vi.useRealTimers();
+    rmSync(root, { recursive: true, force: true });
+    expect(unexpected).toEqual([]);
+  });
+
+  const api = { hold: holdApi, core: coreApi, review: reviewApi, jury: juryApi };
+  const run = options => rawRun(api, options);
+  const note = (outcome, head = ESC_HEAD, at) => renderedNote(api, outcome, head, at);
+  const decideHeld = (change, options = {}) => {
+    const { pr } = scenario(api, options);
+    return decide(pr, { ...pr.referralHold, ...change }, { settings: SETTINGS });
+  };
+
+  it('the captured test and red-team successes leave only the review-owned CI hold', () => {
+    const { pr, plan } = scenario(api, CAPTURED_OPTIONS);
+    expect(pr.referralHoldAutoResolve).toMatchObject({ outcome: 'resume', advisoryOwed: true });
+    expect(coreApi.reviewHoldOnlyRed(pr.statusCheckRollup, ['test', 'red-team', 'review-gate'], ESC_HEAD)).toBe(true);
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'review',
+      advisoryReview: expect.objectContaining({ reason: 'head-moved-advisory' }) })]);
+    expect(plan.refusals).toEqual([]);
+  });
+
+  it('#7385 shape: review:human mechanical head whose one halted review left no verdict and no advisory resumes and plans exactly one head-move advisory', () => {
+    const { pr, plan } = scenario(api, CAPTURED_OPTIONS);
+    expect(pr.referralHold).toMatchObject({ count: 1, attemptsSinceWake: 1 });
+    expect(pr.referralHoldAutoResolve).toMatchObject({ outcome: 'resume', head: ESC_HEAD, advisoryOwed: true, findings: [], counts: {} });
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'review',
+      advisoryReview: expect.objectContaining({ reason: 'head-moved-advisory' }) })]);
+    expect(plan.refusals).toEqual([]);
+    expect(plan.notes[0].text).toContain('resumed once (advisory only; `review:human` kept)');
+    expect(pr.labels).toContain('review:human');
+  });
+
+  it.each([true, false])('a second counted attempt with no note keeps the pause with the write-back-fails diagnostic (incomplete=%s)', incomplete => {
+    const { pr, plan } = scenario(api, { runs: [run(), run({ id: 'review-pr-second', second: true, incomplete })] });
+    expect(pr.referralHold).toMatchObject({ count: incomplete ? 1 : 2, attemptsSinceWake: 2 });
+    expect(pr.referralHoldAutoResolve).toMatchObject({ outcome: 'stay', why: expect.stringMatching(/head reviewed 2 time\(s\) and the PR still carries no advisory for it: the review's write-back fails/) });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals.map(row => row.kind)).toEqual(['review-referrals-pending']);
+  });
+
+  it.each(['accept', 'changes', 'pending-referral'])('after the advisory run the head is never re-reviewed: %s', outcome => {
+    const comments = [note(outcome), ...(outcome === 'pending-referral' ? [pendingReferral(api)] : [])];
+    expect(parseAdvisories(comments)[0].outcome).toBe(outcome);
+    const { pr, plan } = scenario(api, { runs: [run(), run({ id: 'review-pr-second', second: true, outcome })], comments,
+      change: { labels: ['review:human', ...(outcome === 'accept' ? ['advisory:accepted'] : outcome === 'changes' ? ['advisory:changes'] : [])] } });
+    if (outcome === 'pending-referral') expect(pr.referralHold.why).toMatch(/referrals need a ruling/);
+    else expect(pr.referralHold).toMatchObject({ count: 2, attemptsSinceWake: 2 });
+    expect(pr.referralHoldAutoResolve).toMatchObject({ outcome: 'stay', why: expect.stringMatching(outcome === 'pending-referral' ? /still have no readable ruling/ : /no clean advisory accept/) });
+    expect(plan.dispatch.filter(row => row.kind === 'review')).toEqual([]);
+    if (outcome === 'changes') expect(plan.dispatch.every(row => row.kind === 'fix' && row.mode === 'advisory-fix')).toBe(true);
+    else {
+      expect(plan.dispatch).toEqual([]);
+      expect(plan.refusals.map(row => row.kind)).toEqual(['review-referrals-pending']);
+    }
+    if (outcome === 'accept') expect(coreApi.advisoryHeadMoveState(pr).owed).toBe(false);
+    if (outcome === 'pending-referral') expect(comments[0].body).toContain('**Advisory outcome:** `pending-referral`');
+  });
+
+  it.each(['accept', 'changes', 'pending-referral'])('note posted but awaiting-advisory clear failed: no second review, and label repair clears it only for accept/changes (%s)', outcome => {
+    const comments = [note(outcome), ...(outcome === 'pending-referral' ? [pendingReferral(api)] : [])];
+    const { pr, plan } = scenario(api, { runs: [run(), run({ id: 'review-pr-second', second: true, outcome })], comments,
+      change: { labels: ['review:human', 'review:awaiting-advisory', ...(outcome === 'accept' ? ['advisory:accepted'] : outcome === 'changes' ? ['advisory:changes'] : [])] } });
+    expect(plan.dispatch.filter(row => row.kind === 'review')).toEqual([]);
+    const repair = planAdvisoryRepairLabels({ currentLabels: pr.labels, comments, headRefOid: ESC_HEAD });
+    if (outcome === 'pending-referral') expect(repair).toEqual({ add: null, remove: [] });
+    else expect(repair.remove).toContain('review:awaiting-advisory');
+  });
+
+  // These three AC2-b rows deliberately replace the old stay expectations: absence of trusted current-head
+  // coverage means the one pre-escalation panel still owes its advisory; it never grants acceptance.
+  it.each([
+    ['no current advisory', () => []],
+    ['different full advisory head', () => [note('accept', OLD_HEAD)]],
+    ['untrusted advisory author', () => [{ ...note('accept'), author: { login: 'untrusted-contributor' }, authorAssociation: 'NONE' }]],
+  ])('%s resumes once through the planner', (_why, comments) => {
+    const { pr, plan } = scenario(api, { comments: comments() });
+    expect(pr.referralHoldAutoResolve).toMatchObject({ outcome: 'resume', advisoryOwed: true });
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'review' })]);
+    expect(plan.dispatch[0].kind).not.toBe('convert-advisory');
+  });
+
+  it.each([false, true])('a newer marker-leading note is unpinned only without reviewed-head evidence (headed=%s)', headed => {
+    const body = headed ? note('accept', OLD_HEAD).body.replace(/^\*\*Verdict:\*\*.*$/m, '') : `${ADVISORY_NOTE_MARKER}\nunreadable note`;
+    const c = threadComment(body, '2026-11-26T22:05:00Z');
+    expect(reviewedHeadsOf(c).length).toBe(headed ? 1 : 0);
+    const { pr, plan } = scenario(api, { comments: [note('accept', OLD_HEAD), c] });
+    expect(pr.referralHoldAutoResolve.outcome).toBe(headed ? 'resume' : 'stay');
+    expect(coreApi.advisoryHeadMoveState(pr)).toMatchObject(headed ? { owed: true } : { owed: false, unreadable: true });
+    expect(plan.dispatch.length).toBe(headed ? 1 : 0);
+  });
+
+  it('an unreadable untrusted comment keeps an otherwise eligible head paused', () => {
+    const { pr, plan } = scenario(api, { comments: [note('accept', OLD_HEAD), { body: null, author: { login: 'attacker' } }] });
+    expect(pr.referralHoldAutoResolve.outcome).toBe('stay');
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals.map(row => row.kind)).toEqual(['review-referrals-pending']);
+  });
+
+  it('a later headed advisory supersedes an earlier headless marker in thread order', () => {
+    const headless = threadComment(`${ADVISORY_NOTE_MARKER}\nunpinned`);
+    const { pr, plan } = scenario(api, { comments: [headless, note('accept', OLD_HEAD)] });
+    expect(pr.referralHoldAutoResolve).toMatchObject({ outcome: 'resume', advisoryOwed: true });
+    expect(coreApi.advisoryHeadMoveState(pr)).toMatchObject({ owed: true });
+    expect(plan.dispatch.map(row => row.kind)).toEqual(['review']);
+  });
+
+  it.each(['review:accepted', 'review:changes'])('a conflicting verdict label %s keeps the pause', verdict => {
+    const { pr, plan } = scenario(api, { change: { labels: ['review:human', verdict] } });
+    expect(pr.referralHoldAutoResolve.outcome).toBe('stay');
+    expect(plan.dispatch.filter(row => row.kind === 'review')).toEqual([]);
+  });
+
+  it('an unadvised non-human head stays paused', () => {
+    expect(scenario(api, { change: { labels: [] } }).pr.referralHoldAutoResolve.outcome).toBe('stay');
+  });
+
+  it('onClean=pause holds and enabled=false returns no decision for an owed advisory', () => {
+    expect(scenario(api, { settings: { value: { ...SETTINGS.value, onClean: 'pause' } } }).pr.referralHoldAutoResolve.outcome).toBe('stay');
+    expect(scenario(api, { settings: { value: { ...SETTINGS.value, enabled: false } } }).pr.referralHoldAutoResolve).toBeUndefined();
+  });
+
+  it.each([undefined, null, 1.5])('unknown/non-integer attemptsSinceWake=%s holds with the ledger diagnostic', attemptsSinceWake => {
+    expect(decideHeld({ attemptsSinceWake })).toMatchObject({ outcome: 'stay', why: expect.stringMatching(/ledger hold/) });
+  });
+  it.each([undefined, null, 0, 2, 1.5])('count=%s never authorizes an advisory', count => {
+    expect(decideHeld({ count })).toMatchObject({ outcome: 'stay', why: expect.stringMatching(/write-back fails/) });
+  });
+
+  it.each([
+    ['head then another head', [ESC_HEAD, OLD_HEAD], true],
+    ['another head then head', [OLD_HEAD, ESC_HEAD], false],
+    ['no marker', [], true],
+  ])('latest trusted reviewed-sha: %s', (_why, heads, resume) => {
+    const comments = heads.map(h => threadComment(buildReviewedShaMarker(h)));
+    const { pr, plan } = scenario(api, { comments });
+    expect(pr.referralHoldAutoResolve.outcome).toBe(resume ? 'resume' : 'stay');
+    expect(plan.dispatch.length).toBe(resume ? 1 : 0);
+    expect(plan.dispatch.every(row => row.kind === 'review')).toBe(true);
+  });
+  it('an untrusted reviewed-sha naming the head is ignored', () => {
+    const { plan } = scenario(api, { comments: [{ ...threadComment(buildReviewedShaMarker(ESC_HEAD)), author: { login: 'attacker' } }] });
+    expect(plan.dispatch.map(row => row.kind)).toEqual(['review']);
+  });
+
+  it.each(['pre-read failure', 'quota-only incomplete'])('%s is uncounted: the existing fresh-head exposure stays eligible', kind => {
+    const extra = kind === 'pre-read failure' ? run({ findings: {} }) : run({ id: 'review-pr-quota', second: true, incomplete: true,
+      seatTimings: [{ seat: 'security', verdict: 'error', finishedAt: '2026-11-26T22:01:00Z' }],
+      telemetry: [{ step: 'security', failureKind: 'provider-quota' }] });
+    const projected = holdApi.reviewRunEvidence(extra);
+    if (kind === 'pre-read failure') expect(projected).toBeNull();
+    else expect(projected).toMatchObject({ incomplete: true, quotaOnly: true });
+    const { pr, plan } = scenario(api, { runs: [run(), extra] });
+    expect(pr.referralHold).toMatchObject({ count: 1, attemptsSinceWake: 1 });
+    expect(pr.referralHoldAutoResolve.outcome).toBe('resume');
+    expect(plan.dispatch.map(row => row.kind)).toEqual(['review']);
+  });
+
+  it.each([
+    ['newer other head', () => [note('accept', ESC_HEAD, '2026-11-25T22:00:00Z'), note('accept', OLD_HEAD)], true],
+    ['equal dates, higher thread index covers head', () => [note('accept', OLD_HEAD, '2026-11-25T20:00:00Z'), note('accept', ESC_HEAD, '2026-11-25T20:00:00Z')], false],
+    ['invalid date sorts at zero', () => [note('accept', OLD_HEAD), note('accept', ESC_HEAD, 'invalid')], true],
+  ])('newest trusted advisory ordering: %s', (_why, comments, resume) => {
+    const { pr, plan } = scenario(api, { comments: comments() });
+    expect(pr.referralHoldAutoResolve.outcome).toBe(resume ? 'resume' : 'stay');
+    expect(advisoryCoversHead(latestAdvisory(trustedAdvisoryComments(pr.comments)), ESC_HEAD)).toBe(!resume);
+    expect(plan.dispatch.length).toBe(resume ? 1 : 0);
   });
 });
 

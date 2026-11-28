@@ -1831,6 +1831,14 @@ function dispatchReviewRow({
       return;
     }
   }
+  // The pre-pass validated exactly one attempt on this head before clearing its hold. That
+  // bounded advisory is owed even on a content-changing head with historical rounds above the cap.
+  const resumed = pr?.referralHoldAutoResolve;
+  if (!advisoryReview && withPhase?.phase === 'needs-human' && resumed?.outcome === 'resume'
+    && resumed.head === pr.headRefOid && resumed.advisoryOwed === true && resumed.next === 'advisory-review') {
+    advisoryReview = { head: pr.headRefOid, reason: 'referral-hold-resumed',
+      why: 'the live head\'s one halted review left no advisory; one bounded advisory review is owed with review:human kept' };
+  }
   // ── R365 fix 4 (`review-churn.mjs`): a same-tree twin of an accepted head is only RECORDED (`churnShadow`, never enforced: no accept carry exists
   // here), and a PR with `maxLoopsPerPr` reviews of distinct heads raises a needs-you note. Shadow by default:
   // the decision rides on the row as `churnShadow` and nothing changes. A changed tree is always reviewed.

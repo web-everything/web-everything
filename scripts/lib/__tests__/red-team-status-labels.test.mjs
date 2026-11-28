@@ -1,11 +1,65 @@
 // @vitest-environment node
-import { describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readDrainRedTeamEvidence, recordRedTeamStatus } from '../drain-red-team-evidence.mjs';
 import { planRedTeamStatusLabels, syncRedTeamStatusLabels } from '../red-team-status-labels.mjs';
 import { resolveRedTeamProbes } from '../red-team-gate.mjs';
+import * as escalatedEvidence from '../drain-red-team-evidence.mjs';
+import * as escalatedReview from '../../operations/review-pr.mjs';
+import * as escalatedJury from '../jury-core.mjs';
+import { HEAD as ESC_HEAD, REPO as ESC_REPO, redTeamThread, redTeamFixture } from '../../conveyor/soak/breaks/review-human-escalated-head-no-advisory.mjs';
+
+// Runtime policy reads use declared empty configuration in a private fixture, never checkout/host files.
+const policyFixture = vi.hoisted(() => ({ root: null, file: null, unexpected: [] }));
+vi.mock('node:fs', async original => {
+  const fs = await original();
+  return { ...fs, readFileSync(path, ...args) {
+    if (!policyFixture.root) return fs.readFileSync(path, ...args);
+    const name = String(path);
+    if (name.startsWith(policyFixture.root + '/')) return fs.readFileSync(path, ...args);
+    const configuration = name.includes('/scripts/') && name.endsWith('.json')
+      || /\/\.claude\/(?:platform-preferences|operator-overrides)\.json$/.test(name);
+    if (configuration) return fs.readFileSync(policyFixture.file, ...args);
+    policyFixture.unexpected.push(name);
+    throw Error('undeclared fixture read: ' + name);
+  } };
+});
+
+describe('captured #7385 thread', () => {
+  beforeEach(() => {
+    policyFixture.root = mkdtempSync(join(tmpdir(), 'escalated-policy-'));
+    policyFixture.file = join(policyFixture.root, 'policy.json');
+    policyFixture.unexpected = [];
+    writeFileSync(policyFixture.file, '{}');
+  });
+  afterEach(() => {
+    const { root, unexpected } = policyFixture;
+    policyFixture.root = null;
+    rmSync(root, { recursive: true, force: true });
+    expect(unexpected).toEqual([]);
+  });
+
+  it.each(['accept', 'changes'])('a recorded card-queued gate result on the head plans red-team:clear even while a new pass is scheduled (%s)', outcome => {
+    const root = mkdtempSync(join(policyFixture.root, 'escalated-red-team-labels-'));
+    try {
+      const { evidence, env } = redTeamFixture({ review: escalatedReview, jury: escalatedJury, evidence: escalatedEvidence }, root, { outcome });
+      expect(evidence.ok).not.toBe(false);
+      expect(planRedTeamStatusLabels({ repo: ESC_REPO, pr: 7385, head: ESC_HEAD, env,
+        labels: ['red-team:pending'], comments: redTeamThread(), evidence }))
+        .toEqual({ add: 'red-team:clear', remove: ['red-team:pending'] });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('the same scheduled evidence with no head result stays pending', () => {
+    const root = mkdtempSync(join(policyFixture.root, 'escalated-red-team-no-result-'));
+    try {
+      expect(planRedTeamStatusLabels({ repo: ESC_REPO, pr: 7385, head: ESC_HEAD, env: { WE_SHARED_RUNS_DIR: join(root, 'runs') },
+        labels: ['red-team:clear'], comments: [], evidence: { scheduled: true } }))
+        .toEqual({ add: 'red-team:pending', remove: ['red-team:clear'] });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
 const head = 'a'.repeat(40);
 const result = (findings = '') => ({ author: { login: 'web-everything' }, body: `<!-- we:red-team-advisory pr=42 rev=${head} -->\n${findings}` });
 const broken = '1. [**confirmed**] (edge-case, broken) `scripts/x.mjs:1` — break';

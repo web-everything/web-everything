@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import * as ghThrottle from '../gh-throttle.mjs';
 import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -16,6 +16,58 @@ import { readRedTeamCarry, resumeRedTeamCarry } from '../red-team-carry-machine.
 import { evaluateRedTeamCheckFact, withRedTeamCheckLock } from '../red-team-check-run.mjs';
 import { publishStoredRedTeamResult, needsPublish } from '../red-team-withheld-publish.mjs';
 import { RED_TEAM_UNSEALED_HOLD_PREFIX, RED_TEAM_NO_RESULT_HOLD_PREFIX, statusOwesPublication } from '../drain-red-team-evidence.mjs';
+import * as escalatedReview from '../../operations/review-pr.mjs';
+import * as escalatedJury from '../jury-core.mjs';
+import * as escalatedEvidence from '../drain-red-team-evidence.mjs';
+import { redTeamFixture } from '../../conveyor/soak/breaks/review-human-escalated-head-no-advisory.mjs';
+
+// Runtime policy reads use declared empty configuration in a private fixture, never checkout/host files.
+const policyFixture = vi.hoisted(() => ({ root: null, file: null, unexpected: [] }));
+vi.mock('node:fs', async original => {
+  const fs = await original();
+  return { ...fs, readFileSync(path, ...args) {
+    if (!policyFixture.root) return fs.readFileSync(path, ...args);
+    const name = String(path);
+    if (name.startsWith(policyFixture.root + '/')) return fs.readFileSync(path, ...args);
+    const configuration = name.includes('/scripts/') && name.endsWith('.json')
+      || /\/\.claude\/(?:platform-preferences|operator-overrides)\.json$/.test(name);
+    if (configuration) return fs.readFileSync(policyFixture.file, ...args);
+    policyFixture.unexpected.push(name);
+    throw Error('undeclared fixture read: ' + name);
+  } };
+});
+
+describe('#7385 red-team evidence after the owed advisory', () => {
+  beforeEach(() => {
+    policyFixture.root = mkdtempSync(join(tmpdir(), 'escalated-policy-'));
+    policyFixture.file = join(policyFixture.root, 'policy.json');
+    policyFixture.unexpected = [];
+    writeFileSync(policyFixture.file, '{}');
+  });
+  afterEach(() => {
+    const { root, unexpected } = policyFixture;
+    policyFixture.root = null;
+    rmSync(root, { recursive: true, force: true });
+    expect(unexpected).toEqual([]);
+  });
+
+  it.each(['accept', 'changes'])('a completed newer advisory supersedes the halted record (%s)', outcome => {
+    const root = mkdtempSync(join(policyFixture.root, 'escalated-red-team-'));
+    roots.push(root);
+    const { evidence, fresh, status } = redTeamFixture({ review: escalatedReview, jury: escalatedJury, evidence: escalatedEvidence }, root, { outcome });
+    expect(evidence.ok).not.toBe(false);
+    expect(redTeamOwedFor(fresh)).toBe(outcome === 'accept');
+    if (redTeamOwedFor(fresh)) expect(evidence).toMatchObject({ scheduled: true, loopPayload: { id: fresh.id } });
+    else expect(evidence).toMatchObject({ recorded: true, status: { status: 'finished', result: 'ran', sealedBreaks: status.sealedBreaks } });
+  });
+  it.each(['confirm-parked', 'verdict-less'])('%s newer advisory stays review-unfinished; label recovery is deferred to REDTEAM-SWEEP-CHECK-SETTLE', shape => {
+    const root = mkdtempSync(join(policyFixture.root, 'escalated-red-team-held-'));
+    roots.push(root);
+    const { evidence } = redTeamFixture({ review: escalatedReview, jury: escalatedJury, evidence: escalatedEvidence }, root, { shape });
+    expect(evidence)
+      .toMatchObject({ ok: false, reason: 'review-unfinished' });
+  });
+});
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
