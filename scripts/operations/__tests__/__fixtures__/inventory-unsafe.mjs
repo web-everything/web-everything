@@ -10,7 +10,7 @@ export const VARIANTS = Object.freeze(['shell-true', 'inherit-env', 'no-timeout'
   'mix-runs', 'accept-stale', 'follow-symlink', 'trust-persisted-result', 'skip-counts',
   'skip-second-pass', 'repo-only-rulesets', 'fatal-needs-login', 'page-two-unread',
   'redact-and-pass', 'leak-stderr', 'leak-field', 'complete-with-findings-as-complete',
-  'combined-output', 'extra-nested-keys']);
+  'combined-output', 'extra-nested-keys', 'unexpected-write', 'ignore-exit-code', 'native-default-darwin']);
 const variant = process.env.INVENTORY_UNSAFE;
 const complete = out => ({ ...out, result: 'COMPLETE', exitCode: 0, reasons: [], findings: [] });
 function rewrite(out, transform) {
@@ -34,6 +34,7 @@ function unsafeOptions(options) {
       out = rewrite(out, body => ({ ...body, login: 'chalbert' }));
     }
     if (variant === 'treat-error-as-empty' && out.code !== 0) out = { code: 0, stdout: 'HTTP/2.0 200 OK\r\n\r\n{"source_type":"Repository","bypass_actors":[]}' };
+    if (variant === 'ignore-exit-code' && /^HTTP\/2\.0 200 /.test(out.stdout ?? '')) out = { ...out, code: 0 };
     if (variant === 'trust-short-page') out = rewrite(out, body => Array.isArray(body) && body.length === 100 ? { truncated: true } : body);
     if (variant === 'follow-cycle' && out.stdout?.toLowerCase().includes('link:')) {
       // Blindly stop at the first page instead of validating a hostile/cyclic Link.
@@ -54,6 +55,7 @@ function unsafeOptions(options) {
     if (variant === 'page-two-unread' && path.includes('page=2') && out.code !== 0) out = { code: 0, stdout: 'HTTP/2.0 200 OK\r\n\r\n[]' };
     return out;
   } };
+  if (variant === 'native-default-darwin' && options.platform === undefined) result.platform = () => 'darwin';
   if (variant === 'follow-symlink') result.fs = new Proxy(options.fs, { get(target, key) {
     if (key === 'lstat') return path => target.stat(path);
     if (key === 'realpath') return async path => path;
@@ -72,10 +74,13 @@ function unsafeOptions(options) {
 export async function inventory(options) {
   if (variant === 'read-gh-config') await options.fs.readFile(join(options.home, '.config/gh/hosts.yml'));
   if (variant === 'token-read') await options.fs.readFile(join(options.home, '.claude/github-app-token'));
-  return safe.inventory(unsafeOptions(options));
+  const out = await safe.inventory(unsafeOptions(options));
+  if (variant === 'unexpected-write') await options.fs.writeFile(join(options.root, 'stray.txt'), 'x');
+  return out;
 }
 export async function aggregate(options) {
   const out = await safe.aggregate(unsafeOptions(options));
+  if (variant === 'unexpected-write') await options.fs.writeFile(join(options.root, 'stray.txt'), 'x');
   if (['drop-root', 'trust-persisted-findings', 'loose-metadata', 'mix-runs', 'accept-stale'].includes(variant)) return complete(out);
   if (variant === 'complete-with-findings-as-complete' && out.exitCode === 10) return complete(out);
   return out;

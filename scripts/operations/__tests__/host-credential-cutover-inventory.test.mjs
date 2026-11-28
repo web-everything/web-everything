@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { EventEmitter } from 'node:events';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -96,7 +96,7 @@ beforeEach(async () => {
     if (typeof target[key] !== 'function') return target[key];
     return (...args) => {
       if (typeof args[0] === 'string') {
-        ioCalls.push([key, args[0]]);
+        ioCalls.push([key, ...args]);
         expect(args[0] === temp || args[0].startsWith(temp + '/'), `fixture IO ${String(key)}`).toBe(true);
       }
       if (key === 'open') return fixtureOpen(...args);
@@ -159,7 +159,70 @@ const actorResponse = (actor_type, actor_id, bypass_mode = 'always', source_type
   response({ source_type, bypass_actors: [{ actor_type, actor_id, bypass_mode }] });
 const detail = `/repos/${O}/repo/rulesets/7`;
 
+const matrixTitle = 'every unsafe variant fails all its named tests and leaves the rest passing';
+function assertMutationReport(results, variant) {
+  // In Vitest 1.6, assertion failures fail testResults.status, while this counter
+  // counts collection/hook errors. The executable reporter contract below pins it.
+  expect(results.numFailedTestSuites, `${variant}: suite errors`).toBe(0);
+  expect(results.testResults, variant).toHaveLength(1);
+  expect(results.testResults[0].message, `${variant}: suite error`).toBe('');
+  expect(results.testResults[0].status, variant).toBe('failed');
+  const assertions = results.testResults[0].assertionResults;
+  const targets = assertions.filter(t => t.title.startsWith(`[${variant}] `));
+  expect(targets.length, variant).toBeGreaterThan(0);
+  expect(results.numFailedTests, variant).toBe(targets.length);
+  for (const target of targets) expect(target.status, `${variant}: ${target.fullName}`).toBe('failed');
+  for (const other of assertions.filter(t => !targets.includes(t))) {
+    expect(other.status, `${variant}: unrelated ${other.fullName}`).toBe(
+      other.title === matrixTitle ? 'skipped' : 'passed');
+  }
+}
+
+async function failedChildReport(args, report, { cwd = lane, env = process.env, timeout = 60000 } = {}) {
+  // Timeouts, signals, startup failures and missing reports are not mutation evidence.
+  await expect(promisify(execFile)(process.execPath,
+    [join(lane, 'node_modules/vitest/vitest.mjs'), 'run', ...args,
+      '--reporter=json', `--outputFile=${report}`, '--maxWorkers=1', '--minWorkers=1'],
+    { cwd, env: { ...env, WE_TEST_CACHE: '0' }, timeout, maxBuffer: 1024 * 1024 }))
+    .rejects.toMatchObject({ code: 1, killed: false, signal: null });
+  return JSON.parse(await fs.readFile(report, 'utf8'));
+}
+
 describe('pinned transport and bounded adapter', () => {
+  test('native-default-darwin', 'omitted platform uses the native persistence guard', async () => {
+    const { record } = await collect();
+    const modulePath = subject === production ? join(lane, 'scripts/operations/host-credential-cutover.mjs')
+      : join(lane, process.env.INVENTORY_MODULE);
+    for (const platform of ['linux', 'win32']) {
+      const root = join(temp, platform);
+      await fs.mkdir(root);
+      // Change the native builtin in an isolated Node process before importing the
+      // module. Unlike a Vitest mock, this exercises the actual ESM default import.
+      const probe = `
+        import os from 'node:os';
+        import fs from 'node:fs/promises';
+        import { syncBuiltinESMExports } from 'node:module';
+        os.platform = () => ${JSON.stringify(platform)};
+        syncBuiltinESMExports();
+        const subject = await import(${JSON.stringify(pathToFileURL(modulePath).href)});
+        let opens = 0;
+        const io = { ...fs, open: async () => { opens++; throw new Error('probe refuses opens'); } };
+        const options = { fs: io, root: ${JSON.stringify(root)}, home: ${JSON.stringify(home)},
+          commit: ${JSON.stringify(SHA)}, stdout: () => {},
+          run: async () => ({ code: 1, stdout: '', stderr: '' }) };
+        const inventory = await subject.inventory(options);
+        const aggregate = await subject.aggregate({ ...options, root: ${JSON.stringify(temp)},
+          runId: ${JSON.stringify(record.runId)} });
+        console.log(JSON.stringify({ inventory, aggregate, opens }));
+      `;
+      const { stdout } = await promisify(execFile)(process.execPath, ['--input-type=module', '-e', probe],
+        { cwd: lane, env: { ...process.env }, timeout: 10000, maxBuffer: 65536 });
+      const out = JSON.parse(stdout);
+      expect(out.inventory).toEqual({ exitCode: 1, result: 'ERROR', reasons: ['COHORT'] });
+      expect(out.aggregate).toEqual({ exitCode: 1, result: 'ERROR', reasons: ['COHORT'] });
+      expect(out.opens).toBe(0);
+    }
+  });
   it.each(['linux', 'win32'])('unsupported %s persistence refuses before opening evidence', async platform => {
     persistencePlatform.value = platform;
     const out = await collect();
@@ -167,6 +230,43 @@ describe('pinned transport and bounded adapter', () => {
     expect(ioCalls.some(([operation]) => operation === 'open')).toBe(false);
     expect(lines.stdout.join('')).toContain('reason=COHORT action=RERUN');
     expect(await fs.readdir(join(temp, 'state/credential-cutover/runs/20261127T110000-12345678'))).toEqual([]);
+  });
+  test('unexpected-write', 'inventory and aggregate write only the run ancestors and two evidence files, including page-two failure', async () => {
+    for (const pageTwoFailure of [false, true]) {
+      const root = join(temp, pageTwoFailure ? 'failed-page' : 'complete');
+      await fs.mkdir(root);
+      ioCalls.length = 0;
+      const run = await subject.inventory({ ...options, root, run: runner(({ url }) => {
+        if (pageTwoFailure && url.pathname === `/orgs/${O}/repos`) {
+          return url.searchParams.has('page') ? response({}, 502)
+            : response([{ name: 'repo' }], 200, {
+              link: `<https://api.github.com/orgs/${O}/repos?type=all&per_page=100&page=2>; rel="next"`,
+            });
+        }
+      }) });
+      expect(run.record).toBeDefined();
+      if (pageTwoFailure) expect(source(run.record, `repos:${O}`)).toMatchObject({ state: 'failed', reason: 'UNREAD', data: null });
+      const out = await subject.aggregate({ ...options, root, runId: run.record.runId });
+      expect(out.exitCode).toBe(pageTwoFailure ? 20 : 0);
+      const directory = join(root, 'state/credential-cutover/runs', run.record.runId);
+      const writes = ioCalls.filter(([op, , flags]) =>
+        ['writeFile', 'appendFile', 'mkdir', 'rename', 'symlink', 'link', 'copyFile', 'truncate', 'rm', 'unlink', 'rmdir', 'chmod', 'chown', 'utimes'].includes(op)
+        || op === 'open' && (typeof flags === 'number'
+          ? Boolean(flags & (constants.O_CREAT | constants.O_WRONLY | constants.O_RDWR | constants.O_TRUNC | constants.O_APPEND))
+          : flags !== 'r'));
+      expect(writes).toEqual([
+        ...['state', 'state/credential-cutover', 'state/credential-cutover/runs'].map(path => ['mkdir', join(root, path), { mode: 0o700 }]),
+        ['mkdir', directory, { mode: 0o700 }],
+        ...['inventory.json', 'result.txt'].map(file => ['open', join(directory, file),
+          constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | NOFOLLOW_ANY, 0o600]),
+      ]);
+      // Inspect the whole tree as well as the write calls, including directories.
+      expect((await fs.readdir(root, { recursive: true })).sort()).toEqual([
+        'state', 'state/credential-cutover', 'state/credential-cutover/runs',
+        `state/credential-cutover/runs/${run.record.runId}`,
+        ...['inventory.json', 'result.txt'].map(file => `state/credential-cutover/runs/${run.record.runId}/${file}`),
+      ].sort());
+    }
   });
   it.each(['linux', 'win32'])('unsupported %s aggregate refuses before opening evidence', async platform => {
     const { record } = await collect();
@@ -459,6 +559,30 @@ describe('evidence and cohort', () => {
       }
     }
   });
+  it('ancestor replacement inside run mkdir leaves only the documented empty-directory residual', async () => {
+    const outside = join(temp, 'outside');
+    await fs.mkdir(outside);
+    const base = join(temp, 'state/credential-cutover/runs');
+    let swapped = false;
+    const io = { ...options.fs, mkdir: async (path, ...args) => {
+      if (dirname(path) === base) {
+        await fs.rename(base, `${base}-original`);
+        await fs.symlink(outside, base);
+        swapped = true;
+      }
+      return options.fs.mkdir(path, ...args);
+    } };
+    const out = await subject.inventory({ ...options, fs: io });
+    expect(swapped).toBe(true);
+    expect(out).toEqual({ exitCode: 1, result: 'ERROR', reasons: ['COHORT'] });
+    // Pathname mkdir is still racy. Keep the full outside listing visible rather
+    // than filtering to evidence filenames and implying that no directory exists.
+    const entries = await fs.readdir(outside);
+    expect(entries).toEqual(['20261127T110000-12345678']);
+    expect((await fs.stat(join(outside, entries[0]))).mode & 0o777).toBe(0o700);
+    expect(await fs.readdir(join(outside, entries[0]))).toEqual([]);
+    expect(ioCalls.some(([op]) => op === 'open')).toBe(false);
+  });
   it('concurrent aggregates produce exactly one exclusive decision', async () => {
     const { record } = await collect();
     const results = await Promise.all([subject.aggregate({ ...options, runId: record.runId }), subject.aggregate({ ...options, runId: record.runId })]);
@@ -534,6 +658,12 @@ describe('evidence and cohort', () => {
 });
 
 describe('read completeness, pagination and authority', () => {
+  test('ignore-exit-code', 'HTTP 200 with a valid bypass body and nonzero process exit remains unread', async () => {
+    const { run, out } = await checkDecision(({ url }) => url.pathname === detail
+      ? { ...actorResponse('Integration', 1), code: 1 } : undefined, 20, 'UNREAD');
+    expect(source(run.record, `repoRuleset:${O}/repo:7`)).toMatchObject({ state: 'failed', reason: 'UNREAD', data: null });
+    expect(out.findings).toEqual([]);
+  });
   it('rate limits are not retried inside the snapshot run', async () => {
     const { out } = await checkDecision(({ url }) => url.pathname === detail ? response({}, 429, { 'retry-after': '1' }) : undefined, 20, 'RATE-LIMITED');
     expect(calls.filter(c => new URL(c.argv.at(-1), 'https://api.github.com').pathname === detail)).toHaveLength(1);
@@ -544,6 +674,7 @@ describe('read completeness, pagination and authority', () => {
       [response({}, 401), 1, 'AUTH-FAILED'], [response({}, 403, { 'x-ratelimit-remaining': '0' }), 20, 'RATE-LIMITED'],
       [response({}, 429, { 'retry-after': '60' }), 20, 'RATE-LIMITED'], ...[403, 404, 302, 418, 502].map(s => [response({}, s), 20, 'UNREAD']),
       [{ timedOut: true }, 20, 'UNREAD'], [{ code: 1, stdout: '', stderr: SECRET }, 20, 'UNREAD'],
+      [{ ...actorResponse('Integration', 1), code: 1 }, 20, 'UNREAD'],
       [response('not json'), 20, 'MALFORMED'], [response({ source_type: 'Repository' }), 20, 'UNKNOWN'],
       [actorResponse('Robot', 1), 20, 'UNKNOWN'],
     ];
@@ -816,10 +947,47 @@ describe('secrets, result precedence and live admission', () => {
     const bracketed = titles.map(t => t.match(/^\[([^\]]+)\]/)[1]);
     expect([...new Set(bracketed)].sort()).toEqual([...VARIANTS].sort());
   });
+  it('installed Vitest reporter contract distinguishes assertion failures, skips and suite errors', async () => {
+    const root = join(temp, 'reporter');
+    await fs.mkdir(root);
+    const config = join(root, 'vitest.config.mjs');
+    await fs.writeFile(config, `export default { test: { environment: 'node', include: ['contract.test.mjs'] } };`);
+    const contract = `
+      import { describe, it, expect, beforeAll } from ${JSON.stringify(join(lane, 'node_modules/vitest/dist/index.js'))};
+      describe('reporter contract', () => {
+        HOOK
+        it('[contract] assertion failure', () => expect(1).toBe(2));
+        it('passing control', () => expect(1).toBe(1));
+        it.skip(${JSON.stringify(matrixTitle)}, () => {});
+      });
+    `;
+    for (const mode of ['assertion', 'hook', 'collection']) {
+      await fs.writeFile(join(root, 'contract.test.mjs'), mode === 'collection'
+        ? `throw new Error('collection failure');`
+        : contract.replace('HOOK', mode === 'hook' ? `beforeAll(() => { throw new Error('hook failure'); });` : ''));
+      const results = await failedChildReport(['--config', config], join(root, `${mode}.json`), { cwd: root });
+      if (mode !== 'assertion') {
+        expect(results.numFailedTestSuites).toBeGreaterThan(0);
+        expect(() => assertMutationReport(results, 'contract')).toThrow();
+        continue;
+      }
+      expect(results.testResults[0].assertionResults.map(t => t.status)).toEqual(['failed', 'passed', 'skipped']);
+      expect(() => assertMutationReport(results, 'contract')).not.toThrow();
+      // Incomplete/running assertions and unrelated failures must never count as
+      // successful mutation evidence, even if a targeted witness also fails.
+      for (const status of ['pending', 'failed', 'skipped']) {
+        const corrupt = structuredClone(results);
+        corrupt.testResults[0].assertionResults[1].status = status;
+        expect(() => assertMutationReport(corrupt, 'contract')).toThrow();
+      }
+      const missed = structuredClone(results);
+      missed.testResults[0].assertionResults[0].status = 'passed';
+      expect(() => assertMutationReport(missed, 'contract')).toThrow();
+    }
+  }, 30000);
   // Normal CI/verify selection of this suite executes the fixture, not just its
   // title roster. Children cannot recurse, and run one at a time under this gate's slot.
-  it.skipIf(Boolean(process.env.INVENTORY_UNSAFE))('every unsafe variant fails all its named tests and leaves the rest passing', async () => {
-    const execute = promisify(execFile);
+  it.skipIf(Boolean(process.env.INVENTORY_UNSAFE))(matrixTitle, async () => {
     const deadline = performance.now() + 420000;
     const testFile = 'scripts/operations/__tests__/host-credential-cutover-inventory.test.mjs';
     const fixture = 'scripts/operations/__tests__/__fixtures__/inventory-unsafe.mjs';
@@ -827,33 +995,11 @@ describe('secrets, result precedence and live admission', () => {
       const remaining = Math.floor(deadline - performance.now());
       expect(remaining, 'mutation matrix deadline').toBeGreaterThan(0);
       const report = join(temp, `${variant}.json`);
-      let exitCode = 0;
-      try {
-        await execute(process.execPath, [join(lane, 'node_modules/vitest/vitest.mjs'), 'run', testFile,
-          '--reporter=json', `--outputFile=${report}`, '--maxWorkers=1', '--minWorkers=1'], {
-          cwd: lane, env: { ...process.env, INVENTORY_MODULE: fixture, INVENTORY_UNSAFE: variant, WE_TEST_CACHE: '0' },
-          timeout: Math.min(60000, remaining), maxBuffer: 1024 * 1024,
-        });
-      } catch (error) {
-        // Timeouts, signals, startup failures and missing reports are not mutation evidence.
-        expect(error.killed, variant).not.toBe(true);
-        expect(error.signal, variant).toBeNull();
-        expect(error.code, variant).toBe(1);
-        exitCode = error.code;
-      }
-      expect(exitCode, variant).toBe(1);
-      const results = JSON.parse(await fs.readFile(report, 'utf8'));
-      expect(results.numFailedTestSuites, `${variant}: suite errors`).toBe(0);
-      expect(results.testResults, variant).toHaveLength(1);
-      expect(results.testResults[0].message, `${variant}: suite error`).toBe('');
-      const assertions = results.testResults[0].assertionResults;
-      const targets = assertions.filter(t => t.title.startsWith(`[${variant}] `));
-      expect(targets.length, variant).toBeGreaterThan(0);
-      for (const target of targets) expect(target.status, `${variant}: ${target.fullName}`).toBe('failed');
-      for (const other of assertions.filter(t => !targets.includes(t))) {
-        expect(other.status, `${variant}: unrelated ${other.fullName}`).toBe(
-          other.title === 'every unsafe variant fails all its named tests and leaves the rest passing' ? 'skipped' : 'passed');
-      }
+      const results = await failedChildReport([testFile], report, {
+        env: { ...process.env, INVENTORY_MODULE: fixture, INVENTORY_UNSAFE: variant },
+        timeout: Math.min(60000, remaining),
+      });
+      assertMutationReport(results, variant);
     }
   }, 450000);
 });
