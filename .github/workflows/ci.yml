@@ -82,12 +82,17 @@ jobs:
   # success. `daemon-soak` already finishes in seconds when no daemon code is touched (a card-only PR never is).
   changes:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Room for checkout, the four-minute detector and the one-minute optional reuse step.
+    timeout-minutes: 7
     outputs:
-      light: ${{ steps.detect.outputs.light }}
+      # CI-MAIN-REUSE-MQ: a main push whose exact sha the merge queue already ran in full is treated as light
+      # (heavy jobs skip, required checks still report). `reuse` is only ever 'true' from mq-result-reuse.mjs.
+      light: ${{ steps.reuse.outcome == 'success' && steps.reuse.outputs.reuse == 'true' && 'true' || steps.detect.outputs.light }}
+      reuse: ${{ steps.reuse.outcome == 'success' && steps.reuse.outputs.reuse || 'false' }}
     permissions:
       contents: read
       pull-requests: read
+      actions: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -117,6 +122,16 @@ jobs:
             fi
           fi
           node scripts/ci-card-only.mjs --event="$EVENT_NAME" --base="$BASE_SHA" --base-ref="$BASE_REF" --fresh-main-sha="$FRESH_MAIN_SHA" --head=HEAD >> "$GITHUB_OUTPUT"
+      - name: Reuse the merge-queue result for this exact sha (main push only)
+        id: reuse
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        timeout-minutes: 1
+        continue-on-error: true
+        # Timeout/error leaves reuse false; only a successful step can authorize skipping.
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: node scripts/ci/mq-result-reuse.mjs
       - name: Enforce bot-owned test timings
         if: github.event_name == 'pull_request'
         # Changed files come from the GitHub API (no extra history fetch).
@@ -303,6 +318,7 @@ jobs:
       # Card 12: `--group=covered` is the tests that can reach a coverage-counted file (scripts/ci/coverage-reach.mjs);
       # only those run under --coverage, so the covered files' numbers are unchanged.
       - name: Unit suite shard ${{ matrix.shard }}/9 (coverage, no per-shard bar)
+        id: covered
         if: ${{ needs.changes.outputs.light != 'true' && (matrix.shard != 10) }}
         working-directory: web-everything
         run: |
@@ -313,9 +329,15 @@ jobs:
           files=()
           while IFS= read -r f; do [ -z "$f" ] || files+=("$f"); done <<< "$list"
           echo "unit shard ${{ matrix.shard }}/9: ${#files[@]} files"
-          npm run test:coverage:shard -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}" $(node scripts/ci/quarantine-skip.mjs) # red-main quarantine (xx7ckd6): skip args from ops/quarantine, empty unless redMainMode=quarantine
+          test_args=(npm run test:coverage:shard -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}" $(node scripts/ci/quarantine-skip.mjs))
+          "${test_args[@]}"
+          case " ${test_args[*]} " in
+            *" --exclude"*|*" --quarantined"*) ;;
+            *) echo "full=true" >> "${GITHUB_OUTPUT:-/dev/null}" ;;
+          esac
 
       - name: Unit suite no-coverage group (scripts tests that cannot reach a covered file)
+        id: nocov
         if: ${{ needs.changes.outputs.light != 'true' && (matrix.shard == 10) }}
         working-directory: web-everything
         run: |
@@ -325,7 +347,18 @@ jobs:
           files=()
           while IFS= read -r f; do [ -z "$f" ] || files+=("$f"); done <<< "$list"
           echo "unit no-coverage group: ${#files[@]} files"
-          npm run test:unit -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}" $(node scripts/ci/quarantine-skip.mjs) # red-main quarantine (xx7ckd6): skip args from ops/quarantine, empty unless redMainMode=quarantine
+          test_args=(npm run test:unit -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}" $(node scripts/ci/quarantine-skip.mjs))
+          "${test_args[@]}"
+          case " ${test_args[*]} " in
+            *" --exclude"*|*" --quarantined"*) ;;
+            *) echo "full=true" >> "${GITHUB_OUTPUT:-/dev/null}" ;;
+          esac
+
+      # Only this run's actual, successful test invocation can attest full coverage. Historical ops/quarantine
+      # entries may expire or be removed before main considers reuse, so checking the current list is insufficient.
+      - name: Full test run (no quarantine exclusions)
+        if: ${{ needs.changes.outputs.light != 'true' && (steps.covered.outputs.full == 'true' || steps.nocov.outputs.full == 'true') }}
+        run: echo "All assigned tests ran without quarantine exclusions"
 
       # Upload this shard's partial coverage for the `coverage-merge` job to merge. `if-no-files-found: error`
       # turns a missing report into a red shard (not a silent under-count) — the merge's --expect guard
@@ -469,7 +502,7 @@ jobs:
             exit 1
           fi
           if [ "${{ needs.changes.outputs.light }}" = "true" ]; then
-            echo "Card-only PR: unit shards and coverage merge intentionally omitted."
+            echo "Card-only PR or merge-queue reuse (CI-MAIN-REUSE-MQ): unit shards and coverage merge intentionally omitted."
             exit 0
           fi
           if [ "${{ needs.test-shard.result }}" != "success" ]; then
@@ -605,11 +638,22 @@ jobs:
 
       # Vite can transform private sibling imports; its cache must also stay on the runner.
       - name: Real-git integration suite (lane-pool, operations transport)
+        id: suite
         if: ${{ steps.gate.outputs.run == 'true' }}
         working-directory: web-everything
         env:
           WE_INTEGRATION_GROUP: ${{ matrix.group }}
-        run: npm run test:integration:vitest -- --reporter=default --reporter=json --outputFile.json=coverage/timing-integration-${{ matrix.group }}.json $(node scripts/ci/quarantine-skip.mjs --job="integration")
+        run: |
+          test_args=(npm run test:integration:vitest -- --reporter=default --reporter=json --outputFile.json=coverage/timing-integration-${{ matrix.group }}.json $(node scripts/ci/quarantine-skip.mjs --job="integration"))
+          "${test_args[@]}"
+          case " ${test_args[*]} " in
+            *" --exclude"*|*" --quarantined"*) ;;
+            *) echo "full=true" >> "${GITHUB_OUTPUT:-/dev/null}" ;;
+          esac
+
+      - name: Full test run (no quarantine exclusions)
+        if: ${{ steps.suite.outputs.full == 'true' }}
+        run: echo "All assigned tests ran without quarantine exclusions"
 
       # Per-file timing evidence only; missing reports never gate CI. One artifact per matrix group
       # (upload-artifact@v4 refuses a duplicate name across matrix legs).
@@ -729,11 +773,12 @@ jobs:
   # with the baseline's daemon worlds. `fail-fast: false` mirrors `test-shard`: one shard's break
   # failing must not hide a sibling shard's own result.
   soak-shard:
-    needs: daemon-soak-scope
+    needs: [daemon-soak-scope, changes]
     # R1068: shards run in the merge queue / on main / on dispatch, never on a pull_request push (~28k CI min/day).
     # CI-SOAK-SCOPE-MQ: the matrix comes from the scope job. Shard 1 (the baseline) always runs; shards 2-8 run
     # only when daemon code was touched (or the scope is unknown). Total stays 8, so it is not strategy.job-total.
-    if: needs.daemon-soak-scope.result == 'success' && (needs.daemon-soak-scope.outputs.run == 'true' || needs.daemon-soak-scope.outputs.run == 'false') && github.event_name != 'pull_request'
+    # CI-MAIN-REUSE-MQ: skipped when main reuses the merge queue's full run of this exact sha.
+    if: needs.daemon-soak-scope.result == 'success' && (needs.daemon-soak-scope.outputs.run == 'true' || needs.daemon-soak-scope.outputs.run == 'false') && github.event_name != 'pull_request' && needs.changes.outputs.reuse != 'true'
     runs-on: ubuntu-latest
     # Measured 2026-10-14: time-balanced shards finish in ~8-14 min on main (shard 3: 13m24s and 13m48s on two
     # green main runs), so the old 15-min cap sat ~1 min above a healthy run. PR #5187's shard 3 was CANCELLED at
@@ -770,7 +815,18 @@ jobs:
         run: npm ci
 
       - name: Soak shard ${{ matrix.shard }}/8
-        run: npm run test:soak:shard -- --shard=${{ matrix.shard }}/8 $(node scripts/ci/quarantine-skip.mjs --job="soak-shard (${{ matrix.shard }})")
+        id: suite
+        run: |
+          test_args=(npm run test:soak:shard -- --shard=${{ matrix.shard }}/8 $(node scripts/ci/quarantine-skip.mjs --job="soak-shard (${{ matrix.shard }})"))
+          "${test_args[@]}"
+          case " ${test_args[*]} " in
+            *" --exclude"*|*" --quarantined"*) ;;
+            *) echo "full=true" >> "${GITHUB_OUTPUT:-/dev/null}" ;;
+          esac
+
+      - name: Full test run (no quarantine exclusions)
+        if: ${{ steps.suite.outputs.full == 'true' }}
+        run: echo "All assigned tests ran without quarantine exclusions"
 
       - name: Measure shard resources
         if: always()
@@ -823,7 +879,7 @@ jobs:
   # (its `needs` dep failing, or the matrix simply not running) is not `success`, so a broken shard can never
   # silently read as satisfied, same guard the `test` aggregator above uses for `test-shard`.
   daemon-soak:
-    needs: [daemon-soak-scope, soak-shard]
+    needs: [daemon-soak-scope, soak-shard, changes]
     if: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -859,6 +915,13 @@ jobs:
             true/\[1,2,3,4,5,6,7,8\]|false/\[1\]) ;;
             *) echo "daemon-soak-scope run/shards outputs disagree (run/shards: '${{ needs.daemon-soak-scope.outputs.run }}/${{ needs.daemon-soak-scope.outputs.shards }}')."; exit 1 ;;
           esac
+          # CI-MAIN-REUSE-MQ: after the scope checks above, only an explicit reuse=true from a successful
+          # `changes` job lets the (skipped) soak shards count as passed.
+          if [ "${{ needs.changes.result }}" = "success" ] && [ "${{ needs.changes.outputs.reuse }}" = "true" ]; then
+            echo "soak reused from the merge-queue run of this exact sha"
+            echo "### daemon-soak: reused merge-queue result (CI-MAIN-REUSE-MQ)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           if [ "${{ needs.soak-shard.result }}" != "success" ]; then
             echo "One or more soak shards did not succeed (soak-shard result: ${{ needs.soak-shard.result }})."
             exit 1

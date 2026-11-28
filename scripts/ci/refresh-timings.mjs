@@ -123,32 +123,51 @@ export async function refreshFromDir({ dir, timingsFile = TIMINGS_FILE, repoRoot
   }
 }
 
+const RUN_LOOKBACK = 50;
+const GH_OPTIONS = { cwd: REPO_ROOT, encoding: 'utf8', timeout: 120_000, maxBuffer: 1024 * 1024 };
+
+/** Successful light/reused pushes have no timing artifacts. Select evidence before downloading it.
+ * The bounded lookback may yield fewer samples than requested; no samples requires an explicit run.
+ * Partial timing sets still reach the report validator, which refuses them without writing.
+ */
+function timingRuns(count, exec) {
+  const found = JSON.parse(exec('gh', ['run', 'list', '--workflow=ci.yml', '--branch=main', '--status=success', '--event=push', `--limit=${RUN_LOOKBACK}`, '--json=databaseId'], GH_OPTIONS));
+  if (!Array.isArray(found) || found.length > RUN_LOOKBACK || found.some(r => !/^\d+$/.test(String(r?.databaseId ?? ''))) ||
+      new Set(found.map(r => String(r.databaseId))).size !== found.length) throw new Error('No valid CI run window; supply --run=<id> or retry after successful main CI pushes');
+  const selected = [];
+  for (const run of found) {
+    const id = String(run.databaseId);
+    const listing = JSON.parse(exec('gh', ['api', `repos/{owner}/{repo}/actions/runs/${id}/artifacts?per_page=100`], GH_OPTIONS));
+    if (!Array.isArray(listing.artifacts) || !Number.isInteger(listing.total_count) || listing.total_count < 0 ||
+        listing.total_count > 100 || listing.total_count !== listing.artifacts.length ||
+        listing.artifacts.some(a => !a || typeof a.name !== 'string' || typeof a.expired !== 'boolean')) {
+      throw new Error(`Incomplete artifact listing for CI run ${id}; supply --run=<id> with complete timing artifacts`);
+    }
+    if (listing.artifacts.some(a => a.name.startsWith('timing-unit-') && !a.expired)) selected.push(id);
+    if (selected.length === count) break;
+  }
+  if (!selected.length) throw new Error(`No timing artifacts in the latest ${RUN_LOOKBACK} successful main CI pushes; supply --run=<id> or run full CI on main`);
+  return selected;
+}
+
 /** Download with bounded argv-based GitHub calls; no shell interpolation of run IDs. */
 export async function downloadReports(run, dir, { exec } = {}) {
   exec ??= (await import('../lib/gh-throttle.mjs')).execFileSyncThrottled;
-  const options = { cwd: REPO_ROOT, encoding: 'utf8', timeout: 120_000, maxBuffer: 1024 * 1024 };
-  let id = run;
-  if (run === 'latest') {
-    const runs = JSON.parse(exec('gh', ['run', 'list', '--workflow=ci.yml', '--branch=main', '--status=success', '--event=push', '--limit=1', '--json=databaseId'], options));
-    id = String(runs[0]?.databaseId ?? '');
-  }
+  const id = run === 'latest' ? timingRuns(1, exec)[0] : run;
   if (!/^\d+$/.test(id)) throw new Error('No valid CI run ID; supply --run=<id> or wait for a successful ci.yml push on main.');
-  exec('gh', ['run', 'download', id, '--pattern=timing-unit-*', '--dir', dir], options);
+  exec('gh', ['run', 'download', id, '--pattern=timing-unit-*', '--dir', dir], GH_OPTIONS);
 }
 
 /** Select a bounded rolling window; each run downloads into its own directory. */
 export async function downloadRuns(runs, dir, { exec } = {}) {
   if (!Number.isInteger(runs) || runs < 1 || runs > 5) throw new Error('--runs must be 1..5; use --run=<id> for a specific run');
   exec ??= (await import('../lib/gh-throttle.mjs')).execFileSyncThrottled;
-  const found = JSON.parse(exec('gh', ['run', 'list', '--workflow=ci.yml', '--branch=main', '--status=success', '--event=push', `--limit=${runs}`, '--json=databaseId'],
-    { cwd: REPO_ROOT, encoding: 'utf8', timeout: 120_000, maxBuffer: 1024 * 1024 }));
-  if (!Array.isArray(found) || !found.length || found.length > runs || found.some(r => !/^\d+$/.test(String(r?.databaseId ?? ''))) ||
-      new Set(found.map(r => String(r.databaseId))).size !== found.length) throw new Error('No valid CI run window; supply --run=<id> or retry after successful main CI pushes');
+  const found = timingRuns(runs, exec);
   const dirs = [];
-  for (const run of found) {
-    const target = join(dir, String(run.databaseId));
+  for (const id of found) {
+    const target = join(dir, id);
     await mkdir(target);
-    await downloadReports(String(run.databaseId), target, { exec });
+    await downloadReports(id, target, { exec });
     dirs.push(target);
   }
   return dirs;
