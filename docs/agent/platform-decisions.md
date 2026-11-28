@@ -5868,6 +5868,28 @@ last-tick stamp) and #4052 (state root).
 
 ### Slow daemon actions run as detached jobs with durable records; the daemon loop never waits on one {#daemon-jobs}
 
+**R755 — dead review runs (2026-11-27).** The review daemon queues a serial `review-run-reap`
+readonly-tree job when none is live (queued, launching, running or retrying), at least 15 minutes
+after the latest terminal job's `finishedAt`; no prior job means immediately. Runtime snapshots,
+heartbeats, stall stops and attempt caps govern it. The sweep yields before every shared probe and
+individual PID probe and after 5 seconds of local scan/write work. It receives the authoritative
+`reviewRunsDir`, `repo`, `OPERATION_REVIEW_JOBS_DIR` and `probeContext` (`checkout`, `pool`, `poolRoot`)
+explicitly; it never mistakes the runtime's `OPERATION_RUNS_DIR` for the review store. Lease probes
+pass `--repo`, `--name` and `LANE_POOL_ROOT`, validating returned repo and root. Only that repository
+is swept; other repositories remain held. Missing authority holds every candidate as `missing-context`,
+including manual/session-reaper apply calls; unavailable probes/stores hold as `probe-unreadable`.
+The tool setting is 1 hour: standard 6 h < platform < tool < environment < explicit `thresholdMs`.
+Invalid cascade values are reported and ignored; unreadable preferences and invalid arguments throw.
+Red-team readers honor only version-bound tombstones by `reap-dead-review-runs`, using a single
+stat/payload/tombstone/stat snapshot. The complete `validateRunRecord` must pass; no verdict or refused
+outcome is allowed; pending is null or judge; effects are an array, empty or all schema-valid applied.
+Suspended answers (pending options array, own `asks` or `of`), mandatory referrals (pending or any
+effect's step), and resumed runs remain held. Legacy/unbound or other-producer sidecars are re-probed
+and atomically replaced; valid tombstones are preserved. Every first unfinished refusal publishes
+the existing fixed `review-unfinished` reason, deduped per repo/PR/head/bounded reason; pending-kind
+details remain log-only. There is no new counter or alert state. Restore unreadable evidence and
+retry the sweep; a legitimate suspension requires its existing operator answer/cancellation path.
+
 **Ratified 2026-09-25** (`4120`, bornAs `4120`, operator, in session: *"I ratify"*). Fork 1 (a) — a job is a
 run-store record kind, with a `host:pid:procStart` handle and a dead-handle relaunch rule; Fork 2 (c) — code
 version per kind (`readonly-tree` runs from a pinned snapshot, `mutates-tree` runs in its own working tree).

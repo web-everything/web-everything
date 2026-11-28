@@ -4,9 +4,9 @@ import { hostname } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
-import { listRunIds, tryReadRun, runPath, isRunRecordTerminal, sharedRunsDir } from '../operations/run-store.mjs';
-import { isRunAbandoned, markRunAbandoned, runRecordVersion as version } from './run-abandoned.mjs';
-import { reviewJobsDir, readJobRecord } from '../operations/review-job-store.mjs';
+import { isValidRunId, tryReadRun, runPath, isRunRecordTerminal, sharedRunsDir } from '../operations/run-store.mjs';
+import { isReaperTombstone, markRunAbandoned, runRecordVersion as version } from './run-abandoned.mjs';
+import { reviewJobsDir, readJobRecordStrict } from '../operations/review-job-store.mjs';
 import { parseJobHandle } from '../operations/job-record.mjs';
 import { pidIdentity } from './pid-alive.mjs';
 import { resolveCascade, readPlatformPreferences, formatCascadeSourcesLine } from './policy-cascade.mjs';
@@ -38,7 +38,7 @@ function settings({ env, log, tool, thresholdMs }) {
 function readReviewJobs(env) {
   const dir = reviewJobsDir(env);
   return readdirSync(dir).filter(n => n.endsWith('.json')).flatMap(n => {
-    const r = readJobRecord(n.slice(0, -5), dir);
+    const r = readJobRecordStrict(n.slice(0, -5), dir);
     if (!r || typeof r !== 'object' || Array.isArray(r)) throw Error('unreadable review-job record');
     // Only a RECOGNIZED sidecar (review-<pr>.<kind>.json, e.g. *.spec-red-team.read.json) may lack a pid; any other
     // pid-less record could be a damaged job record and must hold everything (identity check below). Corrupt files threw above.
@@ -57,16 +57,17 @@ const hasReadError = v => Array.isArray(v) ? v.some(hasReadError)
 const identityOf = ({ pr, repo }) => (Number.isInteger(Number(pr)) && Number(pr) > 0 && /^\d+$/.test(String(pr)) && typeof repo === 'string' && repo.trim() ? `${repo}#${Number(pr)}` : null);
 const TMP = /^(.+?)\.(\d+)\.[^/]+\.tmp$/;
 /** A live writer (lock sidecar or temp sibling) keeps a record. Malformed lock, unreadable listing, unknown pid = ALIVE. */
-function writerHeld(id, dir, identity) {
+async function writerHeld(id, dir, identity, files) {
   const name = `${id}.json`;
-  const alive = pid => !Number.isInteger(pid) || pid <= 0 || identity(pid)?.alive !== false;
-  for (const f of readdirSync(dir)) {
+  const alive = async pid => !Number.isInteger(pid) || pid <= 0 || (await identity(pid))?.alive !== false;
+  for (const f of files) {
+    if (!f.startsWith(name) && f !== `${id}.lock`) continue;
     if (f === `${name}.lock` || f === `${id}.lock`) {
       const text = String(readFileSync(join(dir, f), 'utf8')).trim(); // read error propagates -> probe-unreadable
-      if (!/^[1-9]\d*$/.test(text) || alive(Number(text))) return true; // malformed text (1e3, 0x3e8, +5) = alive
+      if (!/^[1-9]\d*$/.test(text) || await alive(Number(text))) return true; // malformed text (1e3, 0x3e8, +5) = alive
     }
     const m = TMP.exec(f);
-    if (m && m[1] === name && alive(Number(m[2]))) return true;
+    if (m && m[1] === name && await alive(Number(m[2]))) return true;
   }
   return false;
 }
@@ -77,24 +78,45 @@ function writerHeld(id, dir, identity) {
  * store overrides the named run-store helpers and stat(path); production never writes run records.
  * Unavailable evidence is retried on a later sweep after the operator restores the failing probe/store.
  */
-export function reapDeadReviewRuns({ env = process.env, dir = (env.OPERATION_RUNS_DIR?.trim() ? resolve(env.OPERATION_RUNS_DIR.trim()) : sharedRunsDir(env)), now = Date.now(), apply = false,
-  log = console.error, thresholdMs, probes = {}, store = {}, tool } = {}) {
+export async function reapDeadReviewRuns({ env = process.env, dir: explicitDir, repo, probeContext, now = Date.now(), apply = false,
+  log = console.error, thresholdMs, probes = {}, store = {}, tool, clock = Date.now, yieldTurn = () => new Promise(r => setTimeout(r, 0)) } = {}) {
+  if (!Number.isFinite(now)) throw Error('reap-dead-review-runs: unreadable clock; restore clock and retry');
+  const dir = explicitDir ?? (env.OPERATION_RUNS_DIR?.trim() ? resolve(env.OPERATION_RUNS_DIR.trim()) : sharedRunsDir(env));
+  const context = typeof explicitDir === 'string' && !!explicitDir.trim() && typeof repo === 'string' && !!repo.trim()
+    && ['checkout', 'pool', 'poolRoot'].every(k => typeof probeContext?.[k] === 'string' && !!probeContext[k].trim())
+    && typeof env.OPERATION_REVIEW_JOBS_DIR === 'string' && !!env.OPERATION_REVIEW_JOBS_DIR.trim();
+  let lastYield = clock();
+  const turn = async () => { await yieldTurn(); lastYield = clock(); };
+  const localTurn = async () => { if (clock() - lastYield >= 5000) await turn(); };
   const result = { ...settings({ env, log, tool, thresholdMs }), scanned: 0, reaped: [], wouldReap: [], kept: {} };
-  const io = { listRunIds, tryReadRun, runPath, isRunRecordTerminal, markRunAbandoned, stat: statSync, ...store };
+  const io = { tryReadRun, runPath, isRunRecordTerminal, markRunAbandoned, stat: statSync, readdir: readdirSync, ...store };
   const keep = (reason, id) => { (result.kept[reason] ??= []).push(id); };
   const candidates = [];
-  for (const id of io.listRunIds(dir)) {
+  const files = io.readdir(dir);
+  const writers = new Map();
+  for (const name of files) {
+    const match = TMP.exec(name);
+    const id = match ? match[1].replace(/\.json$/, '') : name.replace(/(?:\.json)?\.lock$/, '');
+    if (match || name.endsWith('.lock')) { const siblings = writers.get(id) ?? []; siblings.push(name); writers.set(id, siblings); }
+    await localTurn();
+  }
+  const ids = store.listRunIds ? store.listRunIds(dir) : files.filter(n => n.endsWith('.json')).map(n => n.slice(0, -5)).filter(isValidRunId).sort();
+  for (const id of ids) {
     // The current shared ID grammar admits dots; ignore our metadata even before it is tightened.
-    if (id.endsWith('.abandoned')) continue;
+    await localTurn();
+    if (!id.startsWith('review-pr-') || id.endsWith('.abandoned')) continue;
     let record, stat;
     try { record = io.tryReadRun(id, dir); if (!record) throw Error('missing run'); }
     catch { result.scanned++; keep('unreadable', id); continue; }
     if (record.op !== 'review-pr') continue;
     result.scanned++;
     if (io.isRunRecordTerminal(record)) { keep('terminal', id); continue; }
-    if (isRunAbandoned(id, dir)) { keep('abandoned', id); continue; }
+    if (record.verdict != null) { keep('verdict-present', id); continue; }
+    if (isReaperTombstone(id, dir)) { keep('abandoned', id); continue; }
     if (record.resumeOf != null || record.resumedAt != null) { keep('resumed-run', id); continue; }
     if (!identityOf(record.input ?? {})) { keep('identity-unreadable', id); continue; }
+    if (repo && record.input.repo !== repo) { keep('other-repo', id); continue; }
+    if (apply === true && !context) { keep('missing-context', id); continue; }
     const pending = record.pending;
     if (pending && (Array.isArray(pending.options) || Object.hasOwn(pending, 'asks') || Object.hasOwn(pending, 'of'))) {
       keep('suspended-awaiting-answer', id); continue;
@@ -112,12 +134,13 @@ export function reapDeadReviewRuns({ env = process.env, dir = (env.OPERATION_RUN
 
   // Stage every decision before any writes: a late shared-probe failure must never partly reap a sweep.
   const decisions = new Map();
-  const identity = probes.pidIdentity ?? pidIdentity;
+  const identity = async (...args) => { await turn(); return (probes.pidIdentity ?? pidIdentity)(...args); };
   const exec = probes.execFileSync ?? execFileSync;
   const listing = (cmd, args, arrayField, timeout = 10000) => {
-    const text = exec(cmd, args, { cwd: ROOT, env, encoding: 'utf8', timeout, maxBuffer: 4 * 1024 * 1024 });
+    const text = exec(cmd, args, { cwd: ROOT, env: { ...env, ...(arrayField === 'lanes' ? { LANE_POOL_ROOT: probeContext?.poolRoot } : {}) }, encoding: 'utf8', timeout, maxBuffer: 4 * 1024 * 1024 });
     const parsed = JSON.parse(String(text));
     if (!parsed || typeof parsed !== 'object') throw Error('invalid liveness listing');
+    if (arrayField === 'lanes' && (!probeContext || parsed.repo !== probeContext.pool || parsed.root !== join(probeContext.poolRoot, probeContext.pool))) throw Error('lease pool authority mismatch');
     // lane-pool wraps object rows in `lanes`; sessions use an array or the known `sessions`/`agents` wrappers.
     // An unknown object (including {}) is not evidence that no live holders exist.
     const fields = (arrayField ? [arrayField] : ['sessions', 'agents']).filter(key => Object.hasOwn(parsed, key));
@@ -149,28 +172,37 @@ export function reapDeadReviewRuns({ env = process.env, dir = (env.OPERATION_RUN
     return value;
   };
   try {
-    const jobs = (probes.reviewJobs ?? (() => readReviewJobs(env)))();
+    await turn();
+    await turn();
+    const jobs = await (probes.reviewJobs ?? (() => readReviewJobs(env)))();
     if (!Array.isArray(jobs) || jobs.some(j => !j || typeof j !== 'object' || !identityOf(j))) throw Error('unreadable review-job list or review-job pr/repo identity');
     for (const { id, record } of candidates) {
-      if (writerHeld(id, dir, identity)) { decisions.set(id, 'live-writer'); continue; }
+      if (await writerHeld(id, dir, identity, writers.get(id) ?? [])) { decisions.set(id, 'live-writer'); continue; }
       const matching = jobs.filter(j => identityOf(j) === identityOf(record.input));
-      if (matching.some(j => !Number.isInteger(j.pid) || j.pid <= 0 || identity(j.pid)?.alive !== false)) {
+      let liveJob = false;
+      for (const j of matching) if (!Number.isInteger(j.pid) || j.pid <= 0 || (await identity(j.pid))?.alive !== false) { liveJob = true; break; }
+      if (liveJob) {
         decisions.set(id, 'live-review-job'); continue;
       }
       const handles = record.effects.filter(e => e.status === 'in-flight').map(e => e.handle).filter(h => h != null);
       if (record.job?.handle != null) handles.push(record.job.handle);
-      if (handles.some(handle => {
+      for (const handle of handles) {
         const h = parseJobHandle(handle);
-        return !h || h.host !== hostname() || identity(h.pid, { expectStart: h.procStart })?.alive !== false;
-      })) decisions.set(id, 'live-handle');
+        if (!h || h.host !== hostname() || (await identity(h.pid, { expectStart: h.procStart }))?.alive !== false) {
+          decisions.set(id, 'live-handle'); break;
+        }
+      }
+      await localTurn();
     }
     const remaining = candidates.filter(c => !decisions.has(c.id));
     if (remaining.length) {
-      const leases = textOf((probes.leases ?? (() => listing(process.execPath, ['scripts/lane-pool.mjs', 'status', '--json', '--leased-only', '--max-age-ms=0'], 'lanes', 120000)))());
+      await turn();
+      const leases = textOf(await (probes.leases ?? (() => listing(process.execPath, ['scripts/lane-pool.mjs', 'status', '--json', '--leased-only', '--max-age-ms=0', `--repo=${probeContext?.checkout}`, `--name=${probeContext?.pool}`], 'lanes', 45000)))());
       for (const { id } of remaining) if (leases.includes(id)) decisions.set(id, 'live-lease');
       const sessionCandidates = remaining.filter(c => !decisions.has(c.id));
       if (sessionCandidates.length) {
-        const sessions = textOf((probes.sessions ?? (() => listing('claude', ['agents', '--json'])))());
+        await turn();
+        const sessions = textOf(await (probes.sessions ?? (() => listing('claude', ['agents', '--json'])))());
         for (const { id, record } of sessionCandidates) {
           const handles = record.effects.filter(e => e.status === 'in-flight').map(e => e.handle).filter(h => typeof h === 'string' && h);
           if (record.job?.handle) handles.push(record.job.handle);
@@ -185,16 +217,17 @@ export function reapDeadReviewRuns({ env = process.env, dir = (env.OPERATION_RUN
   }
 
   for (const c of candidates) {
+    await localTurn();
     if (decisions.has(c.id)) { keep(decisions.get(c.id), c.id); continue; }
     let changed;
     try {
-      if (writerHeld(c.id, dir, identity)) { keep('live-writer', c.id); continue; }
       const currentStat = io.stat(io.runPath(c.id, dir));
       const current = io.tryReadRun(c.id, dir);
       // A second stat also catches an atomic writer landing during the final read.
       changed = !current || JSON.stringify(current) !== c.snapshot || version(currentStat) !== version(c.stat)
         || version(io.stat(io.runPath(c.id, dir))) !== version(c.stat)
-        || writerHeld(c.id, dir, identity);
+;
+      if (!changed && await writerHeld(c.id, dir, identity, io.readdir(dir))) { keep('live-writer', c.id); continue; }
     } catch { changed = true; }
     if (changed) { keep('changed-during-sweep', c.id); continue; }
     if (apply !== true) { result.wouldReap.push(c.id); continue; }
@@ -217,7 +250,7 @@ export function reapDeadReviewRuns({ env = process.env, dir = (env.OPERATION_RUN
 const isMain = import.meta.url === pathToFileURL(process.argv[1] || '').href;
 if (isMain) {
   const flags = new Set(process.argv.slice(2));
-  const result = reapDeadReviewRuns({ apply: flags.has('--apply') && !flags.has('--dry-run') });
+  const result = await reapDeadReviewRuns({ apply: flags.has('--apply') && !flags.has('--dry-run') });
   if (flags.has('--json')) console.log(JSON.stringify(result, null, 2));
   else console.log(`reap-dead-review-runs: ${result.scanned} scanned · ${result.reaped.length} reaped · ${result.wouldReap.length} wouldReap` +
     Object.entries(result.kept).map(([reason, ids]) => ` · ${reason}=${ids.length}`).join(''));

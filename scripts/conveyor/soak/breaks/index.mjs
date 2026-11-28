@@ -51,6 +51,7 @@
  * `same-head-hold-clean-head-never-resolves.mjs` uses the same automatic registration.
  * `smoke-queue-force-priority.mjs` uses the same automatic registration.
  * `smoke-dispatch-fix-live-claim-no-prompt.mjs` uses the same automatic registration.
+ * `review-run-dead-pending-judge.mjs` uses the same automatic registration.
  *
  * `unchecked-draft-and-stale-accepted-status.mjs` uses the same automatic registration.
  * `gh-log-escape-sequences-block-ci-heal.mjs` uses the same automatic registration.

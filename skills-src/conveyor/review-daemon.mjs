@@ -1,4 +1,8 @@
 #!/usr/bin/env node
+import { tickReviewRunReap } from '../../scripts/lib/review-run-reap-job.mjs';
+import { sharedRunsDir, daemonJobsDir } from '../../scripts/operations/run-store.mjs';
+import { reviewJobsDir } from '../../scripts/operations/review-job-store.mjs';
+import { defaultPoolRoot } from '../../scripts/lib/lane-pool-paths.mjs';
 /**
  * @file skills-src/conveyor/review-daemon.mjs
  * @description #3876 (epic #3383) — the standalone Review daemon: reconcile-pass.mjs (discovery) +
@@ -2106,10 +2110,20 @@ export function runReviewDispatchPass({ owner, lockRoot = RUNNER_LOCK_ROOT, log 
   return runReviewTickAllRepos({ tick, ...options, ...opts, dispatch: options.dispatch, leaseHeld });
 }
 
+export const defaultReapReviewRuns = () => tickReviewRunReap({
+    dir: daemonJobsDir('review-run-reaper'),
+    codeSha: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: SESSION_REAPER_REPO_ROOT, encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024 }).trim(),
+    input: { reviewRunsDir: sharedRunsDir(), repo: CONSTELLATION_REPOS.we.slug,
+      OPERATION_REVIEW_JOBS_DIR: reviewJobsDir(), probeContext: { checkout: SESSION_REAPER_REPO_ROOT,
+        pool: 'web-everything', poolRoot: defaultPoolRoot(SESSION_REAPER_REPO_ROOT) } },
+    snapshot: { repoDir: SESSION_REAPER_REPO_ROOT }, log: message => console.error(message),
+  });
+
 export function buildCliDaemonEffects({
   owner, intervalMs = DEFAULT_INTERVAL_MS, log = console, factCache = null,
   dispatchLockRoot = RUNNER_LOCK_ROOT,
   reapSessions = defaultReapSessions,
+  reapReviewRuns = null,
   // Keep the production runReview closure testable without replacing its executor bindings.
   tick = runReviewTick,
   // #3383 bug 3 — the real daemon wires the real `acquirableLanes` effect through by default, so production
@@ -2176,6 +2190,8 @@ export function buildCliDaemonEffects({
       // Best-effort, mirrors `runner.mjs`'s own `makeCliMechanicalPasses` discipline: a session-reap failure
       // is logged and swallowed, never lets a lingering `claude` process take down this tick's real job
       // (dispatching/tagging reviews).
+      try { if (reapReviewRuns) await reapReviewRuns(); }
+      catch (e) { log.error(`review-run-reap: held; restore job authority/store and retry (${String(e.message).replace(/[\x00-\x1f\x7f]/g, ' ')})`); }
       let sessionReap = null;
       try {
         sessionReap = reapSessions({ priorityNames });
@@ -2352,7 +2368,7 @@ async function main() {
   // early; the interval stays as the safety net. This daemon also forwards drain-relevant events to the drain
   // daemon's localhost POST /nudge — one forwarder, so the drain wakes on events without its own feed client.
   const { stoppedReason } = await runDaemonLoop(
-    withPrEvents(withSelfSync(withGithubAppAuth(buildCliDaemonEffects({ owner, intervalMs, factCache }), REVIEW_DAEMON_APP_AUTH_OPTS), {
+    withPrEvents(withSelfSync(withGithubAppAuth(buildCliDaemonEffects({ owner, intervalMs, factCache, reapReviewRuns: defaultReapReviewRuns }), REVIEW_DAEMON_APP_AUTH_OPTS), {
       root: selfRoot, onRestart: restartOntoNewCode, hasStaleRefusal: hasStaleMainRefusal,
     }), { role: 'review', repos: REVIEW_DAEMON_REPOS, forward: [makeDrainNudgeForward()] }),
   );

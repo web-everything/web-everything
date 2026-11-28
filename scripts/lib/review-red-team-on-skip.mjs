@@ -1,3 +1,4 @@
+import { isReaperTombstone, reaperReviewShape } from './run-abandoned.mjs';
 /** Recover an owed red-team result on an already-reviewed head through the existing review job. */
 import { execFileSync } from 'node:child_process';
 import { proveCardOnlyHeadMove } from './card-only-head-move.mjs';
@@ -412,6 +413,17 @@ function* reviewRuns({ runsDir, list, read, stat }) {
 // Keep only summaries, replacing each id's entry when its file identity changes.
 const neverReviewedSummaryCache = new Map();
 
+/** The production unfinished-hold publisher; the fixed reason is shared across pending kinds. */
+export function createReviewHoldEscalator({ env, publishNeedsYou = publishAttention, settle = settleRedTeamSkip } = {}) {
+  return ({ repo, pr, head, why }) => {
+    let error;
+    const result = settle({ repo, pr, head, redTeam: { status: 'skipped', reason: why },
+      io: { env, publishNeedsYou, log: message => { error = safeErrorText(message); } } });
+    if (error) throw Error(error);
+    return result;
+  };
+}
+
 /** Complete named-candidate proof; incomplete calls warm the cache but retain the hold. */
 export function headNeverReviewedFromRuns({ repo, pr, head, env = process.env,
   runsDir = runsDirectory(env), list = listRunIds, read = readRun, stat = statSync,
@@ -438,8 +450,11 @@ export function headNeverReviewedFromRuns({ repo, pr, head, env = process.env,
     };
     const { names: namesBefore, ids } = directorySnapshot(candidates);
     const maxParses = resolveRunScanSettings({ env, ...scanSettings }).value.scan.maxParses;
+    const metadata = new Map();
     const identity = id => {
-      const { mtimeMs, ctimeMs, dev, size, ino } = stat(join(runsDir, `${id}.json`));
+      const st = stat(join(runsDir, `${id}.json`));
+      metadata.set(id, st);
+      const { mtimeMs, ctimeMs, dev, size, ino } = st;
       if (![mtimeMs, ctimeMs, dev, size, ino].every(Number.isFinite) || dev < 0 || size < 0 || ino < 0) throw Error('run metadata unreadable');
       return JSON.stringify([mtimeMs, ctimeMs, dev, size, ino]);
     };
@@ -465,12 +480,16 @@ export function headNeverReviewedFromRuns({ repo, pr, head, env = process.env,
           } else assertReviewRunEvidence(run);
           if (run.id !== id) throw Error('review run filename and payload id disagree');
           summary = { ...summary, valid: true, op: run.op, repo: run.input?.repo,
-            pr: Number(run.input?.pr), head: run.findings?.read?.netBasis?.rev };
+            pr: Number(run.input?.pr), head: run.findings?.read?.netBasis?.rev, reaperEligible: reaperReviewShape(run) };
         } catch { /* Invalid evidence is cached only for this exact file identity. */ }
         if (identity(id) !== before) { neverReviewedSummaryCache.delete(key); return false; }
         neverReviewedSummaryCache.set(key, summary);
       }
       if (!summary.valid) return false;
+      if (summary.reaperEligible && isReaperTombstone(id, runsDir, { recordStat: metadata.get(id) })) {
+        if (identity(id) !== before) return false;
+        continue;
+      }
       if (summary.op === 'review-pr' && summary.repo === repo && summary.pr === Number(pr)
         && (!isRealHead(summary.head) || summary.head === head)) return false;
     }
@@ -919,11 +938,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
   settlePending = settlePendingFor({ provider, env }),
   escalate = ({ repo, pr, head, why }) => {
     if (isUnderTest() || isUnderTest(env)) return;
-    let error;
-    const result = settleRedTeamSkip({ repo, pr, head, redTeam: { status: 'skipped', reason: why },
-      io: { env, publishNeedsYou: publishAttention, log: message => { error = safeErrorText(message); } } });
-    if (error) throw Error(error);
-    return result;
+    return createReviewHoldEscalator({ env })({ repo, pr, head, why });
   },
   abandon = key => abandonStaleRedTeamRun({ ...key, env }),
   now = Date.now, lastDispatch: history = lastDispatch, preferLane, settle = settleRedTeamSkip, syncLabels = syncRedTeamStatusLabels,
