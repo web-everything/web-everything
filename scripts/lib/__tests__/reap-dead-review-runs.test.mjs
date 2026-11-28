@@ -4,15 +4,18 @@ import { tmpdir, hostname } from 'node:os';
 import { join } from 'node:path';
 import { newRunRecord } from '../../operations/run-record.mjs';
 import { newJobBlock } from '../../operations/job-record.mjs';
-import { writeRun, tryReadRun, runPath, isRunRecordTerminal, resolveRunsDir, migrateLegacyRuns } from '../../operations/run-store.mjs';
+import { writeRun, tryReadRun, runPath, isRunRecordTerminal, resolveRunsDir, migrateLegacyRuns, reportInvalidRunEntry } from '../../operations/run-store.mjs';
 import { writeJobRecord } from '../../operations/review-job-store.mjs';
 import { abandonedPath, isRunAbandoned, isRunTerminalOrAbandoned, markRunAbandoned } from '../run-abandoned.mjs';
 import { reapDeadReviewRuns } from '../reap-dead-review-runs.mjs';
 
-// Pass-through spies: they observe whether the migrating resolver is reached, without changing behaviour.
+// Observe migrating resolvers; exercise real filename enumeration with an isolated reporter.
 vi.mock('../../operations/run-store.mjs', async importOriginal => {
   const actual = await importOriginal();
-  return { ...actual, resolveRunsDir: vi.fn(actual.resolveRunsDir), migrateLegacyRuns: vi.fn(actual.migrateLegacyRuns) };
+  const reportInvalidRunEntry = vi.fn();
+  return { ...actual, resolveRunsDir: vi.fn(actual.resolveRunsDir), migrateLegacyRuns: vi.fn(actual.migrateLegacyRuns),
+    reportInvalidRunEntry,
+    runFileEntries: (dir, options) => actual.runFileEntries(dir, { ...options, reportInvalid: reportInvalidRunEntry }) };
 });
 const HOUR = 3600000, now = Date.parse('2026-11-08T12:00:00Z');
 let dir, env, probes, probeContext;
@@ -39,6 +42,31 @@ function record(id = 'review-pr-dead', more = {}, age = 8 * HOUR) {
 // Isolate the six-hour standard in guard/cascade fixtures; test the shipped tool policy separately.
 function sweep(more = {}) { return reapDeadReviewRuns({ tool: {}, dir, repo: 'owner/repo', probeContext, now, env, probes, log: () => {}, apply: true, ...more }); }
 async function kept(reason, more = {}) { expect((await sweep(more)).kept[reason]).toEqual(['review-pr-dead']); }
+
+it('reports a malformed run filename through the invalid-entry reporter without aborting the scan', async () => {
+  const malformed = join(dir, 'review-pr-invalid name.json');
+  writeFileSync(malformed, '{}');
+  record();
+  vi.mocked(reportInvalidRunEntry).mockClear();
+
+  const result = await sweep({ clock: () => now, yieldTurn: async () => {} });
+
+  expect(reportInvalidRunEntry).toHaveBeenCalledTimes(1);
+  expect(reportInvalidRunEntry).toHaveBeenCalledWith(malformed);
+  expect(result.scanned).toBe(1);
+  expect(result.reaped).toEqual(['review-pr-dead']);
+  expect(readFileSync(malformed, 'utf8')).toBe('{}');
+});
+it('still scans valid review-pr runs without reporting an invalid entry', async () => {
+  record();
+  vi.mocked(reportInvalidRunEntry).mockClear();
+
+  const result = await sweep({ clock: () => now, yieldTurn: async () => {} });
+
+  expect(result.scanned).toBe(1);
+  expect(result.reaped).toEqual(['review-pr-dead']);
+  expect(reportInvalidRunEntry).not.toHaveBeenCalled();
+});
 
 it('apply creates exactly one sidecar and preserves run bytes, mtime and effects', async () => {
   const original = record(undefined, { effects: [effect('in-flight')] });

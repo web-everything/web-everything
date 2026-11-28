@@ -4,7 +4,7 @@ import { hostname } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
-import { isValidRunId, tryReadRun, runPath, isRunRecordTerminal, sharedRunsDir } from '../operations/run-store.mjs';
+import { runFileEntries, tryReadRun, runPath, isRunRecordTerminal, sharedRunsDir } from '../operations/run-store.mjs';
 import { isReaperTombstone, markRunAbandoned, runRecordVersion as version } from './run-abandoned.mjs';
 import { reviewJobsDir, readJobRecordStrict } from '../operations/review-job-store.mjs';
 import { parseJobHandle } from '../operations/job-record.mjs';
@@ -100,7 +100,7 @@ export async function reapDeadReviewRuns({ env = process.env, dir: explicitDir, 
     if (match || name.endsWith('.lock')) { const siblings = writers.get(id) ?? []; siblings.push(name); writers.set(id, siblings); }
     await localTurn();
   }
-  const ids = store.listRunIds ? store.listRunIds(dir) : files.filter(n => n.endsWith('.json')).map(n => n.slice(0, -5)).filter(isValidRunId).sort();
+  const ids = store.listRunIds ? store.listRunIds(dir) : runFileEntries(dir).map(n => n.slice(0, -5)).sort();
   for (const id of ids) {
     // The current shared ID grammar admits dots; ignore our metadata even before it is tightened.
     await localTurn();
