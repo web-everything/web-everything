@@ -87,7 +87,7 @@ function catchUpCli(unreadable = '', probeQuery = null) {
     mkdirSync(bin); mkdirSync(snapshots); mkdirSync(join(dir, 'backlog'));
     const target = { number: 7, title: 'routing fixture', body: '', headRefName: 'lane/routing',
       headRefOid: '7'.repeat(40), updatedAt: '2026-11-23T00:00:00Z', state: 'OPEN', isDraft: false,
-      baseRefName: 'trunk', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', reviewDecision: '',
+      baseRefName: 'trunk', baseRefOid: 'a'.repeat(40), mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', reviewDecision: '',
       labels: [], files: [], statusCheckRollup: [], commits: [], rowsHead: '7'.repeat(40), rowsComplete: true };
     for (const repo of repos) writeFileSync(join(snapshots, `${repo.replace('/', '__')}.json`),
       JSON.stringify({ v: PR_SNAPSHOT_VERSION, repo, fetchedAtMs: Date.now(), fields: SNAPSHOT_FIELDS,
@@ -119,6 +119,12 @@ if (a[0] === 'repo' && a[1] === 'view') {
 if (a[0] === 'api' && a[1]?.includes('/git/ref/heads/trunk')) { process.stdout.write('a'.repeat(40)); process.exit(0); }
 if (a[0] === 'api' && a[1] === 'graphql') {
   const query = a.find(v => v.startsWith('query=')) || '';
+  if (query.includes('pullRequest(number:') && query.includes('commits(first:100')
+    && a.includes('owner=web-everything') && a.includes('name=web-everything') && a.includes('number=7')
+    && a.includes('--paginate') && a.includes('--slurp')) {
+    out([{data:{repository:{pullRequest:{headRefOid:target.headRefOid,baseRefOid:target.baseRefOid,
+      commits:{totalCount:0,pageInfo:{hasNextPage:false,endCursor:null},nodes:[]}}}}}]);
+  }
   const expected = ${JSON.stringify(repos.map(repo => 'query=' + buildOpenPrPageQuery({ repo, pageSize: 100, inventoryOnly: true })))};
   if (!expected.includes(query)) {
     process.stderr.write('unported fixture call: ' + a.join(' ')); process.exit(1);
@@ -152,7 +158,10 @@ process.stderr.write('unported fixture call: ' + a.join(' ')); process.exit(1);
     const calls = readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
     const expected = repos.map(repo => 'query=' + buildOpenPrPageQuery({ repo, pageSize: 100, inventoryOnly: true }));
     for (const call of calls.filter(c => c.args[0] === 'api' && c.args[1] === 'graphql')) {
-      expect(expected).toContain(call.args.find(a => a.startsWith('query=')));
+      const query = call.args.find(a => a.startsWith('query='));
+      if (query.includes('pullRequest(number:') && query.includes('commits(first:100')) {
+        expect(call.args).toEqual(expect.arrayContaining(['owner=web-everything', 'name=web-everything', 'number=7', '--paginate', '--slurp']));
+      } else expect(expected).toContain(query);
     }
     return { ...result, calls, round: existsSync(round) ? JSON.parse(readFileSync(round, 'utf8')) : null };
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -162,6 +171,9 @@ it('catch-up fast drain with a listing snapshot resolves cross-owner branches an
   const r = catchUpCli();
   expect(r.error, r.stderr).toBeUndefined();
   expect(r.status, r.stderr).toBe(0);
+  expect(r.stderr).not.toContain('commits-degraded');
+  expect(r.calls.some(c => c.args.includes('--paginate') && c.args.includes('--slurp')
+    && c.args.some(v => v.includes('commits(first:100')))).toBe(true);
   expect(JSON.parse(r.stdout)).toMatchObject({ ok: true, merged: [], failed: [] });
   expect(r.round.repos.toSorted()).toEqual(repos.toSorted());
   for (const repo of repos) {

@@ -42,6 +42,14 @@ if (a[0] === 'api') {
   if (path.includes('/status?')) out([{total_count:statusRows.length,statuses:statusRows}]);
   if (a[1] === 'graphql') {
     const q = a.find(x => x.startsWith('query=')) || '';
+    if (q.includes('pullRequest(number:') && q.includes('commits(first:100')) {
+      const [owner, name] = process.env.PRESTAGE_REPO.split('/');
+      const target = a.includes('owner=' + owner) && a.includes('name=' + name) && prs.find(p => p.number === number);
+      if (!target) { fs.writeSync(2, 'unknown commit-history PR'); process.exit(1); }
+      out([{data:{repository:{pullRequest:{headRefOid:target.headRefOid,baseRefOid:target.baseRefOid,
+        commits:{totalCount:target.commits.length,pageInfo:{hasNextPage:false,endCursor:null},
+          nodes:target.commits.map(commit => ({commit:{...commit,authors:{nodes:commit.authors}}}))}}}}}]);
+    }
     if (q.includes('timelineItems(') && pr.mqTimelineErrors) out({ errors:[{message:'fixture timeline unreadable'}] });
     if (q.includes('timelineItems(')) out({ data: { repository: { pullRequest: { timelineItems: {
       nodes:pr.mqTimeline || [], pageInfo:{hasPreviousPage:false}

@@ -100,6 +100,9 @@ describe('real drain pre-stage path', () => {
         pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
         const next = (await run(path === 'prestage', { shadowMode }));
         calls.push(...next.calls);
+        expect(next.stderr).not.toContain('commits-degraded');
+        expect(calls.some(a => a.includes('--paginate') && a.includes('--slurp')
+          && a.some(v => v.includes('commits(first:100')))).toBe(true);
         if (path === 'dependency-held') {
           expect(next.report.deferred, next.stderr).toEqual(expect.arrayContaining([
             expect.objectContaining({num:42,waitOn:['xpar123']}),
