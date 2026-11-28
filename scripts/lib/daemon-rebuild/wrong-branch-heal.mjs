@@ -10,10 +10,19 @@
  * `main` — still refuses, exactly as before. Untracked files are never touched (a checkout that would overwrite
  * one fails, and the heal refuses).
  *
- * DETACHED CASE (live 2026-10-11 ~17:50 ET): the drain daemon was detached at local main's exact commit,
- * blocking rebuilds and overlay loads. Reattach only when verified HEAD equals verified local main and
- * readable status shows zero tracked changes. This changes no files and needs no saved ref; unreadable
- * HEAD, a different commit, or any tracked change still refuses.
+ * DETACHED CASE (2026-10-11, extended DAEMON-CLONE-DETACHED-HEAL, 2026-11-27): a clone detached at local main
+ * heals as before; a clone detached elsewhere heals only when local main equals the adopted smoke-passed
+ * head and the detached HEAD is reachable from origin/main, with the old HEAD saved under a named ref first;
+ * every unknown refuses. A clean detach exactly at main needs no adoption/reachability evidence or saved ref.
+ * Off-main refusal order: in-progress/unreadable git dir; unreadable HEAD; missing main; unreadable status;
+ * tracked changes; invalid (non-40-hex) head/main/adopted SHA or main != adopted; unreadable reachability;
+ * unreachable (foreign) commit. Reachability uses the concrete HEAD SHA and the local origin/main ref,
+ * never a fetch. Re-read detachment, HEAD, main, tracked status, operation markers and reachability
+ * immediately before each write, under prepare's clone write lock. Changed/unreadable detachment, HEAD,
+ * main or reachability refuses as detached-state-changed, with detail.field naming the failed proof.
+ * Save create-only at refs/we/wrong-branch-heal/<ts>-<sha9> (zero old SHA); save failure stops before checkout.
+ * Checkout is non-forced with --no-overwrite-ignore: even ignored untracked collisions refuse. A failed
+ * switch retains the saved ref in detail.savedRef for operator recovery; no refusal tries another heal path.
  *
  * IN-PROGRESS OPERATIONS (red-team, PR #4964): a paused interactive rebase (`break`, `edit`, a stopped pick) leaves
  * HEAD detached on a clean tree, indistinguishable from a stray detach by SHA and status alone. Moving HEAD
@@ -28,6 +37,7 @@
 import { lstatSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { daemonRebuildSettingsPath } from './skip-unrelated.mjs';
+import { FULL_SHA_RE } from './shared.mjs';
 
 export const WRONG_BRANCH_HEAL_DEFAULTS = Object.freeze({
   branches: Object.freeze(['ops/review-requests']),
@@ -70,19 +80,24 @@ export function readInProgress(git) {
 /**
  * Pure: may this clone state be healed back to main?
  * `inProgress`: markers found in the git dir (`[]` none, `null` git dir unreadable; omitted = not checked).
- * @param {{branch: string|null, headSha?: string|null, mainSha?: string|null, changedPaths: string[]|null, hasMain: boolean, settings: {branches: string[], pathPrefixes: string[]}, inProgress?: string[]|null}} o
- * @returns {{heal: true} | {heal: false, reason: string, detail?: object}}
+ * @param {{branch: string|null, headSha?: string|null, mainSha?: string|null, adoptedHead?: string|null, headReachability?: 'reachable'|'unreachable'|'unreadable', changedPaths: string[]|null, hasMain: boolean, settings: {branches: string[], pathPrefixes: string[]}, inProgress?: string[]|null}} o
+ * @returns {{heal: true, savedRefNeeded: boolean} | {heal: false, reason: string, detail?: object}}
  */
-export function planWrongBranchHeal({ branch, headSha, mainSha, changedPaths, hasMain, settings, inProgress = [] }) {
+export function planWrongBranchHeal({ branch, headSha, mainSha, adoptedHead, headReachability, changedPaths, hasMain, settings, inProgress = [] }) {
   if (inProgress === null) return { heal: false, reason: 'git-dir-unreadable' };
   if (inProgress.length) return { heal: false, reason: 'operation-in-progress', detail: { operations: [...inProgress] } };
   if (!branch) {
     if (!headSha) return { heal: false, reason: 'detached-or-unreadable-head' };
     if (!hasMain || !mainSha) return { heal: false, reason: 'no-local-main' };
-    if (headSha !== mainSha) return { heal: false, reason: 'detached-off-main' };
     if (changedPaths === null) return { heal: false, reason: 'status-unreadable' };
     if (changedPaths.length) return { heal: false, reason: 'detached-with-changes' };
-    return { heal: true };
+    if (headSha === mainSha) return { heal: true, savedRefNeeded: false };
+    if (![adoptedHead, mainSha, headSha].every(sha => typeof sha === 'string' && FULL_SHA_RE.test(sha)) || mainSha !== adoptedHead) {
+      return { heal: false, reason: 'detached-not-adopted' };
+    }
+    if (!['reachable', 'unreachable'].includes(headReachability)) return { heal: false, reason: 'detached-reachability-unreadable' };
+    if (headReachability === 'unreachable') return { heal: false, reason: 'detached-foreign-commit' };
+    return { heal: true, savedRefNeeded: true };
   }
   if (branch === 'main') return { heal: false, reason: 'already-on-main' };
   if (!settings.branches.includes(branch)) return { heal: false, reason: 'branch-not-allowlisted', detail: { branch } };
@@ -90,7 +105,7 @@ export function planWrongBranchHeal({ branch, headSha, mainSha, changedPaths, ha
   if (changedPaths === null) return { heal: false, reason: 'status-unreadable' };
   const foreign = changedPaths.filter((p) => !settings.pathPrefixes.some((pre) => p.startsWith(pre)));
   if (foreign.length) return { heal: false, reason: 'non-store-changes', detail: { foreign: foreign.slice(0, 10) } };
-  return { heal: true };
+  return { heal: true, savedRefNeeded: false };
 }
 
 /** Tracked changed paths (staged or not, both sides of a rename) from `status --porcelain -z`, or null. */
@@ -108,11 +123,14 @@ export function parseTrackedChanges(stdout) {
 
 /**
  * IO: read the clone's state, apply the rule, and heal when it allows. Never throws.
- * @param {{git: Function, settings?: object, now?: () => number}} o  `git(args)` → `{status, stdout}`
+ * @param {{git: Function, adoptedHead?: string|null, settings?: object, now?: () => number}} o  `git(args)` → `{status, stdout}`
  * @returns {{healed: true, from: string, savedRef: string|null} | {healed: false, reason: string, detail?: object}}
  */
-export function healWrongBranch({ git, settings = resolveWrongBranchHealSettings(), now = Date.now }) {
+export function healWrongBranch({ git, adoptedHead = null, settings = resolveWrongBranchHealSettings(), now = Date.now }) {
   const out = (r) => String(r?.stdout ?? '').trim();
+  // Both save paths share one fixed-command write site; keep the original push-gate budget.
+  const updateRef = (ref, sha, { message, oldSha } = {}) =>
+    git(['update-ref', ...(message ? ['-m', message] : []), ref, sha, ...(oldSha ? [oldSha] : [])]);
   const head = git(['symbolic-ref', '--short', 'HEAD']);
   const branch = head.status === 0 ? out(head) : null;
   const main = git(['rev-parse', '--verify', '--quiet', 'refs/heads/main']);
@@ -122,9 +140,63 @@ export function healWrongBranch({ git, settings = resolveWrongBranchHealSettings
   const headSha = detachedHead?.status === 0 ? out(detachedHead) : null;
   const inProgress = readInProgress(git);
   const st = git(['status', '--porcelain=v1', '-z', '--untracked-files=no']);
-  const changedPaths = st.status === 0 ? parseTrackedChanges(st.stdout) : null;
-  const plan = planWrongBranchHeal({ branch, headSha, mainSha, changedPaths, hasMain, settings, inProgress });
+  const changedPaths = st.status === 0 && typeof st.stdout === 'string' ? parseTrackedChanges(st.stdout) : null;
+  const readReachability = () => {
+    try {
+      const reachable = git(['merge-base', '--is-ancestor', headSha, 'refs/remotes/origin/main']);
+      return reachable?.status === 0 ? 'reachable' : reachable?.status === 1 ? 'unreachable' : 'unreadable';
+    } catch { return 'unreadable'; }
+  };
+  const headReachability = !branch && headSha !== mainSha && FULL_SHA_RE.test(headSha) ? readReachability() : 'unreadable';
+  const plan = planWrongBranchHeal({ branch, headSha, mainSha, adoptedHead, headReachability, changedPaths, hasMain, settings, inProgress });
   if (!plan.heal) return { healed: false, reason: plan.reason, ...(plan.detail ? { detail: plan.detail } : {}) };
+
+  if (plan.savedRefNeeded) {
+    // Only this path moves a detached tree. Re-check each proof before BOTH the save and the switch.
+    const reverify = () => {
+      let field = 'detached';
+      try {
+        const detached = git(['symbolic-ref', '-q', 'HEAD']);
+        if (detached?.status !== 1) return { healed: false, reason: 'detached-state-changed', detail: { field } };
+        field = 'headSha';
+        const liveHead = git(['rev-parse', '--verify', '--quiet', 'HEAD']);
+        if (liveHead?.status !== 0 || out(liveHead) !== headSha) return { healed: false, reason: 'detached-state-changed', detail: { field } };
+        field = 'mainSha';
+        const liveMain = git(['rev-parse', '--verify', '--quiet', 'refs/heads/main']);
+        if (liveMain?.status !== 0 || out(liveMain) !== mainSha) return { healed: false, reason: 'detached-state-changed', detail: { field } };
+        field = 'status';
+        const liveStatus = git(['status', '--porcelain=v1', '-z', '--untracked-files=no']);
+        if (liveStatus?.status !== 0 || typeof liveStatus.stdout !== 'string') return { healed: false, reason: 'status-unreadable' };
+        if (parseTrackedChanges(liveStatus.stdout).length) return { healed: false, reason: 'detached-with-changes' };
+        field = 'gitDir';
+        const operations = readInProgress(git);
+        if (operations === null) return { healed: false, reason: 'git-dir-unreadable' };
+        if (operations.length) return { healed: false, reason: 'operation-in-progress', detail: { operations } };
+        field = 'reachability';
+        if (readReachability() !== 'reachable') return { healed: false, reason: 'detached-state-changed', detail: { field } };
+        return null;
+      } catch {
+        return { healed: false, reason: field === 'status' ? 'status-unreadable' : field === 'gitDir' ? 'git-dir-unreadable' : 'detached-state-changed', detail: { field } };
+      }
+    };
+    const changed = reverify();
+    if (changed) return changed;
+    let savedRef;
+    try {
+      const timestamp = now();
+      if (!Number.isSafeInteger(timestamp) || timestamp < 0) return { healed: false, reason: 'save-failed' };
+      savedRef = `refs/we/wrong-branch-heal/${timestamp}-${headSha.slice(0, 9)}`;
+      const saved = updateRef(savedRef, headSha, { oldSha: '0000000000000000000000000000000000000000' });
+      if (saved?.status !== 0) return { healed: false, reason: 'save-failed' };
+    } catch { return { healed: false, reason: 'save-failed' }; }
+    const changedBeforeSwitch = reverify();
+    if (changedBeforeSwitch) return { ...changedBeforeSwitch, detail: { ...changedBeforeSwitch.detail, savedRef } };
+    try {
+      const sw = git(['checkout', '--quiet', '--no-overwrite-ignore', 'main']);
+      if (sw?.status !== 0) return { healed: false, reason: 'switch-failed', detail: { savedRef, stderr: String(sw?.stderr ?? '').slice(0, 300) } };
+    } catch { return { healed: false, reason: 'switch-failed', detail: { savedRef } }; }
+    return { healed: true, from: `(detached at ${headSha.slice(0, 9)})`, savedRef };
+  }
 
   // Re-read right before the first mutation: an operation may have started since the plan was read.
   const again = planWrongBranchHeal({ branch, headSha, mainSha, changedPaths, hasMain, settings, inProgress: readInProgress(git) });
@@ -132,11 +204,11 @@ export function healWrongBranch({ git, settings = resolveWrongBranchHealSettings
 
   let savedRef = null;
   if (changedPaths.length) {
-    const created = git(['stash', 'create', `wrong-branch-heal: tracked changes on ${branch}`]);
+    const created = git(['stash', 'create', 'wrong-branch-heal: tracked store changes']);
     const sha = out(created);
     if (created.status !== 0 || !sha) return { healed: false, reason: 'save-failed' };
     savedRef = `refs/we/wrong-branch-heal/${now()}`;
-    if (git(['update-ref', '-m', `wrong-branch-heal from ${branch}`, savedRef, sha]).status !== 0) {
+    if (updateRef(savedRef, sha, { message: `wrong-branch-heal from ${branch}` }).status !== 0) {
       return { healed: false, reason: 'save-failed' };
     }
     // Only tracked store files change here (the rule proved it); untracked files are untouched by reset.

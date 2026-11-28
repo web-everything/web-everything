@@ -1,7 +1,8 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { readQuarantine, writeQuarantineChange, runSafetyNet, resolveQuarantineSettings, rerunRedMainFailedJobs, runAddCommand, runRemovalCommand } from '../red-main-quarantine-io.mjs';
 import { addEntries, pruneOnGreen, testsToSkip } from '../red-main-quarantine.mjs';
@@ -48,7 +49,7 @@ describe('quarantine IO — ops/quarantine branch (real git)', () => {
 
   it('the live safety net publishes the proof, job and owed card on the ops ref', () => {
     const { board, origin } = repo();
-    const fixture = JSON.parse(readFileSync(join('scripts', 'lib', '__tests__', 'fixtures', 'red-main-quarantine-62da75ed3.json'), 'utf8'));
+    const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'red-main-quarantine-62da75ed3.json'), 'utf8'));
     // Supply a hypothetical earlier run of the failing sha whose re-run passed; the recorded episode had none.
     fixture.mainCiRuns.runs.push({ ...fixture.mainCiRuns.runs[0], databaseId: 7, createdAt: '2026-10-14T06:08:00Z', updatedAt: '2026-10-14T06:15:00Z', attempt: 2 });
     const rerunJobs = [{ name: 'integration', conclusion: 'failure', run_attempt: 1 }, { name: 'integration', conclusion: 'success', run_attempt: 2 }];
@@ -109,27 +110,30 @@ describe('runAddCommand — the `add` CLI wiring triggers the rerun', () => {
 });
 
 describe('rerunRedMainFailedJobs — a quarantine add re-runs the failed jobs of the broken main run, once per sha', () => {
+  beforeEach(() => { vi.useFakeTimers({ toFake: ['Date'] }); vi.setSystemTime(new Date('2026-11-08T06:00:00Z')); });
+  afterEach(() => vi.useRealTimers());
   const runs = (list) => JSON.stringify(list);
   const fake = (list, { failRerun = false } = {}) => {
     const calls = [];
     const exec = (cmd, args) => {
       calls.push(args);
       if (args[0] === 'run' && args[1] === 'list') return runs(list);
-      if (args[0] === 'run' && args[1] === 'rerun') { if (failRerun) throw new Error('boom'); return ''; }
+      if (args[0] === 'api' && args[1] === '-X' && args[2] === 'POST') { if (failRerun) throw new Error('boom'); return ''; }
       throw new Error('unexpected ' + args.join(' '));
     };
     return { exec, calls };
   };
   const dirOf = () => mkdtempSync(join(tmpdir(), 'rmq-rr-'));
   const red = [{ databaseId: 42, headSha: SHA, status: 'completed', conclusion: 'failure', createdAt: '2026-11-08T03:47:00Z' }];
-  const reruns = (calls) => calls.filter((a) => a[1] === 'rerun');
+  const reruns = (calls) => calls.filter((a) => a[0] === 'api' && a[1] === '-X' && a[2] === 'POST');
 
-  it('a completed+failed latest run for the broken sha gets exactly one --failed rerun', () => {
+  it('re-runs failed jobs through REST POST actions/runs/<id>/rerun-failed-jobs, never gh run rerun', () => {
     const { exec, calls } = fake(red);
     const r = rerunRedMainFailedJobs({ brokenSha: SHA, exec, dir: dirOf(), repoSlug: 'o/r' });
-    expect(r).toMatchObject({ rerun: true, runId: 42 });
     expect(reruns(calls)).toHaveLength(1);
-    expect(reruns(calls)[0]).toEqual(expect.arrayContaining(['run', 'rerun', '42', '--failed']));
+    expect(reruns(calls)[0]).toEqual(['api', '-X', 'POST', 'repos/o/r/actions/runs/42/rerun-failed-jobs']);
+    expect(calls.some((args) => args[0] === 'run' && args[1] === 'rerun')).toBe(false);
+    expect(r).toMatchObject({ rerun: true, runId: 42 });
   });
   it('a second add for the same sha does not rerun again', () => {
     const { exec, calls } = fake(red);
@@ -155,7 +159,10 @@ describe('rerunRedMainFailedJobs — a quarantine add re-runs the failed jobs of
   it('a failed rerun request is reported with the manual fallback and is NOT retried (at most one request per sha)', () => {
     const dir = dirOf();
     const bad = fake(red, { failRerun: true });
-    expect(rerunRedMainFailedJobs({ brokenSha: SHA, exec: bad.exec, dir, repoSlug: 'o/r' })).toMatchObject({ rerun: false, error: expect.stringContaining('gh run rerun 42 --failed') });
+    const result = rerunRedMainFailedJobs({ brokenSha: SHA, exec: bad.exec, dir, repoSlug: 'o/r' });
+    expect(result).toMatchObject({ rerun: false, error: expect.stringContaining('boom (claim kept; rerun by hand: gh api -X POST repos/o/r/actions/runs/42/rerun-failed-jobs)') });
+    expect(result.error).not.toContain('gh run rerun');
+    expect(reruns(bad.calls)).toHaveLength(1);
     const again = fake(red);
     expect(rerunRedMainFailedJobs({ brokenSha: SHA, exec: again.exec, dir, repoSlug: 'o/r' })).toMatchObject({ rerun: false, reason: 'already-rerun' });
     expect(reruns(again.calls)).toHaveLength(0);

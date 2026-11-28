@@ -9,7 +9,7 @@ import { describe, it, expect, afterAll } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runGhSync, runGhCliPassthrough, ghThrottleLogPath, resolveGhJsonParseRetry, isRetryableGhJsonFailure, ghTransientRetryReason } from '../gh-throttle.mjs';
+import { runGhSync, runGhCliPassthrough, ghThrottleLogPath, resolveGhJsonParseRetry, isRetryableGhJsonFailure, ghTransientRetryReason } from './gh-throttle.window-fixture.mjs';
 
 const made = [];
 const tmp = () => { const d = mkdtempSync(join(tmpdir(), 'gh-json-retry-')); made.push(d); return d; };

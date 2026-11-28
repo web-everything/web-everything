@@ -1,0 +1,6 @@
+{
+  "description": "UTC ISO expiry; tool null blocks inheritance. Activation stamps seven days; active must share its layer. Invalid/expired disables; repair through a reviewed PR.",
+  "owner": "scripts/settings/delivery-tiers.json",
+  "changeVia": "pr",
+  "instant": false
+}

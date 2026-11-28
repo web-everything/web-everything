@@ -21,7 +21,56 @@ const sha = 'a'.repeat(40);
 const prestageWorld = createPrestageWorld((argv, options) => runInProcess(argv, { ...options, ports: prestagePorts }));
 const world = (fn, options) => prestageWorld(fn, { slug: 'web-everything/web-everything', ...options });
 
+async function overlapWorld(fn) {
+  vi.useFakeTimers({ toFake:['Date'] });
+  vi.setSystemTime(new Date('2026-11-27T19:00:00Z'));
+  try {
+    await world(async context => {
+      const { pr } = context;
+      pr.files[0].additions = 100;
+      pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+      pr.readyAt = '2026-11-27T18:59:00Z';
+      pr.peers = [{ ...structuredClone(pr), number:43, id:'PR_WAITER', headRefOid:'d'.repeat(40), headRefName:'lane/waiter',
+        files:[{path:'README.md',changeType:'MODIFIED',additions:1}],
+        commits:[{oid:'d'.repeat(40),messageHeadline:'Waiter',authors:[{name:'Claude',email:'noreply@anthropic.com'}]}],
+        comments:[{author:{login:'chalbert'},body:'<!-- reviewed-sha: '+ 'd'.repeat(40) +' -->',createdAt:new Date().toISOString()}],
+        statusCheckRollup:[{name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:'d'.repeat(40)}] }];
+      pr.mqTimeline = [{ __typename:'RemovedFromMergeQueueEvent', reason:'failed_checks', createdAt:'2026-11-27T18:30:00Z',
+        beforeCommit:{oid:'b'.repeat(40),parents:{nodes:[{oid:'c'.repeat(40)},{oid:sha}]}} }];
+      await fn(context);
+    }, { overlapYield:true });
+  } finally { vi.useRealTimers(); }
+}
+
 describe('real drain pre-stage path', () => {
+  it('a confirmed same-head hold releases its overlap waiter in the same pass', () => overlapWorld(async ({ run }) => {
+    const next = await run();
+    expect(next.report.enqueueOutcomes, next.stderr).toMatchObject([
+      {num:42,kind:'mq-same-head-failed',cause:'head-failed',headSha:sha}, {num:43,outcome:'enqueued'},
+    ]);
+    expect(next.report.deferred).toEqual([]);
+    expect(next.calls.filter(a => a.some(x => x.includes('timelineItems(')) && a.includes('number=42'))).toHaveLength(1);
+    expect(next.calls.filter(a => a.some(x => x.includes('enqueuePullRequest')))).toHaveLength(1);
+    expect(next.stderr.split('\n').filter(line => line.includes('overlap-yield released:'))).toEqual([
+      expect.stringContaining(`#43 no longer yields to #42 (mq-same-head-failed head-failed at ${sha.slice(0,12)})`),
+    ]);
+  }));
+  it('an unknown same-head hold preserves its overlap waiter', () => overlapWorld(async ({ pr, run }) => {
+    pr.mqTimelineErrors = true;
+    const next = await run();
+    expect(next.report.enqueueOutcomes).toMatchObject([{num:42,kind:'mq-same-head-failed',cause:'unknown'}]);
+    expect(next.report.deferred).toMatchObject([{num:43,waitOn:['overlap-yield:#42']}]);
+    expect(next.calls.filter(a => a.some(x => x.includes('enqueuePullRequest')))).toHaveLength(0);
+    expect(next.stderr).not.toContain('overlap-yield released:');
+  }));
+  it('a removal bound to an older head leaves overlap yield unchanged', () => overlapWorld(async ({ pr, run }) => {
+    pr.mqTimeline[0].beforeCommit.parents.nodes[1].oid = 'e'.repeat(40);
+    const next = await run();
+    expect(next.report.enqueueOutcomes).toMatchObject([{num:42,outcome:'enqueued'}]);
+    expect(next.report.deferred).toMatchObject([{num:43,waitOn:['overlap-yield:#42']}]);
+    expect(next.calls.filter(a => a.some(x => x.includes('enqueuePullRequest')))).toHaveLength(1);
+    expect(next.stderr).not.toContain('overlap-yield released:');
+  }));
   it.each(['check-runs', 'status'])('fresh cascade revalidation refuses unreadable %s evidence', endpoint => world(async ({pr,run}) => {
     pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
     pr.unreadableCheckRows = endpoint;

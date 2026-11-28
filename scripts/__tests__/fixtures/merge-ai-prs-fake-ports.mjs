@@ -4,7 +4,16 @@ import { drainScoredGit } from './drain-scored-git.mjs';
 import { openPrPageFixture } from './open-pr-page-fixture.mjs';
 
 function prestageGh(process, fs, page) {
-const a = process.argv.slice(2), pr = JSON.parse(fs.readFileSync(process.env.PRESTAGE_PR, 'utf8'));
+const a = process.argv.slice(2), primary = JSON.parse(fs.readFileSync(process.env.PRESTAGE_PR, 'utf8'));
+const prs = [primary, ...(primary.peers || [])];
+const query = a.find(x => x.startsWith('query=')) || '';
+const number = Number((a[0] === 'pr' && a[1] === 'view' ? a[2] : null)
+  || /\/(?:pulls|issues)\/(\d+)/.exec(a.join(' '))?.[1]
+  || /^(?:pr|number)=(\d+)$/.exec(a.find(x => /^(?:pr|number)=/.test(x)) || '')?.[1]
+  || /pullRequest\(number:\s*(\d+)/.exec(query)?.[1]);
+const commitHead = /\/commits\/([a-f0-9]{40})\//i.exec(a.join(' '))?.[1];
+const pr = prs.find(p => p.number === number || p.headRefOid === commitHead) || primary;
+const queuedPath = process.env.PRESTAGE_PR + (pr.number === primary.number ? '' : '.' + pr.number) + '.queued';
 fs.appendFileSync(process.env.PRESTAGE_LOG, JSON.stringify(a) + '\n');
 // Synchronous writes: an async pipe write past 8KB would be cut off by the exit.
 const out = x => { if (a.includes('-i')) fs.writeSync(1, 'HTTP/2 200 OK\n\n'); fs.writeSync(1, typeof x === 'string' ? x : JSON.stringify(x)); process.exit(0); };
@@ -14,16 +23,17 @@ if (a[0] === 'repo') {
 }
 if (a[0] === 'pr' && ['list', 'view'].includes(a[1]) && a.includes('--repo') && a[a.indexOf('--repo') + 1] !== process.env.PRESTAGE_REPO) out([]);
 if (a[0] === 'pr' && a[1] === 'list' && a.includes('--base')) out(pr.stacked || []);
-if (a[0] === 'pr' && a[1] === 'list') out([pr]);
+if (a[0] === 'pr' && a[1] === 'list') out(prs);
 if (a[0] === 'pr' && a[1] === 'view') out(pr);
 if (a[0] === 'api') {
   if (a[1] === 'user') out('chalbert');
   const path = a.find(x => x.startsWith('repos/')) || '';
   if (path.includes('/rules/branches/')) out(a.includes('--slurp') ? [[{type:'required_status_checks',parameters:{required_status_checks:[{context:'test'}]}}]] : [{type:'required_status_checks',parameters:{required_status_checks:[{context:'test'}]}}]);
   if (path.endsWith('/branches/main')) out({ protected:false });
+  if (path.endsWith('/events')) out([{ event:'labeled', label:{name:'ready-to-merge'}, created_at:pr.readyAt }]);
   if (path.includes('/comments')) out([pr.comments]);
   if (path.includes('/reviews')) out([[]]);
-  if (path.includes('/files')) out([[{filename:'README.md',status:'modified'}]]);
+  if (path.includes('/files')) out([pr.files.map(f => ({filename:f.path,status:'modified',additions:f.additions ?? 1,deletions:f.deletions ?? 0}))]);
   if (pr.unreadableCheckRows && path.includes('/' + pr.unreadableCheckRows + '?')) out([{}]);
   // Complete pages carry the server's total_count: the strict reader attests rows only when delivered === total.
   const runRows = pr.statusCheckRollup.filter(c => c.name).map((c, i) => ({ ...c, id: c.id ?? -(i + 1) }));
@@ -32,18 +42,23 @@ if (a[0] === 'api') {
   if (path.includes('/status?')) out([{total_count:statusRows.length,statuses:statusRows}]);
   if (a[1] === 'graphql') {
     const q = a.find(x => x.startsWith('query=')) || '';
+    if (q.includes('timelineItems(') && pr.mqTimelineErrors) out({ errors:[{message:'fixture timeline unreadable'}] });
     if (q.includes('timelineItems(')) out({ data: { repository: { pullRequest: { timelineItems: {
       nodes:pr.mqTimeline || [], pageInfo:{hasPreviousPage:false}
     } } } } });
-    if (q.includes('enqueuePullRequest')) { fs.writeFileSync(process.env.PRESTAGE_PR+'.queued',''); out({ data: { enqueuePullRequest: { mergeQueueEntry: { id:'E',position:1,state:'QUEUED' } } } }); }
+    if (q.includes('enqueuePullRequest')) {
+      const target = prs.find(p => q.includes('"' + p.id + '"') || a.includes('id=' + p.id)) || pr;
+      fs.writeFileSync(process.env.PRESTAGE_PR + (target.number === primary.number ? '' : '.' + target.number) + '.queued','');
+      out({ data: { enqueuePullRequest: { mergeQueueEntry: { id:'E',position:1,state:'QUEUED' } } } });
+    }
     if (q.includes('isInMergeQueue')) {
       const reads = fs.readFileSync(process.env.PRESTAGE_LOG,'utf8').split('\n').filter(line => line.includes('isInMergeQueue')).length;
-      out({ data: { repository: { pullRequest: { headRefOid:pr.headRefOid, isInMergeQueue:(!!pr.inQueue && (!pr.loseQueueAfterAdmission || reads === 1)) || fs.existsSync(process.env.PRESTAGE_PR+'.queued') } } } });
+      out({ data: { repository: { pullRequest: { headRefOid:pr.headRefOid, isInMergeQueue:(!!pr.inQueue && (!pr.loseQueueAfterAdmission || reads === 1)) || fs.existsSync(queuedPath) } } } });
     }
     if (q.includes('mergeQueue(')) out({ data: { repository: { mergeQueue: { entries: { nodes:[],pageInfo:{hasNextPage:false} } } } } });
     const [owner, name] = process.env.PRESTAGE_REPO.split('/');
     if (q.includes('pullRequests(') && !q.includes('repository(owner:"'+owner+'",name:"'+name+'")')) out(page([], q));
-    out(page([pr], q));
+    out(page(prs, q));
   }
 }
 out([]);
@@ -55,7 +70,9 @@ while (a[0] === '-c') a = a.slice(2);
 fs.appendFileSync(process.env.PRESTAGE_LOG, JSON.stringify(['git', ...a]) + '\n');
 if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:' + process.env.PRESTAGE_REPO + '.git\n');
 else if (['rev-parse', 'cat-file', 'merge-base', 'diff'].includes(a[0])) {
-  const result = scoredGit(a, { gitDir: process.env.PRESTAGE_PR.replace(/pr\.json$/, '.git'), files: [{ path: 'README.md' }] });
+  const primary = JSON.parse(fs.readFileSync(process.env.PRESTAGE_PR, 'utf8'));
+  const pr = [primary, ...(primary.peers || [])].find(p => a.some(arg => arg.includes(p.headRefOid))) || primary;
+  const result = scoredGit(a, { gitDir: process.env.PRESTAGE_PR.replace(/pr\.json$/, '.git'), files: pr.files });
   if (result) { process.stdout.write(result.stdout); process.exit(result.status); }
 } else if (a[0] === 'ls-tree' && a.includes('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')) process.stdout.write('backlog/xabc123-card.md\n');
 else if (a[0] === 'show') {

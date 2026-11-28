@@ -735,7 +735,9 @@ describe('runReviewLoopOnce — a ruling on an unchanged head resumes the paused
     const persistFails = sinksWith({ seen: [], ruled: { value: false } });
     persistFails[REVIEW_EFFECTS.MANDATORY_REFERRALS] = async () => ({ records: [], pending: ['referral-persistence-failed'],
       blocked: [], malformed: false, reason: 'ledger-write-miss' });
-    const args = { declaration, registry, argv, store, makeJudge, mintRunId: () => 'must-not-be-minted' };
+    const diagnosticLog = vi.fn(() => ({ ok: true }));
+    const args = { declaration, registry, argv, store, makeJudge, mintRunId: () => 'must-not-be-minted',
+      diagnostics: { log: diagnosticLog } };
     await runReviewLoopOnce({ ...args, sinks: persistFails, mintRunId: () => 'r-1' });
     const judged = judge.mock.calls.length;
     if (interrupted) persistFails[REVIEW_EFFECTS.MANDATORY_REFERRALS] = async () => { throw new Error('persist interrupted'); };
@@ -779,7 +781,7 @@ describe('runReviewLoopOnce — a ruling on an unchanged head resumes the paused
     expect(reviewRunEvidence(store.read('r-1'))).toMatchObject({ persistenceFailed: false, persistRetries: 3 });
     const done = await runReviewLoopOnce({ ...args, sinks: recovered, findResumableRun });
     if (!notApplied) {
-      expect(done.stopped).toBe('effect-halted');
+      expect(done).toMatchObject({ code: 1, stopped: 'effect-halted' });
       let capped;
       for (let n = 0; n <= RESUME_MAX_ATTEMPTS; n++) {
         capped = await runReviewLoopOnce({ ...args, sinks: recovered, findResumableRun });
@@ -787,7 +789,13 @@ describe('runReviewLoopOnce — a ruling on an unchanged head resumes the paused
       expect(capped).toMatchObject({ code: 2, stopped: 'refused' });
       expect(capped.lines.join('\n')).toContain('unresolved advisory effect');
       expect(advisoryFailures).toBe(1); // Unknown non-idempotent outcomes are never automatically replayed.
-      expect(done.lines.join('\n')).toContain('UNKNOWN outcome');
+      // Public diagnostics are classified; the replay refusal remains available in the private log.
+      expect(done.lines[0]).toBe('error: drive-run:unknown');
+      expect(done.lines[1]).toMatch(/^correlation-id: [0-9a-f-]{36}$/);
+      const correlationId = done.lines[1].slice('correlation-id: '.length);
+      expect(diagnosticLog).toHaveBeenCalledWith(`drive-run correlation-id=${correlationId}`,
+        expect.objectContaining({ message: expect.stringContaining('UNKNOWN outcome') }));
+      expect(done.lines.join('\n')).not.toContain('UNKNOWN outcome');
       expect(seen.filter(e => e.type === failurePoint)).toHaveLength(0);
       expect(seen.filter(e => e.type === REVIEW_EFFECTS.ADVISORY_NOTE))
         .toHaveLength(failurePoint === REVIEW_EFFECTS.ADVISORY_LABEL ? 1 : 0);

@@ -213,6 +213,7 @@ describe('rebuildClone coordination events', () => {
     'tick-in-progress', 'reader-priority', 'concurrent-mover', 'smoke-backoff', 'held-after-rollback',
     'disabled', 'dirty', 'dirty-tree', 'local-commits', 'index-locked', 'switch-busy',
     'smoke-env-load', 'closure-opaque', 'ready-pin-stale', 'future-benign-reason',
+    'detached-not-adopted', 'detached-reachability-unreadable', 'detached-foreign-commit', 'detached-state-changed',
   ])('does not announce a failure for a hold or unknown reason: %s', async (reason) => {
     terminal({ moved: false, reason });
     await rebuildClone(options);
@@ -303,6 +304,8 @@ describe('rebuildClone coordination events', () => {
       'applied-pinned', 'applied-retry', 'applied-stack-fallback', 'auto-rebase of ',
       'branch-not-allowlisted', 'clone-recloned', 'conflict', 'conflict-evidence-unknown', 'deps-job-running', 'deps-job-spaced',
       'deps-job-started', 'detached-off-main', 'detached-or-unreadable-head', 'detached-with-changes',
+      // Detached-heal safety refusals leave prepare on its existing not-on-main hold.
+      'detached-not-adopted', 'detached-reachability-unreadable', 'detached-foreign-commit', 'detached-state-changed',
       'diff-unknown', 'dirty', 'disabled', 'dispatch-smoke', 'executable-or-runtime-file-change',
       'expired', 'fallback-inputs-moved', 'fallback-not-allowed', 'fallback-plain-main', 'forced-sha-pinned',
       'forced-watch-missing', 'forced-watch-owed', 'forced-watch-unreadable',

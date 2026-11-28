@@ -125,25 +125,28 @@ export function planEtagEviction(entries, {
   return plan;
 }
 
-/** Scan `dir`, plan, delete (unless `dryRun`). Never follows symlinks; a vanished file is skipped. Never throws on a missing dir. */
+/** Scan `dir`, plan, delete (unless `dryRun`). Never follows symlinks; a vanished file (ENOENT) is skipped; any other per-file stat error marks the scan incomplete and is reported, so it is never stamped. Never throws on a missing dir. */
 export function pruneEtagDir(dir, { now = Date.now(), maxAgeDays, maxTotalBytes, dryRun = false } = {}) {
   let names;
   try { names = readdirSync(dir); } catch (e) {
     return { files: 0, bytes: 0, deleted: 0, freedBytes: 0, dryRun, ...(e && e.code === 'ENOENT' ? {} : { error: String(e && e.code || e) }) };
   }
   const entries = [];
+  let scanFailed = 0;
+  let firstError = '';
   for (const name of names) {
     if (!ETAG_FILE_RE.test(name)) continue;
     try {
       const st = lstatSync(join(dir, name));
       entries.push({ name, mtimeMs: st.mtimeMs, size: st.size, isFile: st.isFile(), isSymlink: st.isSymbolicLink() });
-    } catch { /* vanished */ }
+    } catch (e) {
+      if (!e || e.code !== 'ENOENT') { scanFailed += 1; firstError ||= String(e && e.code || e); }
+    }
   }
   const plan = planEtagEviction(entries, { now, maxAgeDays, maxTotalBytes });
   let deleted = 0;
   let freedBytes = 0;
   let failed = 0;
-  let firstError = '';
   for (const x of plan) {
     if (!dryRun) {
       try {
@@ -157,7 +160,7 @@ export function pruneEtagDir(dir, { now = Date.now(), maxAgeDays, maxTotalBytes,
     deleted += 1;
     freedBytes += x.size || 0;
   }
-  return { files: entries.length, bytes: entries.reduce((n, x) => n + x.size, 0), deleted, freedBytes, dryRun, ...(failed ? { failed, error: firstError } : {}) };
+  return { files: entries.length, bytes: entries.reduce((n, x) => n + x.size, 0), deleted, freedBytes, dryRun, ...(failed ? { failed, error: firstError } : {}), ...(scanFailed ? { incomplete: true, error: firstError } : {}) };
 }
 
 function writeStamp(file, now) {

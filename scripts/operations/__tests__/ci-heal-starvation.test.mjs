@@ -33,7 +33,7 @@ function fixture() {
     root: dir, checkStaleness: () => ({ fresh: true, behind: 0 }),
     now: () => time, deadlineAt: 180_000,
     reconcile: () => ({ dispatch: PRS.map(prNumber => ({
-      kind: 'ci-heal', prNumber, headRefName: `lane/pr-${prNumber}`, headRefOid: 'a'.repeat(40),
+      kind: 'ci-heal', admission: { admitted: true }, prNumber, headRefName: `lane/pr-${prNumber}`, headRefOid: 'a'.repeat(40),
       waitingSince: `2026-11-01T00:00:0${prNumber}.000Z`,
     })), refusals: [] }),
     flushOwed: () => ({}), pollAttempts: () => [], flushTimeouts: async () => [],
@@ -52,7 +52,7 @@ describe('CI-heal starvation', () => {
     const f = fixture();
     const prs = [1, 2, 3, 4, 5, 6];
     f.options.reconcile = () => ({ dispatch: prs.map(prNumber => ({
-      kind: 'ci-heal', prNumber, headRefOid: 'a'.repeat(40),
+      kind: 'ci-heal', admission: { admitted: true }, prNumber, headRefOid: 'a'.repeat(40),
     })), refusals: [] });
     f.options.pickFreeLanes = () => [11, 12, 13, 14, 15, 16];
     f.options.flushTimeouts = async () => { f.advance(192_000); return []; };
@@ -449,7 +449,7 @@ describe('CI-heal launch waves', () => {
   it.each([4, 6])('latches host refusal after the first launch across %i owed PRs', async count => {
     const f = fixture();
     const prs = Array.from({ length: count }, (_, i) => i + 1);
-    f.options.reconcile = () => ({ dispatch: prs.map(prNumber => ({ kind: 'ci-heal', prNumber,
+    f.options.reconcile = () => ({ dispatch: prs.map(prNumber => ({ kind: 'ci-heal', admission: { admitted: true }, prNumber,
       headRefName: `lane/pr-${prNumber}`, headRefOid: 'a'.repeat(40) })), refusals: [] });
     f.options.pickFreeLanes = () => prs.map(pr => pr + 10);
     f.dispatchThrottle.recheckHost = vi.fn(() => ({ admit: false, kind: 'host-load', why: 'host busy' }))
@@ -483,7 +483,7 @@ describe('CI-heal launch waves', () => {
   it('re-reads the kill switch between waves: a stop requested during the first wave refuses later waves', async () => {
     const f = fixture();
     const prs = [1, 2, 3, 4, 5, 6];
-    f.options.reconcile = () => ({ dispatch: prs.map(prNumber => ({ kind: 'ci-heal', prNumber, headRefName: `lane/pr-${prNumber}`,
+    f.options.reconcile = () => ({ dispatch: prs.map(prNumber => ({ kind: 'ci-heal', admission: { admitted: true }, prNumber, headRefName: `lane/pr-${prNumber}`,
       headRefOid: 'a'.repeat(40), waitingSince: `2026-11-01T00:00:0${prNumber}.000Z` })), refusals: [] });
     f.options.pickFreeLanes = () => [11, 12, 13, 14, 15, 16];
     let killed = false;

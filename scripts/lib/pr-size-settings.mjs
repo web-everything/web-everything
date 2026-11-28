@@ -5,13 +5,32 @@ import { cascadePolicy, readPlatformPreferences } from './policy-cascade.mjs';
 import { BUILT_IN_PR_SIZE_SETTINGS } from './pr-size-defaults.mjs';
 
 const arrayOf = check => value => Array.isArray(value) && value.every(v => typeof v === 'string' && check(v));
+// delivery.sizeDataPaths: only these four families authorize wildcard exemptions.
+// Explicit paths retain their existing contract; schemas are excluded by accounting.
+const ruledDataGlobs = ['src/**/__fixtures__/*.json', 'protocols/**/vectors/*.json',
+  'protocols/**/fixtures/*.json', 'protocols/**/v[0-9]*/traceability.json'];
+
+function withinRuledGlob(candidate, rule) {
+  if (!rule.length) return !candidate.length;
+  const [head, ...rest] = rule;
+  if (head === '**') return withinRuledGlob(candidate, rest)
+    || (candidate.length > 0 && withinRuledGlob(candidate.slice(1), rule));
+  if (!candidate.length || candidate[0] === '**') return false;
+  const segment = candidate[0];
+  const matches = head === segment
+    || (head === '*.json' && segment.endsWith('.json'))
+    || (head === 'v[0-9]*' && /^v[0-9][a-zA-Z0-9_*.-]*$/.test(segment));
+  return matches && withinRuledGlob(candidate.slice(1), rest);
+}
+
 const valid = {
   dataExtensions: arrayOf(v => BUILT_IN_PR_SIZE_SETTINGS.dataExtensions.includes(v)),
   dataDirs: arrayOf(v => !!v && !/[\\/\x00-\x1f]/.test(v) && v !== '.' && v !== '..'),
   dataPaths: arrayOf(v => !!v && !v.startsWith('/') && !/[\\\x00-\x1f]/.test(v)
     && v.split('/').every(segment => segment && segment !== '.' && segment !== '..')
     && !v.split('/')[0].includes('*') // a glob must start with a literal directory, never `**/*.json`
-    && BUILT_IN_PR_SIZE_SETTINGS.dataExtensions.some(extension => v.endsWith(extension))),
+    && BUILT_IN_PR_SIZE_SETTINGS.dataExtensions.some(extension => v.endsWith(extension))
+    && (!v.includes('*') || ruledDataGlobs.some(rule => withinRuledGlob(v.split('/'), rule.split('/'))))),
 };
 
 function validateSettings(settings, layer) {

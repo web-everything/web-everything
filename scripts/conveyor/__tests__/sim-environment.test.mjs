@@ -64,7 +64,7 @@ describe('simulated process environment', () => {
     const first = isolatedProcessEnv(worldRoot(), ambient);
     const second = isolatedProcessEnv(worldRoot(), ambient);
     const spend = (env, nowMs) => acquireGhPointsSync({
-      lockRoot: ghThrottleLockRoot('', env), owner: 'sim-environment-test', budgetPerMin: 1,
+      lockRoot: ghThrottleLockRoot('', env), owner: 'sim-environment-test', budgetPerMin: 1, pointsAlgorithm: 'window',
       now: () => nowMs, timeoutMs: 0,
       sleep: () => { throw new Error('a new world must not wait on another world\'s budget'); },
     });

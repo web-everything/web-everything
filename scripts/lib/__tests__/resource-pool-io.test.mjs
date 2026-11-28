@@ -33,8 +33,9 @@ const fs = await vi.importActual('node:fs');
 const { mkdirSync, writeFileSync } = fs;
 import { execFileSync } from 'node:child_process';
 import { readPoolSource, readPoolJson, readPoolHeavyHeld, poolPidAlive, poolSourcePaths,
+  collectResourcePool, appendShadowRows,
   SOURCES, RED_TEAM_HARD_LEASE_CEILING_MS, loadPoolSettings, readPoolSettingsChecked, readPoolOverrides } from '../resource-pool-io.mjs';
-import { POOL_DEFAULTS, grantDecision } from '../resource-pool.mjs';
+import { POOL_DEFAULTS, grantDecision, summarize } from '../resource-pool.mjs';
 import { readPoolLaneStatus } from '../resource-pool-lanes.mjs';
 import { lockDirFor } from '../../readiness/file-locks.mjs';
 let coord, paths, env, laneDir;
@@ -54,9 +55,10 @@ beforeEach(() => {
   guard.checkout = join(coord, 'web-everything'); guard.writes = []; guard.children = [];
 });
 afterEach(() => { guard.active = false; fs.rmSync(coord, { recursive: true, force: true }); });
-const read = (source, options = {}) => readPoolSource(source, { paths, env, nowMs, namespace: 'local', host: 'studio',
+const read = (source, options = {}) => readPoolSource(source, { paths, env, nowMs, cwd: coord, readRegistry: () => ({ repos: [{ name: 'web-everything' }] }), namespace: 'local', host: 'studio',
   listCommands: () => `${process.pid} 1 node resource-pool.mjs`, roundBudget: () => ({ live: 2 }),
-  laneStatus: () => ({ lanes: [] }), heavyStatus: () => ({ held: [] }), slotAlive: () => true, ...options });
+  laneStatus: () => ({ lanes: [] }), heavyStatus: () => ({ held: [] }), processAlive: () => { throw Error('unexpected process probe'); },
+  readStart: () => { throw Error('unexpected process identity read'); }, slotAlive: () => true, ...options });
 const settingsArgs = () => ({ env: {}, read: () => ({ value: structuredClone(POOL_DEFAULTS), taint: [] }),
   platform: {}, operatorOverride: {}, enumOverride: { ok: false, reason: 'absent' } });
 const expectClosed = settings => {
@@ -186,7 +188,7 @@ it('workers and lane inventory perform zero fs writes and never launch the lane-
   for (const file of sentinels) fs.writeFileSync(file, 'preserve');
   guard.active = true;
   expect(read('workers', { laneStatus: undefined })).toMatchObject({ ok: true, holders: [{ jobId: 'fix-1' }] });
-  expect(readPoolLaneStatus({ env, nowMs, run: execFileSync, readJson: path => readPoolJson(path).data }).lanes)
+  expect(readPoolLaneStatus({ env, nowMs, cwd: coord, readRegistry: () => ({ repos: [{ name: 'web-everything' }] }), run: execFileSync, readJson: path => readPoolJson(path).data }).lanes)
     .toMatchObject([{ leased: true }]);
   expect(guard.writes).toEqual([]);
   expect(guard.children).toHaveLength(4);
@@ -205,7 +207,7 @@ it.each(['acquiredAt', 'renewedAt'])('malformed, future and non-ISO %s remain un
   }
 });
 it('a non-ENOENT lease read error stays unknown', () => {
-  const laneStatus = () => readPoolLaneStatus({ env, nowMs, run: () => guard.checkout,
+  const laneStatus = () => readPoolLaneStatus({ env, nowMs, cwd: coord, readRegistry: () => ({ repos: [{ name: 'web-everything' }] }), run: () => guard.checkout,
     readJson: () => { throw Object.assign(Error('permission denied'), { code: 'EACCES' }); } });
   expect(read('workers', { laneStatus })).toMatchObject({ ok: false, error: expect.stringContaining('permission denied') });
 });
@@ -283,9 +285,49 @@ it('expires red-team leases strictly after 24h but never excuses unreadable evid
   fs.writeFileSync(file, JSON.stringify(status()));
   fs.utimesSync(file, new Date(clock - RED_TEAM_HARD_LEASE_CEILING_MS), new Date(clock - RED_TEAM_HARD_LEASE_CEILING_MS));
   expect(read('redTeam', { nowMs: clock }).holders).toHaveLength(1);
-  expect(read('redTeam', { nowMs: clock + 1, slotAlive: () => { throw Error('must not probe'); } }))
+  expect(read('redTeam', { nowMs: clock + 1, processAlive: () => false, slotAlive: () => { throw Error('must not probe'); } }))
     .toMatchObject({ ok: true, holders: [], expiredRedTeamRows: 1 });
   fs.writeFileSync(file, '{'); expect(read('redTeam', { nowMs: clock + 1 }).ok).toBe(false);
+});
+it('counts an expired red-team lease before consulting slot liveness', () => {
+  const clock = 200000000, file = join(paths.redTeam, filename);
+  fs.writeFileSync(file, JSON.stringify(status()));
+  const statusAt = clock - RED_TEAM_HARD_LEASE_CEILING_MS - 1;
+  fs.utimesSync(file, new Date(statusAt), new Date(statusAt));
+  const slotAlive = vi.fn(() => { throw Error('expired lease must not probe'); });
+  expect(read('redTeam', { nowMs: clock, processAlive: () => false, slotAlive }))
+    .toMatchObject({ ok: true, holders: [], expiredRedTeamRows: 1 });
+  expect(slotAlive).not.toHaveBeenCalled();
+});
+it('an expired red-team lease with a matching live process identity remains counted before the slot callback', () => {
+  const clock = 200000000, file = join(paths.redTeam, filename);
+  fs.writeFileSync(file, JSON.stringify({ ...status(), host: 'studio', pidNamespace: 'local' }));
+  const statusAt = clock - RED_TEAM_HARD_LEASE_CEILING_MS - 1;
+  fs.utimesSync(file, new Date(statusAt), new Date(statusAt));
+  const processAlive = vi.fn(() => true), readStart = vi.fn(() => 'owner-start');
+  const slotAlive = vi.fn(() => false);
+  expect(read('redTeam', { nowMs: clock, processAlive, readStart, slotAlive }))
+    .toMatchObject({ ok: true, holders: [{ kind: 'redTeam', class: 2, size: 1 }], expiredRedTeamRows: 0 });
+  expect(processAlive).toHaveBeenCalledWith(123);
+  expect(readStart).toHaveBeenCalledWith(123);
+  expect(slotAlive).not.toHaveBeenCalled();
+});
+it.each([
+  ['throwing', () => { throw Error('unreadable process'); }],
+  ['unknown', () => null],
+])('an expired red-team lease with a %s process probe fails closed before the slot callback', (_, probe) => {
+  const clock = 200000000, file = join(paths.redTeam, filename);
+  fs.writeFileSync(file, JSON.stringify(status()));
+  const statusAt = clock - RED_TEAM_HARD_LEASE_CEILING_MS - 1;
+  fs.utimesSync(file, new Date(statusAt), new Date(statusAt));
+  const processAlive = vi.fn(probe), readStart = vi.fn(() => 'owner-start');
+  const slotAlive = vi.fn(() => true);
+  expect(read('redTeam', { nowMs: clock, processAlive, readStart, slotAlive }))
+    .toMatchObject({ ok: false, holders: [], expiredRedTeamRows: 0,
+      error: expect.stringContaining('inspect source and rerun') });
+  expect(processAlive).toHaveBeenCalledWith(123);
+  expect(readStart).not.toHaveBeenCalled();
+  expect(slotAlive).not.toHaveBeenCalled();
 });
 it('foreign hosts and unknown local probes stay unknown; only ESRCH proves death', () => {
   const file = join(paths.redTeam, filename);
@@ -369,4 +411,256 @@ it('valid red-team identity delegates to the real probe for live, replaced and d
     .toMatchObject({ ok: true, holders: [{ kind: 'redTeam' }] });
   for (const options of [{ processAlive: () => false }, { processAlive: () => true, readStart: () => 'replacement' }])
     expect(read('redTeam', { slotAlive: undefined, ...options })).toMatchObject({ ok: true, holders: [] });
+});
+
+it('an over-24h live red-team holder is counted and a foreign-host holder makes inventory unknown', () => {
+  const clock = 200000000, file = join(paths.redTeam, filename);
+  const put = patch => {
+    fs.writeFileSync(file, JSON.stringify({ ...status(), ...patch }));
+    fs.utimesSync(file, new Date(0), new Date(0));
+  };
+  put({ host: 'studio', pidNamespace: 'local' });
+  const probe = { nowMs: clock, slotAlive: undefined, processAlive: () => true, readStart: () => 'owner-start' };
+  expect(read('redTeam', probe)).toMatchObject({ ok: true, holders: [{ kind: 'redTeam' }], expiredRedTeamRows: 0 });
+  put({ host: 'foreign' });
+  expect(read('redTeam', probe)).toMatchObject({ ok: false, error: expect.stringContaining('unknown red-team liveness') });
+});
+it('old red-team rows require proven death; unreadable liveness refuses and pid reuse never counts the replacement', () => {
+  const file = join(paths.redTeam, filename); fs.writeFileSync(file, JSON.stringify(status()));
+  fs.utimesSync(file, new Date(0), new Date(0));
+  const probe = { nowMs: 200000000, slotAlive: undefined, processAlive: () => true };
+  for (const readStart of [() => null, () => { throw Error('unreadable process'); }])
+    expect(read('redTeam', { ...probe, readStart })).toMatchObject({ ok: false, error: expect.stringContaining('inspect') });
+  for (const patch of [{ processAlive: () => false }, { readStart: () => 'replacement' }])
+    expect(read('redTeam', { ...probe, ...patch })).toMatchObject({ ok: true, holders: [], expiredRedTeamRows: 1 });
+});
+it('escaped duplicate key rejects in source JSON before last-wins parsing can erase evidence', () => {
+  for (const text of ['{"cpu":{},"c\\u0070u":{}}', '{"outer":{"pid":123,"p\\u0069d":456}}']) {
+    fs.writeFileSync(paths.snapshot, text);
+    expect(() => readPoolJson(paths.snapshot)).toThrow(/duplicate/);
+  }
+  fs.writeFileSync(paths.snapshot, '{"left":{"pid":1},"right":{"pid":2},"text":"{\\\"pid\\\":3}"}');
+  expect(readPoolJson(paths.snapshot).data).toMatchObject({ left: { pid: 1 }, right: { pid: 2 } });
+});
+it('per-source dedupe retains independent fix-claim and worker evidence for the same job', () => {
+  const dir = join(paths.fix, 'b'.repeat(16)); fs.mkdirSync(dir);
+  const claim = { owner: 'fixer', heartbeatAt: new Date(nowMs).toISOString(), meta: { repo: 'we', pr: 12, kind: 'fix' } };
+  fs.writeFileSync(join(dir, 'lock.json'), JSON.stringify(claim));
+  const fix = read('fix'); const session = fix.holders[0].jobId;
+  const row = { owner: `${laneDir}#1`, meta: { dispatchKind: 'fix', session } };
+  const workers = read('workers', { heavyStatus: () => ({ held: [row, row] }) });
+  expect(workers.holders).toHaveLength(1);
+  expect(fix.holders).toHaveLength(1);
+  expect(workers.holders[0].jobId).toBe(session);
+  expect(summarize([...fix.holders, ...workers.holders])['studio.units'].held).toBe(4);
+});
+
+const validPoolSource = source => ({ source, ok: true, holders: [],
+  ...(source === 'snapshot' ? { budget: { unknown: false, units: 30 } } : {}) });
+const collectPool = (options = {}) => collectResourcePool({ env: {}, coord, paths, nowMs, host: 'fixture-host',
+  settings: { value: structuredClone(POOL_DEFAULTS), configuredMode: 'shadow', unknown: false },
+  readSource: validPoolSource, legacy: () => ({ verdict: 'admit', unknown: false }), ...options });
+const expectPoolClosed = report => {
+  expect(report.unknown).toBe(true);
+  expect(report.rows).toHaveLength(3);
+  expect(report.rows.every(row => row.unknown && row.poolDecision === 'hold')).toBe(true);
+  expect(report.digest).toContain('?/?');
+};
+
+it.each(Object.keys(SOURCES))('collector fails closed for failing, malformed or missing %s even with no holders', source => {
+  for (const broken of [() => { throw Error('source unreadable'); },
+    () => { throw Object.assign(Error('missing source'), { code: 'ENOENT' }); },
+    () => { throw Object.assign(Error('source timed out'), { code: 'ETIMEDOUT' }); },
+    () => undefined, () => null, () => ({}),
+    () => ({ source, ok: false, holders: [], error: 'bad source' }),
+    () => ({ source, ok: true, holders: null }),
+    () => ({ source: 'wrong', ok: true, holders: [] })]) {
+    const readSource = vi.fn(name => name === source ? broken() : validPoolSource(name));
+    const report = collectPool({ readSource });
+    expectPoolClosed(report);
+    expect(report.holders).toEqual([]);
+    expect(report.sources.find(row => row.source === source).ok).toBe(false);
+    expect(readSource.mock.calls.map(([name]) => name)).toEqual(Object.keys(SOURCES));
+  }
+});
+
+it.each([
+  ['null', null, 'null'], ['undefined', undefined, 'undefined'], ['str', 'str', 'str'], ['object', {}, '[object Object]'],
+  ['throwing message getter', { get message() { throw Error('getter failed'); } }, 'unprintable error'],
+  ['throwing string conversion', { toString() { throw Error('conversion failed'); } }, 'unprintable error'],
+  ['control characters', Error('bad\x1b[31m\nsource'), 'bad [31m source'],
+])('a readSource that throws %s gives an unknown report', (_label, value, error) => {
+  const readSource = vi.fn(source => { if (source === 'rounds') throw value; return validPoolSource(source); });
+  let report;
+  expect(() => { report = collectPool({ readSource }); }).not.toThrow();
+  expectPoolClosed(report);
+  expect(report.sources.find(row => row.source === 'rounds')).toMatchObject({ ok: false, error });
+  expect(readSource.mock.calls.map(([name]) => name)).toEqual(Object.keys(SOURCES));
+});
+
+it.each([{ class: 0 }, { class: 4 }, { class: '3' }, { size: 0 }, { size: 3 }, { size: '2' }, { source: 'wrong' }])(
+  'collector invalidates a source with malformed holder %j', patch => {
+    const report = collectPool({ readSource: source => ({ ...validPoolSource(source), holders: source === 'fix'
+      ? [{ resource: 'studio.units', source, kind: 'fix', class: 3, size: 2, ...patch }] : [] }) });
+    expectPoolClosed(report);
+    expect(report.sources.find(row => row.source === 'fix').ok).toBe(false);
+    expect(report.holders).toEqual([]);
+  });
+
+it.each([
+  ['missing budget', undefined], ['null budget', null], ['empty budget', {}],
+  ['unknown', { unknown: true, units: 30 }], ['missing unknown', { units: 30 }],
+  ['null unknown', { unknown: null, units: 30 }], ['false-like unknown', { unknown: 0, units: 30 }],
+  ...[undefined, null, -1, 31, 999, 1.5, NaN, Infinity, '30'].map(units =>
+    [`invalid units ${String(units)}`, { unknown: false, units }]),
+])('collector fails closed for snapshot budget: %s', (_label, budget) => {
+  const report = collectPool({ readSource: source => ({ ...validPoolSource(source),
+    ...(source === 'snapshot' ? { budget } : {}) }) });
+  expectPoolClosed(report);
+  expect(report.sources.find(row => row.source === 'snapshot'))
+    .toMatchObject({ ok: false, error: 'invalid source result' });
+  expect(report.sources.filter(row => row.source !== 'snapshot').every(row => row.ok)).toBe(true);
+  expect(report.holders).toEqual([]);
+});
+
+it.each([0, 30])('collector accepts snapshot budget endpoint %i as known evidence', units => {
+  const report = collectPool({ readSource: source => ({ ...validPoolSource(source),
+    ...(source === 'snapshot' ? { budget: { unknown: false, units } } : {}) }) });
+  expect(report.unknown).toBe(false);
+  expect(report.sources.every(row => row.ok)).toBe(true);
+  expect(report.budgets['studio.units']).toBe(units);
+  expect(report.rows.every(row => !row.unknown && row.poolDecision === (units === 0 ? 'hold' : 'grant'))).toBe(true);
+});
+
+it('unknown settings hold every pool decision even with complete sources', () => {
+  expectPoolClosed(collectPool({ settings: { value: structuredClone(POOL_DEFAULTS), unknown: true } }));
+});
+
+it.each(['holders', 'result'])('collector fails closed for truthy %s.unknown', target => {
+  const readSource = vi.fn(source => {
+    const result = validPoolSource(source);
+    if (source === 'workers') (target === 'result' ? result : result.holders).unknown = 'incomplete inventory';
+    return result;
+  });
+  const report = collectPool({ readSource });
+  expectPoolClosed(report);
+  expect(report.sources.find(row => row.source === 'workers'))
+    .toMatchObject({ ok: false, error: 'invalid source result' });
+  expect(readSource.mock.calls.map(([name]) => name)).toEqual(Object.keys(SOURCES));
+});
+
+it('duplicate job evidence with unknown or failed-source flags still holds every grant', () => {
+  for (const patch of [{ unknown: true }, { sourceOk: false }]) {
+    for (const taintedSource of ['workers', 'fix']) {
+      const report = collectPool({ readSource: source => ({ ...validPoolSource(source),
+        holders: ['fix', 'workers'].includes(source) ? [{
+          resource: 'studio.units', source, kind: 'fix', class: 3, size: 2, jobId: 'same-job',
+          ...(source === taintedSource ? patch : {}),
+        }] : [] }) });
+      expect(report.rows.every(row => row.unknown && row.poolDecision === 'hold')).toBe(true);
+      expect(report.rows.every(row => row.reason.includes('inspect named sources and rerun'))).toBe(true);
+      expectPoolClosed(report);
+    }
+  }
+});
+
+it('retained evidence rejected by grant validation makes the report and digest unknown', () => {
+  for (const patch of [{ unknown: true }, { sourceOk: false }]) {
+    const report = collectPool({ readSource: source => ({ ...validPoolSource(source),
+      holders: source === 'workers' ? [{
+        resource: 'studio.units', source, kind: 'fix', class: 3, size: 2, ...patch,
+      }] : [] }) });
+    expect(report.holders).toHaveLength(1);
+    expect(report.rows.every(row => row.unknown && row.poolDecision === 'hold')).toBe(true);
+    expectPoolClosed(report);
+    expect(report.digest).toBe('pool studio ?/?u · C2 ? C3 ? (floor 4)');
+  }
+});
+
+it('duplicate fix jobId across claim and workers counts once while unrelated and unidentified jobs remain', () => {
+  const report = collectPool({ readSource: source => ({ ...validPoolSource(source),
+    holders: ['fix', 'workers'].includes(source) ? [
+      { resource: 'studio.units', source, kind: 'fix', class: 3, size: 2, jobId: 'same-job' },
+      { resource: 'studio.units', source, kind: 'fix', class: 3, size: 2, jobId: `${source}-other` },
+      { resource: 'studio.units', source, kind: 'fix', class: 3, size: 2 },
+    ] : [] }) });
+  expect(report.unknown).toBe(false);
+  expect(report.holders).toHaveLength(5);
+  expect(report.summary['studio.units'].classes[3]).toBe(10);
+});
+
+it('same fix jobId in different repos stays counted while each claim/worker pair deduplicates', () => {
+  const report = collectPool({ readSource: source => ({ ...validPoolSource(source),
+    holders: ['fix', 'workers'].includes(source) ? ['owner/first', 'owner/second'].map(repo => ({
+      resource: 'studio.units', source, kind: 'fix', class: 3, size: 2, jobId: 'same-job', repo,
+    })) : [] }) });
+  expect(report.unknown).toBe(false);
+  expect(report.holders.map(holder => holder.repo)).toEqual(['owner/first', 'owner/second']);
+  expect(report.summary['studio.units'].classes[3]).toBe(4);
+});
+
+it('three same-jobId workers in one source make the next fix a class-max hold', () => {
+  for (const [claims, workers] of [[0, 3], [1, 3], [3, 1], [3, 3]]) {
+    const report = collectPool({ readSource: source => ({ ...validPoolSource(source),
+      holders: Array.from({ length: source === 'fix' ? claims : source === 'workers' ? workers : 0 },
+        (_, index) => ({ resource: 'studio.units', source, kind: 'fix', class: 3, size: 2,
+          repo: 'owner/fixture', jobId: 'same-job', id: `${source}-${index}` })),
+    }) });
+    expect(report.unknown).toBe(false);
+    expect(report.holders).toHaveLength(3);
+    expect(report.summary['studio.units'].classes[3]).toBe(6);
+    expect(report.rows.find(row => row.kind === 'fix'))
+      .toMatchObject({ poolDecision: 'hold', reason: 'class max', unknown: false });
+  }
+});
+
+it('legacy throw produces unknown comparison without changing pool admission', () => {
+  const normal = collectPool(), legacy = vi.fn(() => { throw Error('legacy unavailable'); });
+  const failed = collectPool({ legacy });
+  expect(failed.unknown).toBe(false);
+  expect(failed.rows).toEqual(normal.rows.map(row => ({ ...row, legacyDecision: 'unknown' })));
+  expect(legacy.mock.calls.map(([args]) => args)).toEqual(['review', 'review', 'fix']
+    .map(kind => ({ kind, env: {}, nowMs, root: coord })));
+});
+
+it('collector emits exactly review, redTeam, fix and appends three rows', () => {
+  const report = collectPool();
+  expect(report.unknown).toBe(false);
+  expect(report.rows.map(row => row.kind)).toEqual(['review', 'redTeam', 'fix']);
+  expect(report.rows.map(row => [row.class, row.host, row.ts])).toEqual([2, 2, 3]
+    .map(priority => [priority, 'fixture-host', new Date(nowMs).toISOString()]));
+  expect(report.rows.every(row => row.poolDecision === 'grant' && row.legacyDecision === 'grant')).toBe(true);
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(nowMs);
+  try { expect(appendShadowRows(report.rows, { coord, env: {}, mode: report.mode })).toBe(true); }
+  finally { clock.mockRestore(); }
+  const lines = fs.readFileSync(join(coord, 'resource', 'pool-shadow.jsonl'), 'utf8').trimEnd().split('\n');
+  expect(lines).toHaveLength(3);
+  expect(lines.map(line => JSON.parse(line))).toEqual(report.rows);
+});
+
+it('off mode appends nothing', () => {
+  const append = vi.fn();
+  expect(appendShadowRows(collectPool().rows, { coord, env: {}, mode: 'off', append })).toBe(false);
+  expect(append).not.toHaveBeenCalled();
+  expect(fs.existsSync(join(coord, 'resource', 'pool-shadow.jsonl'))).toBe(false);
+});
+
+it.each([['false result', () => false], ['throw', () => { throw Error('disk full'); }]])(
+  'append failure returns false without throwing or continuing: %s', (_label, fail) => {
+    const append = vi.fn(fail);
+    expect(appendShadowRows(collectPool().rows, { coord, env: {}, append })).toBe(false);
+    expect(append).toHaveBeenCalledTimes(1);
+  });
+
+it.each([false, true])('collector performs zero writes with a pre-existing shadow ledger=%s', present => {
+  const ledger = join(coord, 'resource', 'pool-shadow.jsonl');
+  if (present) fs.writeFileSync(ledger, 'malformed ledger; never admission evidence');
+  guard.active = true;
+  try {
+    expect(collectPool()).toEqual(collectPool());
+    expect(guard.writes).toEqual([]);
+    expect(guard.children).toEqual([]);
+    expect(fs.existsSync(ledger)).toBe(present);
+    if (present) expect(fs.readFileSync(ledger, 'utf8')).toBe('malformed ledger; never admission evidence');
+  } finally { guard.active = false; }
 });

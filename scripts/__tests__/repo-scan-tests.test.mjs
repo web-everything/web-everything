@@ -21,6 +21,15 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const MULTI = 'scripts/__tests__/multi-repo-checks.test.mjs';
 
 describe('selectScanTests', () => {
+  it('registers the audit nonconvergence scanner with its scoped in-file tag', () => {
+    const test = 'scripts/operations/__tests__/audit-nonconvergence.test.mjs';
+    const entry = REPO_SCAN_TESTS.find(e => e.test === test);
+    expect(entry?.scope).toBe('files');
+    expect(readFileSync(join(root, test), 'utf8')).toContain(`${SCAN_TEST_TAG} scope=files`);
+    expect(selectScanTests({ changedFiles: ['scripts/operations/new-consumer.mjs'] }).scoped).toContain(entry);
+    expect(selectScanTests({ changedFiles: [test] }).widened).toContain(entry);
+    expect(selectScanTests({ changedFiles: ['docs/readme.md'] }).scoped).not.toContain(entry);
+  });
   it('selects scoped push boundaries for scripts and widens for rule or allowlist edits', () => {
     const test = 'scripts/__tests__/push-gate-boundary.test.mjs';
     for (const ext of ['mjs', 'js', 'cjs', 'ts', 'mts', 'cts']) {

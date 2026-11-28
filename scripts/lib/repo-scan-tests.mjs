@@ -45,6 +45,20 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
   {
+    test: 'scripts/__tests__/pr-workflows-cancel-superseded.test.mjs',
+    scope: 'files',
+    why: 'retired runner labels are scoped to changed workflows; existing concurrency prefix invariants retain their whole-workflow check',
+    matches: (f) => /^\.github\/workflows\/[^/]+\.ya?ml$/.test(f),
+    inputs: ['scripts/__tests__/pr-workflows-cancel-superseded.test.mjs', 'scripts/lib/repo-scan-tests.mjs'],
+  },
+  {
+    test: 'scripts/operations/__tests__/audit-nonconvergence.test.mjs',
+    scope: 'files',
+    why: 'keeps the explicitly invoked diagnostic free of production consumers and mutating adapters',
+    matches: (f) => f.startsWith('scripts/') && /\.(mjs|cjs|js|ts)$/.test(f) && !skipped(f),
+    inputs: ['scripts/operations/__tests__/audit-nonconvergence.test.mjs'],
+  },
+  {
     test: 'scripts/__tests__/push-gate-boundary.test.mjs',
     scope: 'files',
     why: 'pins raw-push site counts per tracked non-test script; rule or allowlist edits require the full inventory',
@@ -167,6 +181,7 @@ export const REPO_SCAN_TESTS = Object.freeze([
  * @type {Readonly<Record<string, string>>}
  */
 export const DEFERRED_SCAN_TESTS = Object.freeze({
+  'scripts/conveyor/__tests__/stand-down.test.mjs': 'fixed-source contract test: reads the named fix-agent brief and stand-down module, never enumerates the repo; shell execution uses temporary fixture roots; CI runs it on every PR and verify runs it when the test itself changes',
   'scripts/operations/__tests__/direct-exec-tripwire.test.mjs': 'static tripwire: reads three named dispatch modules and walks scripts/ once for launch call sites; small and hermetic; CI runs it on every PR and verify runs it when the test file itself changes',
   'scripts/lib/__tests__/file-class-policy.test.mjs': 'one record-only check walks scripts/ to assert no other script imports the file-class engine; it loads the engine so vitest related selects it when the engine changes, and CI runs it on every PR',
   'scripts/lib/__tests__/settings-registry.test.mjs': 'false positive: git ls-files checks only the named generated settings-registry.md path is untracked; it does not enumerate the repo for a rule scan, and imports settings-registry.mjs so vitest related selects it when the generator changes',

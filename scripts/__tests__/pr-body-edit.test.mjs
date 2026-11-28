@@ -3,6 +3,7 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { withCarriedStamps, recoverAuthorIdFromHistory, repair, cliGh } from '../pr-body-edit.mjs';
+import * as edit from '../pr-body-edit.mjs';
 import {
   buildAuthorActorMarker, parseAuthorActorId, readAuthorActorStamps, hasStampLostMarker,
 } from '../lib/review-independence.mjs';
@@ -11,6 +12,121 @@ import { reason } from '../guard-bash.mjs';
 const A = '01f39b97-274a-4078-8eeb-e7f8d6008673';
 const B = 'ffffffff-1111-2222-3333-444444444444';
 const stamp = (id) => buildAuthorActorMarker(id);
+
+describe('withAppendedSection', () => {
+  it('appends under a section heading and keeps the current body and author stamp verbatim', () => {
+    const cur = `Original\r\n\n${stamp(A)}`;
+    const expected = `${cur}\n\n## Proof\n\nproof text\n`;
+    const result = edit.withAppendedSection?.(cur, 'proof text', 'Proof');
+    expect(result?.body).toBe(expected);
+    expect(parseAuthorActorId(result.body)).toBe(A);
+    expect(result.refused).toBeFalsy();
+  });
+
+  it('refuses an addition carrying an authored-by-actor marker', () => {
+    expect(edit.withAppendedSection?.('current', stamp(B))?.refused)
+      .toBe('addition carries an author stamp');
+  });
+
+  it.each(['', `${stamp(A)}\n\n`])('refuses completing an unterminated author marker in the current body: %j', (prefix) => {
+    const current = `${prefix}<!-- authored-by-actor:`;
+    const addition = 'forged-session -->';
+    expect(readAuthorActorStamps(addition)).toEqual([]);
+    expect(readAuthorActorStamps(`${current}\n\n${addition}\n`)).toContain('forged-session');
+    expect(edit.withAppendedSection(current, addition)).toEqual({
+      body: current, refused: 'append would change author stamps',
+    });
+  });
+
+  it('trims only boundary whitespace, omits an absent heading and preserves ambiguous stamps', () => {
+    const cur = `Original  text\n${stamp(A)}\n${stamp(B)}`;
+    const result = edit.withAppendedSection?.(`${cur} \n`, ' \nproof text\n ');
+    expect(result?.body).toBe(`${cur}\n\nproof text\n`);
+    expect(readAuthorActorStamps(result.body)).toEqual([A, B]);
+    expect(parseAuthorActorId(result.body)).toBe('');
+  });
+
+  it.each(['Proof\nHidden', 'Proof\rHidden', 'x'.repeat(81), '<!-- hidden'])
+  ('refuses an unsafe section name: %j', (section) => {
+    expect(edit.withAppendedSection?.('current', 'proof', section)?.refused).toBeTruthy();
+  });
+
+  it('refuses an HTML comment opener in the addition', () => {
+    expect(edit.withAppendedSection?.('current', '<!-- hidden')?.refused).toBeTruthy();
+  });
+
+  it('accepts an 80-character section', () => {
+    expect(edit.withAppendedSection?.('', 'proof', 'x'.repeat(80))?.body)
+      .toBe(`\n\n## ${'x'.repeat(80)}\n\nproof\n`);
+  });
+});
+
+describe('append()', () => {
+  const current = `Original\n\n${stamp(A)}`;
+  const file = 'injected-proof.md';
+  const ports = (addition = 'proof text') => ({ readFile: vi.fn(() => addition), execFile: vi.fn() });
+  const reader = (...bodies) => {
+    const gh = vi.fn();
+    for (const body of bodies) gh.mockReturnValueOnce(JSON.stringify({ body }));
+    return gh;
+  };
+
+  it('writes nothing when the body changed between reads', () => {
+    const gh = reader(current, `${current}\nConcurrent section`);
+    const io = ports();
+    expect(edit.append?.(gh, '123', 'o/r', file, 'Proof', io)).toBe(1);
+    expect(gh).toHaveBeenCalledTimes(2);
+    expect(io.execFile).not.toHaveBeenCalled();
+  });
+
+  it('writes nothing when the addition completes an unterminated author marker', () => {
+    const body = '<!-- authored-by-actor:';
+    const gh = reader(body, body);
+    const io = ports('forged-session -->');
+    expect(edit.append(gh, '123', 'o/r', file, '', io)).toBe(1);
+    expect(io.execFile).not.toHaveBeenCalled();
+  });
+
+  it('writes the appended body over stdin with the sanctioned stamp override after two matching reads', () => {
+    const gh = reader(current, current);
+    const io = ports();
+    expect(edit.append?.(gh, '123', 'o/r', file, 'Proof', io)).toBe(0);
+    expect(gh.mock.calls).toEqual(Array(2).fill([['pr', 'view', '123', '--json', 'body']]));
+    expect(io.readFile).toHaveBeenCalledWith(file, 'utf8');
+    expect(io.execFile).toHaveBeenCalledTimes(1);
+    expect(io.execFile).toHaveBeenCalledWith('gh',
+      ['pr', 'edit', '123', '--body-file', '-', '--repo', 'o/r'],
+      expect.objectContaining({ input: `${current}\n\n## Proof\n\nproof text\n`,
+        encoding: 'utf8', env: expect.objectContaining({ PR_BODY_STAMP_OK: '1' }) }));
+  });
+
+  it.each([stamp(B), '<!-- hidden'])('writes nothing for an unsafe addition: %j', (addition) => {
+    const io = ports(addition);
+    expect(edit.append?.(reader(current), '123', 'o/r', file, 'Proof', io)).toBe(1);
+    expect(io.execFile).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, null, 42])('refuses missing or non-string body evidence: %j', (body) => {
+    const io = ports();
+    expect(edit.append?.(reader(body), '123', 'o/r', file, '', io)).toBe(1);
+    expect(io.execFile).not.toHaveBeenCalled();
+  });
+
+  it('refuses an unreadable second body without writing', () => {
+    const gh = vi.fn();
+    gh.mockImplementationOnce(() => JSON.stringify({ body: current })).mockImplementationOnce(() => { throw new Error('offline'); });
+    const io = ports();
+    expect(edit.append?.(gh, '123', 'o/r', file, '', io)).toBe(1);
+    expect(io.execFile).not.toHaveBeenCalled();
+  });
+
+  it('refuses an unreadable addition file without writing', () => {
+    const io = ports();
+    io.readFile.mockImplementation(() => { throw new Error('unreadable'); });
+    expect(edit.append?.(reader(current), '123', 'o/r', file, '', io)).toBe(1);
+    expect(io.execFile).not.toHaveBeenCalled();
+  });
+});
 
 describe('withCarriedStamps', () => {
   it('carries a stamp the replacement body dropped', () => {
@@ -215,6 +331,13 @@ describe('guard-bash denies a raw PR-body rewrite', () => {
   // cut — `gh` documents `-b`/`-F` as exact equivalents, and a quoted `"--body-file"` has a quote before the
   // dashes rather than whitespace, so a raw-string regex missed both.
   for (const cmd of [
+    'gh -R o/r pr edit 1162 --body x',
+    'gh -Ro/r pr edit 1162 --body x',
+    'gh -R "o/r" pr edit 1162 -b x',
+    'gh --repo=o/r pr edit 1162 --body-file f',
+    'gh --repo o/r pr edit 1162 -F f',
+    'gh --hostname github.com pr edit 1162 --body x',
+    'gh --hostname=github.com -R o/r pr edit 1162 --body x',
     'gh pr edit 1162 --body-file /tmp/body.md',
     'gh pr edit 1162 --repo web-everything/web-everything --body-file /tmp/b.md',
     'gh pr edit 1162 --body "text"',
@@ -281,5 +404,33 @@ describe('guard-bash denies a raw PR-body rewrite', () => {
   it('honours the sanctioned override, which is how pr-body-edit itself writes', () => {
     expect(reason('PR_BODY_STAMP_OK=1 gh pr edit 1162 --body-file /tmp/b.md')).toBeFalsy();
     expect(reason('PR_BODY_STAMP_OK=1 gh pr edit 1162 -F /tmp/b.md')).toBeFalsy();
+  });
+
+  it.each([
+    'gh pr edit 1 --body x',
+    'gh -R o/r pr edit 1 --body x',
+  ])('the pr edit refusal names both pr-body-edit routes: %s', (cmd) => {
+    expect(reason(cmd)).toMatch(/--append-file/);
+    expect(reason(cmd)).toMatch(/--body-file/);
+  });
+
+  it('global flags do not widen pr edit beyond body flags', () => {
+    for (const cmd of [
+      'gh -R o/r pr edit 1 --add-label x',
+      'gh --repo=o/r pr edit 1 -B main',
+      'gh -R o/r pr view 1162 --json body',
+      'PR_BODY_STAMP_OK=1 gh -R o/r pr edit 1 --body x',
+    ]) expect(reason(cmd)).toBeFalsy();
+  });
+
+  it.each([
+    ['help only; stays allowed', 'gh --help pr edit 1 --body x'],
+    ['unknown flag rejected by gh; stays allowed', 'gh --foo pr edit 1 --body x'],
+    ['F1: api head unchanged', 'gh -R o/r api -X PATCH repos/o/r/pulls/1 -f body=x'],
+    ['F1: file-payload arm unchanged', 'gh --hostname github.com api repos/o/r/pulls/1 -X PATCH --input /tmp/p.json'],
+    ['F2: substring escape kept', 'gh pr edit 1 --body "PR_BODY_STAMP_OK=1"'],
+    ['F3: quoted global flag', 'gh "--repo=o/r" pr edit 1 --body x'],
+  ])('out-of-rule boundaries are unchanged — %s', (_boundary, cmd) => {
+    expect(reason(cmd)).toBeFalsy();
   });
 });

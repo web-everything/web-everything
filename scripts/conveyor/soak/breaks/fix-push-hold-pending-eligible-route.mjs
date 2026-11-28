@@ -24,6 +24,18 @@ const CASES = [
     { labels: ['review:changes', 'red-team:pending'], mergeable: 'MERGEABLE', baseRefName: 'main' }, 'red-team:pending'],
   ['red-team:blocked stays held', { mode: 'advisory-fix', labels: ['review:human'] },
     { labels: ['review:human', 'advisory:changes', 'red-team:pending', 'red-team:blocked'] }, 'red-team:pending'],
+  ['E4 operator send-back launches through pending', { mode: 'operator-send-back',
+    operatorSendBack: { verdictId: 'SB1', body: 'fix A4' }, labels: ['review:changes', 'review:human'] },
+    { labels: ['review:changes', 'review:human', 'red-team:pending'], mergeable: 'MERGEABLE', baseRefName: 'main' }, null],
+  ['E4 empty body stays held', { mode: 'operator-send-back',
+    operatorSendBack: { verdictId: 'SB1', body: '' }, labels: ['review:changes', 'review:human'] },
+    { labels: ['review:changes', 'review:human', 'red-team:pending'], mergeable: 'MERGEABLE', baseRefName: 'main' }, 'red-team:pending'],
+  ['E4 UNKNOWN mergeability stays held', { mode: 'operator-send-back',
+    operatorSendBack: { verdictId: 'SB1', body: 'fix A4' }, labels: ['review:changes', 'review:human'] },
+    { labels: ['review:changes', 'review:human', 'red-team:pending'], mergeable: 'UNKNOWN', baseRefName: 'main' }, 'red-team:pending'],
+  ['mixed advisory-fix plus operatorSendBack stays held', { mode: 'advisory-fix',
+    operatorSendBack: { verdictId: 'SB1', body: 'fix A4' }, labels: ['review:human'] },
+    { labels: ['review:human', 'advisory:changes', 'red-team:pending'] }, 'red-team:pending'],
 ];
 
 const PROBE = `
@@ -46,7 +58,7 @@ function probe(root) {
 
 export default {
   id: 'fix-push-hold-pending-eligible-route',
-  title: 'red-team:pending blocks merge, not an eligible advisory-fix, conflict-bounce or plain send-back push',
+  title: 'red-team:pending blocks merge, not an eligible advisory-fix, conflict-bounce, plain or operator send-back push',
   card: 'REDTEAM-RECOVERY-V2 (SHIP-WM-278, FLOW-DMN-080)',
   fixedBy: { sha: 'pending', where: 'lane/redteam-request-recovery', paths: [DISPATCH] },
   // Decided by behaviour: the two eligible routes launch through pending.

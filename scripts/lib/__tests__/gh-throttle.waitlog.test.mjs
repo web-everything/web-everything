@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, readFileSync, writeFileSync, existsSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runGhSync, recordGhWaitLogEntry, ghWaitLogCaller, GH_WAITLOG_FILENAME, GH_WAITLOG_MAX_BYTES } from '../gh-throttle.mjs';
+import { runGhSync, recordGhWaitLogEntry, ghWaitLogCaller, GH_WAITLOG_FILENAME, GH_WAITLOG_MAX_BYTES } from './gh-throttle.window-fixture.mjs';
 
 function fixture(fn) {
   const lockRoot = mkdtempSync(join(tmpdir(), 'gh-waitlog-'));

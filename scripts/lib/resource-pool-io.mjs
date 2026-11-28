@@ -3,7 +3,8 @@ import * as fs from 'node:fs';
 import { readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { basename, join } from 'node:path';
-import { POOL_DEFAULTS, validClasses, budgetFromSnapshot } from './resource-pool.mjs';
+import { POOL_DEFAULTS, validClasses, budgetFromSnapshot, grantDecision, summarize, digestLine } from './resource-pool.mjs';
+import { appendResourceLog, admit } from './resource-admission.mjs';
 import { readPoolLaneStatus, poolLaneLeased } from './resource-pool-lanes.mjs';
 import { admissionLockRoot, loadAdmissionPolicy, resolveSlotSpan, slotPath } from '../readiness/heavy-admission.mjs';
 import { EXEMPT_DISPATCH_KINDS, PREPARE_DISPATCH_KINDS } from '../readiness/heavy-queue-projection.mjs';
@@ -20,7 +21,7 @@ import { cascadePolicy, readPlatformPreferences, formatCascadeSourcesLine } from
 import { parseSessionSlug } from '../conveyor/session-slug.mjs';
 import { readEnumOverride } from './operator-enum-store.mjs';
 import { readSettingsChecked, SETTINGS_DIR, LEGACY_SETTINGS_PATH } from './settings-files.mjs';
-// No red-team job can legitimately retain a lease beyond one day.
+// Diagnostic age threshold only: active rows still require proven death before omission.
 export const RED_TEAM_HARD_LEASE_CEILING_MS = 24 * 60 * 60 * 1000;
 const object = v => v !== null && typeof v === 'object' && !Array.isArray(v);
 const integer = v => Number.isInteger(v) && v >= 0 && v <= 64;
@@ -35,7 +36,30 @@ export function readPoolJson(path, { io = fs } = {}) {
     let size = 0, n;
     while (size < buffer.length && (n = io.readSync(fd, buffer, size, buffer.length - size, null)) > 0) size += n;
     if (size > info.size || size > limit) throw Error('source grew during read; inspect source manually');
-    const text = buffer.toString('utf8', 0, size), data = JSON.parse(text);
+    const text = buffer.toString('utf8', 0, size);
+    // Consume string tokens atomically and track keys per object, including escaped aliases.
+    const containers = [];
+    for (let i = 0; i < text.length; i++) {
+      const char = text[i];
+      if (char === '{') containers.push(new Set());
+      else if (char === '[') containers.push(null);
+      else if (char === '}' || char === ']') containers.pop();
+      else if (char === '"') {
+        const start = i++;
+        while (i < text.length && text[i] !== '"') {
+          if (text[i] === '\\') i++;
+          i++;
+        }
+        let next = i + 1;
+        while (next < text.length && /\s/.test(text[next])) next++;
+        if (text[next] !== ':') continue;
+        const key = JSON.parse(text.slice(start, i + 1)), keys = containers.at(-1);
+        if (!(keys instanceof Set)) throw Error('invalid source object; inspect source manually');
+        if (keys.has(key)) throw Error('duplicate source key; repair source and rerun');
+        keys.add(key);
+      }
+    }
+    const data = JSON.parse(text);
     if (!object(data)) throw Error('expected source object; inspect source manually');
     return { data, text, mtimeMs: info.mtimeMs };
   } finally { io.closeSync(fd); }
@@ -168,13 +192,14 @@ export function poolPidAlive(pid, kill = (p, signal) => process.kill(p, signal))
   try { kill(pid, 0); return true; }
   catch (e) { return e.code === 'ESRCH' ? false : e.code === 'EPERM' ? true : null; }
 }
-export function readPoolSource(source, { paths, coord, env = process.env, nowMs = Date.now(),
+export function readPoolSource(source, { paths, coord, env = process.env, nowMs = Date.now(), cwd = process.cwd(), readRegistry,
   roundBudget = liveReviewRoundBudget, run = execFileSync,
   listCommands = () => run('ps', ['-Aww', '-o', 'pid=,ppid=,command='], { encoding: 'utf8', timeout: 10000, maxBuffer: 32 * 1024 * 1024 }),
   heavyStatus = () => readPoolHeavyHeld({ env }),
-  laneStatus = () => readPoolLaneStatus({ env, nowMs, run, readJson: json }),
+  laneStatus = () => readPoolLaneStatus({ env, nowMs, cwd, run, readJson: json, readRegistry }),
   processAlive = poolPidAlive, readStart = pidStartTime, host = hostname(), namespace = pidNamespace(),
-  slotAlive = (data, { statusAt }) => {
+  slotAlive } = {}) {
+  const processSlotAlive = data => {
     const killAlive = pid => {
       const alive = processAlive(pid);
       if (typeof alive !== 'boolean') throw Error('unknown process liveness');
@@ -182,7 +207,8 @@ export function readPoolSource(source, { paths, coord, env = process.env, nowMs 
     };
     if (data.host && data.host !== host) return null;
     return probeSlotAlive(data, { killAlive, readStart, host, namespace });
-  } } = {}) {
+  };
+  slotAlive ??= processSlotAlive;
   let expiredRedTeamRows = 0;
   try {
     const holders = [];
@@ -261,16 +287,83 @@ export function readPoolSource(source, { paths, coord, env = process.env, nowMs 
           || !['queued', 'running', 'finished', 'ok', 'failed', 'cancelled', 'canceled', 'timeout', 'timed-out', 'error'].includes(row.status)) throw Error('invalid red-team status');
         const statusAt = checked.mtimeMs;
         if (!Number.isFinite(statusAt)) throw Error('invalid red-team mtime; inspect status manually');
-        if (nowMs - statusAt > RED_TEAM_HARD_LEASE_CEILING_MS) { expiredRedTeamRows++; continue; }
         if (!['running', 'queued'].includes(row.status)) continue;
         if (row.pid == null) throw Error(`unknown red-team liveness: ${entry.name}; missing pid; inspect status manually`);
         if (!Number.isSafeInteger(row.pid) || row.pid <= 0) throw Error(`invalid red-team pid: ${entry.name}`);
         if (typeof row.pidStart !== 'string' || !row.pidStart.trim()) throw Error(`invalid red-team pidStart: ${entry.name}`);
-        const alive = slotAlive(row, { statusAt });
+        // Old rows bypass the slot callback only after direct process-identity evidence.
+        // Age alone never releases a live holder or excuses unreadable liveness.
+        const alive = nowMs - statusAt > RED_TEAM_HARD_LEASE_CEILING_MS
+          ? processSlotAlive(row) : slotAlive(row, { statusAt });
         if (typeof alive !== 'boolean') throw Error(`unknown red-team liveness: ${entry.name}; inspect host/process access`);
         if (alive) add('redTeam', `${row.repo}:${row.pr}:${row.head}`, 2, 1);
+        else if (nowMs - statusAt > RED_TEAM_HARD_LEASE_CEILING_MS) expiredRedTeamRows++;
       }
     } else throw Error('unknown source');
     return { source, ok: true, holders, budget, snapshot, expiredRedTeamRows };
   } catch (e) { return { source, ok: false, holders: [], expiredRedTeamRows, error: `${clean(e.message)}; inspect source and rerun` }; }
+}
+
+/** Even a thrown null or a throwing message getter is failed evidence. */
+function errorText(e) {
+  try { return clean(String(e?.message ?? e)); }
+  catch { return 'unprintable error'; }
+}
+export function collectResourcePool({ env = process.env, nowMs = Date.now(), coord = resolveCoordinationRoot({ env }),
+  settings = loadPoolSettings({ env }), paths = poolSourcePaths({ env, coord }), readSource = readPoolSource,
+  legacy = admit, host = hostname() } = {}) {
+  const sources = Object.entries(SOURCES).map(([source, description]) => {
+    let result;
+    try { result = readSource(source, { paths, coord, env, nowMs }); }
+    catch (e) { result = { source, ok: false, holders: [], error: errorText(e) }; }
+    if (result?.source !== source || !Array.isArray(result?.holders) || typeof result?.ok !== 'boolean'
+      || result.unknown || result.holders.unknown
+      || result.holders.some(h => !h || h.source !== source || ![2, 3].includes(h.class) || ![1, 2].includes(h.size))
+      || (source === 'snapshot' && result.ok && (result.budget?.unknown !== false
+        || !Number.isInteger(result.budget.units) || result.budget.units < 0 || result.budget.units > 30))) result = { ok: false, holders: [], error: 'invalid source result' };
+    return { ...result, source, description, path: paths[source] ?? (source === 'workers' ? 'lane lease files / heavy-admission' : 'ps process inventory') };
+  });
+  // Claims bridge dispatch to worker startup: overlap across sources describes one job.
+  // Preserve each source's multiplicity: retain the largest per-source count for a job.
+  // Missing job identity stays separately counted; never guess from a lane or display ID.
+  // An explicit repo scopes a jobId; identical IDs from different repos are distinct jobs.
+  const jobs = new Map();
+  const holders = sources.flatMap(s => {
+    const sourceJobs = new Map();
+    return (s.ok ? s.holders : []).filter(holder => {
+      // Preserve refusal flags for grantDecision, even behind a healthy duplicate.
+      if (holder.unknown || holder.sourceOk === false) return true;
+      if (holder.kind !== 'fix' || typeof holder.jobId !== 'string' || !holder.jobId) return true;
+      const jobKey = JSON.stringify([holder.repo ?? null, holder.jobId]);
+      const count = (sourceJobs.get(jobKey) ?? 0) + 1;
+      sourceJobs.set(jobKey, count);
+      if (count <= (jobs.get(jobKey) ?? 0)) return false;
+      jobs.set(jobKey, count);
+      return true;
+    });
+  });
+  const unknown = !!settings.unknown || sources.some(s => !s.ok)
+    || sources.find(s => s.source === 'snapshot')?.budget?.unknown !== false;
+  const budgets = { 'studio.units': sources.find(s => s.source === 'snapshot')?.budget?.units };
+  const rows = [['review', 2, 1], ['redTeam', 2, 1], ['fix', 3, 2]].map(([kind, priority, size]) => {
+    const pool = grantDecision({ budget: budgets['studio.units'], held: holders, class: priority, size,
+      classes: settings.value.classes, builderFloor: settings.value.builderFloor, unknown });
+    let old;
+    try { old = legacy({ kind: kind === 'redTeam' ? 'review' : kind, env, nowMs, root: coord }); } catch { /* comparison unknown */ }
+    return { ts: new Date(nowMs).toISOString(), host, resource: 'studio.units', kind, class: priority,
+      poolDecision: pool.decision, legacyDecision: old?.unknown || !old ? 'unknown' : old.verdict === 'admit' ? 'grant' : 'hold',
+      legacySource: 'resource-admission.admit (resource check only; dispatch caps excluded)',
+      unknown: unknown || pool.unknown, reason: pool.reason };
+  });
+  const report = { mode: settings.value.mode, configuredMode: settings.configuredMode,
+    unknown: unknown || rows.some(row => row.unknown), holders, sources, settings,
+    budgets, summary: summarize(holders), rows, builderFloor: settings.value.builderFloor,
+    scope: 'S1a partial inventory: C2 review rounds/red-team, C3 fix/ci-heal claims and live workers', shrink: null };
+  report.digest = digestLine(report);
+  return report;
+}
+export function appendShadowRows(rows, { env = process.env, coord = resolveCoordinationRoot({ env }), mode = 'shadow', append = appendResourceLog } = {}) {
+  if (mode === 'off') return false;
+  try { for (const row of rows) if (append(join(coord, 'resource', 'pool-shadow.jsonl'), row) === false) return false; return true; }
+  catch { return false; }
 }

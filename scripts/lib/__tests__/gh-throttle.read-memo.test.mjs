@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import * as gh from '../gh-throttle.mjs';
+import * as gh from './gh-throttle.window-fixture.mjs';
 
 const made = [];
 afterEach(() => {

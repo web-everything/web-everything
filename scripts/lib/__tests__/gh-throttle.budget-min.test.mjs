@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve as resolvePath } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import * as gh from '../gh-throttle.mjs';
+import * as gh from './gh-throttle.window-fixture.mjs';
 
 const KEY = 'gh.throttle.pointsBudgetPerMin';
 const ENV = 'WE_GH_THROTTLE_POINTS_BUDGET_PER_MIN';
@@ -102,7 +102,7 @@ describe.each(['sync', 'cli'])('%s native process output fidelity with budget re
       const status = ${status};
       const stdout = status === 0 ? 'x'.repeat(3 * 1024 * 1024) : 'partial';
       const stderr = ${outcome === 'success' ? "'w'.repeat(3 * 1024 * 1024)" : JSON.stringify(stderr)};
-      const throttle = { lockRoot: ${JSON.stringify(dir)}, cap: 2, maxAttempts: 1,
+      const throttle = { pointsAlgorithm: 'window', lockRoot: ${JSON.stringify(dir)}, cap: 2, maxAttempts: 1,
         env: { WE_GH_THROTTLE_POINTS_BUDGET_PER_MIN: '375', WE_GH_THROTTLE_NO_BUDGET_PROBE: '1' } };
       if (${JSON.stringify(mode)} === 'cli') {
         const result = runGhCliPassthrough(['api', 'user'], { throttle,

@@ -49,6 +49,46 @@ export function withCarriedStamps(current, next) {
   return { body: `${next.replace(/\s*$/, '')}\n\n${markers.join('\n')}\n`, carried };
 }
 
+/** Append evidence without replacing existing text or accepting forged/hidden authorship. Pure. */
+export function withAppendedSection(current, addition, section = '') {
+  if (readAuthorActorStamps(addition).length) return { body: current, refused: 'addition carries an author stamp' };
+  if (/[\r\n]/.test(section) || section.length > 80) return { body: current, refused: 'section must be one line of at most 80 characters' };
+  if (section.includes('<!--') || addition.includes('<!--')) return { body: current, refused: 'section or addition carries an HTML comment opener' };
+  const body = `${current.trimEnd()}\n\n${section ? `## ${section}\n\n` : ''}${addition.trim()}\n`;
+  // An addition can complete a marker opened in current without carrying a marker itself.
+  if (JSON.stringify(readAuthorActorStamps(body)) !== JSON.stringify(readAuthorActorStamps(current))) {
+    return { body: current, refused: 'append would change author stamps' };
+  }
+  return { body, refused: '' };
+}
+
+/** Compare live bodies before the stdin write; unreadable evidence never authorizes an edit. */
+export function append(gh, pr, repo, file, section, { readFile = readFileSync, execFile = execFileSync } = {}) {
+  try {
+    const readBody = () => {
+      const body = JSON.parse(gh(['pr', 'view', pr, '--json', 'body'])).body;
+      if (typeof body !== 'string') throw new Error('unreadable body');
+      return body;
+    };
+    const current = readBody();
+    const result = withAppendedSection(current, readFile(file, 'utf8'), section);
+    if (result.refused) {
+      writeLineSync(2, `pr-body-edit: #${pr} refused — ${result.refused}; correct the addition or section and retry`);
+      return 1;
+    }
+    if (readBody() !== current) {
+      writeLineSync(2, `pr-body-edit: #${pr} refused — body changed before write; retry from fresh evidence`);
+      return 1;
+    }
+    writeBody(pr, repo, result.body, execFile);
+    writeLineSync(1, `pr-body-edit: #${pr} appended section; existing author stamps preserved`);
+    return 0;
+  } catch {
+    writeLineSync(2, `pr-body-edit: #${pr} append failed; check file and PR evidence are readable before retrying`);
+    return 1;
+  }
+}
+
 /**
  * #3067's RECOVERY — find the author stamp GitHub's own edit history still remembers, when the LIVE body has
  * none. `fromBodies` is every prior body state the caller read from GitHub's edit history (oldest or newest order does not matter — every one is scanned). Pure.
@@ -113,6 +153,14 @@ function main(argv) {
   const file = arg('body-file');
   const repo = arg('repo');
   const gh = cliGh(repo);
+  const appendFile = arg('append-file');
+  if (argv.some((a) => a.startsWith('--append-file='))) {
+    if (!pr || !appendFile || argv.includes('--repair') || argv.some((a) => a.startsWith('--body-file='))) {
+      writeLineSync(2, 'usage: pr-body-edit.mjs --pr=<n> --append-file=<path> [--section=<name>] [--repo=<owner/name>]; cannot combine with --body-file or --repair');
+      return 2;
+    }
+    return append(gh, pr, repo, appendFile, arg('section'));
+  }
   if (argv.includes('--repair')) {
     if (!pr) {
       writeLineSync(2, 'usage: pr-body-edit.mjs --pr=<n> --repair [--repo=<owner/name>]');
@@ -126,7 +174,8 @@ function main(argv) {
   }
   if (!pr || !file) {
     writeLineSync(2, 'usage: pr-body-edit.mjs --pr=<n> --body-file=<path> [--repo=<owner/name>]\n'
-      + '   or: pr-body-edit.mjs --pr=<n> --repair [--repo=<owner/name>]');
+      + '   or: pr-body-edit.mjs --pr=<n> --repair [--repo=<owner/name>]\n'
+      + '   or: pr-body-edit.mjs --pr=<n> --append-file=<path> [--section=<name>] [--repo=<owner/name>]');
     return 2;
   }
   const current = JSON.parse(gh(['pr', 'view', pr, '--json', 'body'])).body || '';

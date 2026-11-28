@@ -3830,7 +3830,9 @@ order and has no notion of an open PR still in review.
    `review:accepted`, and does not itself depend on X. Blockers, hard dependencies, and a PR whose file list
    is unknown (hit a listing cap) are exempt and never yield. Full mechanical shape (the exact fields, the
    drain plumbing, the idle-accounting treatment): `we:scripts/conveyor/land-overlap-yield.mjs` per the
-   #4308 build card.
+   #4308 build card. A PR the drain has refused this pass as `mq-same-head-failed` with the typed cause
+   `head-failed` (a complete merge-queue timeline with a failed removal bound to its exact current head)
+   is not a yield target for the rest of that pass; any other or missing cause leaves the yield unchanged.
 2. **This is a conflict-COST strategy, not a conflict-reduction one.** It decides **who pays** for reconciling
    an overlap that already exists (the smaller PR re-lands with less to re-review than the larger one would),
    and stops the repeated knock-back of one large PR — it does not shrink the underlying edit collision.
@@ -6759,3 +6761,19 @@ plus its tested guards. It composes with [#deterministic-core-thin-judgment](#de
 writers to `main` keep no unlocked fallback.
 
 **Lineage:** `#4219`.
+
+### Delegated clear-human: required checks present (ADM-REVIEW-GATE-PIN slice 1)
+
+Delegated clear-human counts checks as passing only when every required check is present and green; a
+merge-gate or review-gate row never counts toward that, in any state. Adding or removing a review-gate
+row must leave the eligibility result and refusal reasons unchanged.
+
+The required names come from `DECLARED_REQUIRED_STATUS_CHECKS[repo]` in
+`scripts/lib/required-status-checks.mjs`; `evaluateEligibility` accepts an explicit `requiredChecks` list.
+A missing, non-array or empty list, a non-string or blank name, or a merge-gate/review-gate name
+(case-insensitive) refuses with `required check list invalid`. A missing required name refuses with
+`required check <name> missing`. Names use `name || context`; verdicts use `conclusion || state`.
+Green means SUCCESS, NEUTRAL or SKIPPED, case-insensitive. Any other verdict on any non-hold row
+refuses with `check <name> is <verdict>`, including a superseded failure beside a newer success of the
+same name. That conservative refusal may defer a clearance until the stale row leaves the rollup.
+Other eligibility conditions, modes and the sanctioned writer remain unchanged.

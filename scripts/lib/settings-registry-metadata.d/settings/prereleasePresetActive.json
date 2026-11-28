@@ -1,0 +1,6 @@
+{
+  "description": "Observe-only, off until S13. Strict boolean; invalid disables with warning. True requires future UTC expiry from the same layer. No gate consumes it in S2.",
+  "owner": "scripts/settings/delivery-tiers.json",
+  "changeVia": "pr",
+  "instant": false
+}

@@ -569,6 +569,10 @@ export async function runReconcileCiHealDispatch({
     const { dispatched, refusals } = outcome;
     let launch = null;
     try {
+      if (entry.admission?.admitted !== true) {
+        refusals.push({ pr: entry.prNumber, kind: 'x-no-admission', why: 'CI-heal requires an explicit planner admission' });
+        continue;
+      }
       if (fixLoop.killed()) {
         refusals.push({ pr: entry.prNumber, kind: 'fix-dispatch-killed', why: `kill file ${fixDispatchKillFile()} present` });
         continue;

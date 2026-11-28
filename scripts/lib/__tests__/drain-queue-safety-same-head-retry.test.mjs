@@ -66,6 +66,46 @@ function fixture(test) {
 
 const declined = f => f.log.mock.calls.map(([line]) => line).filter(line => /^mq-same-head-retry-declined:/.test(line));
 
+function causePreferences(fn) {
+  const root = mkdtempSync(join(tmpdir(),'same-head-cause-'));
+  try {
+    const preferences = join(root,'preferences.json');
+    writeFileSync(preferences,'{}');
+    vi.stubEnv('WE_PLATFORM_PREFERENCES_FILE',preferences);
+    fn();
+  } finally { vi.unstubAllEnvs(); rmSync(root,{recursive:true,force:true}); }
+}
+
+describe('typed same-head hold causes', () => {
+  it.each(['confirmed failure','queue read error','incomplete timeline','untyped event','merge conflict','authorized retry'])(
+    'keeps the hold shape and refresh gate for %s', scenario => causePreferences(() => fixture(f => {
+      const base = f.exec;
+      f.exec = vi.fn((command,args,opts) => {
+        if (scenario === 'queue read error' && args.some(a => a.includes('isInMergeQueue'))) throw new Error('fixture unreadable queue');
+        if (scenario === 'incomplete timeline' && args.some(a => a.includes('timelineItems')))
+          return JSON.stringify({data:{repository:{pullRequest:{timelineItems:{nodes:f.events,pageInfo:{hasPreviousPage:true}}}}}});
+        return base(command,args,opts);
+      });
+      if (scenario === 'untyped event') f.events.push({reason:'failed_checks'});
+      if (scenario === 'merge conflict') { f.events[0].reason = 'merge_conflict'; f.live.mergeStateStatus = 'BLOCKED'; }
+      if (scenario !== 'authorized retry') { f.list = {ok:false,error:'fixture no retry evidence'}; f.checks = []; }
+      const has = vi.fn(() => true);
+      const decision = mqSameHeadGuard({repo,pr,head,exec:f.exec,log:f.log,now:NOW,readFreeze:() => null,
+        quarantine:{readList:() => f.list,now:() => NOW}, refresh:{store:{has}}});
+      expect(Object.keys(decision)).toEqual(['hold','line']);
+      expect(decision.hold).toBe(scenario !== 'authorized retry');
+      expect(decision.cause).toBe(scenario === 'confirmed failure' ? 'head-failed' : scenario === 'authorized retry' ? null : 'unknown');
+      // store.has is the first effect of mqSameHeadRefresh; only the confirmed hold reaches it.
+      expect(has).toHaveBeenCalledTimes(scenario === 'confirmed failure' ? 1 : 0);
+    })));
+
+  it('exports the closed same-head cause vocabulary', async () => {
+    const { MQ_SAME_HEAD_CAUSES } = await import('../drain-queue-safety.mjs');
+    expect(MQ_SAME_HEAD_CAUSES).toEqual(['head-failed','unknown']);
+    expect(Object.isFrozen(MQ_SAME_HEAD_CAUSES)).toBe(true);
+  });
+});
+
 it('mqSameHeadGuard reads ANSI-colored job logs with the escape flag and reaches the quarantine retry decision', () => fixture(f => {
   const base = f.exec;
   f.exec = vi.fn((command, args, opts) => {
@@ -1006,6 +1046,19 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     f.events.push({ ...added, createdAt: iso(removedAt + 60_000) });
     expectExactHold(f, /failed_checks \(the two infrastructure retries were already spent\); operator must inspect history and enqueue manually/);
   }));
+
+  it('an authorized infrastructure retry has null cause and never invokes refresh', () => causePreferences(() => exactFixture(f => {
+    f.mqChecks = [check(31, 'test-shard (1)', 800, 'cancelled')];
+    f.artifacts = {}; f.reports = {};
+    const has = vi.fn(() => true);
+    const result = mqSameHeadGuard({ repo,pr:exactPr,head,exec:f.exec,log:f.log,now:f.now,readFreeze:() => null,
+      quarantine:{readList:() => ({ok:false,error:'fixture no quarantine'}),now:() => NOW},refresh:{store:{has}} });
+    expect(result.hold).toBe(false);
+    expect(result.cause).toBeNull();
+    expect(Object.keys(result)).toEqual(['hold','line']);
+    expect(has).not.toHaveBeenCalled();
+    expect(f.log.mock.calls[0][0]).toMatch(/infra retry 2\/2/);
+  })));
 
   it('preserves the two-removal infrastructure retry route without exact-test report evidence', () => exactFixture(f => {
     f.mqChecks = [check(31, 'test-shard (1)', 800, 'cancelled')];

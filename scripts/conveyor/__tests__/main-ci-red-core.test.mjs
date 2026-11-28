@@ -7,6 +7,7 @@
  * full local gate before the push only delays CI.
  */
 import { describe, it, expect } from 'vitest';
+import { reportMainRedMetrics, validMainRedMetric } from '../main-ci-red-core.mjs';
 import {
   MAIN_CI_RED_DEFAULTS, mainCiRedSettings, buildOwnerBrief, resolveMainFixPushPolicy, formatMainFixPushPolicyLine,
   MAIN_FIX_PUSH_BEFORE_GATE_ENV,
@@ -96,5 +97,232 @@ describe('main-red rerun and repair declaration settings', () => {
       mainCiRedOwnerLabels: [], mainCiRedOwnerSupersedeMarker: false };
     expect(mainCiRedSettings(config)).toMatchObject(config);
     expect(mainCiRedSettings({ mainCiRedFlakeRerun: 'false' }).mainCiRedFlakeRerun).toBe(true);
+  });
+});
+
+
+describe('red metrics evidence', () => {
+  it('keeps queued-but-not-started and missing timestamps unknown, separate from service time', async () => {
+    const { measureMainQueue } = await import('../main-ci-red-core.mjs');
+    expect(measureMainQueue({ enqueuedAt: 1000 })).toEqual({ waitMs: null, serviceMs: null });
+    expect(measureMainQueue({ startedAt: 4000, completedAt: 9000 })).toEqual({ waitMs: null, serviceMs: 5000 });
+    expect(measureMainQueue({ enqueuedAt: 1000, startedAt: 4000, completedAt: 9000 }))
+      .toEqual({ waitMs: 3000, serviceMs: 5000 });
+    expect(measureMainQueue({ enqueuedAt: 5000, startedAt: 4000 }).waitMs).toBeNull();
+  });
+
+  it('keeps a valid wait and nulls service when completion precedes start', async () => {
+    const { measureMainQueue } = await import('../main-ci-red-core.mjs');
+    expect(measureMainQueue({ enqueuedAt: 1000, startedAt: 4000, completedAt: 3000 }))
+      .toEqual({ waitMs: 3000, serviceMs: null });
+  });
+
+  it('normalizes whitespace and slash direction before signing', async () => {
+    const { mainFailureSignature } = await import('../main-ci-red-core.mjs');
+    const base = mainFailureSignature({ job: 'x y', file: 'a/b', test: 't' });
+    expect(base).toMatch(/^v1:[a-f0-9]{64}$/);
+    expect(mainFailureSignature({ job: ' x  y ', file: 'a/b', test: 't' })).toBe(base);
+    expect(mainFailureSignature({ job: 'x\ty', file: 'a/b', test: 't' })).toBeNull(); // controls are refused, not collapsed
+    expect(mainFailureSignature({ job: 'x y', file: 'a\\b', test: 't' })).toBe(base);
+    expect(mainFailureSignature({ job: 'x y', file: '  a\\\\b ', test: 't' }))
+      .toBe(mainFailureSignature({ job: 'x y', file: 'a//b', test: 't' }));
+    expect(mainFailureSignature({ job: 'x y', file: 'a/c', test: 't' })).not.toBe(base);
+  });
+
+  it.each(['ghp_x', 'gho_x', 'ghu_x', 'ghs_x', 'ghr_x', 'github_pat_x', 'sk-a', 'SK-A1',
+    'password=x', 'secret: x', 'authorization=x', 'token :x', 'Authorization:x'])(
+  'refuses credential-shaped identifier %s in every field', async text => {
+    const { mainFailureSignature } = await import('../main-ci-red-core.mjs');
+    for (const field of ['job', 'file', 'test']) expect(mainFailureSignature({ [field]: text })).toBeNull();
+  });
+
+  it('versions stable signatures from structured identifiers and refuses secret or oversized text', async () => {
+    const { mainFailureSignature } = await import('../main-ci-red-core.mjs');
+    const ids = { job: 'test-shard (3)', file: 'scripts/a.test.mjs', test: 'rejects routes' };
+    expect(mainFailureSignature(ids)).toMatch(/^v1:[a-f0-9]{64}$/);
+    expect(mainFailureSignature({ ...ids, error: 'token=secret', log: '\u001b[31mboom' })).toBe(mainFailureSignature(ids));
+    expect(mainFailureSignature({ job: 'test\u0000' })).toBeNull();
+    expect(mainFailureSignature({ job: 'token=supersecret' })).toBeNull();
+    expect(mainFailureSignature({ job: 'a'.repeat(1025) })).toBeNull();
+    expect(mainFailureSignature({})).toBeNull();
+  });
+});
+
+
+describe('red metrics replay audit regressions', () => {
+  const event = (changes = {}) => ({ v: 1, key: 'event', repo: 'fixture/repo', head: 'a'.repeat(40),
+    seq: 1, runId: 1, kind: 'red', at: 1000, since: 0, signature: null,
+    queue: { waitMs: 100, serviceMs: null }, truncated: false, ...changes });
+  const options = { from: 0, to: 10000, now: 10000 };
+
+  it.each([
+    ['ISO observation', { kind: 'unknown', at: '2026-11-26T00:00:00Z' }],
+    ['ISO origin', { since: '2026-11-25T00:00:00Z' }],
+    ['out-of-range observation', { at: 8640000000000001 }],
+    ['out-of-range origin', { at: 1e20, since: 1e20 }],
+  ])('rejects %s with an incomplete-evidence warning', async (_label, changes) => {
+    const { validMainRedMetric, reportMainRedMetrics } = await import('../main-ci-red-core.mjs');
+    expect(validMainRedMetric(event(changes))).toBe(false);
+    expect(reportMainRedMetrics([event(changes)], options).warnings.join(' ')).toMatch(/incomplete.*malformed/i);
+  });
+
+  it('refuses unrepresentable query timestamps without crashing daily replay', async () => {
+    const { reportMainRedMetrics } = await import('../main-ci-red-core.mjs');
+    const report = reportMainRedMetrics([event({ at: 1e20, since: 1e20 })], { from: 1e20, to: 1e20 + 1e6, now: 1e20 + 1e6 });
+    expect(report.warnings.join(' ')).toMatch(/incomplete range/i);
+  });
+
+  it('does not count future-only observations as coverage of the requested range', async () => {
+    const { reportMainRedMetrics } = await import('../main-ci-red-core.mjs');
+    const report = reportMainRedMetrics([event({ at: 20000 })], options);
+    expect(report.days).toEqual({});
+    expect(report.warnings.join(' ')).toMatch(/history does not cover.*recover/i);
+  });
+
+  it('warns when a queue observation survives without its red episode start', async () => {
+    const { reportMainRedMetrics } = await import('../main-ci-red-core.mjs');
+    const report = reportMainRedMetrics([event({ kind: 'queue', at: 0 })], options);
+    expect(report.warnings.join(' ')).toMatch(/queue.*no episode start.*recover/i);
+  });
+});
+
+
+describe('red metrics report', () => {
+  const minute = 60000;
+  const signature = `v1:${'a'.repeat(64)}`;
+  const event = (kind, at, changes = {}) => ({ v: 1, key: `${kind}-${at}`, repo: 'fixture/repo',
+    head: 'abcdef0', seq: 1, runId: 1, kind, at: at * minute, since: 0,
+    queue: { waitMs: 100, serviceMs: 200 }, signature, truncated: false, ...changes });
+  const report = (events, from = 0, to = 90) => reportMainRedMetrics(events,
+    { from: from * minute, to: to * minute, now: to * minute });
+
+  it('warns for a repository missing start coverage even when another repository covers it', () => {
+    const covered = event('red', 0);
+    const late = event('red', 2, { repo: 'other/repo', since: minute });
+    expect(report([covered], 0, 10).warnings).toEqual([]);
+    const mixed = report([covered, late], 0, 10);
+    expect(mixed.days).toEqual({ '1970-01-01': 19 });
+    expect(mixed.warnings.join(' ')).toMatch(/history does not cover.*other\/repo.*recover/i);
+    expect(report([covered, { ...late, since: 0 }], 0, 10).warnings).toEqual([]);
+  });
+
+  it('warns on conflicting open episode origins in either direction and preserves the first evidence', () => {
+    const check = (first, second, minutes) => {
+      const rows = [event('red', 2, { since: first }), event('red', 3, { since: second })];
+      const replay = report(rows, 0, 10);
+      expect(replay.days).toEqual({ '1970-01-01': minutes });
+      expect(replay.openEpisodes).toBe(1);
+      expect(replay.warnings.join(' ')).toMatch(/Incomplete episode origin:.*conflicting.*recover/i);
+      expect(report([rows[0], { ...rows[1], since: first }], 0, 10).warnings.join(' '))
+        .not.toMatch(/conflicting/);
+    };
+    check(minute, 0, 9);
+    check(0, minute, 10);
+  });
+
+  it('red metrics report — a closed episode keeps its end across a later unknown then green', () => {
+    const r = report([event('red', 30), event('green', 40), event('unknown', 60), event('green', 80)]);
+    expect(r.days).toEqual({ '1970-01-01': 40 });
+    expect(r.openEpisodes).toBe(0);
+  });
+  it('red metrics report — an unknown observation never closes an open episode', () => {
+    const r = report([event('red', 10, { since: 10 * minute }), event('unknown', 20)]);
+    expect(r.days).toEqual({ '1970-01-01': 80 });
+    expect(r.openEpisodes).toBe(1);
+    expect(r.warnings.join(' ')).toMatch(/Unknown observation/);
+  });
+  it('red metrics report — unknown queue wait, orphan recovery and a future end warn', () => {
+    const unknownWait = report([event('red', 0, { queue: { waitMs: null, serviceMs: 200 } })]);
+    expect(unknownWait.queue.unknown).toBe(1);
+    expect(unknownWait.warnings.join(' ')).toMatch(/^Unknown queue wait: .*recover timestamps\.$/);
+    const orphan = report([event('green', 10, { seq: 2 })]);
+    expect(orphan.warnings).toContain('Incomplete range: recovery has no episode start; recover archived evidence.');
+    const future = reportMainRedMetrics([event('red', 0)], { from: 0, to: 20 * minute, now: 10 * minute });
+    expect(future.days).toEqual({});
+    expect(future.openEpisodes).toBe(0);
+    expect(future.warnings.join(' ')).toMatch(/Incomplete range: invalid range/);
+  });
+  it('retains the latest queue timings before to', () => {
+    const timed = (t, waitMs, serviceMs, changes = {}) => event('queue', t, { queue: { waitMs, serviceMs }, ...changes });
+    const rows = [timed(90, 999, 999), timed(5, 300, 400), event('red', 0, { queue: { waitMs: 100, serviceMs: 200 } }),
+      timed(3, 500, 600)];
+    const r = report(rows);
+    expect(r.queue.waitMs).toEqual([300]);
+    expect(r.queue.serviceMs).toEqual([400]);
+  });
+  it('red metrics report — repeated queue samples of one run give one queue sample and count each signature observation', () => {
+    const r = report([event('red', 0, { signature: null }), ...[1, 2, 3].map(t => event('queue', t))]);
+    expect(r.queue.waitMs).toEqual([100]);
+    expect(r.signatures).toEqual([{ signature, observations: 3 }]);
+  });
+  it('red metrics report — a pre-range sample of an episode open into the range is kept, a lone pre-range sample of a closed episode is not', () => {
+    const r = report([event('red', 0), event('queue', 5), event('red', 1, { seq: 2, runId: 2 }),
+      event('green', 10, { seq: 2 })], 10);
+    expect(r.queue.waitMs).toEqual([100]);
+    expect(r.signatures).toEqual([]);
+  });
+  it('red metrics report — a pre-range red observation of a closed episode adds no queue sample and no signature observation', () => {
+    const r = report([event('red', 0), event('green', 5)], 10);
+    expect(r.queue.waitMs).toEqual([]);
+    expect(r.signatures).toEqual([]);
+  });
+  it('red metrics report — events at exactly to are excluded', () => {
+    const r = report([event('red', 0), event('green', 90), event('queue', 90, { key: 'queue-end', runId: 2 }),
+      event('unknown', 90)]);
+    expect(r.openEpisodes).toBe(1);
+    expect(r.queue.waitMs).toEqual([100]);
+    expect(r.signatures).toEqual([{ signature, observations: 1 }]);
+    expect(r.warnings).toEqual([]);
+  });
+  it('red metrics report — signatures entries carry observations and no count field', () => {
+    expect(report([event('red', 0)]).signatures).toEqual([{ signature, observations: 1 }]);
+  });
+  it('red metrics report — a repeated start of a closed episode warns, never merges', () => {
+    const r = report([event('red', 0), event('green', 40), event('red', 60, { since: 50 * minute })]);
+    expect(r.days).toEqual({ '1970-01-01': 40 });
+    expect(r.openEpisodes).toBe(0);
+    expect(r.warnings).toContain('Incomplete episode identity: an episode start repeats a closed episode; recover archived evidence.');
+  });
+  it('red episode crossing midnight counts each minute once after restart', () => {
+    const midnight = Date.parse('2026-11-26T00:00:00Z');
+    const rows = [event('red', 0, { at: midnight - 5 * minute, since: midnight - 10 * minute }),
+      event('green', 1, { at: midnight + 10 * minute, since: null })];
+    const r = reportMainRedMetrics(JSON.parse(JSON.stringify(rows)),
+      { from: midnight - 10 * minute, to: midnight + 30 * minute, now: midnight + 30 * minute });
+    expect(r.days).toEqual({ '2026-11-25': 10, '2026-11-26': 10 });
+  });
+  it('unions overlapping episode signals and reports unknown observations and incomplete bounds', () => {
+    const r = report([event('red', 10, { since: 5 * minute, truncated: true }),
+      event('red', 20, { seq: 2, since: 10 * minute }), event('unknown', 25),
+      event('green', 40), event('green', 50, { seq: 2 })]);
+    expect(r.days).toEqual({ '1970-01-01': 45 });
+    expect(r.warnings.join(' ')).toMatch(/history does not cover/);
+    expect(r.warnings.join(' ')).toMatch(/Unknown observation/);
+    expect(r.warnings.join(' ')).toMatch(/Incomplete episode origin/);
+  });
+  it('accepts exactly thirty days and refuses even one millisecond more', () => {
+    const to = 30 * 86400000;
+    expect(reportMainRedMetrics([event('red', 0)], { from: 0, to, now: to }).days).toHaveProperty('1970-01-30');
+    const r = reportMainRedMetrics([event('red', 0)], { from: 0, to: to + 1, now: to + 1 });
+    expect(r.days).toEqual({});
+    expect(r.warnings.join(' ')).toMatch(/retention limit.*archive/);
+  });
+  it('refuses oversized event scans with a recovery warning', () => {
+    const r = report(Array(10001).fill(event('red', 0)));
+    expect(r.days).toEqual({});
+    expect(r.warnings).toHaveLength(1);
+    expect(r.warnings[0]).toMatch(/scan limit.*archive/);
+  });
+  it('skips malformed and oversized evidence and keeps the first conflicting duplicate', () => {
+    const first = event('red', 0);
+    const r = report([first, { ...first, since: 1, at: minute },
+      event('queue', 2, { extra: 'x'.repeat(9000) }), event('green', 40)]);
+    expect(r.days).toEqual({ '1970-01-01': 40 });
+    expect(r.warnings.join(' ')).toMatch(/conflicting duplicate/);
+    expect(r.warnings.join(' ')).toMatch(/malformed\/oversized/);
+  });
+  it.each([{ extra: true }, { truncated: undefined }, { truncated: 'yes' },
+    { queue: { waitMs: 1, serviceMs: 2, nested: {} } }, { signature: {} }])('rejects nonexact event shape %j', changes => {
+    expect(validMainRedMetric(event('red', 0, changes))).toBe(false);
   });
 });

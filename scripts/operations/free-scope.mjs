@@ -4,11 +4,11 @@
  * file/subtree conflicts have the same meaning for operators and workers; partial reads never claim free.
  * No filesystem, clock, process or network access. The declared reader is injected by the IO boundary.
  *
- * WHY (operator handoff rules 21 and 26, 2026-10-05): "free scope" means no overlap with (a) the files of any
- * open PR in web-everything/web-everything or plateauapp/plateau-app AND (b) the declared target files of every
- * agent still running without a PR. Agents declare (b) in the shared registry
- * `~/workspace/.operations/coordination/agent-scopes.json` via `we:scripts/operations/free-scope-cli.mjs register`;
- * an entry past its TTL (or past its heartbeat window, when registered with one) is ignored and reported, never silently trusted. Skill: `we:skills-src/free-scope/SKILL.md`.
+ * WHY: Free scope means no overlap with the files of any open PR in web-everything/web-everything,
+ * frontier-ui/frontierui or plateauapp/plateau-app, and with every live registry entry; `fui:` names the
+ * same repo as `frontierui:`, and an unreadable PR list for any of these repos makes the verdict unknown,
+ * never free. Agents declare targets via `we:scripts/operations/free-scope-cli.mjs register`; an entry
+ * past its TTL or heartbeat window is ignored and reported. Skill: `we:skills-src/free-scope/SKILL.md`.
  */
 import { op } from './registry.mjs';
 import { compute } from './step-kinds.mjs';
@@ -16,10 +16,10 @@ import { scopeEntriesOverlap } from '../readiness/scope-lease.mjs';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from '../lib/constellation-repos.mjs';
 
 export const FREE_SCOPE_OP = 'free-scope';
-/** The repos whose open PRs count — WE and plateau-app, read from the one constellation table. */
-export const DEFAULT_REPOS = Object.freeze(['we', 'plateau-app'].map((key) => CONSTELLATION_REPOS[key].slug));
+/** All three repos count; an unreadable PR list makes the verdict unknown. WE stays first for callers. */
+export const DEFAULT_REPOS = Object.freeze(['we', 'frontierui', 'plateau-app'].map((key) => CONSTELLATION_REPOS[key].slug));
 export const DEFAULT_TTL_HOURS = 4;
-const alias = (key) => ({ webeverything: 'we', 'web-everything': 'we', plateau: 'plateau-app' })[key] || key;
+const alias = (key) => ({ webeverything: 'we', 'web-everything': 'we', plateau: 'plateau-app', fui: 'frontierui' })[key] || key;
 export function repoKeyFor(slug) {
   return repoKeyForSlug(slug) ?? slug.split('/').at(-1);
 }

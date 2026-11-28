@@ -12,7 +12,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runGhCliPassthrough, runGhSync, acquireGhSlotSync, ghThrottleLogPath, GH_OUTER_INV_ENV, GH_OUTER_TIMEOUT_ENV, GH_OUTER_KILL_SIGNAL_ENV } from '../gh-throttle.mjs';
+import { runGhCliPassthrough, runGhSync, acquireGhSlotSync, ghThrottleLogPath, GH_OUTER_INV_ENV, GH_OUTER_TIMEOUT_ENV, GH_OUTER_KILL_SIGNAL_ENV } from './gh-throttle.window-fixture.mjs';
 
 const made = [];
 const tmp = () => { const d = mkdtempSync(join(tmpdir(), 'gh-nested-')); made.push(d); return d; };

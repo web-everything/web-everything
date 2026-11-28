@@ -303,7 +303,7 @@ export async function prepareRebuild({
     // A store writer that checked its branch out in THIS clone (live 2026-10-09) is healed back to main when the
     // branch is allowlisted and only store files changed; anything else still refuses (wrong-branch-heal.mjs).
     if (readyOnly) return mutationDue('wrong-branch-heal');
-    const heal = healWrongBranch({ git, now: nowMs });
+    const heal = healWrongBranch({ git, now: nowMs, adoptedHead: state.adopted?.head ?? null });
     alert(heal.healed ? 'wrong-branch-healed' : 'wrong-branch-heal-refused', heal);
     if (heal.healed) {
       headRef = git(['symbolic-ref', '--short', 'HEAD']);

@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { classifyTier, fileTier, HIGH_MUST_STAY, TIER_RULES, NARROWED_NAME_GLOBS } from '../delivery-tier.mjs';
+import { classifyTier, fileTier, HIGH_MUST_STAY, TIER_RULES, NARROWED_NAME_GLOBS, readPrereleasePreset, activatePrereleasePreset } from '../delivery-tier.mjs';
 import { GUARD_FLOOR, REVIEW_AUTH_FLOOR, AUDITOR_FLOOR } from '../protected-path-floor.mjs';
 import { TRUST_CHAIN } from '../gate-config.mjs';
+import * as policyCascade from '../policy-cascade.mjs';
 
 
 // Concrete witnesses, including directory-marker entries from the protected floors.
@@ -259,4 +260,109 @@ describe('delivery tiers (observe-only)', () => {
   it.each(['../docs/x.md', '/docs/x.md', 'docs/../scripts/merge.mjs', 'docs/./x.md', 'docs//x.md', '', null])(
     'invalid path stays HIGH: %j', (path) => expect(classifyTier([path], builtins).tier).toBe('HIGH'),
   );
+});
+
+
+describe('prerelease preset settings (observe-only)', () => {
+  const now = Date.parse('2026-10-30T16:00:00.000Z');
+  const read = (settings, at = now) => readPrereleasePreset({ settings, now: at, platform: {}, env: {} });
+  const off = { active: false, expiresAt: null };
+  it('prerelease preset reads active off with no expiry until activated', () => {
+    expect(readPrereleasePreset({ platform: {}, env: {} })).toEqual(off);
+  });
+  it('activation stamps seven elapsed days in UTC across a DST edge without mutating settings', () => {
+    const settings = { extraHigh: [], prereleasePresetActive: false, prereleasePresetExpiresAt: null };
+    const activated = activatePrereleasePreset(settings, now);
+    expect(activated).toEqual({ ...settings, prereleasePresetActive: true,
+      prereleasePresetExpiresAt: '2026-11-06T16:00:00.000Z' });
+    expect(settings.prereleasePresetActive).toBe(false);
+    expect(settings.prereleasePresetExpiresAt).toBeNull();
+    expect(read(activated)).toEqual({ active: true, expiresAt: '2026-11-06T16:00:00.000Z' });
+  });
+  it('past expiry and the exact expiry boundary read inactive', () => {
+    const settings = activatePrereleasePreset({}, now);
+    const expiry = Date.parse(settings.prereleasePresetExpiresAt);
+    expect(read(settings, expiry - 1).active).toBe(true);
+    expect(read(settings, expiry).active).toBe(false);
+    expect(read(settings, expiry + 1).active).toBe(false);
+  });
+  it.each([undefined, null, [], {}, { prereleasePresetActive: 'true' },
+    { prereleasePresetActive: true }, { prereleasePresetActive: true, prereleasePresetExpiresAt: null },
+    ...['garbage', '2026-11-31T00:00:00.000Z', '2026-11-06', '2026-11-06T16:00:00-05:00', 42]
+      .map(prereleasePresetExpiresAt => ({ prereleasePresetActive: true, prereleasePresetExpiresAt })),
+  ])('malformed preset reads inactive: %j', settings => expect(read(settings)).toEqual(off));
+  it('unreadable and duplicate-key settings read inactive', () => {
+    for (const readSettings of [() => { throw Error('unreadable'); }, () => '{',
+      () => '{"prereleasePresetActive":false,"prereleasePresetActive":true,"prereleasePresetExpiresAt":"2026-11-06T16:00:00.000Z"}']) {
+      expect(readPrereleasePreset({ readSettings, now, platform: {}, env: {} })).toEqual(off);
+    }
+  });
+  it('invalid clocks refuse activation and read inactive', () => {
+    for (const invalid of [NaN, Infinity, '2026-10-30', null, 8.64e15]) {
+      expect(() => activatePrereleasePreset({}, invalid)).toThrow();
+      expect(read(activatePrereleasePreset({}, now), invalid)).toEqual(off);
+    }
+  });
+  it('preset settings never change classification and their files stay explicitly HIGH', () => {
+    const settings = activatePrereleasePreset({ extraHigh: [] }, now);
+    const paths = ['README.md', 'scripts/conveyor/x.mjs', 'scripts/settings/delivery-tiers.json'];
+    expect(classifyTier(paths, { ...builtins, settings })).toEqual(classifyTier(paths, builtins));
+    for (const path of ['scripts/settings/delivery-tiers.json',
+      'scripts/lib/settings-registry-metadata.d/settings/prereleasePresetActive.json',
+      'scripts/lib/settings-registry-metadata.d/settings/prereleasePresetExpiresAt.json']) {
+      expect(matchedHigh(path)).toBe(true);
+    }
+  });
+  it('logs effective settings with tool provenance through the shared cascade', () => {
+    const log = vi.fn();
+    readPrereleasePreset({ now, platform: {}, env: { WE_POLICY_CASCADE_LOG: '1' }, log });
+    expect(log.mock.calls.flat().join(' ')).toContain('tool');
+    expect(log.mock.calls.flat().join(' ')).toContain('prereleasePresetActive');
+  });
+  it('rejects an object resolved from platform active leaves despite explicit tool opt-out, with a warning', () => {
+    const log = vi.fn();
+    expect(readPrereleasePreset({ now, env: {}, log,
+      platform: { prereleasePresetActive: { unexpected: true } },
+      settings: { prereleasePresetActive: false, prereleasePresetExpiresAt: '2026-11-06T16:00:00.000Z' },
+    })).toEqual(off);
+    expect(log.mock.calls.flat().join(' ')).toMatch(/prereleasePresetActive.*boolean/);
+  });
+  it.each([{ unexpected: true }, 'true', null])('rejects non-boolean tool active %j with a validation warning', active => {
+    const log = vi.fn();
+    expect(readPrereleasePreset({ now, env: {}, log,
+      platform: activatePrereleasePreset({}, now),
+      settings: { prereleasePresetActive: active, prereleasePresetExpiresAt: '2026-11-06T16:00:00.000Z' },
+    })).toEqual(off);
+    expect(log.mock.calls.flat().join(' ')).toMatch(/prereleasePresetActive.*boolean/);
+  });
+  it('preserves explicit tool null expiry instead of borrowing a platform expiry for a tool active bit', () => {
+    expect(readPrereleasePreset({ now, env: {},
+      platform: { prereleasePresetExpiresAt: '2026-11-06T16:00:00.000Z' },
+      settings: { prereleasePresetActive: true, prereleasePresetExpiresAt: null },
+    })).toEqual(off);
+  });
+  it('uses the future expiry from the tool activation layer even when platform expiry differs', () => {
+    expect(readPrereleasePreset({ now, env: {},
+      platform: { prereleasePresetActive: false, prereleasePresetExpiresAt: '2026-10-29T16:00:00.000Z' },
+      settings: activatePrereleasePreset({}, now),
+    })).toEqual({ active: true, expiresAt: '2026-11-06T16:00:00.000Z' });
+  });
+  it('rejects activation resolved from platform with a valid future expiry resolved from tool', () => {
+    const settings = activatePrereleasePreset({}, now);
+    const active = policyCascade.resolveCascade({ standard: false, platform: true });
+    const expiry = policyCascade.resolveCascade({ tool: { expiresAt: settings.prereleasePresetExpiresAt } });
+    expect(active.value).toBe(true);
+    expect(active.sources['']).toBe('platform');
+    expect(Date.parse(expiry.value.expiresAt)).toBeGreaterThan(now);
+    expect(expiry.sources.expiresAt).toBe('tool');
+    // Isolate the reader's source check from its input validation using real cascade results.
+    const cascade = vi.spyOn(policyCascade, 'cascadePolicy')
+      .mockReturnValueOnce(active).mockReturnValueOnce(expiry);
+    try {
+      expect(readPrereleasePreset({ settings, now, platform: {}, env: {} })).toEqual(off);
+      expect(cascade).toHaveBeenCalledTimes(2);
+    } finally {
+      cascade.mockRestore();
+    }
+  });
 });

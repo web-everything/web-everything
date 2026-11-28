@@ -17,6 +17,8 @@ import { redTeamForHead, isPublishableRedTeamResult, readRedTeamDisposition, rea
 import { readQuarantine } from './red-main-quarantine-io.mjs';
 import { activeEntries, parseVitestFailures, QUARANTINE_SAFETY_NET_DEFAULTS } from './red-main-quarantine.mjs';
 
+export const MQ_SAME_HEAD_CAUSES = Object.freeze(['head-failed', 'unknown']);
+
 const mqOid = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.test(value) ? value.toLowerCase() : null;
 // Explicit failure reasons only; future enum values require operator inspection.
 const MQ_MERGE_CONFLICT_RETRY_CAP = 3;
@@ -207,7 +209,7 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
     return hold(`repeated merge_conflict ejection (${mergeConflictRemovals} times); operator must inspect history and enqueue manually`);
   if (mergeConflictRemovals > 0 && mergeState !== 'CLEAN')
     return hold(`merge_conflict removal and the PR is not CLEAN (${String(mergeState ?? 'unknown')}); not re-enqueuing`);
-  const retryDetails = `${retryEvidence?.mainRunId != null ? `; main run ${retryEvidence.mainRunId}` : ''}${retryEvidence?.failedNames?.length ? `; failed check(s): ${retryEvidence.failedNames.join(', ')}` : ''}${mqDerivedDetails(retryEvidence)}`;
+  const retryDetails = `${retryEvidence?.mainRunId != null ? `; main run ${retryEvidence.mainRunId}` : ''}${retryEvidence?.failedNames?.length ? `; failed check(s): ${retryEvidence.failedNames.join(', ')}` : ''}${mqDerivedDetails(retryEvidence)}${retryEvidence?.shadow ?? ''}`;
   return { hold: false, line: failedChecksRemovals > 0
     ? hold((cancelledRetry ? `failed_checks cancelled/regroup retry ${reenqueuedAfterFailure + 1}/${cancelledMax} (no failed required job; cancelled: ${retryEvidence.cancelledNames.join(', ')}; aggregate derived: ${retryEvidence.derivedNames.join(', ') || 'none'}; PR CLEAN)`
       : quarantineRetry ? 'failed_checks quarantine retry 1/1 (every failing test quarantined, PR CLEAN)'
@@ -817,7 +819,14 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         && retryPolicy.mqAggregateJobs.includes(localJob(check.name)))
       && rawFailed.every(check => cancelled(check) || check.conclusion === 'failure'
         && retryPolicy.mqAggregateJobs.includes(localJob(check.name)));
-    const attempts = inspectMqReruns({ checks: rawChecks, repo, commit: oid, removedAt });
+    const ejectAfter = retryPolicy.mqEjectAfterFailures ?? 1;
+    const attempts = inspectMqReruns({ checks: rawChecks, repo, commit: oid, removedAt, maxFailures: ejectAfter });
+    // Shadow: what the validator would say at 3, so the live evidence exists before the setting is raised.
+    const verdict = a => a.confirmed ? 'confirmed' : a.reason ? 'hold' : a.candidates.length ? 'rerun' : 'pending';
+    const shadow = ejectAfter === 1 ? (() => {
+      const at3 = inspectMqReruns({ checks: rawChecks, repo, commit: oid, removedAt, maxFailures: 3 });
+      return !at3.failures ? '' : `; mq-flake-shadow: actual=${verdict(attempts)} at3=${verdict(at3)} failures=${at3.failures ?? 0}`;
+    })() : '';
     if (cancelledRegroup) {
       if (rawFailed.length > MQ_INFRA_MAX_JOBS)
         return { logReason: `failed-job count exceeds ${MQ_INFRA_MAX_JOBS}-job limit; operator must inspect failed jobs and enqueue manually` };
@@ -1192,7 +1201,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
       failedNames,
       derivedNames,
       infra: blocked ? null : infra ? (attempts.confirmed ? 'rerun-green' : 'infra') : flaky ? 'flaky-test' : !hasAggregateCandidates && !logReason && mainRed ? 'main-red' : null,
-      logReason,
+      logReason, shadow,
       flakeReason: flaky ? null : flakeReason,
       mergeState };
   } catch { return null; }
@@ -1201,7 +1210,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
 /** Why a same-head failed_checks retry was declined, so a held PR is never silent. */
 function mqRetryDeclineReason(evidence, holdLine) {
   const base = mqRetryDeclineReasonBase(evidence, holdLine);
-  return evidence?.flakeReason ? `${base}; flake evidence: ${evidence.flakeReason}` : base;
+  return (evidence?.flakeReason ? `${base}; flake evidence: ${evidence.flakeReason}` : base) + (evidence?.shadow ?? '');
 }
 function mqRetryDeclineReasonBase(evidence, holdLine) {
   if (evidence?.infra === 'cancelled-regroup' && /already spent/.test(holdLine ?? ''))
@@ -1239,23 +1248,23 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
           ? readMqRetryEvidence({ repo, pr, head: currentHead, timeline, exec, rerunScope, dryRun, quarantine, now, readFreeze,
             retryPolicy: readDrainQueueSafety().value }) : undefined),
         mergeState: timelineHasConflict(timeline) ? readMqMergeState({ repo, pr, head: currentHead, exec }) : undefined });
+  // Unknown/incomplete history cannot authorize recovery. Require a failed removal bound to H.
+  const confirmed = !timeline?.error && timeline?.hasPreviousPage === false
+    && Array.isArray(timeline.nodes) && timeline.nodes.every(event =>
+      event?.__typename === 'AddedToMergeQueueEvent' || event?.__typename === 'HeadRefForcePushedEvent'
+      || (event?.__typename === 'RemovedFromMergeQueueEvent'
+        && (['manual', 'merged'].includes(mqRemovalReason(event))
+          || (mqFailureReasons.has(mqRemovalReason(event))
+            && mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid)))))
+    && timeline.nodes.some(event =>
+    event?.__typename === 'RemovedFromMergeQueueEvent'
+    && mqFailureReasons.has(mqRemovalReason(event))
+    && mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid) === currentHead);
   if (!decision.hold && decision.line) log(decision.line);
   if (decision.hold) {
     log(decision.line);
     if (timelineHasFailedChecks(timeline, currentHead))
       log(`mq-same-head-retry-declined: #${String(pr).replace(/\D/g, '')} head ${currentHead} — ${mqRetryDeclineReason(retryEvidence, decision.line)}${retryEvidence?.failedNames?.length ? `; failed check(s): ${retryEvidence.failedNames.join(', ')}` : ''}${mqDerivedDetails(retryEvidence)}${retryEvidence?.derivedNames?.length && retryEvidence.mainRunId != null ? `; main run ${retryEvidence.mainRunId}` : ''}`);
-    // Unknown/incomplete history cannot authorize recovery. Require a failed removal bound to H.
-    const confirmed = !timeline?.error && timeline?.hasPreviousPage === false
-      && Array.isArray(timeline.nodes) && timeline.nodes.every(event =>
-        event?.__typename === 'AddedToMergeQueueEvent' || event?.__typename === 'HeadRefForcePushedEvent'
-        || (event?.__typename === 'RemovedFromMergeQueueEvent'
-          && (['manual', 'merged'].includes(mqRemovalReason(event))
-            || (mqFailureReasons.has(mqRemovalReason(event))
-              && mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid)))))
-      && timeline.nodes.some(event =>
-      event?.__typename === 'RemovedFromMergeQueueEvent'
-      && mqFailureReasons.has(mqRemovalReason(event))
-      && mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid) === currentHead);
     if (refresh && confirmed) mqSameHeadRefresh({ repo, pr, head: currentHead, exec, log, ...refresh });
   }
   // Keep the historical enumerable hold/line shape for existing callers. Outcome producers
@@ -1264,6 +1273,7 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
     ? `${decision.line}; ${mqRetryDeclineReason(retryEvidence, decision.line)}${mqDerivedDetails(retryEvidence)}${retryEvidence?.mainRunId != null ? `; main run ${retryEvidence.mainRunId}` : ''}`
     : decision.line;
   Object.defineProperties(decision, {
+    cause: { value: decision.hold ? (confirmed ? 'head-failed' : 'unknown') : null },
     reason: { value: reason }, mainRunId: { value: retryEvidence?.mainRunId ?? null },
   });
   return decision;
@@ -1280,9 +1290,9 @@ export function readDrainQueueSafety({ env = process.env, tool, platform, log = 
   }
   const positive = v => typeof v === 'number' && Number.isFinite(v) && v > 0;
   const r = cascadePolicy('drain', tool ?? (env.VITEST || env.WE_UNDER_TEST ? {} : readSettings().drain), {
-    env, platform, standard: { mqAggregateJobs: MQ_AGGREGATE_JOBS, mqCancelledRetryMax: 2, queueRebuildMax: 3, waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true, redTeamPendingBackoffSec: 300, redTeamPendingMaxMin: 45 },
-    valid: { mqAggregateJobs: validMqAggregateJobs, mqCancelledRetryMax: v => Number.isSafeInteger(v) && v >= 1 && v <= 2, queueRebuildMax: v => Number.isSafeInteger(v) && v > 0, waitForRedTeamBeforeEnqueue: v => typeof v === 'boolean', dequeueOnSendBack: v => typeof v === 'boolean', redTeamPendingBackoffSec: positive, redTeamPendingMaxMin: positive },
-    envValues: { mqAggregateJobs, mqCancelledRetryMax: numberEnv('WE_DRAIN_MQ_CANCELLED_RETRY_MAX'), queueRebuildMax: numberEnv('WE_DRAIN_QUEUE_REBUILD_MAX'), waitForRedTeamBeforeEnqueue: booleanEnv('WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE'), dequeueOnSendBack: booleanEnv('WE_DRAIN_DEQUEUE_ON_SEND_BACK'), redTeamPendingBackoffSec: numberEnv('WE_DRAIN_RED_TEAM_PENDING_BACKOFF_SEC'), redTeamPendingMaxMin: numberEnv('WE_DRAIN_RED_TEAM_PENDING_MAX_MIN') },
+    env, platform, standard: { mqAggregateJobs: MQ_AGGREGATE_JOBS, mqCancelledRetryMax: 2, mqEjectAfterFailures: 1, queueRebuildMax: 3, waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true, redTeamPendingBackoffSec: 300, redTeamPendingMaxMin: 45 },
+    valid: { mqAggregateJobs: validMqAggregateJobs, mqCancelledRetryMax: v => Number.isSafeInteger(v) && v >= 1 && v <= 2, mqEjectAfterFailures: v => Number.isSafeInteger(v) && v >= 1 && v <= 3, queueRebuildMax: v => Number.isSafeInteger(v) && v > 0, waitForRedTeamBeforeEnqueue: v => typeof v === 'boolean', dequeueOnSendBack: v => typeof v === 'boolean', redTeamPendingBackoffSec: positive, redTeamPendingMaxMin: positive },
+    envValues: { mqAggregateJobs, mqCancelledRetryMax: numberEnv('WE_DRAIN_MQ_CANCELLED_RETRY_MAX'), mqEjectAfterFailures: numberEnv('WE_DRAIN_MQ_EJECT_AFTER_FAILURES'), queueRebuildMax: numberEnv('WE_DRAIN_QUEUE_REBUILD_MAX'), waitForRedTeamBeforeEnqueue: booleanEnv('WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE'), dequeueOnSendBack: booleanEnv('WE_DRAIN_DEQUEUE_ON_SEND_BACK'), redTeamPendingBackoffSec: numberEnv('WE_DRAIN_RED_TEAM_PENDING_BACKOFF_SEC'), redTeamPendingMaxMin: numberEnv('WE_DRAIN_RED_TEAM_PENDING_MAX_MIN') },
   });
   log(formatCascadeSourcesLine('drain', r));
   // Retired: this switch let the drain enqueue an owed head with NO red-team result once the deadline passed. It is no
