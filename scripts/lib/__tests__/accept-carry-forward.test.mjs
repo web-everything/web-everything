@@ -73,6 +73,13 @@ describe('accepted never started: chained carry provenance', () => {
   it('second-hop carried envelope showing the chain-origin head is not a later verdict', () => {
     expect(latestAcceptRecord(chain(), []).laterVerdict).toBe(false);
   });
+  it('a chain anchored at a superseded acceptance retains the latest acceptance hold', () => {
+    const comments = [accepted(D), accepted(A), trusted(envelope(D, B, D)), trusted(envelope(B, C, D))];
+    const record = latestAcceptRecord(comments, []);
+    expect(record.sha).toBe(A);
+    expect(record.index).toBe(1);
+    expect(record.laterVerdict).toBe(true);
+  });
   it('a first-hop carry stays recognised without context', () => expect(isKnownMachineBody(envelope(A, B), trusted(''))).toBe(true));
   it('a second-hop carry without readable chain context holds', () => expect(isKnownMachineBody(envelope(), trusted(''))).toBe(false));
   it('oversized chain context holds for operator inspection', () => {

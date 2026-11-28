@@ -297,7 +297,8 @@ function verifiedCarryOrigin(edge, comment, displayed, { comments, acceptIndex }
     visited.add(head);
     const accepts = comments.flatMap((c, index) => isTrustedMarkerAuthor(c)
       && lastMatch(REVIEWED_SHA_RE, typeof c?.body === 'string' ? c.body : '') === head ? [index] : []);
-    if (accepts.some(index => index < before)) return [...visited].some(sha => displayed === sha.slice(0, 12));
+    // Provenance must reach the acceptance being evaluated, never a superseded record.
+    if (accepts.includes(acceptIndex) && acceptIndex < before) return [...visited].some(sha => displayed === sha.slice(0, 12));
     const predecessors = comments.flatMap((c, index) => {
       const parsed = parseVerdictCarriedMarker(c?.body);
       return parsed?.toSha === head ? [{ c, index, parsed }] : [];
