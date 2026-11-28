@@ -396,7 +396,8 @@ export function runRebuildChild({
 export function rebuildChildEnv(env = process.env, { ppid = process.ppid, host = hostname(), daemonReader = null } = {}) {
   const childEnv = { ...env, [REBUILD_AS_JOB_ENV]: '0' };
   for (const k of Object.keys(childEnv)) if (k.startsWith('DAEMON_JOB_')) delete childEnv[k];
-  for (const k of ['OPERATION_RUNS_DIR', 'WE_DAEMON_CLONE_LOCK_IGNORE_OWNERS', 'WE_DAEMON_REBUILD_READER']) delete childEnv[k];
+  for (const k of ['OPERATION_RUNS_DIR', 'WE_DAEMON_CLONE_LOCK_IGNORE_OWNERS', 'WE_DAEMON_REBUILD_READER', 'WE_DAEMON_REBUILD_JOB_CHILD']) delete childEnv[k];
+  childEnv.WE_DAEMON_REBUILD_JOB_CHILD = '1';
   if (ppid > 1) childEnv.WE_DAEMON_CLONE_LOCK_IGNORE_OWNERS = `${host}:${ppid}`;
   if (daemonReader) childEnv.WE_DAEMON_REBUILD_READER = JSON.stringify(daemonReader);
   return childEnv;

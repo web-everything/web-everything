@@ -307,15 +307,17 @@ export function assertMainNotStale(root, checkStaleness, {
     try { lg = lastGood(root, dirty); } catch { lg = null; }
     if (lg && lg.onLastGood) {
       const heldWhy = lg.held ? ` held since ${lg.heldSince} (${lg.held.reason ?? '?'}${lg.held.failed ? `: ${lg.held.failed}` : ''})` : '';
+      const heartbeatWhy = lg.holdingBy === 'heartbeat'
+        ? ` — rebuild in flight (heartbeat ${Math.round(lg.heartbeatAgeMs / 1000)}s ago, build ${Math.round(lg.buildAgeMs / 60_000)} min old)` : '';
       write(`${label}: the managed clone is ${st.behind} commit(s) behind origin/${base} but runs its LAST-KNOWN-GOOD `
-        + `build ${String(lg.lastGood).slice(0, 12)}${heldWhy} — dispatching from it, not refusing (x5wbsbc).\n`);
+        + `build ${String(lg.lastGood).slice(0, 12)}${heldWhy}${heartbeatWhy} — dispatching from it, not refusing (x5wbsbc).\n`);
       if (lg.overAge) {
         write(`${label}: ALERT — the clone has been held on its last-good build for ${Math.round(lg.ageMs / 3_600_000)}h, `
           + `past the max age — still dispatching; fix what the rebuild's alerts name (x5wbsbc).\n`);
       }
       st = {
         fresh: true, behind: st.behind, onLastGood: true, lastGood: lg.lastGood, heldSince: lg.heldSince,
-        heldReason: lg.held?.reason ?? null, overAge: lg.overAge,
+        heldReason: lg.held?.reason ?? null, overAge: lg.overAge, holdingBy: lg.holdingBy,
       };
     }
   }
