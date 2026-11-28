@@ -4390,11 +4390,20 @@ function isBraceExpansion(raw, i) {
  *  in `"…"`) or unquoted glob/brace pattern, or -1; `split` marks an expansion that can become any number of
  *  new words: an UNQUOTED one (word splitting), or a quoted `"$@"` / `"${@…}"` / `"${a[@]…}"` / `"${!…}"`
  *  (`"${!a[@]}"`, `"${!p@}"`, and indirection `"${!x}"`, which becomes `"$@"` when `x=@`), which bash expands to
- *  one word PER element even inside `"…"`. `'…'` and `$'…'` text never expands. */
-function argvWordShape(raw) {
+ *  one word PER element even inside `"…"`. `'…'` and `$'…'` text never expands.
+ *  `splitPatterns` also tracks unquoted glob/brace expansion throughout values for the raw-PR parser. */
+function argvWordShape(raw, splitPatterns = false) {
   let value = '';
   let dynamicAt = -1;
   let split = false;
+  let literalBraceEnd = -1;
+  const braceExpansion = i => {
+    if (i <= literalBraceEnd) return false;
+    if (isBraceExpansion(raw, i)) return true;
+    const close = raw.indexOf('}', i + 1);
+    literalBraceEnd = close < 0 ? raw.length : close;
+    return false;
+  };
   const mark = () => { if (dynamicAt < 0) dynamicAt = value.length; };
   const expands = (t, j) => t[j] === '`' || (t[j] === '$' && /[\w{(@*#?$!-]/.test(t[j + 1] || ''));
   // Sticky, so each `$` is tested in place and the read stays linear. `${#a[@]}` (a count), `"$*"` /
@@ -4425,11 +4434,14 @@ function argvWordShape(raw) {
       continue;
     }
     if (expands(raw, i)) { mark(); split = true; }
-    // A pattern only matters while it can sit inside a flag-name prefix of the flag, so the brace scan runs
-    // at most once per prefix position, and it is one indexOf + slice test (no backtracking regex), so the
-    // whole read stays linear in the word.
-    else if (dynamicAt < 0 && value.length <= SKIP_PRE_PR_REVIEW.length
-      && ('*?['.includes(raw[i]) || (raw[i] === '{' && isBraceExpansion(raw, i)))) mark();
+    // Raw PR option values need pattern detection at any offset. Stop once splitting is known;
+    // cache literal brace spans so nested non-expansions cannot cause repeated suffix scans.
+    // Other callers only need patterns in the bounded flag-name prefix, as before.
+    else if ((splitPatterns ? !split : (dynamicAt < 0 && value.length <= SKIP_PRE_PR_REVIEW.length))
+      && ('*?['.includes(raw[i]) || (raw[i] === '{' && braceExpansion(i)))) {
+      mark();
+      if (splitPatterns) split = true;
+    }
     value += raw[i];
   }
   // A NUL only ever comes from a `$'…'` fragment, and `runValue` already ends THAT fragment there.
@@ -4499,6 +4511,131 @@ function prePrReviewBypass(head) {
   const found = shapes.slice(i).map(mayBeSkipFlag);
   return found.includes('literal') ? 'literal' : found.includes('dynamic') ? 'dynamic' : null;
 }
+
+/** Read raw creation argv without evaluating shell expansions or consulting gh configuration.
+ * Keep quote provenance: '$GH' is literal text, while "$GH" is an unreadable command. */
+function rawPrCreation(head) {
+  // Mask expansion-bearing words before stripping redirects across word boundaries. This keeps
+  // substitutions (and redirects inside them) opaque, while `gh > out pr create` retains its argv.
+  // Attached redirects on an opaque word remain unknown and therefore fail closed below.
+  let masked = '';
+  const opaque = new Map();
+  for (const raw of shellWords(head)) {
+    const shape = argvWordShape(raw, true);
+    if (shape.dynamicAt >= 0 || shape.split) {
+      opaque.set(masked.length, shape);
+      masked += 'x'.repeat(raw.length) + ' ';
+    } else masked += raw + ' ';
+  }
+  const tokens = headWords(masked, true).map(word => opaque.get(word.start)
+    ?? argvWordShape(masked.slice(word.start, word.end), true));
+  const start = wrapperPrefixLength(tokens.map(word => word.value));
+  const shapes = tokens.slice(start);
+  const words = shapes.map(shape => shape.value);
+  const hidden = i => shapes[i]?.dynamicAt >= 0 || shapes[i]?.split;
+  if (words[0]?.split('/').at(-1) !== 'gh' && !hidden(0)) return null;
+  let i = 1;
+  let uncertain = hidden(0);
+  // Persistent flags may precede either command word. Only single-argument dynamic values
+  // preserve a visible read command: splitting values can inject `create` or consume `pr`.
+  const skipFlags = () => {
+    while (words[i]?.startsWith('-')) {
+      const flag = words[i];
+      const valueFlag = ['-R', '--repo', '--hostname'].includes(flag);
+      const attachedValue = /^(?:-R.|--(?:repo|hostname)=)/.test(flag);
+      if (shapes[i]?.split) return false;
+      if (hidden(i)) {
+        const prefix = flag.slice(0, shapes[i].dynamicAt);
+        if (!attachedValue || !/^(?:-R|--(?:repo|hostname)=)/.test(prefix)) return false;
+        uncertain = true;
+      }
+      i += 1;
+      if (valueFlag) {
+        if (shapes[i]?.split) return false;
+        uncertain ||= hidden(i);
+        i += 1;
+      }
+      if (flag === '--') break;
+    }
+    return true;
+  };
+  if (!skipFlags()) {
+    // A splitting value alone still does not identify an unknown launcher as gh.
+    if (hidden(0) && !words.slice(i).some(word => ['pr', 'api'].includes(word))) return null;
+    return 'dynamic';
+  }
+  // An unknown launcher AND unknown subcommand alone do not identify a gh operation (`$CMD $ARG`).
+  // A visible `gh` still fails closed on its subcommand; an unknown launcher with visible `pr`/`api`
+  // continues below. Leave other launchers to their own guards, including dynamic Node invocations.
+  if (hidden(i)) return hidden(0) ? null : 'dynamic';
+  if (words[i] === 'pr') {
+    i += 1;
+    if (!skipFlags() || hidden(i)) return 'dynamic';
+    if (['create', 'new'].includes(words[i])) return uncertain ? 'dynamic' : 'literal';
+    return null;
+  }
+  if (words[i] !== 'api') return null;
+  let endpoint = null;
+  let method = null;
+  let dynamicMethod = false;
+  let splitApiValue = false;
+  let payload = false;
+  let opaqueInput = false;
+  const queries = [];
+  for (let k = i + 1; k < words.length; k++) {
+    const arg = words[k];
+    const option = /^(--[\w-]+)(?:=(.*))?$|^-[is]*([XfFRHqtp])(.+)?$/s.exec(arg);
+    const flag = option ? option[1] ?? `-${option[3]}` : arg;
+    const inline = option ? option[2] ?? option[4] : undefined;
+    const takesValue = ['-X', '--method', '-f', '-F', '--field', '--raw-field', '--input',
+      '-R', '--repo', '--hostname', '-H', '--header', '-q', '--jq', '-t', '--template', '--cache', '-p', '--preview'].includes(flag);
+    if (takesValue) {
+      const optionAt = k;
+      const valueAt = inline === undefined ? ++k : k;
+      const value = inline ?? words[valueAt];
+      const unreadable = hidden(optionAt) || hidden(valueAt) || value === undefined;
+      splitApiValue ||= !!shapes[valueAt]?.split;
+      if (flag === '-X' || flag === '--method') {
+        method = value;
+        dynamicMethod ||= unreadable;
+      } else if (flag === '--input') {
+        payload = true;
+        opaqueInput = true;
+      } else if (['-f', '-F', '--field', '--raw-field'].includes(flag)) {
+        payload = true;
+        if (value?.startsWith('query=')) {
+          opaqueInput ||= unreadable || value.startsWith('query=@');
+          queries.push(value.slice('query='.length));
+        } else if (unreadable && !/^[A-Za-z_]\w*=/.test(value ?? '')) opaqueInput = true;
+      }
+    } else if (hidden(k)) return 'dynamic';
+    else if (!arg.startsWith('-') && endpoint === null) endpoint = arg;
+  }
+  // Normalise once before dispatching either API kind, including GH Enterprise URL prefixes.
+  let path;
+  try {
+    path = decodeURIComponent((endpoint ?? '').replace(/^https?:\/\/[^/]+/i, '').split(/[?#]/)[0])
+      .replace(/^\/?api\/v3\//, '/').replace(/\/+$/, '');
+  } catch { return 'dynamic'; } // An unreadable encoded endpoint needs the explicit operator fallback.
+  if (/^\/?(?:api\/)?graphql$/.test(path)) {
+    if (opaqueInput || splitApiValue) return 'dynamic';
+    // GraphQL strings, block strings and comments are data, including creation-related text.
+    // Only a mutation with the actual creation field is a known inline creation.
+    const creates = queries.some(query => {
+      const code = query.replace(/"""(?:\\"""|(?!""")[\s\S])*"""|"(?:\\.|[^"\\])*"|#[^\r\n]*/g, ' ')
+        .replace(/[,\uFEFF]/g, ' ');
+      // Fragments can precede the operation that spreads them. Commas and BOMs are ignored
+      // GraphQL tokens, so neither can hide the field's argument list.
+      return /\bmutation\b/.test(code) && /\bcreatePullRequest\s*\(/.test(code);
+    });
+    return creates ? (uncertain ? 'dynamic' : 'literal') : null;
+  }
+  // Individual PR endpoints are edits; owner/repo placeholders are valid gh endpoints.
+  if (!/^\/?repos\/[^/]+\/[^/]+\/pulls$/.test(path)) return null;
+  if (dynamicMethod || splitApiValue) return 'dynamic';
+  return (method ? method.toUpperCase() === 'POST' : payload) ? (uncertain ? 'dynamic' : 'literal') : null;
+}
+
 
 export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLiveLease = false, markedLeaseSlug = null, contestedHolderSlug = null, dispatchKind = null, cwd = null, daemonCloneRoots = [], fixClaimedBranches = [], pushTargets = [], fixPushes = [] } = {}) {
   const s = segment.trim();
@@ -4761,7 +4898,11 @@ export function reason(segment, { primaryCwd = false, staleBehind = 0, foreignLi
   }
 
   // Reuse command-position normalization so paths/env wrappers match, but quoted prose does not.
-  if (!hasLeadingEnvEscape(s, 'RAW_PR_CREATE_OK') && atCommand(/^gh\s+pr\s+create\b/))
+  const creation = rawPrCreation(s)
+    ?? (/^gh(?:\s|$)/.test(canon) ? rawPrCreation(canon) : null);
+  if (!hasLeadingEnvEscape(s, 'RAW_PR_CREATE_OK') && creation === 'dynamic')
+    return 'raw PR creation carries a shell expansion or opaque API payload the guard cannot read and may omit the `authored-by-actor` stamp. Write the gh command, subcommand and API query literally, or use the open-pr operation. Operator fallback: prefix `RAW_PR_CREATE_OK=1`.';
+  if (!hasLeadingEnvEscape(s, 'RAW_PR_CREATE_OK') && creation === 'literal')
     return 'raw `gh pr create` opens a PR with no `authored-by-actor` stamp, so the review gate cannot prove reviewer independence and the mandatory referral reviewer\'s rulings are ignored (plateau-app #204). Open it with `node <web-everything lane>/scripts/operations/run.mjs open-pr --ref=<branch> …` run from the target repo\'s lane clone (works for plateau-app and frontierui too), or repair an existing PR with `node scripts/pr-body-edit.mjs --pr=<n> --repair`. Escape hatch: prefix `RAW_PR_CREATE_OK=1`.';
 
   // Operator-only bypass: inspect script argv, not prose or Node option values.
