@@ -8,7 +8,7 @@ import { checkSiblingBase } from '../../lib/pr-size-admission.mjs';
 const dirs = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
-function fixture() {
+function fixture({ ownCommit = true } = {}) {
   const cwd = mkdtempSync(join(process.env.TMPDIR, 'sibling-base-'));
   dirs.push(cwd);
   const git = (args, options = {}) => execFileSync('git', args, { cwd, encoding: 'utf8', ...options });
@@ -27,7 +27,7 @@ function fixture() {
   commit('two', 'second sibling change');
   git(['update-ref', 'refs/remotes/origin/lane/7357', 'HEAD']);
   git(['checkout', '-qb', 'lane/own']);
-  commit('own', 'own change');
+  if (ownCommit) commit('own', 'own change');
   const calls = [];
   const run = (base = 'main', overrides = {}) => createPrLandRunner({
     cwd, git, canonicalAudit: () => ({ ok: true }), prePrReview: () => ({ action: 'pass' }),
@@ -209,6 +209,62 @@ describe('open-pr sibling base', () => {
     expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base' });
     expect(result.detail).toContain('lane/7357');
     expect(f.calls[0]).toContain('--check');
+  });
+
+  it('refuses inherited sibling work after the sibling advances beyond the submitted head', () => {
+    const f = fixture();
+    const head = f.git(['rev-parse', 'lane/own']).trim();
+    const creation = f.git(['reflog', 'show', '--format=%H%x00%gs', 'lane/7357']).trim().split('\n').at(-1);
+    f.git(['checkout', 'lane/7357']);
+    f.git(['merge', '--ff-only', 'lane/own']);
+    f.commit('later', 'sibling work beyond submitted head');
+    f.git(['update-ref', 'refs/remotes/origin/lane/7357', 'HEAD']);
+    f.git(['checkout', 'lane/own']);
+    expect(f.git(['merge-base', 'lane/own', 'lane/7357']).trim()).toBe(head);
+    expect(f.git(['rev-parse', 'lane/7357']).trim()).not.toBe(head);
+    expect(f.git(['rev-parse', 'origin/lane/7357'])).toBe(f.git(['rev-parse', 'lane/7357']));
+    expect(f.git(['reflog', 'show', '--format=%H%x00%gs', 'lane/7357']).trim().split('\n').at(-1)).toBe(creation);
+    const result = f.run();
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base' });
+    expect(result.detail).toContain('lane/7357');
+    expect(f.calls).toHaveLength(1);
+    expect(f.calls[0]).toContain('--check');
+  });
+
+  it('refuses an unchanged fork after its sibling advances', () => {
+    const f = fixture({ ownCommit: false });
+    const head = f.git(['rev-parse', 'lane/own']).trim();
+    expect(f.git(['rev-parse', 'lane/7357']).trim()).toBe(head);
+    const creation = f.git(['reflog', 'show', '--format=%H%x00%gs', 'lane/7357']).trim().split('\n').at(-1);
+    f.git(['checkout', 'lane/7357']);
+    f.commit('later', 'sibling work after unchanged fork');
+    f.git(['update-ref', 'refs/remotes/origin/lane/7357', 'HEAD']);
+    f.git(['checkout', 'lane/own']);
+    expect(f.git(['merge-base', 'lane/own', 'lane/7357']).trim()).toBe(head);
+    expect(f.git(['rev-parse', 'lane/7357']).trim()).not.toBe(head);
+    expect(f.git(['rev-parse', 'origin/lane/7357'])).toBe(f.git(['rev-parse', 'lane/7357']));
+    expect(f.git(['reflog', 'show', '--format=%H%x00%gs', 'lane/7357']).trim().split('\n').at(-1)).toBe(creation);
+    const result = f.run();
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base' });
+    expect(result.detail).toContain('lane/7357');
+    expect(f.calls).toHaveLength(1);
+    expect(f.calls[0]).toContain('--check');
+  });
+
+  it('allows a legitimate descendant lane created at the submitted head', () => {
+    const f = fixture();
+    f.git(['checkout', 'main']);
+    f.git(['branch', '-f', 'lane/own', 'main']);
+    f.git(['checkout', 'lane/own']);
+    f.commit('clean', 'clean own change');
+    const head = f.git(['rev-parse', 'HEAD']).trim();
+    f.git(['checkout', '-qb', 'lane/child']);
+    f.commit('child', 'descendant work');
+    f.git(['checkout', 'lane/own']);
+    expect(f.git(['merge-base', 'lane/own', 'lane/child']).trim()).toBe(head);
+    expect(f.run()).toMatchObject({ outcome: 'opened' });
+    expect(f.calls).toHaveLength(1);
+    expect(f.calls[0]).not.toContain('--check');
   });
 
   it('refuses a different sibling lane sharing the submitted head', () => {

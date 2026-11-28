@@ -137,10 +137,9 @@ export function checkSiblingBase({ git, ref, sha, base = 'main', now = () => per
       const [, name, tip] = match;
       const lane = laneName(name);
       if (lane.replace(/-v\d+$/, '') === ownLane) continue;
-      // A different lane at the very tip we submit shares our whole history: its ownership evidence is
-      // judged like any other lane's. Only a lane that is strictly AHEAD of this head built on it, so
-      // the head itself is the sibling's inheritance only when the two tips coincide.
-      const inheritedByUs = inherited => carried.has(inherited) && (inherited !== head || tip === head);
+      // A sibling can advance through our head after we inherit its work. Include head-equal
+      // shared ancestry too; the creation record below establishes ownership direction.
+      const inheritedByUs = inherited => carried.has(inherited);
       // A lane may have advanced since this branch forked. Inspect the shared ancestry,
       // and judge only the inherited portion for squash equivalence below.
       const shared = list(read(['merge-base', '--all', head, tip])).map(commitSha);
