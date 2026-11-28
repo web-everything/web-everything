@@ -8,31 +8,31 @@ dateOpened: "2026-11-27"
 tags: []
 ---
 
-# open-pr sibling gate: an advanced sibling containing the submitted head skips the ownership check (PR #7526 follow-up)
+# open-pr sibling gate: leftovers after #7526 head 65bc0560 fixed the advanced-sibling carve-out (PR #7526 follow-up)
 
-Problem: `we:scripts/lib/pr-size-admission.mjs:143,148` exempts every lane strictly ahead of the head when merge-base == head (`carried.has(inherited) && (inherited !== head || tip === head)`). That treats the lane as our child without asking the creation record, so an advancing source sibling is admitted. Shape A: lane/sib authors S; lane/own is created at S and adds nothing, so head = S; sib advances to C; carried={S}, merge-base(S,C)=S=head with tip!=head hits `continue` and returns ok:true, S is admitted. Shape B: own adds O on top of S, sib later contains O (fast-forwarded or merged own, then advanced): shared=[O]=head, same skip, so sib's first-parent ownHistory (:166, which includes S and would refuse) never runs. No test covers either shape (:203 covers divergence, :191 pins the legitimate advanced child).
+Problem: #7526 head 65bc0560 fixed the `we:scripts/lib/pr-size-admission.mjs` :143 carve-out. Shapes A and B are fixed there. Leftovers: (1) Missing test: the fetched-creation rule at `we:scripts/lib/pr-size-admission.mjs:170-174` is untested, because the new test at :254 builds its child with `checkout -qb` (reflog "Created from HEAD"), so a child created from fetched `origin/lane/own` is never exercised. (2) Small fail-closed regression: a published stacked child that shares the head now gets `sibling-base-unknown` at :174 (inheritedByUs(head) is true and isAncestor(head, creation[1]=head)); on 0978c72c it was admitted. A legitimate published child must not be refused. (3) The test uses `process.env.TMPDIR` at `we:scripts/operations/__tests__/open-pr-sibling-base.test.mjs:12` instead of `tmpdir()`.
 
 Scope:
 
 - we:scripts/lib/pr-size-admission.mjs
 - we:scripts/operations/__tests__/open-pr-sibling-base.test.mjs
 
-Fix direction: for a strictly-ahead lane, decide the ownership direction from creation evidence: it is a child only if its creation record (`creation[1]`) descends from or equals the shared commit and its first-parent ownHistory excludes `carried`; otherwise it becomes a candidate. Keep the fetched-creation rule at :173 from false-refusing a child created from published `origin/lane/own`. The :131 / same-tip "new branch name" advisories are the same family; include them if they are still open.
+Fix direction: change the :170-174 fetched-creation rule so a published stacked child sharing the head is admitted (not `sibling-base-unknown`), while a real unknown base still fails closed; keep the shape A and shape B tests green. Add the fetched-creation test. Replace `process.env.TMPDIR` with `tmpdir()` at that test's line 12.
 
-Acceptance (red on 0978c72c, green after):
-- 'refuses an unchanged fork after its sibling advances' (shape A).
-- 'refuses inherited sibling work after the sibling advances beyond the submitted head' (shape B; advance both the local and the origin/ sibling refs, keep the original creation reflog).
-- Both expect reason sibling-base naming lane/7357, with only a `--check` spawn.
-- :191 'allows an advanced parent with an unmerged child...' stays green, plus a new green test for a child created from fetched `origin/lane/own`.
+Acceptance:
+- New green test in `we:scripts/operations/__tests__/open-pr-sibling-base.test.mjs`: a child created from fetched `origin/lane/own` is admitted.
+- A published stacked child sharing the head is admitted (red on the current 65bc0560 behaviour, green after).
+- The shape A and shape B tests stay green.
+- `we:scripts/operations/__tests__/open-pr-sibling-base.test.mjs:12` uses `tmpdir()`.
 - Full verify green.
 
-Severity: not a security finding. main has no checkSiblingBase today, so these shapes already pass; the PR closes the common shapes. Impact is a PR carrying sibling commit S through review and drain (visible in the diff), i.e. duplicate or out-of-order landing, not unreviewed code on main.
+Severity: not a security finding. main has no checkSiblingBase today; the regression fails closed (a legitimate child is refused with `sibling-base-unknown`), it does not admit anything unsafe.
 
-Evidence: PR #7526 review comment 2026-11-28T00:46:55Z (both findings CONFIRMED), chunk-1 reviewer's block rationale 00:41:35Z, Steward Opus judge ruling 2026-11-27 (handoff-state judge-7526r6 text in this card), earlier ruling handoff-state judge-7526-ruling-2026-11-27 file (the --verbatim finding at :189 is fixed and holds; the :143 carve-out comes from 3bad8c0, before it).
+Evidence: PR #7526 head 65bc0560 judge ruling (context in the handoff-state card-7526-sibling-advanced file), PR #7526 review comment 2026-11-28T00:46:55Z, Steward Opus judge ruling 2026-11-27 (handoff-state judge-7526r6), earlier ruling handoff-state judge-7526-ruling-2026-11-27 file (the --verbatim finding at :189 is fixed and holds). Citation form: we:backlog/xteoojb-open-pr-sibling-gate-an-advanced-sibling-containing-the-subm.md@pr7625.
 
 ## Acceptance
 
-- [A1] **Executable** — `npm run test:unit -- we:scripts/operations/__tests__/open-pr-sibling-base.test.mjs` is red on 0978c72c for the two new shape A/B tests and green after (see the Acceptance list above).
+- [A1] **Executable** — `npm run test:unit -- we:scripts/operations/__tests__/open-pr-sibling-base.test.mjs` is green, including the new fetched-creation test and the published-stacked-child admission test (see the Acceptance list above).
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
