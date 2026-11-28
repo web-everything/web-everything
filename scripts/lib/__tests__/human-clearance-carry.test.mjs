@@ -14,6 +14,39 @@ import {
 } from '../human-clearance-carry.mjs';
 import { normalizeDiffFingerprint, normalizeContributionFingerprint, parseLatestHumanClearedSha, REVIEW_LABELS } from '../review-escalation.mjs';
 import { carryHumanClearanceOnIdenticalDiff, createTamperParkCarryCallback, decideDrainReviewGate, readDrainAcceptance } from '../../merge-ai-prs.mjs';
+import { A as chainA, C as chainC, chain } from './fixtures/accepted-never-started.mjs';
+import * as carryEquivalencePolicy from '../carry-equivalence.mjs';
+
+describe('accepted never started human live guard', () => {
+  it.each(['valid', 'human-hold', 'invalid-chain'])('human-clearance-second-hop-live-reread %s', kind => {
+    const cwd = mkdtempSync(join(tmpdir(), 'human-chain-'));
+    const policy = vi.spyOn(carryEquivalencePolicy, 'resolveCarryEquivalenceSetting').mockReturnValue({ value: 'strict', source: 'fixture' });
+    try {
+      const comments = chain(); comments[0] = clearHumanComment(chainA);
+      if (kind === 'human-hold') comments.push({ body: 'Do not merge', author: { login: 'human' } });
+      if (kind === 'invalid-chain') comments.splice(1, 1);
+      const exec = vi.fn(() => { throw Error('unexpected IO'); });
+      exec.mockImplementation((cmd, args) => {
+        if (cmd === 'gh') return '';
+        if (cmd === 'git' && args[0] === 'rev-parse' && args[1] === '--verify') return 'f'.repeat(40);
+        throw Error('unexpected IO');
+      });
+      const result = applyHumanClearanceCarry({ evidence: { humanClearance: { sha: chainA, diff: FP,
+        actor: 'chalbert', sourceId: 'IC_clearance' }, headSha: chainC, headDiffSha: chainC, headDiff: DIFF },
+        pr: 9, repo: 'fixture/repo', cwd, exec, setting: ON, mechanicalCarry: TRUST_DRAIN, equivalence: 'strict',
+        netPatchSetting: { value: false, source: 'fixture' }, numberingSetting: { value: false, source: 'fixture' },
+        proveNumbering: () => ({ ok: false, reason: 'fixture: not numbering' }), log: vi.fn(),
+        readLiveEvidence: () => ({ headSha: chainC, comments, reviews: [] }) });
+      if (kind === 'valid') {
+        expect(result).toMatchObject({ carried: { recorded: true, fromSha: chainA, toSha: chainC } });
+        expect(exec.mock.calls.filter(([cmd]) => cmd === 'gh')).toHaveLength(1);
+      } else {
+        expect(result).toMatchObject({ action: 'defer', applyLabel: null });
+        expect(exec.mock.calls.filter(([cmd]) => cmd === 'gh')).toHaveLength(0);
+      }
+    } finally { policy.mockRestore(); rmSync(cwd, { recursive: true, force: true }); }
+  });
+});
 
 const DIFF = 'diff --git a/x.mjs b/x.mjs\n--- a/x.mjs\n+++ b/x.mjs\n@@ -1 +1 @@\n-old\n+new\n';
 const FP = normalizeDiffFingerprint(DIFF);

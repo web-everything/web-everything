@@ -565,9 +565,11 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
     const held = new Set((plan?.refusals ?? []).filter(row => row.kind === 'already-reviewed-head'
       && (managed.has(Number(row.prNumber)) || isRealHead(row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid))
       && !allowed.has(Number(row.prNumber)) && !bypassed.has(Number(row.prNumber))).map(row => Number(row.prNumber)));
+    const heldEntries = new Map(queue.entries().map(entry => [entry.key, entry]));
     const causes = queue.holdCauses();
     for (const pr of held) {
-      const cause = causes.get(`${repo}#${pr}`) ?? 'capacity';
+      const entry = heldEntries.get(`${repo}#${pr}`);
+      const cause = entry?.blocked ?? causes.get(`${repo}#${pr}`) ?? (entry ? 'capacity' : 'not-queued');
       const detail = NON_RUNNABLE_REASONS.has(cause)
         ? ` (${readableCapacity(capacity) ? 'waiting for a probe turn' : 'probes disabled'})` : '';
       note(log, `hold ${repo}#${pr}: ${cause}${detail}; waiting for a later tick`);

@@ -70,6 +70,24 @@ const numbers = entries => entries.map(entry => entry.pr);
 const capacity = count => ({ lanes: count, remainingStarts: count, budget: { left: count } });
 const prefix = 'review-daemon: red-team queue ';
 
+describe('accepted never started hold-cause labels', () => {
+  it.each([
+    ['non-queued refusal is not labelled capacity', false, null, false, 'not-queued'],
+    ['queue entry with a real capacity wait still logs capacity', true, null, false, 'capacity'],
+    ['absent-entry-with-unreadable-evidence-keeps-cause', false, null, true, 'evidence-unreadable'],
+    ['evidence-unreadable keeps its own cause', true, null, true, 'evidence-unreadable'],
+    ['blocked-entry-with-unreadable-evidence-keeps-blocked-cause', true, 'planner-skip', true, 'planner-skip'],
+  ])('%s', (_, present, blocked, waiting, expected) => {
+    const key = `${repo}#9`, log = vi.fn();
+    const queue = { entries: () => present ? [{ key, repo, pr: 9, head: head(9), ...(blocked ? { blocked } : {}) }] : [],
+      reconcile: () => new Map(), sync: vi.fn(), admit: () => [], settle: vi.fn(),
+      holdCauses: () => new Map(waiting ? [[key, 'evidence-unreadable']] : blocked ? [[key, blocked]] : []) };
+    runWithRedTeamQueue({ queue, ...inputs([9]), capacity: capacity(1), floor: { minConcurrent: 0, maxProbesPerTick: 0 },
+      readSkipCardOnly: () => false, readNetFiles: () => ({ ok: false }), run: () => ({}), log });
+    expect(log.mock.calls.flat().join('\n')).toContain(`${prefix}hold ${key}: ${expected}`);
+  });
+});
+
 // Sync IO doubles match node:fs semantics without touching the operator's queue.
 // No persisted envelope is assumed: restart assertions exercise the public reader.
 // maxAttempts is deliberately NOT defaulted here: omitting it exercises the production default (3).

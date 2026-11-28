@@ -24,6 +24,61 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } 
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { createRedTeamDispatchQueue, runWithRedTeamQueue } from '../red-team-dispatch-queue.mjs';
+import { A as chainA, C as chainC, D as chainD, accepted as chainAccept, trusted as chainTrusted,
+  note as machineNote, recovered as retryRecovered, chain } from './fixtures/accepted-never-started.mjs';
+
+describe('accepted never started queue-to-planner settlement', () => {
+  const outcomes = [
+    { name: 'shape A same head', shape: 'A', action: 'clear', reason: 'not owed (stored review)', head: chainC, labels: ['review:accepted'] },
+    { name: 'shape C same head', shape: 'C', action: 'clear', reason: 'not owed (stored review)', head: chainC, labels: ['review:accepted'] },
+    { name: 'shape A moved head with policy-clear restamp', shape: 'A', action: 'carry', reason: 'prior policy-clear across acceptance re-stamp', head: chainC, labels: ['review:accepted'] },
+    { name: 'shape C moved head with policy-clear restamp', shape: 'C', action: 'carry', reason: 'prior policy-clear across acceptance re-stamp', head: chainC, labels: ['review:accepted'] },
+    { name: 'shape B unprovable moved head', shape: 'B', action: 'review', reason: 'unprovable head move needs a full review', head: chainD, labels: ['review:accepted', 'red-team:pending'] },
+    { name: 'genuine human hold', shape: 'hold', action: 'skip', reason: 'later verdict or hold supersedes acceptance', head: chainC, labels: ['review:accepted', 'red-team:pending'] },
+  ];
+  it.each(outcomes)('$name has the declared action, reason, head and labels', expected => {
+    const cwd = mkdtempSync(join(tmpdir(), 'accepted-queue-'));
+    try {
+      const note = expected.shape === 'A' ? machineNote() : retryRecovered();
+      const comments = expected.action === 'carry' ? [chainAccept(),
+        chainTrusted(`${redTeamMarker(9, chainA)}\nRed team not required on this head: card-only diff`), chainTrusted(note),
+        chainTrusted(`📌 review — acceptance re-stamped after a rebase (no new review)\n<!-- reviewed-sha: ${chainC} -->\n<!-- numbering-restamp: from=${chainA} to=${chainC} -->`)]
+        : expected.shape === 'B' ? chain() : [chainAccept(chainC),
+          expected.shape === 'hold' ? { body: 'Do not merge', author: { login: 'human' } } : chainTrusted(note)];
+      const raw = { number: 9, headRefOid: expected.head, state: 'OPEN', isDraft: false, comments, reviews: [],
+        labels: expected.action === 'carry' ? ['review:accepted'] : ['review:accepted', 'red-team:pending'] };
+      const env = { WE_SHARED_RUNS_DIR: join(cwd, 'runs') }, now = () => 2_000_000;
+      const queue = createRedTeamDispatchQueue({ file: join(cwd, 'queue.json'), now, reprobeDir: null,
+        readLivePr: () => raw, readStatus: () => null, readCarry: () => null,
+        readCarriedCheck: () => false, readCheckFact: () => ({ ok: false, reason: 'no check' }), env });
+      queue.sync(repo, [{ pr: 9, head: expected.head }]); queue.admit(repo, 1);
+      queue.settle(repo, { rows: [{ prNumber: 9, action: 'skip', why: 'later verdict or hold supersedes acceptance' }] });
+      expect(queue.entries()[0].blocked).toBe('planner-skip');
+      const stored = { status: 'finished', result: 'not-owed' };
+      const o = runFixture({ env, cwd, rawPrs: [raw], readComments: () => comments, readReviews: () => [],
+        readEvidence: () => expected.action === 'carry' || expected.action === 'review'
+          ? { inFlight: false, recorded: false, seatRecorded: false }
+          : { loopPayload: { verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: expected.head } } } },
+            inFlight: false, recorded: false, seatRecorded: false, status: stored },
+        readStatus: () => expected.action === 'carry' || expected.action === 'review' ? null : stored,
+        readCarry: () => null, readSeal: () => null, readCarriedCheck: () => false, readReviewRuns: () => [],
+        headNeverReviewed: () => false, proveMove: () => ({ ok: false }), now, log: vi.fn(),
+        readHeadFiles: () => ({ ok: false }), provider: { readPrState: () => raw },
+        publishCheck: vi.fn(() => ({ ok: true })), settle: vi.fn(() => ({ outcome: 'policy-clear' })),
+        syncLabels: vi.fn(() => { raw.labels = raw.labels.filter(label => label !== 'red-team:pending'); }),
+        escalate: vi.fn(), dispatch: vi.fn(() => ({ jobPid: 42 })) });
+      runGhSync.mockImplementation(() => '');
+      const out = runWithRedTeamQueue({ ...o, queue, repo, plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: 9, headSha: expected.head }] },
+        floor: { minConcurrent: 0, maxProbesPerTick: 1 }, readLivePr: () => raw,
+        readSkipCardOnly: () => false, readNetFiles: () => ({ ok: false }), run: runRedTeamOnSkip });
+      expect(out.rows[0]).toMatchObject({ action: expected.action, why: expected.reason, head: expected.head });
+      expect(raw.labels).toEqual(expected.labels);
+      if (expected.action === 'skip') expect(queue.entries()[0].blocked).toBe('planner-skip');
+      else { expect(queue.entries()).toEqual([]); expect(o.escalate).not.toHaveBeenCalled(); }
+    } finally { runGhSync.mockReset(); rmSync(cwd, { recursive: true, force: true }); }
+  });
+});
 
 vi.mock('../gh-throttle.mjs', async importOriginal => ({
   ...await importOriginal(), runGhSync: vi.fn(),
@@ -47,6 +102,19 @@ function fixture(over = {}) {
     now: 2_000_000, setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(), ...over };
 }
 const decide = over => planRedTeamOnSkip(fixture(over))[0];
+
+describe('accepted never started later-hold escalation', () => {
+  it.each([true, false])('guardedSkip preserves skip and escalates only with review:accepted=%s', labelled => {
+    const row = decide({ rawPrs: [{ number: pr, headRefOid: head, labels: labelled ? ['review:accepted'] : [],
+      reviews: [], comments: [{ body: `✅ review — accepted\n<!-- reviewed-sha: ${head} -->`, viewerDidAuthor: true },
+        { body: 'Do not merge', author: { login: 'human' } }] }],
+      readEvidence: () => ({ ok: false, reason: 'review-unfinished' }), headNeverReviewed: () => true,
+      readStatus: () => null, readReviewRuns: () => [],
+      readSeal: () => null, readCarriedCheck: () => false });
+    expect(row).toMatchObject({ action: 'skip', why: 'later verdict or hold supersedes acceptance' });
+    expect(row.escalate === true).toBe(labelled);
+  });
+});
 
 describe('unfinished CI-held record retry', () => {
   const saved = (attempts = 1, error = 'review held: CI still pending on reviewed head', counters = {}) => reviewRunEvidence({

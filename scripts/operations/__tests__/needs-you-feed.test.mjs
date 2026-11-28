@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync, truncateSync } from 'node:fs';
+import fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join, dirname } from 'node:path';
@@ -11,6 +12,10 @@ import { isReadOnlyOperation } from '../registry.mjs';
 import { operatorSessionBootstrapOperation } from '../operator-session-bootstrap.mjs';
 import { bootstrapPlan } from '../operator-session-bootstrap-io.mjs';
 import { withRealRepo } from './helpers/real-repo.mjs';
+import { publishAttention } from '../needs-you-feed.mjs';
+import { writeJsonAtomic } from '../../lib/atomic-json-file.mjs';
+vi.mock('../../lib/atomic-json-file.mjs', async original => ({ ...await original(), writeJsonAtomic: vi.fn((await original()).writeJsonAtomic) }));
+const realReadSync = fs.readSync, realFstatSync = fs.fstatSync;
 const dirs = [];
 const temp = () => { const d = mkdtempSync(join(tmpdir(), 'needs-feed-')); dirs.push(d); return d; };
 afterEach(() => {
@@ -19,6 +24,130 @@ afterEach(() => {
 });
 const at = '2026-10-15T12:00:00.000Z';
 const item = { repo: 'owner/repo', pr: 12, head: 'abc', kind: 'needs-you', reason: 'ready', pick: 'pick 12' };
+describe('accepted never started crash-safe publication', () => {
+  const skip = { ...item, head: 'a'.repeat(40), kind: 'red-team-skip-fixture' };
+  const fixture = () => {
+    const path = join(temp(), 'events.jsonl'), state = sidecarsOf(path).state;
+    return { path, state, publish: (entry = skip, options = {}) => publishAttention(entry, { path, now: at, ...options }),
+      keys: () => JSON.parse(readFileSync(state, 'utf8')).openKeys };
+  };
+  it('restart-after-feed-append-before-dedup-state', () => {
+    const f = fixture();
+    writeJsonAtomic.mockImplementationOnce(() => { throw Error('simulated crash after append'); });
+    expect(() => f.publish()).toThrow('simulated crash');
+    expect(f.publish().lines).toEqual([]);
+    expect(replay({ path: f.path })).toHaveLength(1);
+    expect(f.keys()).toContain(`${skip.repo}#${skip.pr}@${skip.head}:${skip.kind}`);
+  });
+  it('publish-after-clear-same-key-appends-nothing', () => {
+    const f = fixture(), first = f.publish();
+    f.publish(item);
+    appendLines(f.path, diffFeed(first.openKeys, [], at).lines);
+    // Crash leaves stale dedup state containing the now-cleared key.
+    expect(f.publish().lines).toEqual([]);
+    expect(f.keys()).toEqual([`${item.repo}#${item.pr}@${item.head}:${item.kind}`]);
+    expect(replay({ path: f.path })).toHaveLength(3);
+    expect(f.publish({ ...skip, head: 'b'.repeat(40) }).lines).toHaveLength(1);
+    expect(f.publish({ ...skip, kind: 'red-team-skip-other-reason' }).lines).toHaveLength(1);
+  });
+  it('publish-attention-keeps-other-open-keys-on-replay-repair', () => {
+    const f = fixture(); f.publish(item);
+    appendLines(f.path, diffFeed([], [skip], at).lines);
+    expect(f.publish().lines).toEqual([]);
+    expect(f.keys()).toEqual(expect.arrayContaining([`${item.repo}#${item.pr}@${item.head}:${item.kind}`,
+      `${skip.repo}#${skip.pr}@${skip.head}:${skip.kind}`]));
+  });
+  it('publish-attention-keeps-other-state-keys-with-incomplete-semantics-after-unrelated-clears', () => {
+    const f = fixture(), other = f.publish(item);
+    appendLines(f.path, diffFeed(other.openKeys, [], at).lines);
+    appendLines(f.path, diffFeed([], [skip], at).lines);
+    expect(f.publish().lines).toEqual([]);
+    expect(f.keys()).toEqual(expect.arrayContaining([`${item.repo}#${item.pr}@${item.head}:${item.kind}`,
+      `${skip.repo}#${skip.pr}@${skip.head}:${skip.kind}`]));
+  });
+  it('publish-attention-non-red-team-skip-kind-unchanged', () => {
+    const f = fixture(), first = f.publish(item);
+    expect(first).toEqual(diffFeed([], [item], at, { incomplete: true }));
+    appendLines(f.path, diffFeed(first.openKeys, [], at).lines);
+    writeJsonAtomic(f.state, { openKeys: [] });
+    expect(f.publish(item)).toEqual(first);
+    expect(replay({ path: f.path })).toHaveLength(3);
+  });
+  it('malformed feed history refuses publication and preserves state', () => {
+    const f = fixture(); f.publish(item); const before = readFileSync(f.state, 'utf8');
+    appendLines(f.path, ['NEEDS-YOU malformed history']);
+    expect(() => f.publish()).toThrow(/feed|history/);
+    expect(readFileSync(f.state, 'utf8')).toBe(before);
+  });
+  it('oversized feed history refuses publication with an operator fallback', () => {
+    const f = fixture(); f.publish(item); const before = readFileSync(f.state, 'utf8');
+    truncateSync(f.path, 16 * 1024 * 1024 + 1);
+    expect(() => f.publish()).toThrow(/inspect\/archive the feed/);
+    expect(readFileSync(f.state, 'utf8')).toBe(before);
+  });
+  it('publication evidence reads from byte zero through at most the 16 MiB snapshot plus one sentinel byte', () => {
+    const f = fixture(); f.publish(item);
+    const limit = 16 * 1024 * 1024;
+    const line = readFileSync(f.path, 'utf8').trimEnd();
+    writeFileSync(f.path, line + ' '.repeat(limit - Buffer.byteLength(line) - 1) + '\n');
+    const stateSize = fs.statSync(f.state).size;
+    const read = vi.fn(realReadSync);
+    expect(f.publish(skip, { evidenceIo: { readSync: read } }).lines).toHaveLength(1);
+    expect(read.mock.calls.map(([, buffer, offset, length, position]) =>
+      ({ allocated: buffer.length, offset, length, position }))).toEqual([
+      { allocated: stateSize + 1, offset: 0, length: stateSize + 1, position: 0 },
+      { allocated: limit + 1, offset: 0, length: limit + 1, position: 0 },
+    ]);
+  });
+  it.each(['dedup state', 'feed history'].flatMap(label =>
+    ['short read', 'extra byte', 'changed size', 'changed mtime'].map(change => [label, change])))
+  ('%s %s during snapshot reading refuses publication and preserves feed and state', (label, change) => {
+    const f = fixture(); f.publish(item);
+    const feedBefore = readFileSync(f.path), stateBefore = readFileSync(f.state);
+    const targetRead = label === 'dedup state' ? 1 : 2;
+    let reads = 0, targetFd;
+    writeJsonAtomic.mockClear();
+    const read = (fd, ...args) => {
+      const count = realReadSync(fd, ...args);
+      if (++reads !== targetRead) return count;
+      targetFd = fd;
+      return count + (change === 'short read' ? -1 : change === 'extra byte' ? 1 : 0);
+    };
+    const statFd = fd => {
+      const stat = realFstatSync(fd);
+      if (fd !== targetFd) return stat;
+      return { ...stat, size: stat.size + (change === 'changed size' ? 1 : 0),
+        mtimeMs: stat.mtimeMs + (change === 'changed mtime' ? 1 : 0) };
+    };
+    expect(() => f.publish(skip, { evidenceIo: { readSync: read, fstatSync: statFd } })).toThrow(`needs-you-feed: ${label} changed during replay; ${label === 'feed history' ? 'inspect/archive the feed' : 'inspect the state'} before retrying publication`);
+    expect(reads).toBe(targetRead);
+    expect(writeJsonAtomic).not.toHaveBeenCalled();
+    expect(readFileSync(f.path)).toEqual(feedBefore);
+    expect(readFileSync(f.state)).toEqual(stateBefore);
+  });
+  it.each([{}, { openKeys: [7] }, { openKeys: ['invalid-key'] }])('malformed dedup state %j refuses publication', state => {
+    const f = fixture(); f.publish(item);
+    writeFileSync(f.state, JSON.stringify(state));
+    const before = readFileSync(f.path, 'utf8');
+    expect(() => f.publish()).toThrow(/state/);
+    expect(readFileSync(f.path, 'utf8')).toBe(before);
+  });
+  it('non-regular feed history refuses publication', () => {
+    const f = fixture(); mkdirSync(f.path);
+    expect(() => f.publish()).toThrow();
+  });
+  it('oversized dedup state refuses publication with an operator fallback', () => {
+    const f = fixture(); f.publish(item);
+    truncateSync(f.state, 16 * 1024 * 1024 + 1);
+    expect(() => f.publish()).toThrow(/inspect the state/);
+  });
+  it('a published state key without feed history refuses publication', () => {
+    const f = fixture(); f.publish(); rmSync(f.path);
+    const before = readFileSync(f.state, 'utf8');
+    expect(() => f.publish()).toThrow(/history/);
+    expect(readFileSync(f.state, 'utf8')).toBe(before);
+  });
+});
 describe('feed', () => {
   it('does not publish quiet needsYourMergePending notes as needs-you items', () => {
     const items = itemsFromReport({ needsYourMergePending: [{ repo: 'web-everything/web-everything',

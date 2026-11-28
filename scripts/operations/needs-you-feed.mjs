@@ -3,7 +3,7 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, openSync, fstatSync, readSync, closeSync, constants } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -206,10 +206,41 @@ export function appendLines(path, lines) {
   mkdirSync(dirname(path), { recursive: true });
   appendFileSync(path, lines.join('\n') + '\n', { flag: 'a' });
 }
-export function replay({ path = feedPath(), since = '1970-01-01T00:00:00Z' } = {}) {
+// Scoped crash repair must read a bounded, complete regular-file snapshot, never a pipe or a truncated prefix.
+function readPublicationEvidence(path, fallback, label, { readSync: read = readSync, fstatSync: statFd = fstatSync } = {}) {
+  let fd;
+  try { fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK); }
+  catch (error) { if (error.code === 'ENOENT') return fallback; throw error; }
+  try {
+    const stat = statFd(fd);
+    const inspect = label === 'feed history' ? 'inspect/archive the feed' : 'inspect the state';
+    if (!stat.isFile() || stat.size > 16 * 1024 * 1024) {
+      throw Error(`needs-you-feed: ${label} is not a regular file within 16 MiB; ${inspect} before retrying publication`);
+    }
+    const bytes = Buffer.alloc(stat.size + 1);
+    const count = read(fd, bytes, 0, bytes.length, 0);
+    const after = statFd(fd);
+    if (count !== stat.size || after.size !== stat.size || after.mtimeMs !== stat.mtimeMs) {
+      throw Error(`needs-you-feed: ${label} changed during replay; ${inspect} before retrying publication`);
+    }
+    try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, count)); }
+    catch { throw Error(`needs-you-feed: unreadable ${label}; ${inspect} before retrying publication`); }
+  } finally { closeSync(fd); }
+}
+export function replay({ path = feedPath(), since = '1970-01-01T00:00:00Z', strict = false, evidenceIo } = {}) {
   path = checkedFeedPath(path);
   const threshold = Date.parse(since); if (!Number.isFinite(threshold)) throw new Error('needs-you-feed: invalid --since timestamp');
-  return readOptional(path, '').split('\n').map(parseFeedLine).filter(e => e && Date.parse(e.at) >= threshold);
+  const lines = (strict ? readPublicationEvidence(path, '', 'feed history', evidenceIo) : readOptional(path, '')).split('\n');
+  if (lines.at(-1) === '') lines.pop();
+  return lines.map(line => {
+    const event = parseFeedLine(line);
+    if (strict && (!event || !Number.isFinite(Date.parse(event.at)) || typeof event.repo !== 'string' || !event.repo
+      || !Number.isSafeInteger(event.pr) || event.pr <= 0 || typeof event.head !== 'string' || !event.head
+      || typeof event.kind !== 'string' || !event.kind || (event.kind === 'cleared' && typeof event.was !== 'string'))) {
+      throw Error('needs-you-feed: malformed history; inspect the feed before retrying publication');
+    }
+    return event;
+  }).filter(e => e && Date.parse(e.at) >= threshold);
 }
 // Keep the original sidecars only for the canonical filename. Overrides get their own namespace,
 // keyed by resolved path, so changing filenames neither inherits open keys nor another stream's cursor.
@@ -410,13 +441,41 @@ export async function runOnce({ exec = execFileSync, gh = execFileSyncThrottled,
   });
 }
 /** Immediate escalation publisher. Same lock/state as polling; never gated by quiet hours. */
-export function publishAttention(item, { path = feedPath(), now = Date.now() } = {}) {
+export function publishAttention(item, { path = feedPath(), now = Date.now(), evidenceIo } = {}) {
   path = checkedFeedPath(path);
   const statePath = statePathOf(path);
   mkdirSync(dirname(statePath), { recursive: true });
   return withFileLock(`${statePath}.lock`, () => {
-    const prev = JSON.parse(readOptional(statePath, '{"openKeys":[]}'));
-    const result = diffFeed(prev.openKeys, [item], now, { incomplete: true });
+    const crashSafe = String(item?.kind ?? '').startsWith('red-team-skip-');
+    const prev = JSON.parse(crashSafe ? readPublicationEvidence(statePath, '{"openKeys":[]}', 'dedup state', evidenceIo)
+      : readOptional(statePath, '{"openKeys":[]}'));
+    let priorOpenKeys = prev.openKeys;
+    if (crashSafe) {
+      if (!Array.isArray(prev?.openKeys) || prev.openKeys.some(key => typeof key !== 'string'
+        || !/^.+#[1-9]\d*@.+:[^:\r\n]+$/.test(key))) {
+        throw Error('needs-you-feed: malformed dedup state; inspect the state before retrying publication');
+      }
+      // The append itself is the durable receipt. Repair a lost state write from history, including explicit clears.
+      // Keep polling's incomplete-report semantics: unrelated open state keys survive the repair.
+      const key = keyOf(sanitizeItem(item)), replayedOpen = new Set();
+      let seen = false;
+      for (const event of replay({ path, strict: true, evidenceIo })) {
+        const eventKey = keyOf(event.kind === 'cleared' ? { ...event, kind: event.was } : event);
+        if (eventKey === key) seen = true;
+        if (event.kind === 'cleared') replayedOpen.delete(eventKey); else replayedOpen.add(eventKey);
+      }
+      const open = new Set([...prev.openKeys.filter(other => other !== key), ...replayedOpen]);
+      if (seen) {
+        const result = { lines: [], openKeys: [...open] };
+        writeJsonAtomic(statePath, { ...prev, openKeys: result.openKeys });
+        return result;
+      }
+      if (prev.openKeys.includes(key)) {
+        throw Error('needs-you-feed: published state key has no feed history; inspect the feed and state before retrying publication');
+      }
+      priorOpenKeys = [...open];
+    }
+    const result = diffFeed(priorOpenKeys, [item], now, { incomplete: true });
     appendLines(path, result.lines);
     writeJsonAtomic(statePath, { ...prev, openKeys: result.openKeys });
     return result;

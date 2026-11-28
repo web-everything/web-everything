@@ -38,6 +38,9 @@ import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { isManualPassNote, isProducerRefreshNote } from '../operations/operator-action-shape.mjs';
 import { buildVerdictCarriedMarker, parseVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
 import { MARKER_RE, JOB_RE, RETRACTED_RE } from './approval-prevention-notice.mjs';
+import { NO_ASK_NOTE_KINDS } from './pr-comment-policy.mjs';
+import { buildNoteComment } from '../conveyor/reconcile-note-comment.mjs';
+import { buildExhaustedRetryRecoveredComment, EXHAUSTED_RETRY_RECOVERED_KINDS } from '../conveyor/exhausted-retry-recovered-comment.mjs';
 import { breakClass, CONFIRMED_BREAK_ACTIONS, GATE_OUTCOMES, planRedTeamActions, readConfirmedBreaks, parseRedTeamComment, parseRedTeamGateMarker, redTeamMarker, redTeamGateMarker, RED_TEAM_COMMENT_MARKER, RED_TEAM_GATE_MARKER } from './red-team-gate.mjs';
 
 export const ACCEPT_CARRY_FORWARD_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'accept-carry-forward.json');
@@ -140,6 +143,21 @@ const KNOWN_MACHINE_SHAPE_RES = [
 // Every line terminator Markdown / the producers treat as a line break (`\r`, U+0085, U+2028/9, VT, FF as well as `\n`): a second
 // "line" smuggled behind any of them must not ride the header or the marker.
 const NL = '\\r\\n\\u0085\\u2028\\u2029\\v\\f';
+function isNoAskNote(text) {
+  if (/[\r\u0085\u2028\u2029\v\f]/.test(text)) return false;
+  // Recover original text from the producer's own trailer, not from its escaped visible text.
+  const trailers = [...text.matchAll(/^<!-- conveyor-note-key: ([a-z-]+):([1-9]\d*):([^\r\n]*) -->$/gm)];
+  if (trailers.length !== 1) return false;
+  const [, kind, pr, detail] = trailers[0];
+  const prNumber = Number(pr);
+  return NO_ASK_NOTE_KINDS.includes(kind) && Number.isSafeInteger(prNumber)
+    && text === buildNoteComment({ kind, prNumber, text: detail }, { informational: true });
+}
+function isRecoveredRetryNote(text) {
+  const head = /^head: ([0-9a-f]{40})$/m.exec(text)?.[1];
+  return !!head && EXHAUSTED_RETRY_RECOVERED_KINDS.some(kind =>
+    text === buildExhaustedRetryRecoveredComment({ kind, headSha: head }));
+}
 const OPERATOR_ACTION_HEADER = '🛠 operator action — ';
 const OPERATOR_ACTION_MARKER_RE = new RegExp(`\\n<!-- operator-action: (\\{[^${NL}]*\\}) -->\\s*$`); // on its OWN line, last in the body
 function isTrustedAuthorNote(text) {
@@ -220,7 +238,7 @@ function isNonBlockingRedTeamGate(text) {
  * The carry writer's envelope (review-job.mjs): the carried marker, its fixed sentence, then optionally a non-blocking
  * advisory re-bound to the carried-to head (its "Head" label keeps the carried-from head). Anything else is a possible hold.
  */
-function isNonBlockingCarriedVerdict(text, comment, shownHead = null) {
+function isNonBlockingCarriedVerdict(text, comment, shownHead = null, context = {}) {
   if (comment === undefined || !isTrustedMarkerAuthor(comment)) return false;
   const carried = parseVerdictCarriedMarker(text);
   if (!carried) return false;
@@ -234,7 +252,62 @@ function isNonBlockingCarriedVerdict(text, comment, shownHead = null) {
   if (!rest.startsWith('\n') || !rest.trimStart().startsWith(RED_TEAM_COMMENT_MARKER)) return false;
   rest = rest.trim();
   const parsed = parseRedTeamComment(rest);
-  return !!parsed && parsed.rev === carried.toSha && isNonBlockingRedTeamAdvisory(rest, shownHead ?? carried.fromSha.slice(0, 12));
+  if (!parsed || parsed.rev !== carried.toSha) return false;
+  const displayed = / Head `([0-9a-f]{12})` · red team /.exec(rest)?.[1];
+  if (!displayed) return false;
+  if (displayed !== carried.fromSha.slice(0, 12) && displayed !== shownHead
+    && !verifiedCarryOrigin(carried, comment, displayed, context)) return false;
+  return isNonBlockingRedTeamAdvisory(rest, displayed);
+}
+
+/** Only an envelope's own marker line is provenance; the substring parser alone authenticates nothing. */
+function ownCarryEdge(body) {
+  if (typeof body !== 'string') return null;
+  const edge = parseVerdictCarriedMarker(body);
+  if (!edge) return null;
+  const marker = buildVerdictCarriedMarker(edge);
+  if ([...body.matchAll(/<!-- review-verdict-carried /g)].length !== 1) return null;
+  const cut = body.indexOf(marker), prefix = body.slice(0, cut);
+  if (prefix) {
+    const gate = parseRedTeamGateMarker(prefix);
+    if (!gate || gate.rev !== edge.toSha || gate.outcome !== GATE_OUTCOMES.CARD_QUEUED || !prefix.endsWith('\n')) return null;
+    const bare = redTeamGateMarker(gate.pr, gate.rev, gate.outcome, gate.result, gate.grantIds, gate.classCards);
+    if (prefix.slice(0, -1) !== bare && !isNonBlockingRedTeamGate(prefix.slice(0, -1))) return null;
+  }
+  const lead = `${marker}\nReview verdict carried across an identical contribution.`;
+  if (!body.slice(cut).startsWith(lead)) return null;
+  const rest = body.slice(cut + lead.length);
+  if (!rest.trim()) return edge;
+  if (!rest.startsWith('\n')) return null;
+  const advisory = rest.trim(), parsed = parseRedTeamComment(advisory);
+  const shown = / Head `([0-9a-f]{12})` · red team /.exec(advisory)?.[1];
+  return parsed?.rev === edge.toSha && shown && redTeamAdvisoryShape(advisory, shown) ? edge : null;
+}
+
+/** Strictly decreasing list indices bound the walk. Every ambiguous, future or unauthenticated edge holds. */
+function verifiedCarryOrigin(edge, comment, displayed, { comments, acceptIndex } = {}) {
+  // An oversized thread needs operator inspection rather than unbounded quadratic chain work.
+  if (!Array.isArray(comments) || comments.length > 10000 || !Number.isInteger(acceptIndex) || acceptIndex < 0 || acceptIndex >= comments.length) return false;
+  let before = comments.indexOf(comment);
+  if (before <= acceptIndex || ownCarryEdge(comment?.body)?.toSha !== edge.toSha) return false;
+  let head = edge.fromSha;
+  const visited = new Set([edge.toSha]);
+  for (let steps = 0; steps < Math.min(comments.length, 256); steps++) {
+    if (visited.has(head)) return false;
+    visited.add(head);
+    const accepts = comments.flatMap((c, index) => isTrustedMarkerAuthor(c)
+      && lastMatch(REVIEWED_SHA_RE, typeof c?.body === 'string' ? c.body : '') === head ? [index] : []);
+    if (accepts.some(index => index < before)) return [...visited].some(sha => displayed === sha.slice(0, 12));
+    const predecessors = comments.flatMap((c, index) => {
+      const parsed = parseVerdictCarriedMarker(c?.body);
+      return parsed?.toSha === head ? [{ c, index, parsed }] : [];
+    });
+    if (predecessors.length !== 1) return false;
+    const { c, index, parsed } = predecessors[0];
+    if (index >= before || !isTrustedMarkerAuthor(c) || !ownCarryEdge(c?.body)) return false;
+    before = index; head = parsed.fromSha;
+  }
+  return false;
 }
 
 // Resolve exactly the gate's live policy. Unknown policy requires a fresh review.
@@ -248,7 +321,7 @@ function liveRedTeamAdvisoryPlan(parsed) {
 }
 
 /** Validate the rendered envelope and every finding line: the shared evidence parser skips malformed lines. */
-function isNonBlockingRedTeamAdvisory(text, shownHead = null) {
+function redTeamAdvisoryShape(text, shownHead = null) {
   const parsed = parseRedTeamComment(text);
   if (!parsed) return false;
   const lines = text.split('\n');
@@ -262,10 +335,8 @@ function isNonBlockingRedTeamAdvisory(text, shownHead = null) {
     || lines[2] !== '' || !lines[3]?.startsWith(prefix)
     || !/^[^\s`]+\/[^\s`]+(?: · re-check (?:ok|pending|not-needed|error))? · recorded verdict `(accept|changes|null)`\.$/.test(lines[3].slice(prefix.length))
     || lines[4] !== '') return false;
-  if (!findings.length) return lines.length === 6 && lines[5] === 'The red team tried to break this change and reported nothing.';
+  if (!findings.length) return lines.length === 6 && lines[5] === 'The red team tried to break this change and reported nothing.' ? parsed : null;
   if (lines.at(-2) !== '' || lines.at(-1) !== "A confirmed break is recorded as a miss for the accepting review and for the builder's model.") return false;
-  const plan = liveRedTeamAdvisoryPlan(parsed);
-  if (!plan || plan.sendBack.length) return false;
   let count = 0;
   for (const line of lines.slice(5, -2)) {
     const finding = parseRedTeamComment(`${lines[0]}\n${line}`).findings[0];
@@ -276,7 +347,15 @@ function isNonBlockingRedTeamAdvisory(text, shownHead = null) {
       || /^ {3}- Class: [^\r\n]+? → (?:fix-now|defer-card)(?: \(basis: [^\r\n]*\))?$/.test(line)
       || /^ {3}- Also class: [a-z-]+(?:, [a-z-]+)*$/.test(line))) return false;
   }
-  return count === findings.length;
+  return count === findings.length ? parsed : null;
+}
+
+function isNonBlockingRedTeamAdvisory(text, shownHead = null) {
+  const parsed = redTeamAdvisoryShape(text, shownHead);
+  if (!parsed) return false;
+  if (!parsed.findings.length) return true;
+  const plan = liveRedTeamAdvisoryPlan(parsed);
+  return !!plan && plan.sendBack.length === 0;
 }
 
 /**
@@ -285,13 +364,14 @@ function isNonBlockingRedTeamAdvisory(text, shownHead = null) {
  * Red-team gate records and advisories require trusted author metadata, the complete machine shape, and no blocking result.
  * Verdicts, re-arms, stand-downs and non-mechanical drain parks are NOT machine shapes (they supersede the accept).
  */
-export function isKnownMachineBody(body, comment = undefined) {
+export function isKnownMachineBody(body, comment = undefined, context = {}) {
   const text = typeof body === 'string' ? body : '';
   if (!text.trim()) return true;
   if (isLaterVerdictBody(text)) return false;
-  if (text.startsWith('<!-- review-verdict-carried ')) return isNonBlockingCarriedVerdict(text, comment);
+  if (text.startsWith('<!-- review-verdict-carried ')) return isNonBlockingCarriedVerdict(text, comment, null, context);
   // Only non-blocking results are machine notes: a policy send-back or a failed/unknown gate supersedes the accept.
   if (isTrustedMarkerAuthor(comment)) {
+    if (isNoAskNote(text) || isRecoveredRetryNote(text)) return true;
     if (text.startsWith(RED_TEAM_GATE_MARKER)) {
       if (isNonBlockingRedTeamGate(text)) return true;
       const gate = parseRedTeamGateMarker(text);
@@ -309,8 +389,7 @@ export function isKnownMachineBody(body, comment = undefined) {
       if (!envelope.includes(RED_TEAM_COMMENT_MARKER)) return false;
       // Both producer shapes retain the strict finding sequence/completeness checks:
       // the original displayed head, or the advisory rendered for the current head.
-      return isNonBlockingCarriedVerdict(envelope, comment)
-        || isNonBlockingCarriedVerdict(envelope, comment, gate.rev.slice(0, 12));
+      return isNonBlockingCarriedVerdict(envelope, comment, gate.rev.slice(0, 12), context);
     }
     if (text.startsWith(RED_TEAM_COMMENT_MARKER)) {
       const parsed = parseRedTeamComment(text);
@@ -405,7 +484,7 @@ export function latestAcceptRecord(comments, reviews = undefined, { sha: sourceS
     .some((c) => BODY_DERIVED_HOLD_RE.test(typeof c?.body === 'string' ? c.body : ''));
   // ANY author: an unrecognised comment is a possible hold (see the file's "inverted rule" note), a recognised verdict
   // shape is one. A formal review that stands against the accept is the other channel.
-  const laterVerdict = later.some((c) => !isKnownMachineBody(c?.body, c)) || (Array.isArray(reviews) && laterReviewHold(reviews, rec.at));
+  const laterVerdict = later.some((c) => !isKnownMachineBody(c?.body, c, { comments: list, acceptIndex: rec.index })) || (Array.isArray(reviews) && laterReviewHold(reviews, rec.at));
   return { ...rec, laterBodyDerivedHold, laterVerdict, reviewsUnreadable: reviews === null };
 }
 
