@@ -133,17 +133,25 @@ describe('forge key structure: bounded unclosed object scans fail closed',()=>{
     expect(Date.now()-started).toBeLessThan(2000);
   });
   it('keeps the signal scan linear on bracket-heavy input',()=>{
-    // Linear takes ~30ms locally; a quadratic scan on this 120KB input takes many seconds. The budget sits far
-    // below the quadratic cost but far above shared-runner scheduling noise (a 500ms cap flaked at 501ms on CI),
-    // and the best of three runs absorbs a single noisy slice.
-    const bytes=Buffer.from('[a]'.repeat(40000));
-    let best=Infinity;
-    for(let run=0;run<3;run++) {
-      const started=Date.now();
-      expect(keyStructureFinding(bytes)).toBeNull();
-      best=Math.min(best,Date.now()-started);
-    }
-    expect(best).toBeLessThan(2000);
+    // Count regex executions instead of wall-clock: a time cap flaked on loaded CI runners (501ms vs 500ms) while
+    // work counts are deterministic. Quadrupling the input must roughly quadruple the work (linear), not 16x it.
+    const exec=RegExp.prototype.exec;
+    let calls=0;
+    const spy=vi.spyOn(RegExp.prototype,'exec').mockImplementation(function(text) {
+      calls++;
+      return exec.call(this,text);
+    });
+    const work=n=>{
+      calls=0;
+      expect(keyStructureFinding(Buffer.from('[a]'.repeat(n)))).toBeNull();
+      return calls;
+    };
+    try {
+      const small=work(10000);
+      const large=work(40000);
+      expect(small).toBeGreaterThan(0);
+      expect(large/small).toBeLessThanOrEqual(5);
+    } finally {spy.mockRestore();}
   });
   it('still blocks a PEM private key inside a large doc',()=>{
     const pem='-----BEGIN '+['PRIVATE','KEY'].join(' ')+'-----\nQUJD\n-----END '+['PRIVATE','KEY'].join(' ')+'-----';
