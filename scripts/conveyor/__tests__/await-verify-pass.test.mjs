@@ -470,6 +470,25 @@ describe('defaultAwaitVerifyIo — the real push and resume ports (#5137 review)
   });
   const gitPushes = (calls) => calls.filter((c) => c[0] === 'git' && c.includes('push'));
 
+  it('M12h joined repair push ignores pending labels and reads only the bound PR ref/state/url/fork', async () => {
+    const { exec: injectedExec, calls } = fakeExec();
+    const livePr = { headRefName: PR_HEAD, state: 'OPEN', url: PR_URL, isCrossRepository: false,
+      labels: ['review:changes', 'red-team:pending', 'status:ci-red'] };
+    const exec = (cmd, args, opts) => {
+      if (cmd !== 'gh') return injectedExec(cmd, args, opts);
+      calls.push([cmd, ...args]);
+      expect(args[args.indexOf('--json') + 1]).toBe('headRefName,state,url,isCrossRepository');
+      return `${livePr.state} ${livePr.url} ${livePr.isCrossRepository} ${livePr.headRefName}\n`;
+    };
+    const root = mkdtempSync(join(tmpdir(), 'e5-push-'));
+    try {
+      const io = await build(exec, { weRoot: root, poolRoot: root, sleep: () => {} });
+      expect(io.push(pushArg({ lane: join(root, 'lane-5') }))).toEqual({ ok: true });
+      expect(gitPushes(calls)).toHaveLength(1);
+      expect(calls.filter(c => c[0] === 'gh')).toHaveLength(1);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('pushes sha:refs/heads/<ref> only — never --force, --no-verify or a + refspec — with the lane config pinned', async () => {
     const { exec, calls } = fakeExec();
     const result = (await build(exec)).push(pushArg());

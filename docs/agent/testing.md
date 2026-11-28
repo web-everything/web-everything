@@ -688,7 +688,22 @@ can destroy retained pipes. An exit-only fixture leaves the completion promise p
 `WE_RED_TEAM_STATUS_LABELS` as the environment override; effective value and source are logged.
 The existing label provider provisions the known metadata and writes the mutually exclusive
 `red-team:pending`, `red-team:clear`, and `red-team:blocked` labels. They describe scheduling
-and the recorded disposition on the live head, never grant clearance. The conveyor's existing
+and the recorded disposition on the live head, never grant clearance.
+`red-team:pending` blocks merge and never blocks a fix LAUNCH for the closed route set
+E1-E5, or for the separate pre-existing stale-base exception (`repair.staleBase`, unchanged);
+every other route stays held. E5 is a joined CI-plus-review repair with a valid `joinedInputs`
+object (non-null, non-array, lowercase 40-hex `head`, array `ciFailures`, nonempty array
+`reviewFindings`), no repair mode, conflict, MQ recovery or open operator send-back, and no
+excluded route (takeover, scopeBloat, restack, rulingNotAddressed, blockRuledReferrals,
+operatorSendBack). Its joined, planned and live heads must match; planned and live labels
+must carry `review:changes`; live labels must carry none of `review:accepted`,
+`red-team:blocked` or `merge-status:conflicting`; the live PR must be MERGEABLE on `main`.
+Presence of malformed `joinedInputs`, including explicit falsy values, refuses E5 without
+falling through to E3. Independent human and mechanical holds still apply. The exemption
+is evaluated at launch only and grants nothing at the merge gate or any push-side check.
+Concurrent red-team execution on the old head remains an accepted compute cost: landing
+requires a valid result on the new head.
+The conveyor's existing
 label sweep removes stale head labels and repairs missed status writes. Re-arm removes merge
 readiness and stale status labels atomically; missing-only re-arm preserves readiness only
 when a trusted acceptance marker still names the unchanged live head.
