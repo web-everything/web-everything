@@ -27,6 +27,9 @@ import { CONFLICT_LABEL } from '../parked-pr-conflict-watch.mjs';
 import { resolvePrWorkUnit } from '../pr-work-unit.mjs';
 import { DISPATCHED_AGENT_SYSTEM_PROMPT_FILE, dispatchSessionCwd } from '../../operations/dispatch-lane-io.mjs';
 import { buildAuthorActorMarker } from '../../lib/review-independence.mjs';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import * as orphanListing from '../orphan-fix-round.mjs';
 
 // Existing resume fixtures have no completion record; never consult the host store.
 vi.mock('../../operations/completion-store.mjs', async (importOriginal) => ({
@@ -46,6 +49,72 @@ const item3438 = { num: '3438', slug: 'wire-reconcile-pass', specPath: 'backlog/
 // #4295 — a second, scope-DISJOINT item so multi-PR dispatch tests aren't (correctly) serialized by the overlap filter.
 const item3439 = { num: '3439', slug: 'other-thing', specPath: 'backlog/3439-other-thing.md', scope: ['we:scripts/other.mjs'] };
 const findItemStub = (key, _loadItems) => (key === '3438' ? item3438 : key === '3439' ? item3439 : null);
+
+describe('ORPHAN-LIST-INCOMPLETE dispatch consumer', () => {
+  const slug = 'web-everything/web-everything';
+  const held = async (scan, check) => {
+    const root = mkdtempSync(join(tmpdir(), 'orphan-incomplete-consumer-'));
+    const reconcile = vi.fn(() => { throw new Error('incomplete evidence reached planning'); });
+    const dispatch = vi.fn(() => { throw new Error('incomplete evidence reached dispatch'); });
+    try {
+      const result = runReconcileFixDispatch({ root, repo: slug, checkStaleness: FRESH,
+        orphanScan: scan, reconcile, dispatch, now: 0, clock: () => 0, stepNow: () => 0,
+        stepLog: () => {}, priorityShadow: null, prStack: null, netScope: null,
+        readPrView: () => { throw new Error('unexpected PR read'); },
+        fixSettings: {}, prStackSettings: {}, listBuildClaims: () => [], listFixClaims: () => [],
+        tryResumeRound: null, pickFreeLanes: () => [], loadItems: () => [],
+      });
+      expect(result).toMatchObject({ dispatched: [], orphanScanComplete: false,
+        refusals: [expect.objectContaining({ kind: 'orphan-guard-deferred' })] });
+      expect(reconcile).not.toHaveBeenCalled();
+      expect(dispatch).not.toHaveBeenCalled();
+      check(result);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  };
+
+  it.each([null, {}, { rows: [] }, { complete: 'true', rows: [] }])('required-evidence-missing: legacy guard result holds before any writer (%j)', scan =>
+    held(scan, result => expect(result.refusals[0].why).toMatch(/required-evidence-missing.*retry.*operator/i)));
+
+  it('holds reconciliation and dispatch when the real producer receives complete:false with reason:complete', async () => {
+    const unexpected = vi.fn(() => { throw new Error('contradictory listing reached PR processing'); });
+    const scan = await orphanListing.runOrphanFixRoundPass({ env: {}, nowMs: 0, now: () => 0,
+      repos: [{ key: 'we', slug }],
+      listBounced: () => ({ items: [{ number: 1, labels: [{ name: 'review:changes' }],
+        headRefOid: 'a'.repeat(40), isDraft: false }], complete: false, reason: 'complete', continuation: null }),
+      readComments: unexpected, isOwned: unexpected, cardReadable: unexpected,
+      rearm: unexpected, redispatch: unexpected, escalate: unexpected, postComment: unexpected,
+      resolveProfile: unexpected });
+    expect(scan).toMatchObject({ complete: false, reason: 'required-evidence-missing', handled: 0 });
+    expect(unexpected).not.toHaveBeenCalled();
+    await held(scan, result => {
+      expect(result.refusals[0].why).toMatch(/required-evidence-missing.*retry.*operator/i);
+      expect(result.orphanScan).toBe(scan);
+    });
+  });
+
+  it.each(['page-cap', 'page-failure', 'listing-deadline'])('real producer %s reaches the dispatch consumer as incomplete and preserves continuation', async reason => {
+    let time = 0;
+    const exec = vi.fn((_cmd, args) => {
+      const page = Number(new URLSearchParams(args[1].split('?')[1]).get('page'));
+      if (reason === 'page-failure' && page === 3) throw new Error('HTTP 503');
+      if (reason === 'listing-deadline' && page === 2) time = 10;
+      return JSON.stringify(page <= 2 ? Array.from({ length: 100 }, (_, i) => ({
+        number: 301 - (page - 1) * 100 - i, labels: [], head: { sha: 'a'.repeat(40) }, draft: false,
+      })) : []);
+    });
+    const scan = await orphanListing.runOrphanFixRoundPass({ env: {}, nowMs: 0, now: () => time,
+      repos: [{ key: 'we', slug }],
+      listBounced: (repo, input) => orphanListing.readBouncedListing(repo, { ...input, exec,
+        now: () => time, timeoutMs: 1000, deadlineAt: 10, maxPages: reason === 'page-cap' ? 2 : 10 }),
+      readComments: () => { throw new Error('partial discovery reached comments'); },
+      isOwned: () => { throw new Error('partial discovery reached claims'); }, cardReadable: () => false });
+    await held(scan, result => {
+      expect(result.refusals[0].why).toContain(reason);
+      expect(result.orphanScan.repoCursors).toEqual(scan.repoCursors);
+      expect(result.orphanScan.reason).toBe(reason);
+    });
+  });
+});
 
 describe('planFixesFromReconcile', () => {
   it('narrows to `kind:\'fix\'` entries and plans one per dispatchable PR', () => {
