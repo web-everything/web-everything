@@ -350,11 +350,12 @@ it.each([
   record(); delete probes[probe]; probes.execFileSync = () => listingText(probe, listing);
   expect((await sweep()).reaped).toEqual(['review-pr-dead']);
 });
-it('session-reaper flag opts in to a dry-run and adds deadReviewRuns to JSON', async () => {
+it('session-reaper flag opts in to a dry-run and reports missing context in JSON', async () => {
   const { runSessionReaperCli } = await import('../../conveyor/session-reaper.mjs');
   for (const [key, value] of Object.entries({ ...env, OPERATION_RUNS_DIR: dir, WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' })) vi.stubEnv(key, value);
-  // Young work exercises the real sweep without invoking host lease/session probes.
+  // Even young work is held before age classification when the CLI lacks daemon authority.
   record(); utimesSync(runPath('review-pr-dead', dir), new Date(), new Date());
+  const before = readFileSync(runPath('review-pr-dead', dir), 'utf8');
   const args = ['--json', '--dry-run', '--no-run-rating', '--no-ground-truth', '--no-completion-record',
     '--no-hung-detection', '--no-auth-expired-detection', '--no-idle-finished-detection', '--no-pid-dead-detection'];
   let stdout = '', stderr = '';
@@ -363,8 +364,14 @@ it('session-reaper flag opts in to a dry-run and adds deadReviewRuns to JSON', a
   expect(JSON.parse(stdout).deadReviewRuns).toBeNull();
   stdout = '';
   expect((await runSessionReaperCli([...args, '--reap-dead-review-runs'], io))).toBe(0);
-  expect(JSON.parse(stdout).deadReviewRuns.kept.young).toEqual(['review-pr-dead']);
+  const result = JSON.parse(stdout).deadReviewRuns;
+  expect(result.scanned).toBe(1);
+  expect(result.kept).toEqual({ 'missing-context': ['review-pr-dead'] });
+  expect(result.reaped).toEqual([]);
+  expect(result.wouldReap).toEqual([]);
   expect(stderr).toContain('session-reaper dead-review-runs:');
+  expect(readFileSync(runPath('review-pr-dead', dir), 'utf8')).toBe(before);
+  expect(readdirSync(dir).some(f => f.endsWith('.abandoned.json'))).toBe(false);
   expect(tryReadRun('review-pr-dead', dir).pending).not.toBeNull();
 });
 
