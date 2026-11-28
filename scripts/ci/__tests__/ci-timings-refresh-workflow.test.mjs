@@ -186,13 +186,10 @@ describe('CI timing refresh workflow permissions and publication', () => {
     expect(workflow.on).toHaveProperty('workflow_dispatch');
   });
 
-  it('refreshes only successful CI main push completions or explicit scheduled/manual runs', () => {
-    const ci = yaml.load(readFileSync(new URL('../../../.github/workflows/ci.yml', import.meta.url), 'utf8'));
-    expect(workflow.on.workflow_run).toEqual({ workflows: [ci.name], types: ['completed'] });
-    expect(workflow.jobs.refresh.if).toBe(
-      "github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || " +
-      "(github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && " +
-      "github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.event == 'push')");
+  it('refreshes only on the weekly schedule or a manual run, never per main CI completion', () => {
+    expect(Object.keys(workflow.on).sort()).toEqual(['schedule', 'workflow_dispatch']);
+    expect(workflow.on).not.toHaveProperty('workflow_run');
+    expect(workflow.jobs.refresh.if).toBe("github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'");
     expect(download.run).toBe('node scripts/ci/refresh-timings.mjs --runs=5 --min-stale=1.15');
   });
 
