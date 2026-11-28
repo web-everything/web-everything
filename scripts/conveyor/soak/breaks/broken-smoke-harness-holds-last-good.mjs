@@ -113,7 +113,7 @@ export default {
           const stateDir = daemonStateDir(w.env);
 
           const state = rebuildModule.readRebuildState(w.simCloneRoot, w.env);
-          if (state.held?.reason !== 'smoke-harness-broken') {
+          if (state.held?.reason !== 'smoke-harness-broken' || !state.rejected?.harnessBroken || !state.rejected?.retryAt) {
             api.violation('not-held-as-harness-broken', `state.held.reason is ${JSON.stringify(state.held?.reason ?? null)} (expected "smoke-harness-broken") — full held record: ${JSON.stringify(state.held)}`);
           }
 

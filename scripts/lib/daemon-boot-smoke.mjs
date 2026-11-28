@@ -362,7 +362,7 @@ export function buildEntryBootScript(entry) {
     `  await ${im}(new URL(${JSON.stringify(entry)}, 'file://' + process.cwd() + '/').href);`,
     "  process.stdout.write(JSON.stringify({ ok: true }));",
     '} catch (e) {',
-    "  process.stdout.write(JSON.stringify({ ok: false, error: String((e && e.stack) || e).split('\\n').slice(0, 3).join(' | ') }));",
+    "  process.stdout.write(JSON.stringify({ ok: false, error: String((e && e.stack) || e) }));",
     '}',
   ];
   return lines.join('\n');
@@ -384,11 +384,17 @@ async function bootOneEntry(entry, { root, timeoutMs, bootMinChildMs, runChild, 
   const keep = (text) => writeStderrTail(text, { dir: diagnosticsDir, label: `boot-${entry}`, now });
   // The culprit attribution (`daemon-rebuild/smoke.mjs#smokeFailureFiles`) reads these typed paths, not the text.
   const filesIn = (text) => sourceFilesIn(text, root).filter(isRepoFile);
-  const importFailure = (parsed, elapsedMs) => {
-    // The boot script joins its stack lines with ' | '.
-    const error = String(parsed?.error ?? '').split(' | ').join('\n');
-    return { entry, ok: false, kind: 'import failed', startedAt, elapsedMs, signal: null, exitCode: null,
+  const importFailure = (parsed, elapsedMs, childFailure = {}) => {
+    // Preserve the entire child error, including literal delimiters and stack tails.
+    const error = parsed.error;
+    const failure = { entry, ok: false, kind: 'import failed', startedAt, elapsedMs,
+      signal: smokeSignal(childFailure?.signal), exitCode: smokeExitCode(childFailure?.status),
       errorClass: smokeErrorClass(error), files: filesIn(error), stderrFile: keep(error) };
+    // In-process only: NON-ENUMERABLE, so it never serialises (a result must never carry raw child text out). It is the
+    // byte-exact child error `failsSameChecks` compares for exact equality, since `errorClass` is lossy (masked, truncated).
+    // A copied or persisted row loses it and then never matches (fails closed).
+    Object.defineProperty(failure, 'rawError', { value: error, enumerable: false });
+    return failure;
   };
   let out;
   try {
@@ -399,7 +405,7 @@ async function bootOneEntry(entry, { root, timeoutMs, bootMinChildMs, runChild, 
     // Only a complete failure report overrides the child failure; malformed/missing output stays failed.
     let parsed;
     try { parsed = JSON.parse(e?.stdout); } catch { /* no complete harness report */ }
-    if (parsed?.ok === false && typeof parsed.error === 'string') return importFailure(parsed, elapsedMs);
+    if (validImportFailureReport(parsed)) return importFailure(parsed, elapsedMs, e);
     const stderr = String(e?.stderr ?? '');
     // The rebuild's own budget refusal and the bounded child's own kill reasons (never child text): kept verbatim,
     // matched exactly, so a timeout still reads as one.
@@ -417,8 +423,14 @@ async function bootOneEntry(entry, { root, timeoutMs, bootMinChildMs, runChild, 
     return { entry, ok: false, kind: 'unparsable child output', startedAt, elapsedMs, signal: null, exitCode: null,
       errorClass: 'SyntaxError: unparsable child output', stderrFile: keep(out) };
   }
-  if (parsed?.ok) return { entry, ok: true, startedAt, elapsedMs };
-  return importFailure(parsed, elapsedMs);
+  if (parsed?.ok === true && Object.keys(parsed).length === 1) return { entry, ok: true, startedAt, elapsedMs };
+  if (validImportFailureReport(parsed)) return importFailure(parsed, elapsedMs);
+  return { entry, ok: false, kind: 'invalid child report', startedAt, elapsedMs, errorClass: null, stderrFile: keep(out) };
+}
+
+function validImportFailureReport(report) {
+  return !!report && report.ok === false && typeof report.error === 'string' && report.error.length > 0
+    && Object.keys(report).length === 2;
 }
 
 const BUDGET_REFUSAL = /^skipped: rebuild smoke budget exhausted \(\d+ms left\)$/;
@@ -475,7 +487,10 @@ export async function checkDaemonEntriesBoot({
       results[index] = await bootOneEntry(entries[index], options);
       attempts.push(results[index]);
     }
-    results[index] = { ...results[index], attempts };
+    const last = results[index];
+    results[index] = { ...last, attempts };
+    // The spread drops the non-enumerable in-process raw error; carry it over (still non-enumerable).
+    if (typeof last.rawError === 'string') Object.defineProperty(results[index], 'rawError', { value: last.rawError, enumerable: false });
   }
   const retryNotes = results.filter(r => r.attempts.length > 1)
     .map(r => `${r.entry}: retried after ${r.attempts.slice(0, -1).map(a => a.signal).join(', ')}`).join('; ');

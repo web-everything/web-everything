@@ -1,0 +1,6 @@
+{
+  "$comment": "daemons.rebuild.adoptNotWorse (R: SMOKE-ENVTIMEOUT-BUDGET-V2.S2a). When false (default) a daemon rebuild NEVER adopts a candidate whose smoke fails, even when the last-good control fails the same check: it holds on last-good (smoke-harness-broken, retry backoff) and the ruled force-adopt runbook is the fallback. When true, the exact-match adopt-not-worse path runs. Gating conditions for turning it on (audit findings of S2a rounds 1-3): (1) the compared boot error must be a lossless typed signature, not the truncated child report (stack frames beyond three lines and delimiters are lost); (2) evidence must carry a valid typed error class and a validated child report schema; (3) infrastructure failures must be rejected by a positive allow-list of error types, not a text blacklist. S1 supplies typed evidence. Layers: standard (false) -> platform -> this file -> env WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE (0 off, tightening-only; cannot enable).",
+  "rebuildAdoptNotWorse": {
+    "enabled": false
+  }
+}

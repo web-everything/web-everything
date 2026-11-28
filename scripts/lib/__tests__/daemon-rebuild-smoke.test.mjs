@@ -12,6 +12,18 @@ import { checkDaemonEntriesBoot, DAEMON_ENTRIES_ENV } from '../daemon-boot-smoke
 import { runRealDispatchSmoke } from '../daemon-load-overlay.mjs';
 import { alertsFilePath } from '../daemon-rebuild/state.mjs';
 
+// Exercise the enabled branch through the strict settings reader, as in the fallback suite.
+// All other settings and the default-off path still use the real reader.
+const adoptFlag = vi.hoisted(() => ({ on: false }));
+vi.mock('../settings-files.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    readSettingsChecked: (options) => (adoptFlag.on && options?.namespace === 'rebuildAdoptNotWorse'
+      ? { value: { enabled: true }, taint: [], duplicates: [] } : actual.readSettingsChecked(options)),
+  };
+});
+
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
 // Like daemon-rebuild.test.mjs and daemon-rebuild-fallback.test.mjs, these cases drive real Git
@@ -99,6 +111,7 @@ const refs = (f) => readOverlayState(f.cloneDir, { env: f.env }).overlays.map((o
 
 beforeEach(() => { tempDirs.length = 0; });
 afterEach(() => {
+  adoptFlag.on = false;
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
   tempDirs.length = 0;
 });
@@ -382,15 +395,47 @@ describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
     expect(run).not.toHaveBeenCalled();
   });
 
-  it('adopting a candidate "as no worse" (harness broken) still requires the dispatch smoke', async () => {
+  // Matching boot failures qualify for the guarded path. Keep rawError in-process only, like real boot rows.
+  const entry = { entry: 'daemon.mjs', ok: false, kind: 'import failed', errorClass: 'TypeError: harness broke' };
+  Object.defineProperty(entry, 'rawError', { value: 'TypeError: harness broke', enumerable: false });
+  const BOOT_FAIL = { verdict: 'code', attempts: 1, smoke: { results: [
+    { ok: false, name: 'daemon-entries-boot', detail: 'boom', entries: [entry] },
+  ] } };
+
+  it('default-off adopt-not-worse holds on last-good without dispatch smoke even with matching boot failures', async () => {
     const f = makeFixture();
     const lastGood = head(f);
     addDispatchOverlay(f);
-    const run = vi.fn(async () => ({ ok: false, reason: 'no-commands-ran' }));
-    const r = await rebuild(f, run, { runSmoke: vi.fn(async () => FAIL) });
-    expect(run).toHaveBeenCalledTimes(1);
-    expect(r.reason).toBe('dispatch-smoke-failed');
+    const run = vi.fn();
+    const r = await rebuild(f, run, { runSmoke: vi.fn(async () => BOOT_FAIL) });
+    expect(run).not.toHaveBeenCalled();
+    expect(r.adopted).toBeFalsy();
+    expect(r.reason).toBe('smoke-harness-broken');
     expect(head(f)).toBe(lastGood);
+    expect(readRebuildState(f.cloneDir, f.env).held.reason).toBe('smoke-harness-broken');
+  });
+
+  it.each([false, true])('when enabled, adopting a candidate "as no worse" still requires dispatch smoke (ok=%s)', async (ok) => {
+    adoptFlag.on = true;
+    const f = makeFixture();
+    const lastGood = head(f);
+    addDispatchOverlay(f);
+    const run = vi.fn(async () => ({ ok, reason: ok ? 'passed' : 'no-commands-ran' }));
+    const r = await rebuild(f, run, { runSmoke: vi.fn(async () => BOOT_FAIL) });
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0][0].tree).not.toBe(f.cloneDir);
+    expect(r.reason).toBe(ok ? 'harness-broken-adopted-not-worse' : 'dispatch-smoke-failed');
+    const state = readRebuildState(f.cloneDir, f.env);
+    if (ok) {
+      expect(r.adopted).toBe(true);
+      expect(head(f)).toBe(r.plan.finalSha);
+      expect(head(f)).not.toBe(lastGood);
+      expect(state.held).toBeNull();
+    } else {
+      expect(r.adopted).toBeFalsy();
+      expect(head(f)).toBe(lastGood);
+      expect(state.held.reason).toBe('dispatch-smoke-failed');
+    }
   });
 }, 60_000);
 

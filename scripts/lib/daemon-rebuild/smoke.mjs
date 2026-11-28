@@ -7,7 +7,7 @@ import {
   redactDetail,
 } from './smoke-classify/index.mjs';
 import { envTimeoutRetry, resolveRecovery, envTimeoutAppliesToPlan } from './recovery.mjs';
-import { isRepoFile, pickSmokeDiagnostics, sourceFilesIn } from '../daemon-boot-smoke.mjs';
+import { isRepoFile, pickSmokeDiagnostics, sourceFilesIn, smokeErrorClass } from '../daemon-boot-smoke.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
 import { readRebuildState, writeRebuildState, alertsFilePath, writeReadyCandidate, clearReadyCandidate } from './state.mjs';
 import { releaseBuildLease } from './lease.mjs';
@@ -26,7 +26,7 @@ import { pinnedStatus, planRebuild } from './plan.mjs';
 import { makeAuditedTipGate } from './audited-tip.mjs';
 import { runBounded } from '../bounded-child.mjs';
 import { SMOKE_CHECKS, SMOKE_BUDGET_ENV, resolveSmokeBudgets, isDispatchDryRunScript } from '../daemon-live-smoke.mjs';
-import { readDeclaredSettings } from '../settings-files.mjs';
+import { readDeclaredSettings, readSettingsChecked } from '../settings-files.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
 
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
@@ -180,10 +180,20 @@ export function rejectRetryDelayMs(env, attempts) {
   return Math.min(base * 2 ** Math.max(0, attempts - 1), max);
 }
 
-/** Default ON: when last-good fails every check the candidate failed, adopt the candidate as no worse.
- *  A harness fix that lives in the candidate can only ever arrive this way when the running harness also
- *  fails last-good. Set to '0' to retain the hold-on-last-good and retry-backoff behavior. */
-export const HARNESS_BROKEN_ADOPT_NOT_WORSE_ENV = 'WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE';
+/** IO: `rebuildAdoptNotWorse.enabled` (daemons.rebuild.adoptNotWorse). DEFAULT OFF: a failed-smoke candidate is never
+ *  adopted (hold on last-good; force-adopt is the fallback). The legacy environment zero remains a tightening-only veto, and the key
+ *  is tighten-only in the safe-direction table.
+ *  Strict read: a read error, a duplicate owner or any value other than boolean true means false. Never throws. */
+export function resolveAdoptNotWorse(env = process.env) {
+  if (env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE === '0') return { enabled: false, source: 'environment' };
+  try {
+    const { value, taint, duplicates } = readSettingsChecked({ namespace: 'rebuildAdoptNotWorse' });
+    if (taint.length || duplicates.length) return { enabled: false, source: 'unreadable' };
+    return { enabled: value?.enabled === true, source: 'file' };
+  } catch {
+    return { enabled: false, source: 'unreadable' };
+  }
+}
 
 /** The failed check rows of a smoke result (`[]` for a pass or a missing result). */
 function failedRows(smokeResult) {
@@ -193,8 +203,57 @@ function failedRows(smokeResult) {
 /** PURE: does `control` fail every check `candidate` failed (by name)? — the "the harness itself is broken"
  *  test: a failure the last-good build reproduces is not evidence against the candidate's code. */
 export function failsSameChecks(candidateFailed, controlFailed) {
-  const c = new Set((controlFailed || []).map((r) => r.name));
-  return Array.isArray(candidateFailed) && candidateFailed.length > 0 && candidateFailed.every((r) => c.has(r.name));
+  if (!Array.isArray(candidateFailed) || candidateFailed.length === 0 || !Array.isArray(controlFailed)) return false;
+  // S2a (strict, fails closed): a control vouches for a candidate failure ONLY with typed, executed-check evidence
+  // (a failed boot ENTRY whose import failed with a typed error class) AND the same identity: same check, same boot
+  // entry, same lossless error text. Untyped / textual-only rows, budget refusals, skips, timeouts and
+  // infrastructure errors (spawn ENOENT...) never match. S1's typed ledger will extend this to the other checks.
+  return candidateFailed.every((row) => {
+    if (!executedFailure(row) || row.name !== 'daemon-entries-boot' || !validBootEntries(row.entries)) return false;
+    const control = controlFailed.find((r) => executedFailure(r) && r.name === row.name && validBootEntries(r.entries));
+    if (!control) return false;
+    const have = new Set(control.entries.filter(typedBootFailure).map(bootFailureIdentity));
+    const failed = row.entries.filter((e) => e && e.ok === false);
+    return failed.length > 0 && failed.every((e) => typedBootFailure(e) && have.has(bootFailureIdentity(e)));
+  });
+}
+
+function validBootEntries(entries) {
+  return Array.isArray(entries) && entries.length > 0 && entries.every(entry => entry
+    && typeof entry.ok === 'boolean' && typeof entry.entry === 'string' && isRepoFile(entry.entry));
+}
+
+const APPLICATION_ERROR = /^(?:TypeError|ReferenceError|SyntaxError|RangeError|EvalError|URIError|AggregateError):/;
+
+function executedFailure(row) {
+  return !!row && row.ok === false && ['skipped', 'reused', 'budgetInterrupted', 'budgetSkipped'].every(flag => row[flag] == null || row[flag] === false);
+}
+
+/** The parent's own tree-cleanliness timeout can justify retry, never adoption.
+ * Other untyped/malformed reports retain their ordinary sticky rejection. */
+export function matchesHarnessHold(candidate, control) {
+  return Array.isArray(candidate) && candidate.length > 0 && Array.isArray(control)
+    && candidate.every(row => executedFailure(row) && control.some(other => executedFailure(other)
+      && other.name === row.name && (failsSameChecks([row], [other])
+        || (row.name === 'tree-stays-clean' && typeof row.detail === 'string'
+          && /^git status --porcelain failed: timed out after \d+ms \(process group killed\)$/.test(row.detail)
+          && other.detail === row.detail))));
+}
+
+/** SHIP-WM-321: a boot entry failure with executed-check evidence: an import that ran and failed with a typed error class. */
+function typedBootFailure(entry) {
+  return executedFailure(entry) && typeof entry.entry === 'string' && isRepoFile(entry.entry) && entry.kind === 'import failed'
+    && typeof entry.errorClass === 'string' && APPLICATION_ERROR.test(entry.errorClass)
+    && entry.errorClass === smokeErrorClass(entry.rawError)
+    && APPLICATION_ERROR.test(entry.rawError)
+    && typeof entry.rawError === 'string' && entry.rawError.length > 0
+    && !/ENOENT|EACCES|EMFILE|ENOMEM|EAGAIN|spawn|timed out|timeout|budget|skipped/i.test(entry.rawError);
+}
+
+/** Exact raw equality only (no normalisation, lowercasing, number masking or errorClass): S1's lossless typed
+ *  signature may relax this later. */
+function bootFailureIdentity(entry) {
+  return `${entry.entry}\u0000${entry.rawError}`;
 }
 
 // ── the rebuild's smoke BUDGET (live 2026-10-10) ─────────────────────────────────────────────────────────────
@@ -340,10 +399,9 @@ async function resolveDispatchSmoke(opt, env) {
  *       why; `main-staleness.mjs#assertMainNotStale` keeps dispatching from that build (max-age alert, never a
  *       refusal), and the health watch's `daemon-held-on-last-good` sign notifies after 15 min.
  *   (c) to tell (b) apart from a broken HARNESS, the last-good build itself (C = `prevHead`, full smoke, no
- *       skip-unchanged) is smoked as a control: C failing every check A failed means the failure is the smoke's
- *       environment: adopt A as no worse by default so candidate harness fixes can arrive. With
- *       {@link HARNESS_BROKEN_ADOPT_NOT_WORSE_ENV} set to '0', hold as `smoke-harness-broken` with a retry
- *       backoff (never sticky), including across main moves (see `prepareRebuild`). Never blocks.
+ *       skip-unchanged) is smoked as a control: matching executed boot failures hold as `smoke-harness-broken`
+ *       with retry backoff (never sticky), including across main moves (see `prepareRebuild`). Only an explicit
+ *       boolean true from {@link resolveAdoptNotWorse} enables adoption as no worse unless the legacy environment-zero veto is set.
  * `'transient'` (env noise that survived its retries) keeps today's rule — no reject record — and also holds.
  *
  * #4126 `readyOnly` (the rebuild JOB, `rebuild-job.mjs`): a passing build is recorded as the clone's ready
@@ -661,10 +719,19 @@ export async function smokeAndAdopt({
         moved: false, reason: 'ready-recorded', readyRecorded: true, target: p.finalSha, plan: p, alerts: [...prepAlerts, ...alertsList],
       };
     }
-    const fin = await withWriteLock(root, () => finalizeRebuild({
-      root, env, log, run, stateOpts, now, plan: p, prevHead, lease, onAdopted,
-      auditedTip: makeAuditedTipGate(env), // unaudited-tip: evidence revoked during the smoke must not be adopted
-    }), finalizeLockOpts);
+    const fin = await withWriteLock(root, () => {
+      // F5: adoption over a failed smoke is re-checked UNDER the write lock — a tightening veto (legacy env zero, a settings
+      // flip, an unreadable setting) that lands after the ready record was written must stop the adoption (fail closed).
+      if (overFailedSmoke === true && resolveAdoptNotWorse(env).enabled !== true) return { vetoed: true };
+      return finalizeRebuild({
+        root, env, log, run, stateOpts, now, plan: p, prevHead, lease, onAdopted,
+        auditedTip: makeAuditedTipGate(env), // unaudited-tip: evidence revoked during the smoke must not be adopted
+      });
+    }, finalizeLockOpts);
+    if (fin.ok && fin.value?.vetoed === true) {
+      clearReadyCandidate(root, stEnv); // never leave the vetoed build adoptable
+      return { moved: false, reason: 'adopt-not-worse-vetoed', vetoed: true, plan: p, alerts: [...prepAlerts, ...alertsList] };
+    }
     if (!fin.ok) {
       if (fin.reason === 'tick-in-progress') {
         log.error?.(`daemon-rebuild: could not take the write lock to finalize ${p.finalSha} after a passing smoke (reader ${fin.heldBy ?? '?'} still ticking) — kept as the ready candidate; the next write-lock holder adopts it without re-smoking`);
@@ -994,8 +1061,9 @@ export async function smokeAndAdopt({
   const c = budgetAllows('last-good') ? await smokeSha(prevHead, null, 'last-good') : { budgetSkipped: true };
   const cFailed = c.smokeResult ? failedRows(c.smokeResult) : null;
   const harnessBroken = !!(cFailed && failsSameChecks(failedA, cFailed));
-  if (harnessBroken) {
-    if (!c.reused && env[HARNESS_BROKEN_ADOPT_NOT_WORSE_ENV] !== '0') {
+  if (harnessBroken || (!c.reused && matchesHarnessHold(failedA, cFailed))) {
+    // F5: the rebuild JOB (`readyOnly`) never records adoption-ready evidence for a failed candidate — it holds on last-good.
+    if (harnessBroken && !c.reused && !readyOnly && resolveAdoptNotWorse(env).enabled === true) {
       // xhiqxz3 — "no worse" on the ordinary smoke says nothing about the worker launch: prove that first.
       if (aSuspects.length) {
         const d = await dispatchOnly(plan.finalSha, aSuspects);
@@ -1008,7 +1076,8 @@ export async function smokeAndAdopt({
         message: 'last-good failed every check the candidate failed — adopting the candidate as no worse so a candidate harness fix can arrive',
       });
       const fin = await finalize(plan, undefined, undefined, a.smokeResult, { overFailedSmoke: true });
-      return { ...fin, reason: fin.adopted ? 'harness-broken-adopted-not-worse' : fin.reason };
+      if (!fin.vetoed) return { ...fin, reason: fin.adopted ? 'harness-broken-adopted-not-worse' : fin.reason };
+      // vetoed under the lock: fall through to the ordinary harness-broken hold
     }
     const prevAttempts = priorRejected?.harnessBroken ? (priorRejected.attempts || 1) : 0;
     const attempts = prevAttempts + 1;

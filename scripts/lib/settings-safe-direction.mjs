@@ -15,6 +15,7 @@
 /** Keyed `<policy>.<leaf>`; a scalar policy (empty leaf) is keyed by the policy alone. */
 export const SAFE_DIRECTION = Object.freeze({
   'ciUnitRerun.enabled': { kind: 'safety', safe: 'false' },
+  'rebuildAdoptNotWorse.enabled': { kind: 'safety', safe: 'false' },
   'ciUnitRerun.maxFiles': { kind: 'safety', safe: 'min' },
   'review.unattendedAcceptRequiresCleanReferrals': { kind: 'safety', safe: 'true' },
   'review.careExemptPaths': { kind: 'safety', safe: 'subset' },

@@ -321,7 +321,8 @@ marking budget interruptions. Only an all-timeout boot failure set at the full r
 counts as env-timeout (caps at least `MIN_OWN_CAP_MS`, each attempt's measured `elapsedMs`
 at least `min(minElapsedMs, cap * 0.9)`; aggregate row time cannot substitute for entry timing).
 An import failure already reported on child stdout remains `import failed` even when a pending
-timer keeps the child alive until a timeout kills it.
+timer keeps the child alive until a timeout kills it. Preserve the caught child's validated signal
+and exit code alongside that import report; keep raw import evidence non-enumerable.
 Mixed import failures, crashes, budget slices and missing entry evidence remain code failures.
 
 Smoke diagnostics never carry raw child stderr or stdout (operator decision, PR 5460). A boot or
@@ -6552,3 +6553,13 @@ Before changing an admission gate, compare each PREP acceptance line with the ne
 behavior change. Every new refusal path needs explicit authorization in the card;
 keep a deterministic test for admission without timing metadata so a separate
 measurement policy cannot silently reintroduce per-PR timing work.
+
+### Adopt-not-worse evidence and conservative holds
+
+`daemon-rebuild-smoke-audit.test.mjs` covers the environment-zero veto, lossless child
+stack text, report schema refusal, positive application-error types, executed flags on
+both sides, and unconditional soak regression registration. Raw text remains private
+and non-enumerable. Generic system `Error` failures cannot authorize adoption. Untyped
+parent-generated tree-cleanliness timeouts can only retain last-good with retry backoff.
+Malformed dispatch output retains sticky rejection. The fallback and cache suites assert
+the exact held reason, persisted retry state, and retry after expiry where applicable.

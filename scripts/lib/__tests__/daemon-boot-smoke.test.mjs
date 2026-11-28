@@ -10,14 +10,107 @@
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import * as settingsFiles from '../settings-files.mjs';
+import * as policyCascade from '../policy-cascade.mjs';
 
 import {
   buildEntryBootScript, checkDaemonEntriesBoot, DAEMON_BOOT_SMOKE_CHECK, DAEMON_ENTRIES_ENV, DAEMON_ENTRY_MODULES,
   isSafeRelativeEntry, pickSmokeDiagnostics, resolveDaemonEntries, resolveBootSettings, smokeErrorClass, writeStderrTail,
 } from '../daemon-boot-smoke.mjs';
-import { budgetedRunChild } from '../daemon-rebuild/smoke.mjs';
+import { budgetedRunChild, failsSameChecks } from '../daemon-rebuild/smoke.mjs';
 import { redactDetail } from '../daemon-rebuild/smoke-classify/redact-detail.mjs';
+
+describe('boot evidence privacy (S2a audit)', () => {
+  let root;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'we-boot-evidence-'));
+    vi.spyOn(settingsFiles, 'readDeclaredSettings').mockReturnValue({ settings: {} });
+    const cascade = policyCascade.cascadePolicy;
+    vi.spyOn(policyCascade, 'cascadePolicy').mockImplementation((policy, tool, options) =>
+      cascade(policy, tool, { ...options, platform: {}, operatorOverride: {}, log() {} }));
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  async function bootWithRetry() {
+    const rawError = 'TypeError: private "raw-child-sentinel" | at fixture.mjs:1:1';
+    const runChild = vi.fn()
+      .mockRejectedValueOnce(Object.assign(new Error('native abort'), { signal: 'SIGTRAP', status: null, stderr: 'native fault' }))
+      .mockResolvedValueOnce(JSON.stringify({ ok: false, error: rawError }));
+    const result = await checkDaemonEntriesBoot({
+      root, diagnosticsDir: join(root, 'diagnostics'), clock: () => 1_000_000,
+      budgets: { daemonBootMs: 45_000 }, log: { error() {} },
+      env: { [DAEMON_ENTRIES_ENV]: 'fixture.mjs', WE_SMOKE_BOOT_CONCURRENCY: '1', WE_SMOKE_BOOT_SIGNAL_RETRIES: '1' },
+      runChild,
+    });
+    expect(runChild).toHaveBeenCalledTimes(2);
+    expect(runChild.mock.calls.every(([, , options]) => options.cwd === root && options.timeoutMs === 45_000)).toBe(true);
+    expect(result.ok).toBe(false);
+    expect(result.entries[0].attempts).toHaveLength(2);
+    return { name: 'daemon-entries-boot', ...result };
+  }
+
+  it('boot raw errors remain private across retries and serialization', async () => {
+    const row = await bootWithRetry();
+    const entry = row.entries[0];
+    expect(entry.attempts[0].signal).toBe('SIGTRAP');
+    expect(Object.hasOwn(entry.attempts[0], 'rawError')).toBe(false);
+    for (const failure of [entry, entry.attempts[1]]) {
+      expect(failure.kind).toBe('import failed');
+      expect(Object.getOwnPropertyDescriptor(failure, 'rawError')).toMatchObject({
+        value: 'TypeError: private "raw-child-sentinel" | at fixture.mjs:1:1', enumerable: false,
+      });
+    }
+    for (const value of [row, entry, ...entry.attempts]) {
+      expect(JSON.stringify(value)).not.toContain('rawError');
+      expect(JSON.stringify(value)).not.toContain('raw-child-sentinel');
+    }
+  });
+
+  it('copied boot entries cannot establish failsSameChecks', async () => {
+    const candidate = await bootWithRetry();
+    const control = await bootWithRetry();
+    expect(failsSameChecks([candidate], [control])).toBe(true);
+    for (const copy of [entry => ({ ...entry }), entry => Object.assign({}, entry),
+      entry => JSON.parse(JSON.stringify(entry)), entry => structuredClone(entry)]) {
+      const copied = { ...control, entries: control.entries.map(copy) };
+      expect(Object.hasOwn(copied.entries[0], 'rawError')).toBe(false);
+      expect(failsSameChecks([candidate], [copied])).toBe(false);
+      expect(failsSameChecks([copied], [control])).toBe(false);
+    }
+    expect(failsSameChecks([candidate], [JSON.parse(JSON.stringify(control))])).toBe(false);
+  });
+
+  it.each([
+    ['SIGKILL', null, 'SIGKILL', null],
+    [null, 1, null, 1],
+    ['SIGTERM', 0, 'SIGTERM', 0],
+    ['invalid-signal', '1', null, null],
+    ['SIGKILL\nprivate-signal-sentinel', 1.5, null, null],
+    [42, Number.MAX_SAFE_INTEGER + 1, null, null],
+  ])('a caught import report preserves valid termination metadata and rejects invalid values: signal=%s, status=%s (F1)', async (signal, status, expectedSignal, expectedExitCode) => {
+    const rawError = 'TypeError: private "caught-child-sentinel" | at fixture.mjs:1:1';
+    const result = await checkDaemonEntriesBoot({
+      root, diagnosticsDir: join(root, 'diagnostics'), clock: () => 1_000_000,
+      budgets: { daemonBootMs: 45_000 }, log: { error() {} },
+      env: { [DAEMON_ENTRIES_ENV]: 'fixture.mjs', WE_SMOKE_BOOT_SIGNAL_RETRIES: '0' },
+      runChild: vi.fn(async (_command, _args, options) => {
+        expect(options.cwd).toBe(root);
+        throw Object.assign(new Error('child failed'), { signal, status, stdout: JSON.stringify({ ok: false, error: rawError }) });
+      }),
+    });
+    const entry = result.entries[0];
+    for (const failure of [entry, entry.attempts[0]]) {
+      expect(failure).toMatchObject({ kind: 'import failed', signal: expectedSignal, exitCode: expectedExitCode });
+      expect(Object.getOwnPropertyDescriptor(failure, 'rawError')).toMatchObject({ value: rawError, enumerable: false });
+      expect(JSON.stringify(failure)).not.toContain('caught-child-sentinel');
+    }
+    expect(failsSameChecks([{ name: 'daemon-entries-boot', ...result }], [{ name: 'daemon-entries-boot', ...result }])).toBe(true);
+  });
+});
 
 describe('resolveDaemonEntries', () => {
   it('uses the real list when no override is set', () => {
@@ -259,7 +352,7 @@ describe('checkDaemonEntriesBoot — injected runChild (no real subprocess)', ()
   });
 
   it('preserves a reported import failure when a pending timer later causes a timeout', async () => {
-    const error = 'SyntaxError: broken module | at /candidate/fixture.mjs:1:1';
+    const error = 'SyntaxError: broken module\n at /candidate/fixture.mjs:1:1';
     const r = await checkDaemonEntriesBoot({ ...ctx(async () => {
       throw Object.assign(new Error('timed out after 45000ms (process group killed)'), {
         stdout: JSON.stringify({ ok: false, error }), signal: 'SIGKILL',
@@ -452,7 +545,7 @@ describe('smoke diagnostics carry an allow-listed summary, never raw child text 
   });
 
   it('an import failure keeps its stack frames in the file, never in the summary', async () => {
-    const error = 'ReferenceError: Cannot access \'secretname\' before initialization | at file:///x/limaframe.mjs:3 | at file:///x/mikeframe.mjs:9';
+    const error = 'ReferenceError: Cannot access \'secretname\' before initialization\n at file:///x/limaframe.mjs:3\n at file:///x/mikeframe.mjs:9';
     const r = await checkDaemonEntriesBoot({
       root: '/candidate', budgets: { daemonBootMs: 1000 }, env: { [DAEMON_ENTRIES_ENV]: 'fixture.mjs' }, diagnosticsDir: dir,
       runChild: async () => JSON.stringify({ ok: false, error }),
