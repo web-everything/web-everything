@@ -230,11 +230,16 @@ function readPublicationEvidence(path, fallback, label, { readSync: read = readS
 export function replay({ path = feedPath(), since = '1970-01-01T00:00:00Z', strict = false, evidenceIo } = {}) {
   path = checkedFeedPath(path);
   const threshold = Date.parse(since); if (!Number.isFinite(threshold)) throw new Error('needs-you-feed: invalid --since timestamp');
-  const lines = (strict ? readPublicationEvidence(path, '', 'feed history', evidenceIo) : readOptional(path, '')).split('\n');
+  const text = strict ? readPublicationEvidence(path, '', 'feed history', evidenceIo) : readOptional(path, '');
+  if (strict && text && !text.endsWith('\n')) {
+    throw Error('needs-you-feed: unterminated final record; inspect or repair the feed before retrying publication');
+  }
+  const lines = text.split('\n');
   if (lines.at(-1) === '') lines.pop();
   return lines.map(line => {
     const event = parseFeedLine(line);
-    if (strict && (!event || !Number.isFinite(Date.parse(event.at)) || typeof event.repo !== 'string' || !event.repo
+    // A crash before the newline followed by an append joins two records; the display parser only returns the last.
+    if (strict && (/}NEEDS-YOU(?:-CLEARED)? /.test(line) || !event || !Number.isFinite(Date.parse(event.at)) || typeof event.repo !== 'string' || !event.repo
       || !Number.isSafeInteger(event.pr) || event.pr <= 0 || typeof event.head !== 'string' || !event.head
       || typeof event.kind !== 'string' || !event.kind || (event.kind === 'cleared' && typeof event.was !== 'string'))) {
       throw Error('needs-you-feed: malformed history; inspect the feed before retrying publication');

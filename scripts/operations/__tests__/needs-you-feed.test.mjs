@@ -79,6 +79,51 @@ describe('accepted never started crash-safe publication', () => {
     expect(() => f.publish()).toThrow(/feed|history/);
     expect(readFileSync(f.state, 'utf8')).toBe(before);
   });
+  it('strict replay refuses a feed whose final record has no trailing newline', () => {
+    const f = fixture();
+    writeFileSync(f.path, diffFeed([], [skip], at).lines[0]);
+    expect(() => replay({ path: f.path, strict: true })).toThrow(
+      'needs-you-feed: unterminated final record; inspect or repair the feed before retrying publication');
+  });
+  it('publishAttention appends nothing and surfaces the error when the feed ends without a newline', () => {
+    const f = fixture(); f.publish(item);
+    fs.appendFileSync(f.path, diffFeed([], [skip], at).lines[0]);
+    const feedBefore = readFileSync(f.path), stateBefore = readFileSync(f.state);
+    writeJsonAtomic.mockClear();
+    expect(() => f.publish()).toThrow(
+      'needs-you-feed: unterminated final record; inspect or repair the feed before retrying publication');
+    expect(writeJsonAtomic).not.toHaveBeenCalled();
+    expect(readFileSync(f.path)).toEqual(feedBefore);
+    expect(readFileSync(f.state)).toEqual(stateBefore);
+  });
+  it('two events concatenated on one line (the crash-then-append shape) are never read as one event in strict mode', () => {
+    const f = fixture(); f.publish(item);
+    fs.appendFileSync(f.path, diffFeed([], [skip], at).lines[0]);
+    appendLines(f.path, diffFeed([], [{ ...skip, head: 'b'.repeat(40) }], at).lines);
+    const feedBefore = readFileSync(f.path), stateBefore = readFileSync(f.state);
+    writeJsonAtomic.mockClear();
+    expect(() => replay({ path: f.path, strict: true })).toThrow(
+      'needs-you-feed: malformed history; inspect the feed before retrying publication');
+    expect(() => f.publish()).toThrow(
+      'needs-you-feed: malformed history; inspect the feed before retrying publication');
+    expect(writeJsonAtomic).not.toHaveBeenCalled();
+    expect(readFileSync(f.path)).toEqual(feedBefore);
+    expect(readFileSync(f.state)).toEqual(stateBefore);
+  });
+  it('non-strict replay still returns a partial final line\'s earlier complete records unchanged', () => {
+    const f = fixture(); f.publish(item);
+    const before = replay({ path: f.path });
+    fs.appendFileSync(f.path, diffFeed([], [skip], at).lines[0].slice(0, -1));
+    expect(replay({ path: f.path })).toEqual(before);
+  });
+  it('a feed ending in a single trailing newline still publishes', () => {
+    const f = fixture(); f.publish(item);
+    expect(readFileSync(f.path, 'utf8')).toMatch(/[^\n]\n$/);
+    expect(f.publish().lines).toEqual(diffFeed([], [skip], at).lines);
+    expect(replay({ path: f.path, strict: true })).toEqual([{ at, ...item }, { at, ...skip }]);
+    expect(f.keys()).toEqual([`${item.repo}#${item.pr}@${item.head}:${item.kind}`,
+      `${skip.repo}#${skip.pr}@${skip.head}:${skip.kind}`]);
+  });
   it('oversized feed history refuses publication with an operator fallback', () => {
     const f = fixture(); f.publish(item); const before = readFileSync(f.state, 'utf8');
     truncateSync(f.path, 16 * 1024 * 1024 + 1);
