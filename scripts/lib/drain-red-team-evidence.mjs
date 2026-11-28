@@ -602,6 +602,8 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
   };
   return (exactHead = true, order = tieBreak, { writtenAfter, newestHead } = {}) => {
     if (!TIE_ORDERS.includes(order)) throw new TypeError('unknown run tieBreak');
+    // Recovery's carry fallback shares this lookup; a hard hold must not start another scan.
+    if (hardHold) return { ok: false, reason: 'scan-capped' };
     if (!scan) {
       // Injected listing fixtures retain the index/fallback seam; production uses names.
       if (list === listRunIds) {
