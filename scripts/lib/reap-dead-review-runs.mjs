@@ -116,7 +116,7 @@ export async function reapDeadReviewRuns({ env = process.env, dir: explicitDir, 
     if (record.resumeOf != null || record.resumedAt != null) { keep('resumed-run', id); continue; }
     if (!identityOf(record.input ?? {})) { keep('identity-unreadable', id); continue; }
     if (repo && record.input.repo !== repo) { keep('other-repo', id); continue; }
-    if (apply === true && !context) { keep('missing-context', id); continue; }
+    if (!context) { keep('missing-context', id); continue; }
     const pending = record.pending;
     if (pending && (Array.isArray(pending.options) || Object.hasOwn(pending, 'asks') || Object.hasOwn(pending, 'of'))) {
       keep('suspended-awaiting-answer', id); continue;

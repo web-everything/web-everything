@@ -2119,6 +2119,11 @@ export const defaultReapReviewRuns = () => tickReviewRunReap({
     snapshot: { repoDir: SESSION_REAPER_REPO_ROOT }, log: message => console.error(message),
   });
 
+/** The CLI's production wiring, also exercised without launching a daemon loop. */
+export function buildProductionDaemonEffects(options) {
+  return buildCliDaemonEffects({ ...options, reapReviewRuns: defaultReapReviewRuns });
+}
+
 export function buildCliDaemonEffects({
   owner, intervalMs = DEFAULT_INTERVAL_MS, log = console, factCache = null,
   dispatchLockRoot = RUNNER_LOCK_ROOT,
@@ -2368,7 +2373,7 @@ async function main() {
   // early; the interval stays as the safety net. This daemon also forwards drain-relevant events to the drain
   // daemon's localhost POST /nudge — one forwarder, so the drain wakes on events without its own feed client.
   const { stoppedReason } = await runDaemonLoop(
-    withPrEvents(withSelfSync(withGithubAppAuth(buildCliDaemonEffects({ owner, intervalMs, factCache, reapReviewRuns: defaultReapReviewRuns }), REVIEW_DAEMON_APP_AUTH_OPTS), {
+    withPrEvents(withSelfSync(withGithubAppAuth(buildProductionDaemonEffects({ owner, intervalMs, factCache }), REVIEW_DAEMON_APP_AUTH_OPTS), {
       root: selfRoot, onRestart: restartOntoNewCode, hasStaleRefusal: hasStaleMainRefusal,
     }), { role: 'review', repos: REVIEW_DAEMON_REPOS, forward: [makeDrainNudgeForward()] }),
   );

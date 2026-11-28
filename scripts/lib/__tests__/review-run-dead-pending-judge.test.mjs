@@ -23,6 +23,7 @@ beforeEach(() => {
   dir = join(root, 'runs'); fs.mkdirSync(dir);
   env = { HOME: root, WE_PLATFORM_PREFERENCES_FILE: join(root, 'prefs.json'),
     OPERATION_REVIEW_JOBS_DIR: join(root, 'review-jobs'), WE_SHARED_RUNS_DIR: dir,
+    WE_DAEMON_JOBS_ROOT: join(root, 'daemon-jobs'),
     WE_COORDINATION_ROOT: join(root, 'coordination') };
   fs.mkdirSync(env.OPERATION_REVIEW_JOBS_DIR);
   probeContext = { checkout: root, pool: 'fixture-pool', poolRoot: join(root, 'pools') };
@@ -82,19 +83,42 @@ it('legacy-sidecar-recovery', async () => {
 });
 const effect = (status, more = {}) => ({ key: 'one', type: 'review', stepIndex: 0, index: 0, status, ...more });
 it.each([['empty', []], ['applied', [effect('applied')]]])('record-shape-allowed-%s', (_, effects) => {
-  const r = record({ effects }); tombstone(r.id); expect(neverReviewed()).toBe(true); expect(evidence().reason).not.toBe('review-unfinished');
+  const r = record({ effects });
+  const complete = evidence().settleBounds.completeHeadRead;
+  tombstone(r.id); expect(neverReviewed()).toBe(true); expect(evidence().reason).not.toBe('review-unfinished');
+  expect(complete({ pr, head, at: now - 8 * HOUR })).toEqual({ complete: true, blocked: false });
 });
 it.each([['absent', undefined], ['non-array', {}], ...['declared','pending','in-flight','failed','refused','skipped','superseded'].map(s => [s, [effect(s)]]),
   ['mixed', [effect('applied'), effect('pending', { key: 'two', index: 1 })]]])('record-shape-rejected-%s', (_, effects) => {
-  const r = record({ effects }); tombstone(r.id); expect(neverReviewed()).toBe(false); expect(evidence().ok).toBe(false);
+  // Capture the real settlement reader before installing the tombstone. Malformed records can
+  // make the bounded evidence read refuse before it exposes settlement bounds.
+  record(); const complete = evidence().settleBounds.completeHeadRead;
+  const r = record({ effects }); tombstone(r.id);
+  expect(abandoned.isReaperTombstone(r.id, dir)).toBe(true);
+  expect(neverReviewed()).toBe(false); expect(evidence().ok).toBe(false);
+  expect(complete({ pr, head, at: now - 8 * HOUR })).not.toEqual({ complete: true, blocked: false });
 });
 it.each([
   ['rejection', { verdict: { verdict: 'changes' } }], ['pending-effect', { effects: [effect('pending')] }],
   ['in-flight-effect', { effects: [effect('in-flight')] }], ['malformed-effect', { effects: [{}] }],
   ['mandatory-referral', { effects: [effect('applied', { step: 'mandatoryReferrals' })] }],
   ['suspended-answer', { pending: { kind: 'judge', step: 'judge', stepIndex: 0, asks: 'human' } }],
+  ['suspended-options', { pending: { kind: 'judge', step: 'judge', stepIndex: 0, options: [] } }],
+  ['suspended-of', { pending: { kind: 'judge', step: 'judge', stepIndex: 0, of: 'q' } }],
+  ['suspended-of-null', { pending: { kind: 'judge', step: 'judge', stepIndex: 0, of: null } }],
+  ['suspended-asks-null', { pending: { kind: 'judge', step: 'judge', stepIndex: 0, asks: null } }],
+  ['mandatory-referral-cursor', { pending: { kind: 'judge', step: 'mandatoryReferrals', stepIndex: 0 } }],
+  ['resumeOf', { resumeOf: 'review-pr-previous' }],
+  ['resumedAt', { resumedAt: '2026-11-27T22:00:00Z' }],
   ['outcome-refused', { outcome: 'refused' }], ['confirm-pending', { pending: { kind: 'confirm', step: 'confirm', stepIndex: 0 } }],
-])('reader-holds-%s', (_, extra) => { const r = record(extra); tombstone(r.id); expect(neverReviewed()).toBe(false); });
+])('reader-holds-%s', (_, extra) => {
+  record(); const complete = evidence().settleBounds.completeHeadRead;
+  const r = record(extra); tombstone(r.id);
+  expect(abandoned.isReaperTombstone(r.id, dir)).toBe(true);
+  expect(abandoned.reaperReviewShape(r)).toBe(false);
+  expect(neverReviewed()).toBe(false); expect(evidence().ok).toBe(false);
+  expect(complete({ pr, head, at: now - 8 * HOUR })).not.toEqual({ complete: true, blocked: false });
+});
 it('applied-effect-duplicate-key-holds', () => {
   const r = record({ effects: [effect('applied'), effect('applied')] }); tombstone(r.id); expect(neverReviewed()).toBe(false);
 });
@@ -139,6 +163,60 @@ it('writer-appears-after-initial-index', async () => {
 });
 
 const jobModule = () => import('../review-run-reap-job.mjs');
+const daemonModule = () => import('../../../skills-src/conveyor/review-daemon.mjs');
+function daemonOptions(extra = {}) {
+  vi.stubEnv('WE_REVIEW_FACTS', '0');
+  vi.stubEnv('WE_PLATFORM_PREFERENCES_FILE', env.WE_PLATFORM_PREFERENCES_FILE);
+  return { owner: 'fixture', log: { error: vi.fn() }, reapSessions: () => null,
+    runReview: () => ({}), convertAdvisoryEnabled: false, runPrepReview: () => null, ...extra };
+}
+it('daemon-tick-awaits-review-run-reaper-before-discovery', async () => {
+  const { buildCliDaemonEffects } = await daemonModule();
+  let release; const barrier = new Promise(resolve => { release = resolve; });
+  const reaper = vi.fn(() => barrier), runReview = vi.fn(() => ({}));
+  const tick = buildCliDaemonEffects(daemonOptions({ reapReviewRuns: reaper, runReview })).tickOnce();
+  try {
+    await Promise.resolve(); expect(reaper).toHaveBeenCalledTimes(1); expect(runReview).not.toHaveBeenCalled();
+  } finally { release(); await tick; }
+  expect(runReview).toHaveBeenCalledTimes(1);
+});
+it('daemon-reaper-failure-logs-authority-fallback-and-continues', async () => {
+  const { buildCliDaemonEffects } = await daemonModule();
+  const options = daemonOptions({ reapReviewRuns: async () => { throw Error('unreadable authority'); }, runReview: vi.fn(() => ({})) });
+  await buildCliDaemonEffects(options).tickOnce();
+  expect(options.log.error).toHaveBeenCalledWith(expect.stringContaining('restore job authority/store and retry'));
+  expect(options.runReview).toHaveBeenCalledTimes(1);
+});
+it('production-daemon-enqueues-authoritative-review-reaper', async () => {
+  for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value);
+  vi.stubEnv('LANE_POOL_ROOT', join(root, 'pools'));
+  const jobs = await jobModule(), actualTick = jobs.tickReviewRunReap;
+  // Keep the real enqueue/store path; replace only reattachment so no child can launch.
+  const reattach = vi.fn(async () => ({}));
+  const tick = vi.spyOn(jobs, 'tickReviewRunReap').mockImplementation(options => {
+    expect(options.dir).toBe(join(env.WE_DAEMON_JOBS_ROOT, 'review-run-reaper'));
+    return actualTick({ ...options, now, reattach });
+  });
+  const daemon = await daemonModule();
+  await daemon.buildProductionDaemonEffects(daemonOptions()).tickOnce();
+  expect(tick).toHaveBeenCalledTimes(1);
+  const options = tick.mock.calls[0][0];
+  expect(() => jobs.validateReapInput(options.input)).not.toThrow();
+  expect(options.input).toEqual({ reviewRunsDir: dir, repo: 'web-everything/web-everything',
+    OPERATION_REVIEW_JOBS_DIR: env.OPERATION_REVIEW_JOBS_DIR,
+    probeContext: { checkout: join(dirname(fileURLToPath(import.meta.url)), '../../..'), pool: 'web-everything', poolRoot: join(root, 'pools') } });
+  expect(options.snapshot.repoDir).toBe(options.input.probeContext.checkout);
+  expect(options.codeSha).toMatch(/^[0-9a-f]{40}$/);
+  const queued = createJobStore(options.dir).list();
+  expect(queued.corrupt).toEqual([]); expect(queued.records).toHaveLength(1);
+  expect(queued.records[0].input).toEqual(options.input);
+  expect(queued.records[0].job).toMatchObject({ kind: 'review-run-reap', status: 'queued' });
+  expect(reattach).toHaveBeenCalledTimes(1);
+});
+it('main-uses-production-daemon-effects', () => {
+  const source = fs.readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../../skills-src/conveyor/review-daemon.mjs'), 'utf8');
+  expect(source.slice(source.indexOf('async function main()'))).toContain('buildProductionDaemonEffects({ owner, intervalMs, factCache })');
+});
 function input() { return { reviewRunsDir: dir, repo, probeContext, OPERATION_REVIEW_JOBS_DIR: env.OPERATION_REVIEW_JOBS_DIR }; }
 function jobStore() { const d = join(root, 'daemon-jobs'); fs.mkdirSync(d, { recursive: true }); return createJobStore(d); }
 async function launched(store) {
@@ -239,10 +317,10 @@ it('reap-probe-failure-held-all', async () => {
   const r = record(); probes.leases = () => { throw Error('lease timed out'); };
   expect((await sweep()).kept['probe-unreadable']).toEqual([r.id]);
 });
-it('cli-other-pool-live-lease-held', () => {
+it.each([['--apply'], ['--dry-run'], []])('cli-missing-context-held %j', (...flags) => {
   const r = record({}, undefined, 8 * HOUR);
   const script = join(dirname(fileURLToPath(import.meta.url)), '../reap-dead-review-runs.mjs');
-  const result = spawnSync(process.execPath, [script, '--apply', '--json'], { cwd: root, env: { ...env, OPERATION_RUNS_DIR: dir },
+  const result = spawnSync(process.execPath, [script, ...flags, '--json'], { cwd: root, env: { ...env, OPERATION_RUNS_DIR: dir },
     encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024 });
   expect(result.error).toBeUndefined(); expect(result.status, result.stderr).toBe(0);
   expect(JSON.parse(result.stdout).kept['missing-context']).toEqual([r.id]);
@@ -255,10 +333,10 @@ it('reap-cli-apply-json-dry-run-awaited', () => {
     expect(result.error).toBeUndefined(); expect(result.status, result.stderr).toBe(0); expect(JSON.parse(result.stdout).scanned).toBe(1);
   }
 });
-it('session-reaper-other-pool-live-lease-held', async () => {
+it.each(['--apply', '--dry-run'])('session-reaper-missing-context-held %s', async mode => {
   const { runSessionReaperCli } = await import('../../conveyor/session-reaper.mjs'); const r = record({}, undefined, 8 * HOUR);
   let stdout = '';
-  const code = await runSessionReaperCli(['--reap-dead-review-runs', '--apply', '--json', '--no-run-rating', '--no-ground-truth',
+  const code = await runSessionReaperCli(['--reap-dead-review-runs', mode, '--json', '--no-run-rating', '--no-ground-truth',
     '--no-completion-record','--no-hung-detection','--no-auth-expired-detection','--no-idle-finished-detection','--no-pid-dead-detection'],
     { exec: () => '[]', stdout: s => { stdout += s; }, stderr: () => {},
       reapDeadReviewRuns: opts => reapDeadReviewRuns({ ...opts, env: { ...env, OPERATION_RUNS_DIR: dir }, probes, now }) });
@@ -273,7 +351,7 @@ function alertFixture(publishNeedsYou, capture = []) {
   return () => runRedTeamOnSkip({ repo, env, cwd: root, now: () => now, lastDispatch: new Map(),
     plan: { refusals: [{ kind: 'already-reviewed-head', prNumber: pr, headSha: head }] }, rawPrs: [raw],
     setting: { enabled: true, retryCooldownMin: 30 }, capacity: { lanes: 1, budget: { left: 1 } },
-    readEvidence: () => ({ ok: false, reason: 'review-unfinished' }), readStatus: () => null,
+    readEvidence: evidence, readStatus: () => null,
     readReviewRuns: () => [], readWitness: null, readCarry: () => null, headNeverReviewed: () => false,
     readCarriedCheck: () => false, readSeal: () => null, escalate, syncLabels: () => {},
     exec: () => { throw Error('external calls forbidden'); }, dispatch: () => { throw Error('must hold'); },
@@ -294,6 +372,7 @@ it('alert-pending-kind-transitions-one-publication', () => {
   expect(fs.readdirSync(join(root, 'red-team-status', 'skip-published'))).toHaveLength(1);
 });
 it('alert-publication-failure-retries', () => {
+  record();
   let failed = true;
   const published = vi.fn(() => { if (failed) throw Error('publication unavailable'); });
   const run = alertFixture(published); expect(run().rows[0].settleError).toContain('publication unavailable');

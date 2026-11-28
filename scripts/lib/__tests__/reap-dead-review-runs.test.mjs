@@ -18,16 +18,17 @@ vi.mock('../../operations/run-store.mjs', async importOriginal => {
     runFileEntries: (dir, options) => actual.runFileEntries(dir, { ...options, reportInvalid: reportInvalidRunEntry }) };
 });
 const HOUR = 3600000, now = Date.parse('2026-11-08T12:00:00Z');
-let dir, env, probes, probeContext;
+let root, dir, env, probes, probeContext;
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), 'dead-review-runs-'));
+  root = mkdtempSync(join(tmpdir(), 'dead-review-runs-'));
+  dir = join(root, 'runs'); mkdirSync(dir);
   env = { WE_PLATFORM_PREFERENCES_FILE: join(dir, 'preferences.json'), OPERATION_REVIEW_JOBS_DIR: join(dir, 'jobs') };
   mkdirSync(env.OPERATION_REVIEW_JOBS_DIR);
   probeContext = { checkout: dir, pool: 'fixture-pool', poolRoot: join(dir, 'pools') };
   probes = { reviewJobs: vi.fn(() => []), pidIdentity: vi.fn(() => ({ alive: false })),
     leases: vi.fn(() => '[]'), sessions: vi.fn(() => '[]') };
 });
-afterEach(() => { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => { vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); });
 const leaseListing = listing => JSON.stringify({ repo: probeContext.pool, root: join(probeContext.poolRoot, probeContext.pool), ...listing });
 const listingText = (probe, listing) => probe === 'leases' && listing && !Array.isArray(listing) && typeof listing === 'object'
   ? leaseListing(listing) : JSON.stringify(listing);
@@ -107,6 +108,16 @@ it('dry-run leaves file bytes identical and reports wouldReap', async () => {
   expect(r.wouldReap).toEqual(['review-pr-dead']); expect(r.reaped).toEqual([]);
   expect(readdirSync(dir).some(f => f.endsWith('.abandoned.json'))).toBe(false);
   expect(readFileSync(runPath('review-pr-dead', dir))).toEqual(before);
+});
+it.each([false, true])('missing authority is missing-context with the default lease probe (apply=%s)', async apply => {
+  record(); delete probes.leases;
+  probes.execFileSync = vi.fn(() => JSON.stringify({ repo: 'fixture-pool', root: join(dir, 'pools', 'fixture-pool'), lanes: [] }));
+  const log = vi.fn();
+  const result = await sweep({ apply, probeContext: undefined, log });
+  expect(result.kept).toEqual({ 'missing-context': ['review-pr-dead'] });
+  expect(result.reaped).toEqual([]); expect(result.wouldReap).toEqual([]);
+  expect(probes.execFileSync).not.toHaveBeenCalled();
+  expect(log.mock.calls.flat().join('\n')).not.toContain('restore probe access');
 });
 it('ignores other operations and keeps terminal records without running probes', async () => {
   record('review-pr-other', { op: 'fix' }); record('review-pr-terminal', { pending: null });
@@ -428,7 +439,7 @@ it('keeps a record when a writer lock appears after the sweep decided (live pid 
   probes.sessions = () => { writeFileSync(join(dir, 'review-pr-dead.json.lock'), '4242'); locked = true; return '[]'; };
   const r = (await sweep()); expect(r.kept).toEqual({ 'live-writer': ['review-pr-dead'] }); expect(calls).toBe(0);
 });
-it.each([['dry-run', false], ['apply', true]])('resolves the default dir without migration and requires explicit apply authority (%s)', async (_mode, apply) => {
+it.each([['dry-run', false], ['apply', true]])('resolves the default dir without migration and requires explicit authority (%s)', async (_mode, apply) => {
   // No `dir`, no OPERATION_RUNS_DIR: the shared folder is derived from the coordination root (a temp "home").
   const shared = join(dir, 'ws', 'runs');
   const home = { ...env, WE_COORDINATION_ROOT: join(dir, 'ws', 'coordination') };
@@ -441,8 +452,8 @@ it.each([['dry-run', false], ['apply', true]])('resolves the default dir without
   const result = (await reapDeadReviewRuns({ repo: 'owner/repo', probeContext, now, env: home, probes, log: () => {}, apply }));
   expect(result.scanned).toBe(1); // the default dir was really used
   expect(result.reaped).toEqual([]);
-  if (apply) expect(result.kept['missing-context']).toEqual(['review-pr-dead']);
-  else expect(result.wouldReap).toEqual(['review-pr-dead']);
+  expect(result.kept['missing-context']).toEqual(['review-pr-dead']);
+  expect(result.wouldReap).toEqual([]);
   expect(resolveRunsDir).not.toHaveBeenCalled(); // the only resolver that migrates legacy per-clone runs
   expect(migrateLegacyRuns).not.toHaveBeenCalled();
   expect(readdirSync(shared).filter(f => f.endsWith('.abandoned.json'))).toEqual([]);
