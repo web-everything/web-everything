@@ -211,16 +211,22 @@ export function behindFiles(root, base = 'main', run = gitRun, env = process.env
   return [...new Set(String(r.stdout ?? '').split('\n').map((x) => x.trim()).filter(Boolean))];
 }
 
-/** Does the working tree differ from HEAD in a way that changes what runs — any TRACKED change, or an untracked
- *  code file (see {@link isCodePath})? Untracked non-code files (a `backlog/*.md` card a job wrote) do not.
- *  `true` on any git failure (fail closed). */
+/** Does the working tree differ from HEAD in a TRACKED file (porcelain XY other than `??`)? Untracked files never
+ *  count here: the gated rebuild (daemon-rebuild/local-state.mjs) only sees tracked files, so an untracked file
+ *  must not refuse dispatch (it would never clear). Untracked CODE files are surfaced separately by
+ *  {@link untrackedCodeFiles} as a non-blocking alert. `true` on any git failure (fail closed). */
 export function codeDirty(root, run = gitRun) {
   const r = run(['status', '--porcelain', '--untracked-files=all'], { cwd: root, timeout: 30_000, killSignal: 'SIGKILL' });
   if (r.status !== 0) return true;
-  return String(r.stdout ?? '').split('\n').filter(Boolean).some((line) => {
-    if (!line.startsWith('?? ')) return true;
-    return isCodePath(line.slice(3).trim().replace(/^"|"$/g, ''));
-  });
+  return String(r.stdout ?? '').split('\n').filter(Boolean).some((line) => !line.startsWith('?? '));
+}
+
+/** Untracked code files (see {@link isCodePath}) in the working tree, or `null` when git cannot say. */
+export function untrackedCodeFiles(root, run = gitRun) {
+  const r = run(['status', '--porcelain', '--untracked-files=all'], { cwd: root, timeout: 30_000, killSignal: 'SIGKILL' });
+  if (r.status !== 0) return null;
+  return String(r.stdout ?? '').split('\n').filter((line) => line.startsWith('?? '))
+    .map((line) => line.slice(3).trim().replace(/^"|"$/g, '')).filter((p) => isCodePath(p));
 }
 
 /**
@@ -252,6 +258,7 @@ export function assertMainNotStale(root, checkStaleness, {
   lastGood = (r, dirty) => lastGoodForClone({ root: r, headSha: headForClone(r), dirty, env }),
   rebuildGrace = (r) => rebuildGraceForClone({ root: r, env }),
   treeDirtyForCode = (r) => codeDirty(r, run),
+  untrackedCodeFiles: listUntracked = (r) => untrackedCodeFiles(r, run),
   // Do NOT use gitRun here: it erases the distinction between absent and killed.
   originRefProbe = (r, b) => spawnGit('git', ['rev-parse', '--verify', '--quiet', `origin/${b}^{commit}`],
     { cwd: r, encoding: 'utf8', timeout: 60_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024 }),
@@ -290,6 +297,14 @@ export function assertMainNotStale(root, checkStaleness, {
     });
   };
   const refusal = (reason, message) => {
+    if (reason === 'dirty-managed-tree') {
+      // A dirty TRACKED tree is not something the gated rebuild resets (local-state.mjs refuses it as `dirty`),
+      // so this refusal must NOT carry the stale marker: the marker triggers a rebuild that can never help.
+      const error = new PreStartDispatchRefusalError(`${label}: ${message} — refusing to dispatch from a managed clone with modified tracked files. `
+        + 'Restore or commit the tracked changes by hand; a rebuild will not clear them.');
+      error.reason = reason;
+      throw error;
+    }
     const error = new PreStartDispatchRefusalError(`${label}: ${message} — refusing to dispatch ${STALE_MAIN_REFUSAL_MARKER}. `
       + 'This is a DAEMON-MANAGED clone: only its gated rebuild moves it; inspect its rebuild state and clone-held-stale alert before retrying.');
     error.reason = reason;
@@ -311,6 +326,16 @@ export function assertMainNotStale(root, checkStaleness, {
     // A1's clean-code gate is independent of the checker's optional dirty field.
     try { dirty = treeDirtyForCode(root) !== false; } catch { dirty = true; }
     if (dirty && st?.action !== 'warn') refusal('dirty-managed-tree', 'the adopted build has a dirty or unreadable code tree');
+    // Untracked code never blocks (the rebuild cannot see it either); name it once in a non-blocking alert.
+    // An unreadable listing is not an alert and not a refusal: the tracked gate above already failed closed.
+    if (!dirty) {
+      let untracked = null;
+      try { untracked = listUntracked(root); } catch { /* unknown: tracked gate is the safety net */ }
+      if (Array.isArray(untracked) && untracked.length > 0) {
+        write(`${label}: ALERT (non-blocking) — the managed clone has ${untracked.length} untracked code file(s): `
+          + `${untracked.join(', ')} — dispatching anyway; the gated rebuild cannot see them, remove or commit them.\n`);
+      }
+    }
     // 2b. local main can be current while a detached, adopted HEAD is behind.
     if (st?.action !== 'warn') {
       const files = behindList();

@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import {
   classifyStaleness, checkMainStaleness, assertMainNotStale, staleRemedy, isCodePath,
-  isStaleMainRefusalMessage, STALE_MAIN_REFUSAL_MARKER, behindFiles, codeDirty, PreStartDispatchRefusalError,
+  isStaleMainRefusalMessage, STALE_MAIN_REFUSAL_MARKER, behindFiles, codeDirty, untrackedCodeFiles as untrackedCodeFilesOf, PreStartDispatchRefusalError,
 } from '../main-staleness.mjs';
 import { cloneKeyOf, readRebuildStateFile, decideLastGood } from '../daemon-last-good.mjs';
 
@@ -356,12 +356,18 @@ describe('assertMainNotStale — managed clone never auto-ffs (#4044 Module E)',
       expect(() => assertMainNotStale('/repo', warn, { ...opts, dispatchPath: null, rebuildGrace: building })).toThrow(/STALE/);
     });
   });
-  it('codeDirty: untracked non-code files do not count; a tracked change or untracked code does', () => {
+  it('codeDirty: only TRACKED changes count (the rebuild sees tracked files only); failed status is dirty', () => {
     const run = (out, status = 0) => () => ({ status, stdout: out });
     expect(codeDirty('/r', run('?? backlog/x1.md\n?? backlog/x2.md\n'))).toBe(false);
-    expect(codeDirty('/r', run('?? backlog/x1.md\n?? scripts/new.mjs\n'))).toBe(true);
+    expect(codeDirty('/r', run('?? backlog/x1.md\n?? scripts/new.mjs\n?? a.json\n'))).toBe(false);
     expect(codeDirty('/r', run(' M backlog/x1.md\n'))).toBe(true);
+    expect(codeDirty('/r', run('?? scripts/new.mjs\n M scripts/t.mjs\n'))).toBe(true);
     expect(codeDirty('/r', run('', 128))).toBe(true);
+  });
+  it('untrackedCodeFilesOf: names only untracked code files; null on a failed status', () => {
+    const run = (out, status = 0) => () => ({ status, stdout: out });
+    expect(untrackedCodeFilesOf('/r', run('?? backlog/x.md\n?? scripts/a.mjs\n?? b.json\n M c.mjs\n'))).toEqual(['scripts/a.mjs', 'b.json']);
+    expect(untrackedCodeFilesOf('/r', run('', 128))).toBeNull();
   });
   it('last-good fallback ignores untracked non-code files (live 2026-10-04: review cards left in the clone)', () => {
     const warn = () => ({ action: 'warn', reason: 'not-auto-syncing', behind: 9, ahead: 0, dirty: true });
@@ -475,7 +481,8 @@ describe('REVIEW-GUARD-RELEVANT-BEHIND', () => {
     let err;
     try { fn(); } catch (e) { err = e; }
     expect(err).toBeInstanceOf(PreStartDispatchRefusalError);
-    expect(isStaleMainRefusalMessage(err.message)).toBe(true);
+    // a dirty tracked tree is not fixable by a rebuild, so it carries no stale marker (no rebuild loop)
+    expect(isStaleMainRefusalMessage(err.message)).toBe(err.reason !== 'dirty-managed-tree');
     if (reason) expect(err.reason).toBe(reason);
     return err;
   }
@@ -596,13 +603,75 @@ describe('REVIEW-GUARD-RELEVANT-BEHIND', () => {
         refused(() => guard(st, { treeDirtyForCode, rebuildGrace: () => ({ grace: true }), lastGood: () => ({ onLastGood: true }) }),
           st?.action === 'warn' ? undefined : 'dirty-managed-tree');
       }
-      for (const [status, allowed] of [[' M tracked.txt\n', false], ['?? backlog/x.md\n', true], ['?? scripts/x.mjs\n', false]]) {
-        const treeDirtyForCode = () => codeDirty(root, () => ({ status: 0, stdout: status }));
-        if (allowed) expect(() => guard(st, { treeDirtyForCode })).not.toThrow();
-        else refused(() => guard(st, { treeDirtyForCode }));
+      for (const [status, allowed] of [[' M tracked.txt\n', false], [' M scripts/t.mjs\n', false], [' M cfg/t.json\n', false],
+        ['?? backlog/x.md\n', true], ['?? scripts/x.mjs\n', true], ['?? cfg/x.json\n', true]]) {
+        const fakeRun = () => ({ status: 0, stdout: status });
+        const treeDirtyForCode = () => codeDirty(root, fakeRun);
+        const untrackedCodeFiles = () => untrackedCodeFilesOf(root, fakeRun);
+        // a warn checker with a tracked dirty tree falls through to the existing stale refusal; only
+        // the non-warn dirty-managed-tree refusal is asserted here (below: it carries no stale marker).
+        if (allowed) expect(() => guard(st, { treeDirtyForCode, untrackedCodeFiles, write: () => {} })).not.toThrow();
+        else if (st?.action !== 'warn') refused(() => guard(st, { treeDirtyForCode, untrackedCodeFiles }), 'dirty-managed-tree');
       }
     }
     expect(guard(fresh, { listBehindFiles: () => [] }).guardPath).toBe('fresh');
+  });
+  it('10b tracked dirty code refuses dirty-managed-tree WITHOUT the stale marker (no no-op rebuild loop)', () => {
+    for (const st of [fresh, { offline: true }, null]) {
+      const e = refused(() => guard(st, { treeDirtyForCode: () => true, untrackedCodeFiles: () => [] }), 'dirty-managed-tree');
+      expect(e.message).not.toContain(STALE_MAIN_REFUSAL_MARKER);
+      expect(isStaleMainRefusalMessage(e.message)).toBe(false);
+      expect(e.message).toContain('dirty');
+    }
+    // unreadable status also fails closed, still marker-free
+    const e = refused(() => guard(fresh, { treeDirtyForCode: () => { throw Error('status failed'); } }), 'dirty-managed-tree');
+    expect(isStaleMainRefusalMessage(e.message)).toBe(false);
+    // genuinely stale refusals keep the marker
+    expect(isStaleMainRefusalMessage(refused(() => guard(warn, { adoptedHead: () => A }), 'off-adopted-build').message)).toBe(true);
+  });
+  it('10c untracked code permits dispatch (stale=false) and raises exactly ONE alert naming every file', () => {
+    const writes = [];
+    for (const st of [fresh, { offline: true }]) {
+      writes.length = 0;
+      const result = guard(st, { treeDirtyForCode: () => false, untrackedCodeFiles: () => ['scripts/x.mjs', 'cfg/y.json'],
+        write: s => writes.push(s) });
+      expect(result.stale).not.toBe(true);
+      const alerts = writes.filter(s => s.includes('ALERT'));
+      expect(alerts).toHaveLength(1);
+      expect(alerts[0]).toContain('scripts/x.mjs');
+      expect(alerts[0]).toContain('cfg/y.json');
+      expect(isStaleMainRefusalMessage(alerts[0])).toBe(false);
+    }
+    // none untracked: no alert; unreadable untracked listing: no alert and no refusal (tracked gate is the safety net)
+    writes.length = 0;
+    guard(fresh, { untrackedCodeFiles: () => [], write: s => writes.push(s) });
+    guard(fresh, { untrackedCodeFiles: () => null, write: s => writes.push(s) });
+    expect(writes.filter(s => s.includes('ALERT'))).toEqual([]);
+  });
+  it('10d real git fixture: untracked .mjs/.json do not block; a tracked modification refuses marker-free', () => {
+    const { realOptions } = (() => {
+      const git = (...a) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...a], { cwd: root, encoding: 'utf8' });
+      git('init', '-q', '-b', 'main');
+      writeFileSync(join(root, '.git/info/exclude'), 'state/\n');
+      writeFileSync(join(root, 'tracked.mjs'), 'export {};\n');
+      git('add', '-A'); git('commit', '-q', '-m', 'c1');
+      const head = git('rev-parse', 'HEAD').trim();
+      const run = args => { try { return { status: 0, stdout: git(...args) }; } catch (e) { return { status: e.status ?? 1, stdout: '' }; } };
+      return { realOptions: { adoptedHead: () => head, readHeadSha: () => head, run,
+        treeDirtyForCode: () => codeDirty(root, run), untrackedCodeFiles: () => untrackedCodeFilesOf(root, run),
+        listBehindFiles: () => [] } };
+    })();
+    writeFileSync(join(root, 'new.mjs'), 'export {};\n');
+    writeFileSync(join(root, 'new.json'), '{}\n');
+    const writes = [];
+    expect(() => guard(fresh, { ...realOptions, write: s => writes.push(s) })).not.toThrow();
+    const alerts = writes.filter(s => s.includes('ALERT'));
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toContain('new.mjs');
+    expect(alerts[0]).toContain('new.json');
+    writeFileSync(join(root, 'tracked.mjs'), 'export const x = 1;\n');
+    const e = refused(() => guard(fresh, { ...realOptions, write: () => {} }), 'dirty-managed-tree');
+    expect(isStaleMainRefusalMessage(e.message)).toBe(false);
   });
   it('11 tolerance precedence refuses relevant, unknown or empty files', () => {
     for (const files of [null, ['scripts/lib/review-core.mjs'], ['backlog/x.md', 'scripts/lane-pool.mjs', 'scripts/lib/jury-core.mjs']]) {
