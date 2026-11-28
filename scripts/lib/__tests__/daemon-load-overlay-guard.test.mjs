@@ -4,7 +4,7 @@
  *   side door around `daemon-overlay add`'s guard. It now runs add's own admission (stack-aware merge-tree preview
  *   under the add-guard lock, plus the operator-credential `--allow-conflict` rule) before registering. Real git repos.
  */
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, afterEach, afterAll, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -15,6 +15,13 @@ import { rebuildClone, dryRunRebuild, previewOverlayConflict } from '../daemon-r
 import { stackAwareOverlayCheck } from '../../daemon-overlay.mjs';
 import * as planner from '../daemon-rebuild/plan.mjs';
 import * as strategies from '../daemon-rebuild/overlay-strategies.mjs';
+import { withOverlayAuditOff } from './helpers/overlay-audit-off.mjs';
+
+// OVERLAY-SHA-PIN: env can no longer select legacy tip-following; the prefs-file helper does (audited-tip gate has its own test).
+const AUDIT_OFF_DIR = mkdtempSync(join(tmpdir(), 'overlay-audit-off-'));
+process.env.WE_PLATFORM_PREFERENCES_FILE = withOverlayAuditOff(process.env, { dir: AUDIT_OFF_DIR }).WE_PLATFORM_PREFERENCES_FILE;
+delete process.env.WE_DAEMON_OVERLAY_FOLLOW_TIP;
+afterAll(() => rmSync(AUDIT_OFF_DIR, { recursive: true, force: true }));
 
 const temps = [];
 afterEach(() => {

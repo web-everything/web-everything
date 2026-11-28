@@ -6,7 +6,7 @@
  *   and #4663; the rebuild applied #4643 first (list order) and conflict-dropped #4658/#4663, so prepares stopped
  *   until they were re-adopted at 20:19Z. These tests replay that sequence through the real rebuild path.
  */
-import { describe, it, expect, afterEach, vi } from 'vitest';
+import { describe, it, expect, afterEach, afterAll, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -15,8 +15,14 @@ import { planRebuild, rebuildClone } from '../daemon-rebuild.mjs';
 import { addOverlay } from '../daemon-overlays.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { readOverlayConflictWakes } from '../overlay-conflict-wake.mjs';
+import { withOverlayAuditOff } from './helpers/overlay-audit-off.mjs';
 
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
+// OVERLAY-SHA-PIN: env can no longer select legacy tip-following; the prefs-file helper does (audited-tip gate has its own test).
+const AUDIT_OFF_DIR = mkdtempSync(join(tmpdir(), 'overlay-audit-off-'));
+process.env.WE_PLATFORM_PREFERENCES_FILE = withOverlayAuditOff(process.env, { dir: AUDIT_OFF_DIR }).WE_PLATFORM_PREFERENCES_FILE;
+delete process.env.WE_DAEMON_OVERLAY_FOLLOW_TIP;
+afterAll(() => rmSync(AUDIT_OFF_DIR, { recursive: true, force: true }));
 
 // Like daemon-rebuild.test.mjs, these cases create real Git repos and run multiple rebuilds.
 // Keep a finite hang guard without depending on a loaded CI worker finishing within Vitest's default 5s.

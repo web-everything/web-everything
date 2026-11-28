@@ -10,7 +10,7 @@
  *   this suite never spawns the real live smoke gate or a real `gh` call. Every state/lock/overlay dir is a
  *   fresh mkdtemp per fixture via `env`, never `~/.claude/*`.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
 import {
   mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync, statSync, existsSync, utimesSync, symlinkSync, lstatSync, chmodSync,
 } from 'node:fs';
@@ -35,10 +35,15 @@ import { readOverlayConflictWakes, markOverlayConflictWake } from '../overlay-co
 import { writeRebuildState } from '../daemon-rebuild/state.mjs';
 import { rebuildCommitEnv } from '../daemon-rebuild/shared.mjs';
 import { lastGoodForClone, heartbeatOwnerAlive } from '../daemon-last-good.mjs';
+import { withOverlayAuditOff } from './helpers/overlay-audit-off.mjs';
 
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
-process.env.WE_DAEMON_OVERLAY_FOLLOW_TIP = 'follow'; // legacy tip-following; the audited-tip gate has its own test
+const AUDIT_OFF_DIR = mkdtempSync(join(tmpdir(), 'overlay-audit-off-'));
+// Legacy tip-following via the prefs-file helper; the audited-tip gate has its own test.
+process.env.WE_PLATFORM_PREFERENCES_FILE = withOverlayAuditOff(process.env, { dir: AUDIT_OFF_DIR }).WE_PLATFORM_PREFERENCES_FILE;
+delete process.env.WE_DAEMON_OVERLAY_FOLLOW_TIP;
+afterAll(() => rmSync(AUDIT_OFF_DIR, { recursive: true, force: true }));
 
 // Most tests here drive real `git` (init/clone/fetch/rebase) in temp repos: 3-8s each on a loaded host (CI shard +
 // coverage, or a busy laptop), so vitest's 5s default timed out a different test on every run (main red @ 8717e0735).
