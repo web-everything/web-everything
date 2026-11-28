@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import {
   classifyStaleness, checkMainStaleness, assertMainNotStale, staleRemedy, isCodePath,
-  isStaleMainRefusalMessage, STALE_MAIN_REFUSAL_MARKER, behindFiles, codeDirty, untrackedCodeFiles as untrackedCodeFilesOf, PreStartDispatchRefusalError,
+  isStaleMainRefusalMessage, STALE_MAIN_REFUSAL_MARKER, behindFiles, codeDirty, trackedDirty, untrackedCodeFiles as untrackedCodeFilesOf, PreStartDispatchRefusalError,
 } from '../main-staleness.mjs';
 import { cloneKeyOf, readRebuildStateFile, decideLastGood } from '../daemon-last-good.mjs';
 
@@ -356,13 +356,19 @@ describe('assertMainNotStale — managed clone never auto-ffs (#4044 Module E)',
       expect(() => assertMainNotStale('/repo', warn, { ...opts, dispatchPath: null, rebuildGrace: building })).toThrow(/STALE/);
     });
   });
-  it('codeDirty: only TRACKED changes count (the rebuild sees tracked files only); failed status is dirty', () => {
+  it('codeDirty (strict, last-good/adopted-build admission): untracked non-code files do not count; a tracked change or untracked code does', () => {
     const run = (out, status = 0) => () => ({ status, stdout: out });
     expect(codeDirty('/r', run('?? backlog/x1.md\n?? backlog/x2.md\n'))).toBe(false);
-    expect(codeDirty('/r', run('?? backlog/x1.md\n?? scripts/new.mjs\n?? a.json\n'))).toBe(false);
+    expect(codeDirty('/r', run('?? backlog/x1.md\n?? scripts/new.mjs\n'))).toBe(true);
     expect(codeDirty('/r', run(' M backlog/x1.md\n'))).toBe(true);
-    expect(codeDirty('/r', run('?? scripts/new.mjs\n M scripts/t.mjs\n'))).toBe(true);
     expect(codeDirty('/r', run('', 128))).toBe(true);
+  });
+  it('trackedDirty (managed dispatch gate): only TRACKED changes count (the rebuild sees tracked files only); failed status is dirty', () => {
+    const run = (out, status = 0) => () => ({ status, stdout: out });
+    expect(trackedDirty('/r', run('?? backlog/x1.md\n?? scripts/new.mjs\n?? a.json\n'))).toBe(false);
+    expect(trackedDirty('/r', run(' M backlog/x1.md\n'))).toBe(true);
+    expect(trackedDirty('/r', run('?? scripts/new.mjs\n M scripts/t.mjs\n'))).toBe(true);
+    expect(trackedDirty('/r', run('', 128))).toBe(true);
   });
   it('untrackedCodeFilesOf: names only untracked code files; null on a failed status', () => {
     const run = (out, status = 0) => () => ({ status, stdout: out });
@@ -606,7 +612,7 @@ describe('REVIEW-GUARD-RELEVANT-BEHIND', () => {
       for (const [status, allowed] of [[' M tracked.txt\n', false], [' M scripts/t.mjs\n', false], [' M cfg/t.json\n', false],
         ['?? backlog/x.md\n', true], ['?? scripts/x.mjs\n', true], ['?? cfg/x.json\n', true]]) {
         const fakeRun = () => ({ status: 0, stdout: status });
-        const treeDirtyForCode = () => codeDirty(root, fakeRun);
+        const treeDirtyForCode = () => trackedDirty(root, fakeRun);
         const untrackedCodeFiles = () => untrackedCodeFilesOf(root, fakeRun);
         // a warn checker with a tracked dirty tree falls through to the existing stale refusal; only
         // the non-warn dirty-managed-tree refusal is asserted here (below: it carries no stale marker).
@@ -658,7 +664,7 @@ describe('REVIEW-GUARD-RELEVANT-BEHIND', () => {
       const head = git('rev-parse', 'HEAD').trim();
       const run = args => { try { return { status: 0, stdout: git(...args) }; } catch (e) { return { status: e.status ?? 1, stdout: '' }; } };
       return { realOptions: { adoptedHead: () => head, readHeadSha: () => head, run,
-        treeDirtyForCode: () => codeDirty(root, run), untrackedCodeFiles: () => untrackedCodeFilesOf(root, run),
+        treeDirtyForCode: () => trackedDirty(root, run), untrackedCodeFiles: () => untrackedCodeFilesOf(root, run),
         listBehindFiles: () => [] } };
     })();
     writeFileSync(join(root, 'new.mjs'), 'export {};\n');

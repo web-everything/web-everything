@@ -211,11 +211,23 @@ export function behindFiles(root, base = 'main', run = gitRun, env = process.env
   return [...new Set(String(r.stdout ?? '').split('\n').map((x) => x.trim()).filter(Boolean))];
 }
 
-/** Does the working tree differ from HEAD in a TRACKED file (porcelain XY other than `??`)? Untracked files never
- *  count here: the gated rebuild (daemon-rebuild/local-state.mjs) only sees tracked files, so an untracked file
- *  must not refuse dispatch (it would never clear). Untracked CODE files are surfaced separately by
- *  {@link untrackedCodeFiles} as a non-blocking alert. `true` on any git failure (fail closed). */
+/** Does the working tree differ from HEAD in a way that changes what runs — any TRACKED change, or an untracked
+ *  code file (see {@link isCodePath})? Untracked non-code files (a `backlog/*.md` card a job wrote) do not.
+ *  `true` on any git failure (fail closed). Strict form: last-good and adopted-build admission keep using it. */
 export function codeDirty(root, run = gitRun) {
+  const r = run(['status', '--porcelain', '--untracked-files=all'], { cwd: root, timeout: 30_000, killSignal: 'SIGKILL' });
+  if (r.status !== 0) return true;
+  return String(r.stdout ?? '').split('\n').filter(Boolean).some((line) => {
+    if (!line.startsWith('?? ')) return true;
+    return isCodePath(line.slice(3).trim().replace(/^"|"$/g, ''));
+  });
+}
+
+/** Does the working tree differ from HEAD in a TRACKED file (porcelain XY other than `??`)? Used ONLY by the
+ *  managed-clone dispatch gate: the gated rebuild (daemon-rebuild/local-state.mjs) sees tracked files only, so an
+ *  untracked file must not refuse dispatch (the refusal would never clear). Untracked CODE files are surfaced by
+ *  {@link untrackedCodeFiles} as a non-blocking alert. `true` on any git failure (fail closed). */
+export function trackedDirty(root, run = gitRun) {
   const r = run(['status', '--porcelain', '--untracked-files=all'], { cwd: root, timeout: 30_000, killSignal: 'SIGKILL' });
   if (r.status !== 0) return true;
   return String(r.stdout ?? '').split('\n').filter(Boolean).some((line) => !line.startsWith('?? '));
@@ -257,7 +269,7 @@ export function assertMainNotStale(root, checkStaleness, {
   reexec = reexecSelf, changedFiles = (r, from, to) => changedFilesBetween(r, from, to),
   lastGood = (r, dirty) => lastGoodForClone({ root: r, headSha: headForClone(r), dirty, env }),
   rebuildGrace = (r) => rebuildGraceForClone({ root: r, env }),
-  treeDirtyForCode = (r) => codeDirty(r, run),
+  treeDirtyForCode = (r) => trackedDirty(r, run),
   untrackedCodeFiles: listUntracked = (r) => untrackedCodeFiles(r, run),
   // Do NOT use gitRun here: it erases the distinction between absent and killed.
   originRefProbe = (r, b) => spawnGit('git', ['rev-parse', '--verify', '--quiet', `origin/${b}^{commit}`],
