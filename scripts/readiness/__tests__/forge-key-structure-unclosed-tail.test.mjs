@@ -133,9 +133,17 @@ describe('forge key structure: bounded unclosed object scans fail closed',()=>{
     expect(Date.now()-started).toBeLessThan(2000);
   });
   it('keeps the signal scan linear on bracket-heavy input',()=>{
-    const started=Date.now();
-    expect(keyStructureFinding(Buffer.from('[a]'.repeat(40000)))).toBeNull();
-    expect(Date.now()-started).toBeLessThan(500);
+    // Linear takes ~30ms locally; a quadratic scan on this 120KB input takes many seconds. The budget sits far
+    // below the quadratic cost but far above shared-runner scheduling noise (a 500ms cap flaked at 501ms on CI),
+    // and the best of three runs absorbs a single noisy slice.
+    const bytes=Buffer.from('[a]'.repeat(40000));
+    let best=Infinity;
+    for(let run=0;run<3;run++) {
+      const started=Date.now();
+      expect(keyStructureFinding(bytes)).toBeNull();
+      best=Math.min(best,Date.now()-started);
+    }
+    expect(best).toBeLessThan(2000);
   });
   it('still blocks a PEM private key inside a large doc',()=>{
     const pem='-----BEGIN '+['PRIVATE','KEY'].join(' ')+'-----\nQUJD\n-----END '+['PRIVATE','KEY'].join(' ')+'-----';
