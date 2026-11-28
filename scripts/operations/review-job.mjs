@@ -1655,7 +1655,9 @@ export function dispatchReviewJob({
   // The job path is the DEFAULT review dispatch (the daemon calls it), so it must narrow a managed clone's
   // refusal to the review code path exactly like `dispatchReview` does (#4387). Without this the narrowing
   // never applied and every landed code file made the clone stale (live 2026-10-03: 21 commits behind).
-  assertMainNotStale(root, checkStaleness, { dispatchPath: isReviewCodePath });
+  const guard = assertMainNotStale(root, checkStaleness, { dispatchPath: isReviewCodePath });
+  process.stderr.write(`review-guard: job=${planned.sessionSlug} path=${guard.guardPath} checker=${guard.checker} `
+    + `behind-commits=${guard.behindCommits ?? 'unknown'} behind-files=${guard.behindFileCount ?? 'unknown'}\n`);
   const slug = planned.sessionSlug;
   const logPath = jobLogPath(slug, dir);
   const base = { mode: 'job', pr: planned.pr, repo: planned.repo, repoKey: planned.repoKey, sessionSlug: slug, agentId: null, logPath };

@@ -45,6 +45,17 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
   {
+    test: 'scripts/operations/__tests__/review-dispatch.test.mjs',
+    scope: 'files',
+    why: 'audits executable review skill references in captured source fixtures; changed closure inputs require the full boundary check',
+    matches: (f) => !skipped(f) && (f.startsWith('scripts/') && /\.(mjs|cjs|js|json)$/.test(f)
+      || f.startsWith('skills-src/') && f.endsWith('.mjs')),
+    inputs: ['scripts/operations/__tests__/review-dispatch.test.mjs', 'scripts/lib/import-closure.mjs',
+      'scripts/operations/review-dispatch.mjs', 'scripts/operations/review-job.mjs',
+      'scripts/operations/review-pr.mjs', 'scripts/operations/cli-adapter.mjs',
+      'scripts/operations/review-loop-cli.mjs', 'scripts/conveyor/run-scorecard-store.mjs'],
+  },
+  {
     test: 'scripts/__tests__/pr-workflows-cancel-superseded.test.mjs',
     scope: 'files',
     why: 'retired runner labels are scoped to changed workflows; existing concurrency prefix invariants retain their whole-workflow check',

@@ -3,15 +3,16 @@
  *   boundary (injected `run`); the fresh/auto-ff/warn CLASSIFICATION and the fail-soft behaviour are decided
  *   here and unit-tested without a real repo.
  */
-import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import {
   classifyStaleness, checkMainStaleness, assertMainNotStale, staleRemedy, isCodePath,
-  isStaleMainRefusalMessage, STALE_MAIN_REFUSAL_MARKER, behindFiles, codeDirty,
+  isStaleMainRefusalMessage, STALE_MAIN_REFUSAL_MARKER, behindFiles, codeDirty, trackedDirty, untrackedCodeFiles as untrackedCodeFilesOf, PreStartDispatchRefusalError,
 } from '../main-staleness.mjs';
+import { cloneKeyOf, readRebuildStateFile, decideLastGood } from '../daemon-last-good.mjs';
 
 describe('classifyStaleness', () => {
   it('behind 0 → fresh', () => {
@@ -232,14 +233,14 @@ describe('assertMainNotStale — managed clone never auto-ffs (#4044 Module E)',
 
   it('unmanaged (env unset): a clean behind checkout auto-fast-forwards silently', () => {
     const clonePath = makeBehindClone();
-    const st = withManagedCloneEnv(undefined, () => assertMainNotStale(clonePath, undefined, { label: 'test' }));
+    const st = withManagedCloneEnv(undefined, () => assertMainNotStale(clonePath, undefined, { label: 'test', adoptedHead: r => git(r, 'rev-parse', 'HEAD').trim(), treeDirtyForCode: r => codeDirty(r) }));
     expect(st.synced).toBe(true);
     expect(git(clonePath, 'rev-list', '--count', 'HEAD..origin/main').trim()).toBe('0');
   });
 
   it('managed clone (WE_DAEMON_MANAGED_CLONE=1): the SAME clean-behind checkout REFUSES instead of fast-forwarding', () => {
     const clonePath = makeBehindClone();
-    expect(() => withManagedCloneEnv('1', () => assertMainNotStale(clonePath, undefined, { label: 'test' })))
+    expect(() => withManagedCloneEnv('1', () => assertMainNotStale(clonePath, undefined, { label: 'test', adoptedHead: r => git(r, 'rev-parse', 'HEAD').trim(), treeDirtyForCode: r => codeDirty(r) })))
       .toThrow(/STALE code from this checkout/);
     expect(git(clonePath, 'rev-list', '--count', 'HEAD..origin/main').trim()).not.toBe('0'); // never touched
   });
@@ -247,7 +248,7 @@ describe('assertMainNotStale — managed clone never auto-ffs (#4044 Module E)',
   // behind. Commits that change no code file cannot make a checkout's import path stale.
   it('managed clone behind ONLY in non-code files (backlog/*.md) is not stale — no throw, and the clone is never touched', () => {
     const clonePath = makeBehindClone('9999-backlog-card.md');
-    const st = withManagedCloneEnv('1', () => assertMainNotStale(clonePath, undefined, { label: 'test' }));
+    const st = withManagedCloneEnv('1', () => assertMainNotStale(clonePath, undefined, { label: 'test', adoptedHead: r => git(r, 'rev-parse', 'HEAD').trim(), treeDirtyForCode: r => codeDirty(r) }));
     expect(st).toMatchObject({ fresh: true, behindNonCodeOnly: true, behind: 1 });
     expect(git(clonePath, 'rev-list', '--count', 'HEAD..origin/main').trim()).toBe('1'); // only the rebuild moves it
   });
@@ -256,6 +257,7 @@ describe('assertMainNotStale — managed clone never auto-ffs (#4044 Module E)',
     const clonePath = makeBehindClone('unrelated.mjs');
     const logs = [];
     const st = withManagedCloneEnv('1', () => assertMainNotStale(clonePath, undefined, {
+      adoptedHead: r => git(r, 'rev-parse', 'HEAD').trim(), treeDirtyForCode: r => codeDirty(r),
       label: 'test', dispatchPath: (p) => p === 'review.mjs', write: (s) => logs.push(s),
     }));
     expect(st).toMatchObject({ fresh: true, behindOffDispatchPath: true, behind: 1, codeFiles: 1 });
@@ -265,20 +267,21 @@ describe('assertMainNotStale — managed clone never auto-ffs (#4044 Module E)',
   it('managed clone behind in code ON the dispatch path still refuses (#4387)', () => {
     const clonePath = makeBehindClone('review.mjs');
     expect(() => withManagedCloneEnv('1', () => assertMainNotStale(clonePath, undefined, {
+      adoptedHead: r => git(r, 'rev-parse', 'HEAD').trim(), treeDirtyForCode: r => codeDirty(r),
       label: 'test', dispatchPath: (p) => p === 'review.mjs', write: () => {},
     }))).toThrow(/STALE code from this checkout/);
   });
   it('dispatchPath fails closed: unknown or empty behind-file list refuses; unset keeps the #4044 rule (#4387)', () => {
     const warn = () => ({ action: 'warn', reason: 'not-auto-syncing', behind: 3, ahead: 0, dirty: false });
-    const opts = { label: 'test', dispatchPath: () => false, write: () => {}, lastGood: () => null };
+    const opts = { adoptedHead: () => 'fixture-head', readHeadSha: () => 'fixture-head', treeDirtyForCode: () => false, label: 'test', dispatchPath: () => false, write: () => {}, lastGood: () => null };
     withManagedCloneEnv('1', () => {
       expect(() => assertMainNotStale('/repo', warn, { ...opts, listBehindFiles: () => null })).toThrow(/STALE/);
       expect(() => assertMainNotStale('/repo', warn, { ...opts, listBehindFiles: () => [] })).toThrow(/STALE/);
       expect(() => assertMainNotStale('/repo', warn, { ...opts, dispatchPath: null, listBehindFiles: () => ['x.mjs'] }))
         .toThrow(/STALE/);
-      // a behind TEST file on the dispatch path is not code — tolerated
-      expect(assertMainNotStale('/repo', warn, { ...opts, dispatchPath: (p) => p.startsWith('a/'), listBehindFiles: () => ['a/__tests__/r.mjs', 'x.mjs'] }))
-        .toMatchObject({ fresh: true, behindOffDispatchPath: true });
+      // A declared path includes its own test files; no non-code shortcut applies.
+      expect(() => assertMainNotStale('/repo', warn, { ...opts, dispatchPath: (p) => p.startsWith('a/'), listBehindFiles: () => ['a/__tests__/r.mjs', 'x.mjs'] }))
+        .toThrow(/STALE/);
     });
   });
   it('dispatchPath never widens an UNMANAGED checkout\'s rule — a diverged checkout still refuses (#4387)', () => {
@@ -325,6 +328,7 @@ describe('assertMainNotStale — managed clone never auto-ffs (#4044 Module E)',
     const clonePath = makeOverlayClone();
     const logs = [];
     const st = withManagedCloneEnv('1', () => assertMainNotStale(clonePath, undefined, {
+      adoptedHead: r => git(r, 'rev-parse', 'HEAD').trim(), treeDirtyForCode: r => codeDirty(r),
       label: 'test', dispatchPath: (p) => p === 'review.mjs', write: (s) => logs.push(s),
       lastGood: () => null, rebuildGrace: () => ({ grace: false }),
     }));
@@ -335,6 +339,7 @@ describe('assertMainNotStale — managed clone never auto-ffs (#4044 Module E)',
     const warn = () => ({ action: 'warn', reason: 'not-auto-syncing', behind: 9, ahead: 0, dirty: false });
     const logs = [];
     const opts = {
+      adoptedHead: () => 'fixture-head', readHeadSha: () => 'fixture-head', treeDirtyForCode: () => false,
       label: 'test', dispatchPath: (p) => p === 'review.mjs', write: (s) => logs.push(s), lastGood: () => null,
       listBehindFiles: () => ['review.mjs', 'backlog/x.md'],
     };
@@ -351,17 +356,30 @@ describe('assertMainNotStale — managed clone never auto-ffs (#4044 Module E)',
       expect(() => assertMainNotStale('/repo', warn, { ...opts, dispatchPath: null, rebuildGrace: building })).toThrow(/STALE/);
     });
   });
-  it('codeDirty: untracked non-code files do not count; a tracked change or untracked code does', () => {
+  it('codeDirty (strict, last-good/adopted-build admission): untracked non-code files do not count; a tracked change or untracked code does', () => {
     const run = (out, status = 0) => () => ({ status, stdout: out });
     expect(codeDirty('/r', run('?? backlog/x1.md\n?? backlog/x2.md\n'))).toBe(false);
     expect(codeDirty('/r', run('?? backlog/x1.md\n?? scripts/new.mjs\n'))).toBe(true);
     expect(codeDirty('/r', run(' M backlog/x1.md\n'))).toBe(true);
     expect(codeDirty('/r', run('', 128))).toBe(true);
   });
+  it('trackedDirty (managed dispatch gate): only TRACKED changes count (the rebuild sees tracked files only); failed status is dirty', () => {
+    const run = (out, status = 0) => () => ({ status, stdout: out });
+    expect(trackedDirty('/r', run('?? backlog/x1.md\n?? scripts/new.mjs\n?? a.json\n'))).toBe(false);
+    expect(trackedDirty('/r', run(' M backlog/x1.md\n'))).toBe(true);
+    expect(trackedDirty('/r', run('?? scripts/new.mjs\n M scripts/t.mjs\n'))).toBe(true);
+    expect(trackedDirty('/r', run('', 128))).toBe(true);
+  });
+  it('untrackedCodeFilesOf: names only untracked code files; null on a failed status', () => {
+    const run = (out, status = 0) => () => ({ status, stdout: out });
+    expect(untrackedCodeFilesOf('/r', run('?? backlog/x.md\n?? scripts/a.mjs\n?? b.json\n M c.mjs\n'))).toEqual(['scripts/a.mjs', 'b.json']);
+    expect(untrackedCodeFilesOf('/r', run('', 128))).toBeNull();
+  });
   it('last-good fallback ignores untracked non-code files (live 2026-10-04: review cards left in the clone)', () => {
     const warn = () => ({ action: 'warn', reason: 'not-auto-syncing', behind: 9, ahead: 0, dirty: true });
     const seen = [];
     const opts = {
+      adoptedHead: () => 'fixture-head', readHeadSha: () => 'fixture-head',
       label: 'test', write: () => {}, listBehindFiles: () => ['review.mjs'], dispatchPath: (p) => p === 'review.mjs',
       rebuildGrace: () => ({ grace: false }),
       lastGood: (_r, dirty) => { seen.push(dirty); return dirty ? { onLastGood: false } : { onLastGood: true, lastGood: 'a'.repeat(40) }; },
@@ -380,7 +398,7 @@ describe('assertMainNotStale — managed clone never auto-ffs (#4044 Module E)',
   it('managed clone: the refusal points at the rebuild\'s clone-held-stale alert, never "rebase or merge by hand"', () => {
     const clonePath = makeBehindClone();
     let message = '';
-    try { withManagedCloneEnv('1', () => assertMainNotStale(clonePath, undefined, { label: 'test' })); } catch (e) { message = e.message; }
+    try { withManagedCloneEnv('1', () => assertMainNotStale(clonePath, undefined, { label: 'test', adoptedHead: r => git(r, 'rev-parse', 'HEAD').trim(), treeDirtyForCode: r => codeDirty(r) })); } catch (e) { message = e.message; }
     expect(message).toContain('DAEMON-MANAGED');
     expect(message).toContain('clone-held-stale');
     expect(message).not.toMatch(/by hand\)?\s*$/);
@@ -437,5 +455,351 @@ describe('strict freshness reads for fast review admission', () => {
       return { status: 0, stdout: args[0] === 'rev-parse' ? args[1] : args[0] === 'rev-list' ? '1' : args[0] === 'symbolic-ref' ? 'main' : '', stderr: '' };
     };
     expect(checkMainStaleness({ strict: true, cleanOnly: true, autoFf: false, run })).toEqual({ offline: true });
+  });
+});
+
+
+// All IO is injected or confined to a per-test repository. No network or host state.
+describe('REVIEW-GUARD-RELEVANT-BEHIND', () => {
+  const H = '931427a';
+  const A = '0148225';
+  const warn = { action: 'warn', behind: 6, ahead: 0, dirty: false };
+  const fresh = { fresh: true, behind: 0 };
+  const checks = [warn, fresh, { offline: true }, null];
+  let root, logs, options;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'review-guard-'));
+    vi.stubEnv('WE_DAEMON_MANAGED_CLONE', '1');
+    vi.stubEnv('WE_DAEMON_STATE_DIR', join(root, 'state'));
+    logs = [];
+    options = {
+      env: { WE_DAEMON_MANAGED_CLONE: '1', WE_DAEMON_STATE_DIR: join(root, 'state') },
+      adoptedHead: () => H, readHeadSha: () => H, treeDirtyForCode: () => false,
+      listBehindFiles: () => ['off-path.mjs'], dispatchPath: p => p === 'scripts/lib/review-core.mjs',
+      lastGood: () => null, rebuildGrace: () => null, write: s => logs.push(s),
+      originRefProbe: () => ({ status: 1 }),
+      run: () => ({ status: 0, stdout: '1\n' }),
+    };
+  });
+  afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); rmSync(root, { recursive: true, force: true }); });
+  const guard = (st = warn, extra = {}) => assertMainNotStale(root, () => st, { ...options, ...extra });
+  function refused(fn, reason) {
+    let err;
+    try { fn(); } catch (e) { err = e; }
+    expect(err).toBeInstanceOf(PreStartDispatchRefusalError);
+    // a dirty tracked tree is not fixable by a rebuild, so it carries no stale marker (no rebuild loop)
+    expect(isStaleMainRefusalMessage(err.message)).toBe(err.reason !== 'dirty-managed-tree');
+    if (reason) expect(err.reason).toBe(reason);
+    return err;
+  }
+  // Only local git operations; fetch is injected below, never sent to a remote.
+  const git = (...args) => execFileSync('git', [
+    '-c', 'user.name=fixture', '-c', 'user.email=fixture@example.test', '-c', 'commit.gpgsign=false', ...args,
+  ], { cwd: root, encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
+    env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null',
+      GIT_AUTHOR_DATE: '2026-11-27T12:00:00Z', GIT_COMMITTER_DATE: '2026-11-27T12:00:00Z' } }).trim();
+  function commit(file, text) {
+    mkdirSync(join(root, file, '..'), { recursive: true });
+    writeFileSync(join(root, file), text);
+    git('add', file); git('commit', '-q', '-m', file);
+    return git('rev-parse', 'HEAD');
+  }
+  function realFixture(files = []) {
+    git('init', '-q', '-b', 'main');
+    const adopted = commit('tracked.txt', 'base');
+    git('init', '-q', '--bare', join(root, 'origin.git'));
+    git('remote', 'add', 'origin', join(root, 'origin.git'));
+    // Ignore all fixture infrastructure, so status measures only deliberate edits.
+    writeFileSync(join(root, '.git/info/exclude'), 'origin.git/\nstate/\n');
+    for (const [i, file] of files.entries()) commit(file, `change ${i}`);
+    const origin = git('rev-parse', 'HEAD');
+    git('update-ref', 'refs/remotes/origin/main', origin);
+    git('checkout', '-q', '--detach', adopted);
+    const state = { adopted: { head: adopted, at: '2026-11-27T00:00:00Z', applied: [] } };
+    mkdirSync(join(root, 'state'));
+    writeFileSync(join(root, 'state', `${cloneKeyOf(root)}.rebuild.json`), JSON.stringify(state));
+    expect(readRebuildStateFile(root).adopted.head).toBe(adopted);
+    const run = (args, opts = {}) => {
+      if (args[0] === 'fetch') return { status: 0, stdout: '' };
+      try { return { status: 0, stdout: git(...args), stderr: '' }; }
+      catch (error) { if (error.status == null) throw error; return { status: error.status, stdout: '', stderr: String(error.stderr) }; }
+    };
+    const realOptions = { ...options, adoptedHead: () => readRebuildStateFile(root)?.adopted?.head,
+      readHeadSha: () => git('rev-parse', 'HEAD'), treeDirtyForCode: () => codeDirty(root, run),
+      listBehindFiles: () => behindFiles(root, 'main', run, {}), run };
+    return { adopted, origin, state, run, realOptions };
+  }
+
+  it('1 off-adopted-build refuses the historical off-path fixture (origin 0744f35)', () => {
+    const e = refused(() => guard(warn, { adoptedHead: () => A }), 'off-adopted-build');
+    expect(e.message).toContain(`HEAD ${H} is not the adopted build ${A}`);
+    expect(logs).toEqual([]);
+  });
+  it('2 behind zero and HEAD unequal to adopted refuses', () => {
+    refused(() => guard(fresh, { adoptedHead: () => A }), 'off-adopted-build');
+  });
+  it('3 unreadable adopted state refuses behind and passes fresh-like without probing the tree', () => {
+    for (const adoptedHead of [() => null, () => undefined, () => { throw Error('unreadable'); }]) {
+      expect(refused(() => guard(warn, { adoptedHead }), 'off-adopted-build').message).toContain('<unreadable>');
+      for (const st of checks.slice(1)) {
+        const dirty = vi.fn(() => { throw Error('must not run'); });
+        expect(() => guard(st, { adoptedHead, treeDirtyForCode: dirty })).not.toThrow();
+        expect(dirty).not.toHaveBeenCalled();
+      }
+    }
+  });
+  it('4 unreadable HEAD refuses every checker result with a readable adoption', () => {
+    for (const st of checks) for (const readHeadSha of [() => null, () => { throw Error('HEAD'); }]) {
+      const e = refused(() => guard(st, { readHeadSha }), 'off-adopted-build');
+      expect(e.message).toContain('HEAD <unreadable>');
+      expect(e.message).not.toMatch(/null|undefined/);
+    }
+  });
+  it('5 unmanaged clones preserve synced results and self re-execution without clean-tree probes', () => {
+    vi.stubEnv('WE_DAEMON_MANAGED_CLONE', '');
+    const dirty = vi.fn(() => { throw Error('must not run'); });
+    const opts = { env: {}, treeDirtyForCode: dirty };
+    expect(guard(fresh, opts)).toMatchObject({ ...fresh, guardPath: 'unmanaged' });
+    const reexec = vi.fn();
+    const st = { synced: true, behind: 3, from: A, to: H };
+    expect(guard(st, { ...opts, codeRoot: root, armed: true, reexeced: false,
+      changedFiles: () => ['scripts/x.mjs'], reexec })).toMatchObject({ ...st, reexeced: true });
+    expect(reexec).toHaveBeenCalledOnce();
+    expect(dirty).not.toHaveBeenCalled();
+  });
+  it('6 offline and null checkers still enforce identity', () => {
+    for (const st of [null, { offline: true }]) {
+      expect(() => guard(st)).not.toThrow();
+      refused(() => guard(st, { adoptedHead: () => A }), 'off-adopted-build');
+      refused(() => guard(st, { readHeadSha: () => null }), 'off-adopted-build');
+    }
+  });
+  it('7 legitimate overlay HEAD is adopted; commit-list semantics exclude its own files', () => {
+    const { adopted, realOptions } = realFixture();
+    git('checkout', '-q', '-b', 'fixture-overlay');
+    const overlay = commit('scripts/lib/review-core.mjs', 'overlay');
+    git('checkout', '-q', 'main');
+    commit('backlog/main.md', 'main');
+    git('merge', '-q', '--no-ff', '-m', 'overlay', overlay);
+    const head = git('rev-parse', 'HEAD');
+    git('update-ref', 'refs/remotes/origin/main', overlay);
+    const state = { adopted: { head, applied: [{ head: overlay }], at: '2026-11-27T00:00:00Z' } };
+    writeFileSync(join(root, 'state', `${cloneKeyOf(root)}.rebuild.json`), JSON.stringify(state));
+    expect(head).not.toBe(adopted);
+    expect(behindFiles(root, 'main', realOptions.run, {})).toEqual([]);
+    refused(() => guard(warn, realOptions));
+    expect(assertMainNotStale(root, undefined, realOptions).guardPath).toBe('fresh');
+  });
+  it('8 forceUnverified tree hashes and skipped-unrelated adoptions pass identity', () => {
+    const { realOptions } = realFixture();
+    const head = git('rev-parse', 'HEAD');
+    for (const extra of [{ forceUnverifiedTrees: [git('rev-parse', 'HEAD^{tree}')] }, { result: 'skipped-unrelated' }]) {
+      const state = { adopted: { head, at: '2026-11-27T00:00:00Z' }, ...extra };
+      writeFileSync(join(root, 'state', `${cloneKeyOf(root)}.rebuild.json`), JSON.stringify(state));
+      expect(guard(fresh, realOptions).guardPath).toBe('fresh');
+    }
+  });
+  it('9 adoption-window mismatch refuses with a neutral mid-adoption diagnosis', () => {
+    const e = refused(() => guard(fresh, { adoptedHead: () => A }), 'off-adopted-build');
+    expect(e.message).toContain('a rebuild may be mid-adoption, or a foreign checkout moved this clone');
+  });
+  it('10 independent dirty-tree gate covers every checker and rejects failed status probes', () => {
+    for (const st of checks) {
+      for (const treeDirtyForCode of [() => true, () => { throw Error('status failed'); }]) {
+        refused(() => guard(st, { treeDirtyForCode, rebuildGrace: () => ({ grace: true }), lastGood: () => ({ onLastGood: true }) }),
+          st?.action === 'warn' ? undefined : 'dirty-managed-tree');
+      }
+      for (const [status, allowed] of [[' M tracked.txt\n', false], [' M scripts/t.mjs\n', false], [' M cfg/t.json\n', false],
+        ['?? backlog/x.md\n', true], ['?? scripts/x.mjs\n', true], ['?? cfg/x.json\n', true]]) {
+        const fakeRun = () => ({ status: 0, stdout: status });
+        const treeDirtyForCode = () => trackedDirty(root, fakeRun);
+        const untrackedCodeFiles = () => untrackedCodeFilesOf(root, fakeRun);
+        // a warn checker with a tracked dirty tree falls through to the existing stale refusal; only
+        // the non-warn dirty-managed-tree refusal is asserted here (below: it carries no stale marker).
+        if (allowed) expect(() => guard(st, { treeDirtyForCode, untrackedCodeFiles, write: () => {} })).not.toThrow();
+        else if (st?.action !== 'warn') refused(() => guard(st, { treeDirtyForCode, untrackedCodeFiles }), 'dirty-managed-tree');
+      }
+    }
+    expect(guard(fresh, { listBehindFiles: () => [] }).guardPath).toBe('fresh');
+  });
+  it('10b tracked dirty code refuses dirty-managed-tree WITHOUT the stale marker (no no-op rebuild loop)', () => {
+    for (const st of [fresh, { offline: true }, null]) {
+      const e = refused(() => guard(st, { treeDirtyForCode: () => true, untrackedCodeFiles: () => [] }), 'dirty-managed-tree');
+      expect(e.message).not.toContain(STALE_MAIN_REFUSAL_MARKER);
+      expect(isStaleMainRefusalMessage(e.message)).toBe(false);
+      expect(e.message).toContain('dirty');
+    }
+    // unreadable status also fails closed, still marker-free
+    const e = refused(() => guard(fresh, { treeDirtyForCode: () => { throw Error('status failed'); } }), 'dirty-managed-tree');
+    expect(isStaleMainRefusalMessage(e.message)).toBe(false);
+    // genuinely stale refusals keep the marker
+    expect(isStaleMainRefusalMessage(refused(() => guard(warn, { adoptedHead: () => A }), 'off-adopted-build').message)).toBe(true);
+  });
+  it('10c untracked code permits dispatch (stale=false) and raises exactly ONE alert naming every file', () => {
+    const writes = [];
+    for (const st of [fresh, { offline: true }]) {
+      writes.length = 0;
+      const result = guard(st, { treeDirtyForCode: () => false, untrackedCodeFiles: () => ['scripts/x.mjs', 'cfg/y.json'],
+        write: s => writes.push(s) });
+      expect(result.stale).not.toBe(true);
+      const alerts = writes.filter(s => s.includes('ALERT'));
+      expect(alerts).toHaveLength(1);
+      expect(alerts[0]).toContain('scripts/x.mjs');
+      expect(alerts[0]).toContain('cfg/y.json');
+      expect(isStaleMainRefusalMessage(alerts[0])).toBe(false);
+    }
+    // none untracked: no alert; unreadable untracked listing: no alert and no refusal (tracked gate is the safety net)
+    writes.length = 0;
+    guard(fresh, { untrackedCodeFiles: () => [], write: s => writes.push(s) });
+    guard(fresh, { untrackedCodeFiles: () => null, write: s => writes.push(s) });
+    expect(writes.filter(s => s.includes('ALERT'))).toEqual([]);
+  });
+  it('10d real git fixture: untracked .mjs/.json do not block; a tracked modification refuses marker-free', () => {
+    const { realOptions } = (() => {
+      const git = (...a) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...a], { cwd: root, encoding: 'utf8' });
+      git('init', '-q', '-b', 'main');
+      writeFileSync(join(root, '.git/info/exclude'), 'state/\n');
+      writeFileSync(join(root, 'tracked.mjs'), 'export {};\n');
+      git('add', '-A'); git('commit', '-q', '-m', 'c1');
+      const head = git('rev-parse', 'HEAD').trim();
+      const run = args => { try { return { status: 0, stdout: git(...args) }; } catch (e) { return { status: e.status ?? 1, stdout: '' }; } };
+      return { realOptions: { adoptedHead: () => head, readHeadSha: () => head, run,
+        treeDirtyForCode: () => trackedDirty(root, run), untrackedCodeFiles: () => untrackedCodeFilesOf(root, run),
+        listBehindFiles: () => [] } };
+    })();
+    writeFileSync(join(root, 'new.mjs'), 'export {};\n');
+    writeFileSync(join(root, 'new.json'), '{}\n');
+    const writes = [];
+    expect(() => guard(fresh, { ...realOptions, write: s => writes.push(s) })).not.toThrow();
+    const alerts = writes.filter(s => s.includes('ALERT'));
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toContain('new.mjs');
+    expect(alerts[0]).toContain('new.json');
+    writeFileSync(join(root, 'tracked.mjs'), 'export const x = 1;\n');
+    const e = refused(() => guard(fresh, { ...realOptions, write: () => {} }), 'dirty-managed-tree');
+    expect(isStaleMainRefusalMessage(e.message)).toBe(false);
+  });
+  it('11 tolerance precedence refuses relevant, unknown or empty files', () => {
+    for (const files of [null, ['scripts/lib/review-core.mjs'], ['backlog/x.md', 'scripts/lane-pool.mjs', 'scripts/lib/jury-core.mjs']]) {
+      refused(() => guard(warn, { listBehindFiles: () => files,
+        dispatchPath: p => /review-core|jury-core/.test(p) }));
+    }
+    expect(guard(warn, { listBehindFiles: () => ['backlog/x.md'], dispatchPath: null }).guardPath).toBe('non-code');
+    refused(() => guard(warn, { listBehindFiles: () => [] }));
+    refused(() => guard(warn, { listBehindFiles: () => [], dispatchPath: null }));
+    refused(() => guard(warn, { listBehindFiles: () => ['a/__tests__/r.mjs'], dispatchPath: p => p.startsWith('a/') }));
+    refused(() => guard(warn, { listBehindFiles: () => ['a/__tests__/r.json'], dispatchPath: p => p.startsWith('a/') }));
+  });
+  it('behind managed clone with empty evidence refuses without last-good and cannot use rebuild grace', () => {
+    const lastGood = vi.fn(() => null);
+    const rebuildGrace = vi.fn(() => ({ grace: true }));
+    const opts = { listBehindFiles: () => [], lastGood, rebuildGrace };
+    const error = refused(() => guard(warn, opts));
+    expect(error.message).toContain('6 commit(s) behind origin/main');
+    expect(error.message).toContain('0 file(s) behind');
+    expect(error.message).toContain('clone-held-stale');
+    expect(lastGood).toHaveBeenCalledOnce();
+    expect(rebuildGrace).not.toHaveBeenCalled();
+    expect(guard(warn, { ...opts, lastGood: () => ({ onLastGood: true, lastGood: H }) }).guardPath).toBe('last-good');
+    expect(guard(fresh, opts).guardPath).toBe('fresh');
+  });
+  it('15 overrides are explicit and ordered after identity and cleanliness; unknown diff may use last-good', () => {
+    const lastGood = () => ({ onLastGood: true, lastGood: H });
+    const rebuildGrace = () => ({ grace: true });
+    const onPath = { listBehindFiles: () => ['scripts/lib/review-core.mjs'] };
+    expect(guard(warn, { ...onPath, lastGood }).guardPath).toBe('last-good');
+    expect(logs.join('')).toContain('LAST-KNOWN-GOOD');
+    expect(guard(warn, { ...onPath, rebuildGrace }).guardPath).toBe('grace');
+    expect(logs.join('')).toContain('within the grace');
+    expect(guard(warn, { listBehindFiles: () => null, lastGood }).guardPath).toBe('last-good');
+    for (const override of [{ lastGood }, { rebuildGrace }]) {
+      refused(() => guard(warn, { ...onPath, ...override, adoptedHead: () => A }), 'off-adopted-build');
+      refused(() => guard(warn, { ...onPath, ...override, treeDirtyForCode: () => true }));
+    }
+    expect(decideLastGood({ headSha: H, dirty: false, nowMs: Date.parse('2026-11-27T12:00:00Z'),
+      state: { adopted: { head: H, at: '2026-11-27T11:59:00Z' } }, freshAdoptMs: 3_600_000 }).onLastGood).toBe(true);
+  });
+  it('16 refusal and grace diagnostics name up to five relevant prompt paths', () => {
+    const files = Array.from({ length: 7 }, (_, i) => `skills-src/review/prompt-${i}.md`);
+    const opts = { listBehindFiles: () => files, dispatchPath: p => p.startsWith('skills-src/review/') };
+    const e = refused(() => guard(warn, opts));
+    guard(warn, { ...opts, rebuildGrace: () => ({ grace: true }) });
+    for (const text of [e.message, logs.join('')]) {
+      expect(text).toContain(files[0]); expect(text).toContain(files[4]);
+      expect(text).not.toContain(files[5]); expect(text).toContain('+2 more');
+    }
+  });
+  it('17 real fresh-by-local-main does not hide lagging adopted HEAD; off-path and empty lists pass', () => {
+    const { run, realOptions, origin } = realFixture(['scripts/lib/review-core.mjs']);
+    expect(checkMainStaleness({ run, autoFf: false, cleanOnly: true })).toEqual(fresh);
+    const e = refused(() => assertMainNotStale(root, undefined, realOptions));
+    expect(e.message).toContain('scripts/lib/review-core.mjs');
+    expect(assertMainNotStale(root, undefined, { ...realOptions, dispatchPath: () => false }).guardPath).toBe('off-path');
+    git('checkout', '-q', '--detach', origin);
+    const listBehindFiles = vi.fn(() => behindFiles(root, 'main', run, {}));
+    expect(assertMainNotStale(root, undefined, { ...realOptions, adoptedHead: () => origin, listBehindFiles }).guardPath).toBe('fresh');
+    expect(listBehindFiles).toHaveBeenCalledOnce();
+  });
+  it('19 comparison failure is not an absent ref, including signals/errors from the production adapter', () => {
+    const absent = { listBehindFiles: () => null, originRefProbe: () => ({ status: 1 }) };
+    expect(guard(fresh, absent).guardPath).toBe('fresh');
+    for (const probe of [() => ({ status: 0 }), () => ({ status: 128 }), () => ({ status: null, signal: 'SIGKILL' }),
+      () => ({ status: 1, error: Error('timeout') }), () => { throw Error('probe'); }]) {
+      expect(refused(() => guard(fresh, { ...absent, originRefProbe: probe })).message).toContain('could not compare HEAD with origin/main');
+    }
+    expect(guard(fresh, { ...absent, originRefProbe: () => ({ status: 0 }), lastGood: () => ({ onLastGood: true, lastGood: H }) }).guardPath).toBe('last-good');
+    const probe = vi.fn(() => { throw Error('empty must not probe'); });
+    expect(guard(fresh, { listBehindFiles: () => [], originRefProbe: probe }).guardPath).toBe('fresh');
+    expect(probe).not.toHaveBeenCalled();
+    for (const result of [{ status: null, signal: 'SIGKILL' }, { status: 1, error: Error('spawn') }]) {
+      const spawnSync = vi.fn(() => result);
+      refused(() => guard(fresh, { ...absent, originRefProbe: undefined, spawnSync }));
+      expect(spawnSync).toHaveBeenCalledWith('git', ['rev-parse', '--verify', '--quiet', 'origin/main^{commit}'],
+        expect.objectContaining({ cwd: root, timeout: 60_000, killSignal: 'SIGKILL', maxBuffer: expect.any(Number) }));
+    }
+    git('init', '-q', '-b', 'main');
+    expect(guard(fresh, { ...absent, originRefProbe: undefined }).guardPath).toBe('fresh');
+    const e = refused(() => guard(fresh, { ...absent, base: 'release', originRefProbe: (_r, base) => {
+      expect(base).toBe('release'); return { status: 0 };
+    } }));
+    expect(e.message).toContain('could not compare HEAD with origin/release');
+    expect(e.message).not.toContain('origin/main');
+  });
+  it('19 real log failure refuses while origin is readable and counts against the configurable base', () => {
+    const { run, realOptions, origin } = realFixture(['scripts/lib/review-core.mjs']);
+    const failLog = (args, opts) => args[0] === 'log' ? { status: null, signal: 'SIGKILL' } : run(args, opts);
+    refused(() => assertMainNotStale(root, undefined, { ...realOptions,
+      listBehindFiles: () => behindFiles(root, 'main', failLog, {}), originRefProbe: undefined }));
+    git('update-ref', 'refs/remotes/origin/release', origin);
+    git('update-ref', 'refs/remotes/origin/main', git('rev-parse', 'HEAD'));
+    const counts = [];
+    const releaseRun = (args, opts) => { counts.push(args); return run(args, opts); };
+    const e = refused(() => assertMainNotStale(root, () => fresh, { ...realOptions, base: 'release', run: releaseRun,
+      listBehindFiles: () => behindFiles(root, 'release', releaseRun, {}) }));
+    expect(e.message).toContain('1 commit(s) behind origin/release');
+    expect(counts).toContainEqual(['rev-list', '--count', 'HEAD..origin/release']);
+  });
+  it('20 file and commit counts stay separate on both checker and HEAD-based warn paths', () => {
+    const { realOptions } = realFixture(Array(3).fill('scripts/lib/review-core.mjs'));
+    for (const checker of [undefined, () => ({ ...warn, behind: 3 })]) {
+      const e = refused(() => assertMainNotStale(root, checker, realOptions));
+      expect(e.message).toContain('3 commit(s) behind origin/main');
+      expect(e.message).toContain('1 file(s)');
+    }
+  });
+  it('21 observations preserve checker classification and unknown counts across tolerances', () => {
+    for (const st of checks) {
+      const result = guard(st);
+      expect(result.guardPath).toBe('off-path');
+      expect(result.checker).toBe(st === null ? 'null' : st.offline ? 'offline' : st.fresh ? 'fresh' : 'warn');
+      expect(result.behindCommits).toBe(st == null || st.offline ? null : st.fresh ? 1 : st.behind);
+      expect(result.behindFileCount).toBe(1);
+    }
+    const unknown = guard({ offline: true }, { listBehindFiles: () => null });
+    expect(unknown.behindCommits).toBeNull();
+    expect(unknown.behindFileCount).toBeNull();
+  });
+  it('22 a child environment cannot disable the managed process identity gate', () => {
+    refused(() => guard(fresh, { env: {}, adoptedHead: () => A }), 'off-adopted-build');
   });
 });
