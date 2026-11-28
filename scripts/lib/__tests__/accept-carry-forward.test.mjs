@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { latestAcceptRecord, isKnownMachineBody } from '../accept-carry-forward.mjs';
 import { NO_ASK_NOTE_KINDS } from '../pr-comment-policy.mjs';
-import { A, B, C, D, accepted, trusted, note, recovered, envelope, chain } from './fixtures/accepted-never-started.mjs';
+import { A, B, C, D, REFERRAL_HEAD, OTHER_REFERRAL_HEAD, accepted, trusted, note as fixtureNote, producedNote,
+  recovered, envelope, chain } from './fixtures/accepted-never-started.mjs';
+import { buildNoteComment } from '../../conveyor/reconcile-note-comment.mjs';
 import { readConfirmedBreaks } from '../red-team-gate.mjs';
 import { sweepExhaustedRetry } from '../../conveyor/ci-red-recovery-watch.mjs';
 import { buildExhaustedRetrySpentComment } from '../../conveyor/exhausted-retry.mjs';
@@ -11,20 +13,20 @@ vi.mock('../red-team-gate.mjs', async original => ({ ...await original(), readCo
   value: { broken: 'send-back', degraded: 'card', unconfirmed: 'advisory' },
 })) }));
 afterEach(() => vi.clearAllMocks());
-const later = body => latestAcceptRecord([accepted(), trusted(body)], []).laterVerdict;
+const later = body => latestAcceptRecord([accepted(REFERRAL_HEAD), trusted(body)], []).laterVerdict;
+const note = (kind = 'referral-hold-auto-resolved', text, prNumber = 9) => fixtureNote(kind, text, prNumber);
+const render = output => buildNoteComment(output, { informational: true });
 
 describe('accepted never started: exact no-ask notes', () => {
   it.each(NO_ASK_NOTE_KINDS)('%s note is not a later verdict', kind => expect(later(note(kind))).toBe(false));
-  it('compares all producer-escaped delimiters to the original trailer text', () => {
-    const body = note(undefined, 'text <!-- nested --> and --!>');
-    expect(body).toContain('text <!- - nested - -> and - -!>');
-    expect(later(body)).toBe(false);
+  it.each(['<!--', '-->', '--!>'])('a no-ask note whose detail carries comment delimiter %s still sets laterVerdict', delimiter => {
+    expect(later(note(undefined, `${producedNote('referral-hold-auto-resolved').text} ${delimiter}`))).toBe(true);
   });
   it.each([
     ['duplicated trailer still sets laterVerdict', b => `${b}\n${b.split('\n').at(-1)}`],
     ['a note with extra prose lines still sets laterVerdict', b => b.replace('\n\nnote:', '\nDo not merge\n\nnote:')],
     ['a note whose trailer key does not match kind/pr/text still sets laterVerdict', b => b.replace(':9:', ':10:').replace('note-key: referral', 'note-key: timeout')],
-    ['visible text mismatch still sets laterVerdict', b => b.replace('Resolved automatically.', 'Do not merge.')],
+    ['visible text mismatch still sets laterVerdict', b => b.replace('referral hold auto-resolved —', 'Do not merge —')],
   ])('%s', (_, alter) => expect(later(alter(note()))).toBe(true));
   it.each(['\r', '\u0085', '\u2028', '\u2029', '\v', '\f'])('alternate line separator %j holds', separator => {
     expect(later(note(undefined, `first${separator}second`))).toBe(true);
@@ -37,6 +39,81 @@ describe('accepted never started: exact no-ask notes', () => {
     ['an untrusted look-alike note still sets laterVerdict', { author: { login: 'attacker' } }],
     ['missing author metadata still sets laterVerdict', {}],
   ])('%s', (_, metadata) => expect(latestAcceptRecord([accepted(), { ...metadata, body: note() }], []).laterVerdict).toBe(true));
+
+  it.each(NO_ASK_NOTE_KINDS)('trusted no-ask note with free-text detail "Do not merge" still sets laterVerdict (%s)', kind => {
+    expect(later(note(kind, 'Do not merge'))).toBe(true);
+  });
+  it('referral note naming a head other than the accepted reviewed-sha still holds', () => {
+    expect(latestAcceptRecord([accepted(A), trusted(note())], []).laterVerdict).toBe(true);
+  });
+  it('referral note without accept context still holds', () => {
+    const comment = trusted(note());
+    expect(isKnownMachineBody(comment.body, comment)).toBe(false);
+  });
+  it('timeout-retry note without accept context still holds', () => {
+    const comment = trusted(note('timeout-retry-fallback-heal'));
+    expect(isKnownMachineBody(comment.body, comment)).toBe(false);
+  });
+  it('referral tally containing block still holds', () => {
+    const output = producedNote('referral-hold-auto-resolved', { counts: { card: 1 } });
+    expect(later(render({ ...output, text: output.text.replace('1 card', '1 block') }))).toBe(true);
+  });
+  it('timeout-retry note with timeout-evidence free-text reason still holds', () => {
+    expect(later(render(producedNote('timeout-retry-fallback-heal', { reason: 'timeout-evidence:incomplete-diff' })))).toBe(true);
+  });
+  it('timeout-retry note whose PR #N differs from the key still holds', () => {
+    const output = producedNote('timeout-retry-fallback-heal');
+    expect(later(render({ ...output, text: output.text.replace('PR #9:', 'PR #10:') }))).toBe(true);
+  });
+  it('referral TALLY with a repeated category (1 card, 2 card) still sets laterVerdict', () => {
+    const output = producedNote('referral-hold-auto-resolved', { counts: { card: 1 } });
+    expect(later(render({ ...output, text: output.text.replace('1 card', '1 card, 2 card') }))).toBe(true);
+  });
+  it.each(['0 card', '01 card', '-1 card', '1 unknown', '1 card, 0 cleared', '1 card, 2 not-real, 3 not-real', '1 card; 2 cleared'])(
+    'referral TALLY outside the closed grammar (%s) still holds', tally => {
+      const output = producedNote('referral-hold-auto-resolved', { counts: { card: 1 } });
+      expect(later(render({ ...output, text: output.text.replace('1 card', tally) }))).toBe(true);
+    });
+  it.each(NO_ASK_NOTE_KINDS)('extra detail after the %s template still holds', kind => {
+    const output = producedNote(kind);
+    expect(later(render({ ...output, text: `${output.text}; Do not merge` }))).toBe(true);
+  });
+  it.each([REFERRAL_HEAD, OTHER_REFERRAL_HEAD])('producer referral note on incident prefix %s is not a later verdict', head => {
+    const comments = [accepted(head), trusted(render(producedNote('referral-hold-auto-resolved', { head })))];
+    expect(latestAcceptRecord(comments, []).laterVerdict).toBe(false);
+  });
+  it.each([false, true])('producer referral variants (advisory only=%s) are not later verdicts', human => {
+    for (const counts of [null, { card: 1 }, { 'not-real': 2 }, { cleared: 3 }, { card: 1, 'not-real': 2, cleared: 3 }]) {
+      expect(later(render(producedNote('referral-hold-auto-resolved', { counts, human })))).toBe(false);
+    }
+  });
+  it.each(['mixed-infra-cancelled-and-real-failure', 'log-unreadable', 'infra-cancelled-heal-mode', 'missing-check-origin'])(
+    'producer timeout-retry reason %s is not a later verdict', reason => {
+      expect(later(render(producedNote('timeout-retry-fallback-heal', { reason })))).toBe(false);
+    });
+  it('referral note head resolves against the latest accept preceding the note', () => {
+    const comment = trusted(note());
+    const comments = [accepted(REFERRAL_HEAD), comment, accepted(OTHER_REFERRAL_HEAD)];
+    expect(isKnownMachineBody(comment.body, comment, { comments, acceptIndex: 2 })).toBe(true);
+    const wrong = trusted(render(producedNote('referral-hold-auto-resolved', { head: OTHER_REFERRAL_HEAD })));
+    expect(isKnownMachineBody(wrong.body, wrong, { comments: [comments[0], wrong, comments[2]], acceptIndex: 2 })).toBe(false);
+  });
+  it('referral head uses the last reviewed-sha marker of the preceding trusted accept', () => {
+    const preceding = trusted(`${accepted(A).body}\n<!-- reviewed-sha: ${REFERRAL_HEAD} -->`);
+    expect(latestAcceptRecord([preceding, trusted(note())], []).laterVerdict).toBe(false);
+  });
+  it.each([
+    ['missing comment list', () => ({ acceptIndex: 0 })],
+    ['missing accept index', comments => ({ comments })],
+    ['invalid accept index', comments => ({ comments, acceptIndex: -1 })],
+    ['untrusted accept', (_, comment) => ({ comments: [{ ...accepted(REFERRAL_HEAD), viewerDidAuthor: false, author: { login: 'attacker' } }, comment], acceptIndex: 0 })],
+    ['unreadable accept', (_, comment) => ({ comments: [trusted(null), comment], acceptIndex: 0 })],
+    ['note absent from context', comments => ({ comments: [comments[0]], acceptIndex: 0 })],
+    ['oversized context', comments => ({ comments: [...comments, ...Array(10000).fill(trusted(''))], acceptIndex: 0 })],
+  ])('referral note with %s holds', (_, context) => {
+    const comment = trusted(note()), comments = [accepted(REFERRAL_HEAD), comment];
+    expect(isKnownMachineBody(comment.body, comment, context(comments, comment))).toBe(false);
+  });
 });
 
 describe('accepted never started: recovered retry', () => {

@@ -143,15 +143,51 @@ const KNOWN_MACHINE_SHAPE_RES = [
 // Every line terminator Markdown / the producers treat as a line break (`\r`, U+0085, U+2028/9, VT, FF as well as `\n`): a second
 // "line" smuggled behind any of them must not ride the header or the marker.
 const NL = '\\r\\n\\u0085\\u2028\\u2029\\v\\f';
-function isNoAskNote(text) {
+// Closed producer templates (reconcile-core / review-referral-hold). Builder equality alone also reproduces arbitrary holds.
+const REFERRAL_RESOLVED_DETAIL_RE = /^referral hold auto-resolved — (?:no referral finding exists on head ([0-9a-f]{9}); no ruling is owed|every referral finding on head ([0-9a-f]{9}) is ruled \(([1-9]\d* (?:card|not-real|cleared)(?:, [1-9]\d* (?:card|not-real|cleared)){0,2})\); no ruling is owed); the head's one finished review (?:is resumed once|left no advisory on the PR, so it is resumed once \(advisory only; `review:human` kept\))$/;
+const TIMEOUT_FALLBACK_DETAIL_RE = /^PR #([1-9]\d*): timeout retry ineligible \((?:mixed-infra-cancelled-and-real-failure|log-unreadable|infra-cancelled-heal-mode|missing-check-origin)\); falling back to ordinary ci-heal \(\d+ of \d+ attempts spent\)$/;
+
+/** Bind a note to its preceding trusted accept, even when a later restamp is the selected record. Unknown context holds. */
+function acceptShaBeforeNote(comment, { comments, acceptIndex } = {}) {
+  if (!Array.isArray(comments) || comments.length > 10000 || !Number.isInteger(acceptIndex)
+    || acceptIndex < 0 || acceptIndex >= comments.length) return null;
+  const before = comments.indexOf(comment);
+  if (before < 0 || comments.lastIndexOf(comment) !== before) return null;
+  const reviewedSha = c => isTrustedMarkerAuthor(c) && typeof c?.body === 'string'
+    ? lastMatch(REVIEWED_SHA_RE, c.body) : null;
+  // The supplied index must itself name an acceptance; malformed context never supplies a fallback.
+  const selected = reviewedSha(comments[acceptIndex]);
+  if (!selected) return null;
+  for (let index = before - 1; index >= 0; index--) {
+    const sha = reviewedSha(comments[index]);
+    if (sha) return sha;
+  }
+  return selected;
+}
+
+function isNoAskNoteDetail(kind, pr, detail, acceptedSha) {
+  if (/<!--|-->|--!>/.test(detail)) return false;
+  if (kind === 'referral-hold-auto-resolved') {
+    const match = REFERRAL_RESOLVED_DETAIL_RE.exec(detail);
+    if (!match || (match[1] ?? match[2]) !== acceptedSha.slice(0, 9)) return false;
+    const categories = match[3]?.split(', ').map(entry => entry.split(' ')[1]) ?? [];
+    return new Set(categories).size === categories.length;
+  }
+  if (kind === 'timeout-retry-fallback-heal') return TIMEOUT_FALLBACK_DETAIL_RE.exec(detail)?.[1] === pr;
+  return false;
+}
+
+function isNoAskNote(text, comment, context) {
   if (/[\r\u0085\u2028\u2029\v\f]/.test(text)) return false;
   // Recover original text from the producer's own trailer, not from its escaped visible text.
   const trailers = [...text.matchAll(/^<!-- conveyor-note-key: ([a-z-]+):([1-9]\d*):([^\r\n]*) -->$/gm)];
   if (trailers.length !== 1) return false;
   const [, kind, pr, detail] = trailers[0];
   const prNumber = Number(pr);
-  return NO_ASK_NOTE_KINDS.includes(kind) && Number.isSafeInteger(prNumber)
-    && text === buildNoteComment({ kind, prNumber, text: detail }, { informational: true });
+  if (!NO_ASK_NOTE_KINDS.includes(kind) || !Number.isSafeInteger(prNumber)) return false;
+  const acceptedSha = acceptShaBeforeNote(comment, context);
+  if (!acceptedSha || !isNoAskNoteDetail(kind, pr, detail, acceptedSha)) return false;
+  return text === buildNoteComment({ kind, prNumber, text: detail }, { informational: true });
 }
 function isRecoveredRetryNote(text) {
   const head = /^head: ([0-9a-f]{40})$/m.exec(text)?.[1];
@@ -372,7 +408,7 @@ export function isKnownMachineBody(body, comment = undefined, context = {}) {
   if (text.startsWith('<!-- review-verdict-carried ')) return isNonBlockingCarriedVerdict(text, comment, null, context);
   // Only non-blocking results are machine notes: a policy send-back or a failed/unknown gate supersedes the accept.
   if (isTrustedMarkerAuthor(comment)) {
-    if (isNoAskNote(text) || isRecoveredRetryNote(text)) return true;
+    if (isNoAskNote(text, comment, context) || isRecoveredRetryNote(text)) return true;
     if (text.startsWith(RED_TEAM_GATE_MARKER)) {
       if (isNonBlockingRedTeamGate(text)) return true;
       const gate = parseRedTeamGateMarker(text);
