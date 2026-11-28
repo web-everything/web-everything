@@ -6,17 +6,21 @@
  *   for the `cloneKeyOf` cross-check and the `assertMainNotStale` behavioral tests; everything else is pure.
  */
 import {
-  describe, it, expect, beforeEach, afterEach,
+  describe, it, expect, beforeEach, afterEach, vi,
 } from 'vitest';
 import {
-  mkdtempSync, rmSync, mkdirSync, symlinkSync, writeFileSync,
+  mkdtempSync, rmSync, mkdirSync, symlinkSync, writeFileSync, readFileSync, chmodSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { tmpdir, hostname } from 'node:os';
+import { once } from 'node:events';
+import { spawnKeepAlive } from '../test-keepalive.mjs';
+import { join, delimiter } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import * as lastGoodReader from '../daemon-last-good.mjs';
+import { processStartMs, pidReusedSince } from '../daemon-rebuild/lease.mjs';
 
 import {
-  cloneKeyOf, decideLastGood, lastGoodMaxAgeMs, LAST_GOOD_MAX_AGE_ENV, DEFAULT_LAST_GOOD_MAX_AGE_MS,
+  cloneKeyOf, decideLastGood, lastGoodForClone, lastGoodMaxAgeMs, LAST_GOOD_MAX_AGE_ENV, DEFAULT_LAST_GOOD_MAX_AGE_MS,
   daemonConveyorStateRoot, daemonStateDir, CONVEYOR_STATE_ROOT_ENV,
   decideRebuildGrace, rebuildGraceForClone, staleGuardRebuildGraceMs, STALE_GUARD_REBUILD_GRACE_ENV,
   DEFAULT_STALE_GUARD_REBUILD_GRACE_MS,
@@ -74,6 +78,415 @@ beforeEach(() => {
 afterEach(() => {
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
   tempDirs.length = 0;
+});
+
+/** A private ps executable injects process evidence without probing the host or the real checkout. */
+function installFixturePs(dir, { pid = null } = {}) {
+  const start = new Date('2026-11-27T20:46:06Z');
+  const at = `${start.toDateString().slice(0, 10)} ${start.toTimeString().slice(0, 8)} ${start.getFullYear()}`;
+  const calls = join(dir, 'ps-calls.jsonl');
+  const file = join(dir, 'ps');
+  writeFileSync(file, '#!' + process.execPath + '\n'
+    + 'const fs = require("node:fs");\n'
+    + 'const args = process.argv.slice(2);\n'
+    + 'fs.appendFileSync(' + JSON.stringify(calls) + ', JSON.stringify({args, locale: process.env.LC_ALL}) + "\\n");\n'
+    + 'if (args.length !== 4 || args[0] !== "-o" || args[1] !== "lstart=" || args[2] !== "-p"'
+    + (pid === null ? ' || !/^[1-9][0-9]*$/.test(args[3])' : ' || args[3] !== ' + JSON.stringify(String(pid)))
+    + ' || process.env.LC_ALL !== "C") process.exit(2);\n'
+    + 'process.stdout.write(' + JSON.stringify(at + '\n') + ');\n');
+  chmodSync(file, 0o755);
+  vi.stubEnv('PATH', dir + delimiter + process.env.PATH);
+  return calls;
+}
+
+describe('BUILD-LEASE-SMOKE-AWARE-SLICE1 heartbeat process identity', () => {
+  const minute = 60_000;
+  const startedMs = Date.parse('2026-11-27T20:46:06Z');
+  const iso = (ms) => new Date(ms).toISOString();
+  const thisHost = 'heartbeat-fixture-host';
+  let root, env;
+  beforeEach(() => {
+    root = mktemp('we-heartbeat-identity-');
+    env = {
+      WE_DAEMON_STATE_DIR: mktemp('we-heartbeat-identity-state-'),
+      WE_DAEMON_CLONE_LOCK_ROOT: mktemp('we-heartbeat-identity-lock-'),
+    };
+    for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value);
+  });
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
+  async function withOwner(check) {
+    const child = spawnKeepAlive({ cwd: root, env, anchorPid: process.pid });
+    try {
+      await once(child, 'spawn');
+      await check(child);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        const exited = once(child, 'exit');
+        child.kill('SIGKILL');
+        await exited;
+      }
+    }
+  }
+  function fixture(pid, leaseStartMs = startedMs) {
+    const building = { token: '123-deadbeef', jobMode: true, pid, host: thisHost, startedAt: iso(leaseStartMs) };
+    const nowMs = leaseStartMs + 35 * minute;
+    return {
+      headSha: 'smoke-verified-head', state: { adopted: { head: 'smoke-verified-head', at: iso(nowMs - 120 * minute) }, building },
+      heartbeat: { ...building, at: iso(nowMs) }, nowMs, maxAgeMs: DEFAULT_LAST_GOOD_MAX_AGE_MS, freshAdoptMs: 60 * minute, thisHost,
+    };
+  }
+  function read(o, startTimeOf = () => startedMs) {
+    return decideLastGood({
+      ...o, ownerAlive: (building) => lastGoodReader.heartbeatOwnerAlive(building, { thisHost, startTimeOf }),
+    });
+  }
+
+  it.each([[-20 * minute - 1, false], [-20 * minute, true], [-14 * minute, true]])(
+    'S1 owner-start offset %s has heartbeat holding %s', async (offset, holds) => {
+      await withOwner((child) => {
+        expect(read(fixture(child.pid), () => startedMs + offset))
+          .toMatchObject({ onLastGood: holds, holdingBy: holds ? 'heartbeat' : null });
+      });
+    });
+  it('S3 N2 replay: long-lived owner and leftover 60-second heartbeat refuse', async () => {
+    await withOwner((child) => {
+      const o = fixture(child.pid);
+      o.heartbeat.at = iso(o.nowMs - minute);
+      expect(read(o, () => startedMs - 30 * minute)).toMatchObject({ onLastGood: false, holdingBy: null });
+    });
+  });
+  it.each([undefined, false, 'true', true])('S3b/S8 recent inline owner requires exact jobMode true: %s', async (jobMode) => {
+    await withOwner((child) => {
+      const o = fixture(child.pid);
+      delete o.state.building.jobMode;
+      if (jobMode !== undefined) o.state.building.jobMode = jobMode;
+      expect(read(o, () => startedMs - minute))
+        .toMatchObject({ onLastGood: jobMode === true, holdingBy: jobMode === true ? 'heartbeat' : null });
+    });
+  });
+  it.each([['S4a stale heartbeat', 35 * minute, 6 * minute], ['S4b over-cap build', 91 * minute, 0]])(
+    '%s ignores Infinity caps', async (_name, buildAge, heartbeatAge) => {
+      await withOwner((child) => {
+        const o = fixture(child.pid);
+        o.nowMs = startedMs + buildAge;
+        o.heartbeat.at = iso(o.nowMs - heartbeatAge);
+        expect(read({ ...o, heartbeatStaleMs: Infinity, buildMaxMs: Infinity }))
+          .toMatchObject({ onLastGood: false, holdingBy: null });
+      });
+    });
+  it('S5 pins the owner window to default job lock wait plus five minutes', async () => {
+    const { DEFAULT_REBUILD_JOB_LOCK_WAIT_MS } = await import('../daemon-rebuild/lease.mjs');
+    expect(lastGoodReader.HEARTBEAT_OWNER_START_WINDOW_MS).toBe(DEFAULT_REBUILD_JOB_LOCK_WAIT_MS + 5 * minute);
+  });
+  it('S2/T10a real lease and refreshed heartbeat hold after both legacy windows expire', async () => {
+    await withOwner(async (child) => {
+      const { claimBuildLease, startBuildHeartbeat, ACTIVE_BUILD_TOKENS } = await import('../daemon-rebuild/lease.mjs');
+      const { writeRebuildState } = await import('../daemon-rebuild/state.mjs');
+      const state = { adopted: { head: 'smoke-verified-head', at: iso(startedMs - 120 * minute) } };
+      const lease = claimBuildLease({ state, root, plan: { finalSha: 'candidate', inputsKey: 'fixture' },
+        run: () => { throw new Error('unexpected git'); }, env: { ...env, WE_DAEMON_REBUILD_JOB_CHILD: '1' }, nowMs: startedMs });
+      ACTIVE_BUILD_TOKENS.delete(lease.token);
+      Object.assign(lease, { pid: child.pid, host: hostname() });
+      writeRebuildState(root, state, env);
+      const now = startedMs + 35 * minute;
+      const hb = startBuildHeartbeat({ root, env, lease, now: () => now });
+      try {
+        expect(lastGoodReader.heartbeatOwnerAlive(lease, { thisHost: lease.host, startTimeOf: () => startedMs })).toBe(true);
+        expect(lastGoodReader.readRebuildStateFile(root, env).building).toEqual(lease);
+        expect(lastGoodReader.readBuildHeartbeatFile(root, env)).toEqual({ token: lease.token, pid: child.pid,
+          host: lease.host, startedAt: lease.startedAt, at: iso(now) });
+        const result = lastGoodForClone({ root, env, now, headSha: state.adopted.head,
+          ownerAlive: (building) => lastGoodReader.heartbeatOwnerAlive(building, { thisHost: lease.host, startTimeOf: () => startedMs }) });
+        expect(result, JSON.stringify(result))
+          .toMatchObject({ onLastGood: true, holdingBy: 'heartbeat' });
+      } finally { hb.stop(); }
+    });
+  });
+  it('S4c surviving SIGTERM cannot extend either heartbeat cap', async () => {
+    const child = spawnKeepAlive({ cwd: root, env, anchorPid: process.pid,
+      stdio: ['ignore', 'ignore', 'ignore', 'ipc'], prelude: "process.on('SIGTERM', () => {}); process.on('message', () => process.send('alive'));", postlude: "process.send('ready');" });
+    try {
+      await once(child, 'message');
+      expect(child.kill('SIGTERM')).toBe(true);
+      // IPC acknowledgement proves the process survived the signal before the read.
+      const acknowledged = once(child, 'message');
+      child.send('probe');
+      expect((await acknowledged)[0]).toBe('alive');
+      expect(process.kill(child.pid, 0)).toBe(true);
+      for (const [buildAge, heartbeatAge] of [[35 * minute, 6 * minute], [91 * minute, 0]]) {
+        const o = fixture(child.pid);
+        o.nowMs = startedMs + buildAge;
+        o.heartbeat.at = iso(o.nowMs - heartbeatAge);
+        expect(read({ ...o, heartbeatStaleMs: Infinity, buildMaxMs: Infinity }))
+          .toMatchObject({ onLastGood: false, holdingBy: null });
+      }
+    } finally {
+      const exited = once(child, 'exit'); child.kill('SIGKILL'); await exited;
+    }
+  });
+
+  it('pid reused after the lease: live pid whose start time is later than the lease start + slack does not hold by heartbeat', async () => {
+    await withOwner((child) => {
+      expect(read(fixture(child.pid, startedMs - 35 * minute)))
+        .toMatchObject({ onLastGood: false, holdingBy: null });
+    });
+  });
+  it.each([
+    ['null', () => null], ['NaN', () => NaN], ['infinite', () => Infinity],
+    ['throwing reader', () => { throw new Error('ps unavailable'); }],
+  ])('unreadable process start time does not hold: %s', async (_name, startTimeOf) => {
+    await withOwner((child) => {
+      expect(read(fixture(child.pid), startTimeOf)).toMatchObject({ onLastGood: false, holdingBy: null });
+    });
+  });
+  it.each(['different', 'missing'])('heartbeat startedAt differing from the lease startedAt does not hold: %s', async (kind) => {
+    await withOwner((child) => {
+      const o = fixture(child.pid);
+      if (kind === 'different') o.heartbeat.startedAt = iso(startedMs - minute);
+      else delete o.heartbeat.startedAt;
+      expect(read(o)).toMatchObject({ onLastGood: false, holdingBy: null });
+      expect(decideLastGood({ ...o, ownerAlive: () => true })).toMatchObject({ onLastGood: false, holdingBy: null });
+    });
+  });
+  it('a live keepalive child started before the lease still holds', async () => {
+    await withOwner((child) => {
+      expect(read(fixture(child.pid, startedMs + 10_000)))
+        .toMatchObject({ onLastGood: true, holdingBy: 'heartbeat' });
+    });
+  });
+  it('the local process-start reader is pinned equal to lease.mjs processStartMs on a live child', async () => {
+    await withOwner((child) => {
+      const calls = installFixturePs(root, { pid: child.pid });
+      const canonical = processStartMs(child.pid);
+      expect(canonical).toBe(startedMs);
+      expect(lastGoodReader.heartbeatProcessStartMs(child.pid)).toBe(canonical);
+      expect(readFileSync(calls, 'utf8').trim().split('\n').map((line) => JSON.parse(line))).toEqual([
+        { args: ['-o', 'lstart=', '-p', String(child.pid)], locale: 'C' },
+        { args: ['-o', 'lstart=', '-p', String(child.pid)], locale: 'C' },
+      ]);
+    });
+  });
+  it('pins the 2000 ms pid-reuse slack and its inclusive boundary to lease.mjs', async () => {
+    await withOwner((child) => {
+      expect(lastGoodReader.HEARTBEAT_PID_REUSE_SLACK_MS).toBe(2000);
+      for (const [elapsed, reused] of [[1999, false], [2000, false], [2001, true]]) {
+        const leaseStart = startedMs - elapsed;
+        expect(pidReusedSince(child.pid, leaseStart, () => startedMs)).toBe(reused);
+        expect(read(fixture(child.pid, leaseStart)))
+          .toMatchObject({ onLastGood: !reused, holdingBy: reused ? null : 'heartbeat' });
+      }
+    });
+  });
+  it.each(['unparseable', undefined])('an unreadable lease startedAt does not hold: %s', async (startedAt) => {
+    await withOwner((child) => {
+      const o = fixture(child.pid);
+      o.state.building.startedAt = o.heartbeat.startedAt = startedAt;
+      expect(lastGoodReader.heartbeatOwnerAlive(o.state.building, { thisHost, startTimeOf: () => startedMs })).toBe(false);
+      expect(read(o)).toMatchObject({ onLastGood: false, holdingBy: null });
+    });
+  });
+  it.each([
+    ['missing output', () => ({ status: 0, stdout: '' })],
+    ['unparseable output', () => ({ status: 0, stdout: 'unreadable' })],
+    ['failed ps', () => ({ status: 1, stdout: 'Fri Nov 27 20:46:06 2026' })],
+    ['timed-out ps', () => ({ status: null, error: Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }) })],
+    ['throwing ps', () => { throw new Error('ps unavailable'); }],
+  ])('the bounded start-time reader refuses %s', async (_name, result) => {
+    await withOwner((child) => {
+      const run = vi.fn(result);
+      const startTimeOf = (pid) => lastGoodReader.heartbeatProcessStartMs(pid, run);
+      expect(startTimeOf(child.pid)).toBeNull();
+      expect(read(fixture(child.pid), startTimeOf)).toMatchObject({ onLastGood: false, holdingBy: null });
+      expect(run).toHaveBeenCalledWith('ps', ['-o', 'lstart=', '-p', String(child.pid)],
+        expect.objectContaining({ encoding: 'utf8', timeout: 5000, env: expect.objectContaining({ LC_ALL: 'C' }) }));
+    });
+  });
+});
+
+describe('BUILD-LEASE-SMOKE-AWARE-SLICE1 reader', () => {
+  const minute = 60_000;
+  const now = Date.parse('2026-11-27T21:21:54.737Z');
+  const iso = (t) => new Date(t).toISOString();
+  let root, env;
+  beforeEach(() => {
+    root = mktemp('we-heartbeat-reader-');
+    env = { WE_DAEMON_STATE_DIR: mktemp('we-heartbeat-state-'), WE_DAEMON_CLONE_LOCK_ROOT: mktemp('we-heartbeat-lock-') };
+    for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value);
+  });
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
+  // Match the existing incident clock with injected ps evidence; keep their assertions and kill probes.
+  beforeEach(() => installFixturePs(root));
+  const fixture = () => {
+    const building = { token: '123-deadbeef', jobMode: true, pid: 123, host: 'fixture-host', startedAt: iso(now - 35 * minute) };
+    return {
+      headSha: '2996145c', state: { adopted: { head: '2996145c', at: iso(now - 120 * minute) }, building },
+      dirty: false, nowMs: now, maxAgeMs: 24 * 60 * minute, freshAdoptMs: 60 * minute,
+      heartbeat: { ...building, at: iso(now - 24_737) }, ownerAlive: () => true, thisHost: 'fixture-host',
+    };
+  };
+  const heartbeatFile = (token) => join(env.WE_DAEMON_STATE_DIR, `${cloneKey(root)}.build-heartbeat.${token}.json`);
+
+  it('default heartbeat owner probe refuses EIO and every other process-check error', () => {
+    const o = fixture();
+    o.state.building.host = o.heartbeat.host = hostname();
+    const probe = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    const read = () => lastGoodForClone({
+      root, env, headSha: o.headSha, now,
+      readState: () => o.state, readHeartbeat: () => o.heartbeat,
+    });
+    try {
+      expect(read()).toMatchObject({ onLastGood: true, holdingBy: 'heartbeat' });
+      for (const code of ['EIO', 'EPERM', 'ESRCH', undefined]) {
+        probe.mockImplementation(() => { throw Object.assign(new Error('probe failed'), { code }); });
+        expect(read()).toMatchObject({ onLastGood: false, holdingBy: null });
+      }
+      expect(probe).toHaveBeenCalledWith(o.state.building.pid, 0);
+    } finally { probe.mockRestore(); }
+  });
+
+  it.each([
+    ['T1', '2026-11-27T20:20:16Z', '2026-11-27T20:46:06Z', '2026-11-27T21:21:54.737Z'],
+    ['T2', '2026-11-27T17:52:00Z', '2026-11-27T19:39:41Z', '2026-11-27T20:15:53Z'],
+  ])('%s incident replay holds only with the live heartbeat', (_id, adoptedAt, startedAt, at) => {
+    const o = fixture();
+    o.nowMs = Date.parse(at);
+    o.state.adopted.at = adoptedAt;
+    o.state.building.startedAt = startedAt;
+    o.heartbeat.startedAt = startedAt;
+    o.heartbeat.at = iso(o.nowMs - 24_737);
+    expect(decideLastGood({ ...o, heartbeat: null }).onLastGood).toBe(false);
+    expect(decideLastGood(o)).toMatchObject({ onLastGood: true, holdingBy: 'heartbeat', heartbeatAgeMs: 24_737,
+      buildAgeMs: o.nowMs - Date.parse(startedAt) });
+  });
+  it('T3a dead owner cannot extend a 35-minute lease', () => {
+    expect(decideLastGood({ ...fixture(), ownerAlive: () => false })).toMatchObject({ onLastGood: false, holdingBy: null });
+  });
+  it('T3b dead owner still holds by the unchanged 20-minute lease floor', () => {
+    const o = fixture();
+    o.state.building.startedAt = iso(now - 19 * minute);
+    expect(decideLastGood({ ...o, ownerAlive: () => false })).toMatchObject({ onLastGood: true, holdingBy: 'lease' });
+  });
+  it.each([['T4a', 5 * minute + 1000, false], ['T4b', 4 * minute, true],
+    ['heartbeat age zero', 0, true], ['heartbeat age 5 min', 5 * minute, true],
+    ['heartbeat age 5 min - 1 ms', 5 * minute - 1, true],
+    ['heartbeat age 5 min + 1 ms', 5 * minute + 1, false], ['heartbeat age -1 ms', -1, false],
+  ])('%s heartbeat freshness boundary', (_id, age, holds) => {
+    const o = fixture(); o.heartbeat.at = iso(now - age);
+    expect(decideLastGood(o)).toMatchObject({ onLastGood: holds, holdingBy: holds ? 'heartbeat' : null });
+  });
+  it.each([['T5a', 91 * minute, false], ['T5b', 89 * minute, true],
+    ['build age 90 min', 90 * minute, true], ['build age 90 min + 1 ms', 90 * minute + 1, false],
+    ['build age 90 min - 1 ms', 90 * minute - 1, true],
+  ])('%s absolute build cap', (_id, age, holds) => {
+    const o = fixture(); o.state.building.startedAt = iso(now - age); o.heartbeat.startedAt = o.state.building.startedAt;
+    expect(decideLastGood(o)).toMatchObject({ onLastGood: holds, holdingBy: holds ? 'heartbeat' : null });
+  });
+  it('T6 dirty tree refuses', () => expect(decideLastGood({ ...fixture(), dirty: true })).toMatchObject({ onLastGood: false, holdingBy: null }));
+  it('T7 different HEAD refuses', () => expect(decideLastGood({ ...fixture(), headSha: 'other' })).toMatchObject({ onLastGood: false, holdingBy: null }));
+  it.each([
+    ['token', (o) => { o.heartbeat.token = '123-cafebabe'; }],
+    ['pid', (o) => { o.heartbeat.pid++; }],
+    ['heartbeat host', (o) => { o.heartbeat.host = 'other-host'; }],
+    ['foreign lease host', (o) => { o.state.building.host = o.heartbeat.host = 'other-host'; }],
+    ['adoptOnly', (o) => { o.state.building.adoptOnly = true; }],
+    ['no lease', (o) => { o.state.building = null; }],
+    ['invalid token', (o) => { o.state.building.token = o.heartbeat.token = '../escape'; }],
+    ['null host', (o) => { o.thisHost = o.state.building.host = o.heartbeat.host = null; }],
+    ['string pid', (o) => { o.state.building.pid = o.heartbeat.pid = '123'; }],
+    ['zero pid', (o) => { o.state.building.pid = o.heartbeat.pid = 0; }],
+    ['missing token', (o) => { delete o.state.building.token; delete o.heartbeat.token; }],
+    ['missing heartbeat', (o) => { o.heartbeat = null; }],
+    ['unknown liveness', (o) => { delete o.ownerAlive; }],
+    ['ambiguous liveness', (o) => { o.ownerAlive = () => 'unknown'; }],
+    ['throwing liveness', (o) => { o.ownerAlive = () => { throw new Error('unreadable'); }; }],
+  ])('T8 %s refuses heartbeat', (_id, mutate) => {
+    const o = fixture(); mutate(o);
+    expect(decideLastGood(o)).toMatchObject({ onLastGood: false, holdingBy: null });
+  });
+  it.each(['future', 'invalid heartbeat', 'invalid build'])('T9 %s clock refuses', (kind) => {
+    const o = fixture();
+    if (kind === 'future') o.heartbeat.at = iso(now + 2 * minute);
+    if (kind === 'invalid heartbeat') o.heartbeat.at = 'unparseable';
+    if (kind === 'invalid build') o.state.building.startedAt = 'unparseable';
+    expect(decideLastGood(o)).toMatchObject({ onLastGood: false, holdingBy: null });
+  });
+  it('T10 IO shell reads its lease token file and refuses after owner exit', async () => {
+    const child = spawnKeepAlive({ cwd: root, env, anchorPid: process.pid });
+    try {
+      await once(child, 'spawn');
+      const o = fixture();
+      Object.assign(o.state.building, { pid: child.pid, host: hostname() });
+      const hb = { ...o.state.building, at: iso(now) };
+      writeFileSync(join(env.WE_DAEMON_STATE_DIR, `${cloneKey(root)}.rebuild.json`), JSON.stringify(o.state));
+      writeFileSync(heartbeatFile(hb.token), JSON.stringify(hb));
+      const read = () => lastGoodForClone({ root, env, headSha: o.headSha, now });
+      expect(read()).toMatchObject({ onLastGood: true, holdingBy: 'heartbeat' });
+      const exited = once(child, 'exit'); child.kill('SIGKILL'); await exited;
+      expect(read()).toMatchObject({ onLastGood: false, holdingBy: null });
+    } finally { child.kill('SIGKILL'); }
+  });
+  it.each(['{', '{}', 'null', '[]', '{"at":"2026-11-27T21:21:54Z"}', null])('T11 malformed/absent file %s equals no heartbeat', (content) => {
+    const o = fixture(); o.state.building.host = hostname();
+    writeFileSync(join(env.WE_DAEMON_STATE_DIR, `${cloneKey(root)}.rebuild.json`), JSON.stringify(o.state));
+    if (content !== null) writeFileSync(heartbeatFile(o.state.building.token), content);
+    const opts = { root, env, headSha: o.headSha, now, ownerAlive: () => true };
+    expect(lastGoodForClone(opts)).toEqual(lastGoodForClone({ ...opts, readHeartbeat: () => null }));
+  });
+  it('T11 reads only the exact valid lease token, never a foreign file or traversal', () => {
+    const o = fixture(); o.state.building.host = hostname();
+    writeFileSync(heartbeatFile('123-cafebabe'), JSON.stringify({ ...o.state.building, at: iso(now) }));
+    const read = () => lastGoodForClone({ root, env, headSha: o.headSha, now, ownerAlive: () => true });
+    for (const token of ['123-deadbeef', '../escape', null]) {
+      o.state.building.token = token;
+      writeFileSync(join(env.WE_DAEMON_STATE_DIR, `${cloneKey(root)}.rebuild.json`), JSON.stringify(o.state));
+      expect(read()).toMatchObject({ onLastGood: false, holdingBy: null });
+    }
+  });
+  it('T11 unreadable heartbeat and injected reader errors leave the old rule unchanged', () => {
+    const o = fixture(); o.state.building.host = hostname();
+    writeFileSync(join(env.WE_DAEMON_STATE_DIR, `${cloneKey(root)}.rebuild.json`), JSON.stringify(o.state));
+    mkdirSync(heartbeatFile(o.state.building.token));
+    const opts = { root, env, headSha: o.headSha, now, ownerAlive: () => true };
+    const absent = lastGoodForClone({ ...opts, readHeartbeat: () => null });
+    expect(lastGoodForClone(opts)).toEqual(absent);
+    expect(lastGoodForClone({ ...opts, readHeartbeat: () => { throw new Error('read failed'); } })).toEqual(absent);
+  });
+  it('T12 heartbeat never extends rebuild grace', () => {
+    const o = fixture();
+    expect(decideRebuildGrace({ ...o, graceMs: 60 * minute })).toMatchObject({ grace: false, reason: 'build-lease-stale' });
+  });
+  it('T13 restart without a live build still refuses', () => {
+    const o = fixture(); o.state.building = null; o.heartbeat = null;
+    o.state.adopted.at = '2026-11-27T17:52:00Z'; o.nowMs = Date.parse('2026-11-27T19:30:00Z');
+    expect(decideLastGood(o)).toMatchObject({ onLastGood: false, holdingBy: null });
+  });
+  it.each([['T14a', 'heartbeat', true], ['T14b', 'held', false]])('%s dispatch log tag and source', (_id, holdingBy, tagged) => {
+    vi.stubEnv('WE_DAEMON_MANAGED_CLONE', '1');
+    const writes = [];
+    const st = assertMainNotStale(root, () => ({ action: 'warn', behind: 12, dirty: false }), {
+      codeRoot: root, armed: false, reexeced: false, reexec: () => { throw new Error('unexpected reexec'); },
+      listBehindFiles: () => ['scripts/dispatch.mjs'], treeDirtyForCode: () => false,
+      rebuildGrace: () => ({ grace: false }), changedFiles: () => [],
+      lastGood: () => ({ onLastGood: true, lastGood: '2996145c', holdingBy, heartbeatAgeMs: 24_737, buildAgeMs: 35 * minute }),
+      write: (s) => writes.push(s),
+    });
+    expect(writes.join('')).toContain('LAST-KNOWN-GOOD');
+    if (tagged) expect(writes.join('')).toContain('rebuild in flight (heartbeat 25s ago, build 35 min old)');
+    else expect(writes.join('')).not.toContain('rebuild in flight');
+    if (tagged) expect(st.holdingBy).toBe(holdingBy);
+  });
+  it('holding sources prefer held, lease, heartbeat, then fresh adoption', () => {
+    const o = fixture(); o.state.adopted.at = iso(now);
+    expect(decideLastGood(o).holdingBy).toBe('heartbeat');
+    o.state.building.startedAt = iso(now);
+    expect(decideLastGood(o).holdingBy).toBe('lease');
+    o.state.held = { since: iso(now) };
+    expect(decideLastGood(o).holdingBy).toBe('held');
+    o.state.held = null; o.state.building = null;
+    expect(decideLastGood(o).holdingBy).toBe('fresh-adoption');
+    o.state.adopted.at = iso(now - 120 * minute);
+    expect(decideLastGood(o).holdingBy).toBeNull();
+  });
 });
 
 // ── a. cloneKeyOf matches daemon-overlays.mjs#cloneKey ─────────────────────────────────────────────────────
