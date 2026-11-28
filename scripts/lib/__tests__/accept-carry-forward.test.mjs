@@ -4,7 +4,8 @@ import { planReconcile } from '../../conveyor/reconcile-core.mjs';
 import { buildNoteComment } from '../../conveyor/reconcile-note-comment.mjs';
 import { buildNumberingRestampBody } from '../numbering-carry.mjs';
 import { NO_ASK_NOTE_KINDS } from '../pr-comment-policy.mjs';
-import { A, B, C, D, accepted, trusted, note, recovered, envelope, chain } from './fixtures/accepted-never-started.mjs';
+import { A, B, C, D, accepted, trusted, note, recovered, envelope, chain, emptyAdvisoryFixture } from './fixtures/accepted-never-started.mjs';
+import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { readConfirmedBreaks } from '../red-team-gate.mjs';
 import { sweepExhaustedRetry } from '../../conveyor/ci-red-recovery-watch.mjs';
 import { buildExhaustedRetrySpentComment } from '../../conveyor/exhausted-retry.mjs';
@@ -15,6 +16,13 @@ vi.mock('../red-team-gate.mjs', async original => ({ ...await original(), readCo
 })) }));
 afterEach(() => { vi.clearAllMocks(); readConfirmedBreaks.mockReset().mockReturnValue({ value: { broken: 'send-back', degraded: 'card', unconfirmed: 'advisory' } }); });
 const later = body => latestAcceptRecord([accepted(), trusted(body)], []).laterVerdict;
+const findingsChain = findings => chain({ findings, renderAdvisory: renderRedTeamComment });
+
+it.each([A, B, C, D])('empty advisory fixture matches the real producer at head %s', rev => {
+  expect(emptyAdvisoryFixture(rev)).toBe(renderRedTeamComment({ pr: 9, rev, provider: 'codex', model: 'fixture',
+    findings: [], foldedVerdict: 'accept', recheckStatus: 'ok', findingClasses: {} }));
+  expect(chain()).toEqual(chain({ renderAdvisory: renderRedTeamComment }));
+});
 
 describe('accepted never started: exact no-ask notes', () => {
   it.each(NO_ASK_NOTE_KINDS)('%s note is not a later verdict', kind => expect(later(note(kind))).toBe(false));
@@ -114,18 +122,18 @@ describe('accepted never started: chained carry provenance', () => {
   const finding = (impactIfUnfixed = 'degraded', confirmedByRecheck = true) => ({ category: 'edge-case', impactIfUnfixed,
     confirmedByRecheck, summary: 'fixture finding', file: 'src/fixture.mjs', line: 1, filesRead: ['src/fixture.mjs'] });
   it.each([['degraded', true], ['broken', false]])('retains non-blocking findings %s confirmed=%s', (impact, confirmed) => {
-    expect(latestAcceptRecord(chain({ findings: [finding(impact, confirmed)] }), []).laterVerdict).toBe(false);
+    expect(latestAcceptRecord(findingsChain([finding(impact, confirmed)]), []).laterVerdict).toBe(false);
   });
   it('a confirmed broken finding (send-back) still holds', () => {
-    expect(latestAcceptRecord(chain({ findings: [finding('broken')] }), []).laterVerdict).toBe(true);
+    expect(latestAcceptRecord(findingsChain([finding('broken')]), []).laterVerdict).toBe(true);
   });
   it('malformed finding sequence still holds', () => {
-    const comments = chain({ findings: [finding()] }); comments[2].body = comments[2].body.replace('1. [', '2. [');
+    const comments = findingsChain([finding()]); comments[2].body = comments[2].body.replace('1. [', '2. [');
     expect(latestAcceptRecord(comments, []).laterVerdict).toBe(true);
   });
   it('unreadable policy still holds for findings-bearing envelopes', () => {
     readConfirmedBreaks.mockImplementationOnce(() => { throw Error('unreadable policy'); });
-    expect(latestAcceptRecord(chain({ findings: [finding()] }), []).laterVerdict).toBe(true);
+    expect(latestAcceptRecord(findingsChain([finding()]), []).laterVerdict).toBe(true);
   });
   it('zero-finding envelopes do not read policy', () => {
     expect(latestAcceptRecord(chain(), []).laterVerdict).toBe(false);

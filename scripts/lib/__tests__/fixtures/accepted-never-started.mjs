@@ -1,7 +1,6 @@
-// Synthetic, producer-built threads; these are not captured incident threads.
+// Synthetic, producer-checked threads; these are not captured incident threads.
 import { buildNoteComment } from '../../../conveyor/reconcile-note-comment.mjs';
-import { buildExhaustedRetryRecoveredComment } from '../../../conveyor/exhausted-retry.mjs';
-import { renderRedTeamComment } from '../../../operations/review-extra-seats.mjs';
+import { buildExhaustedRetryRecoveredComment } from '../../../conveyor/exhausted-retry-recovered-comment.mjs';
 import { buildVerdictCarriedMarker } from '../../review-verdict-carried-marker.mjs';
 import { redTeamGateMarker } from '../../red-team-gate.mjs';
 
@@ -13,9 +12,19 @@ export const note = (kind = 'referral-hold-auto-resolved', text, prNumber = 9) =
   return buildNoteComment({ kind, text, prNumber }, { informational: true });
 };
 export const recovered = (kind = 'ci-heal-exhausted', headSha = C) => buildExhaustedRetryRecoveredComment({ kind, headSha });
-export function envelope(fromSha = B, toSha = C, shown = A, { findings = [], gate = true } = {}) {
-  const advisory = renderRedTeamComment({ pr: 9, rev: shown, provider: 'codex', model: 'fixture', findings,
-    foldedVerdict: 'accept', recheckStatus: 'ok', findingClasses: {} })
+// Pin the empty producer output in accept-carry-forward.test.mjs. Importing the
+// review-seat runner here adds hundreds of modules to every consumer's worker.
+export const emptyAdvisoryFixture = rev => `<!-- we:red-team-advisory pr=9 rev=${rev} -->
+### Post-accept red team — no break found
+
+Advisory only: this comment changes no label itself; the red-team gate (setting \`redTeam.confirmedBreaks\`) sends a confirmed broken break back to the fixer. Head \`${rev.slice(0, 12)}\` · red team codex/fixture · recorded verdict \`accept\`.
+
+The red team tried to break this change and reported nothing.`;
+
+export function envelope(fromSha = B, toSha = C, shown = A, { findings = [], gate = true, renderAdvisory } = {}) {
+  if (findings.length && !renderAdvisory) throw Error('findings fixtures require the real advisory producer');
+  const advisory = (renderAdvisory ? renderAdvisory({ pr: 9, rev: shown, provider: 'codex', model: 'fixture', findings,
+    foldedVerdict: 'accept', recheckStatus: 'ok', findingClasses: {} }) : emptyAdvisoryFixture(shown))
     .replace(`rev=${shown}`, `rev=${toSha}`);
   return [gate ? redTeamGateMarker(9, toSha, 'card-queued', 'a'.repeat(16)) : null,
     buildVerdictCarriedMarker({ fromSha, toSha, patchId: 'f'.repeat(40) }),
