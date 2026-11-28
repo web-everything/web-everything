@@ -753,7 +753,8 @@ export async function landPreventionCard(input, {
       const verdict = audited?.verdict;
       const lines = typeof verdict?.stdout === 'string' ? verdict.stdout.trim().split(/\r?\n/) : [];
       if (verdict?.ok !== true || verdict.code !== 0 || lines[0] !== 'NOT WEAKENED'
-        || lines.slice(1).some(line => line.trim() === 'WEAKENED') || verdict.stderr !== '') {
+        || lines.slice(1).some(line => line.trim() === 'WEAKENED')) {
+        // stderr carries log lines only (e.g. "audit scope: ..."); it never decides admission.
         return auditFailure([verdict?.stdout, verdict?.stderr, audited?.error]
           .filter(Boolean).join('\n') || 'missing or incomplete canonical audit result');
       }

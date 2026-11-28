@@ -4695,6 +4695,9 @@ sibling-repo PRs work. WEAKENED requires a `ruledWeakened` waiver matching ref, 
 exactly, from the same layers `prototype-load` reads: those settings, platform preferences, or the
 operator ops store (`ruled-weakened-add`). Another head cannot supply the audit.
 
+The card filer accepts only `ok === true`, `code === 0`, first verdict line `NOT WEAKENED`, and no
+subsequent bare `WEAKENED`; stderr does not affect admission.
+
 ## Bounded red-team probe fairness
 
 `scripts/lib/__tests__/red-team-dispatch-queue.test.mjs` pins a default of six probes per

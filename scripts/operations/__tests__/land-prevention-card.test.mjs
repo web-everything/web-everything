@@ -80,10 +80,19 @@ describe('landPreventionCard — canonical audit before publication', () => {
   const audit = (stdout, code = 0, stderr = '') => JSON.stringify({
     verdict: { ok: code === 0, code, stdout, stderr },
   });
+  // Keyed on the verdict (ok, code 0, first line NOT WEAKENED, no bare WEAKENED line), never on stderr.
+  const passesVerdict = (answer) => {
+    try {
+      const v = JSON.parse(answer).verdict;
+      const lines = typeof v?.stdout === 'string' ? v.stdout.trim().split(/\r?\n/) : [];
+      return v.ok === true && v.code === 0 && lines[0] === 'NOT WEAKENED'
+        && !lines.slice(1).some(line => line.trim() === 'WEAKENED');
+    } catch { return false; }
+  };
   const run = async (answer, sha = head) => {
     const { exec, calls } = scriptedExec([
       ACQUIRE_OK, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, sha, ...(sha === head ? [answer] : []),
-      ...(sha === head && typeof answer === 'string' && answer === audit('NOT WEAKENED\n')
+      ...(sha === head && typeof answer === 'string' && passesVerdict(answer)
         ? [OPEN_PR_OPENED, 'labelled'] : []), 'released',
     ]);
     const written = [];
@@ -117,6 +126,41 @@ describe('landPreventionCard — canonical audit before publication', () => {
     expect(calls[7].args).toContain('open-pr');
     expect(calls[7].args).toContain('--mode=label-on-green');
     expect(calls[8].args).toContain('review:pending');
+  });
+
+  it('opens the PR after NOT WEAKENED with benign audit stderr', async () => {
+    const { result, calls } = await run(audit('NOT WEAKENED\n', 0, 'audit scope: hunkContextLines=3 (tool)\n'));
+    expect(result.ok).toBe(true);
+    expect(calls[7].args).toContain('open-pr');
+  });
+
+  it.each([
+    ['arbitrary stderr text', 'NOT WEAKENED\n', 'anything at all: not an allowlist\n'],
+    ['CRLF and surrounding whitespace', '  NOT WEAKENED\r\n\r\n', ''],
+    ['CRLF with non-bare trailing text', 'NOT WEAKENED\r\nnote: WEAKENED sections ok\r\n', 'x'],
+  ])('admits %s (stderr never decides admission)', async (_name, stdout, stderr) => {
+    const { result, calls } = await run(audit(stdout, 0, stderr));
+    expect(result.ok).toBe(true);
+    expect(calls[7].args).toContain('open-pr');
+  });
+
+  it.each([
+    ['ok:false with code 0', JSON.stringify({ verdict: { ok: false, code: 0, stdout: 'NOT WEAKENED\n', stderr: '' } })],
+    ['code 3 (record write failed) with ok:true', JSON.stringify({ verdict: { ok: true, code: 3, stdout: 'NOT WEAKENED\n', stderr: '' } })],
+    ['WEAKENED first line', audit('WEAKENED\n', 0)],
+    ['bare WEAKENED line after NOT WEAKENED', audit('NOT WEAKENED\n  WEAKENED \n')],
+    ['bare WEAKENED line with CRLF', audit('NOT WEAKENED\r\nWEAKENED\r\n', 0, 'audit scope: hunkContextLines=3 (tool)\n')],
+    ['stdout missing', JSON.stringify({ verdict: { ok: true, code: 0, stderr: '' } })],
+    ['thrown exec error', Object.assign(new Error('boom'), { stderr: 'audit scope: hunkContextLines=3 (tool)' })],
+  ])('still refuses %s and never opens a PR', async (_name, answer) => {
+    const { result, calls } = await run(answer);
+    expect(result).toMatchObject({ ok: false, step: 'codex-audit' });
+    expect(calls.some(c => c.args.includes('open-pr'))).toBe(false);
+  });
+
+  it('keeps stderr in the failure message when the audit is refused', async () => {
+    const { result } = await run(audit('WEAKENED\nx\n', 1, 'audit scope: hunkContextLines=3 (tool)\n'));
+    expect(result.reason).toContain('audit scope: hunkContextLines=3 (tool)');
   });
 
   it.each([

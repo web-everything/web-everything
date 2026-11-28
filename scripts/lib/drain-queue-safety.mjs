@@ -17,6 +17,8 @@ import { redTeamForHead, isPublishableRedTeamResult, readRedTeamDisposition, rea
 import { readQuarantine } from './red-main-quarantine-io.mjs';
 import { activeEntries, parseVitestFailures, QUARANTINE_SAFETY_NET_DEFAULTS } from './red-main-quarantine.mjs';
 
+export const MQ_SAME_HEAD_CAUSES = Object.freeze(['head-failed', 'unknown']);
+
 const mqOid = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.test(value) ? value.toLowerCase() : null;
 // Explicit failure reasons only; future enum values require operator inspection.
 const MQ_MERGE_CONFLICT_RETRY_CAP = 3;
@@ -1246,23 +1248,23 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
           ? readMqRetryEvidence({ repo, pr, head: currentHead, timeline, exec, rerunScope, dryRun, quarantine, now, readFreeze,
             retryPolicy: readDrainQueueSafety().value }) : undefined),
         mergeState: timelineHasConflict(timeline) ? readMqMergeState({ repo, pr, head: currentHead, exec }) : undefined });
+  // Unknown/incomplete history cannot authorize recovery. Require a failed removal bound to H.
+  const confirmed = !timeline?.error && timeline?.hasPreviousPage === false
+    && Array.isArray(timeline.nodes) && timeline.nodes.every(event =>
+      event?.__typename === 'AddedToMergeQueueEvent' || event?.__typename === 'HeadRefForcePushedEvent'
+      || (event?.__typename === 'RemovedFromMergeQueueEvent'
+        && (['manual', 'merged'].includes(mqRemovalReason(event))
+          || (mqFailureReasons.has(mqRemovalReason(event))
+            && mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid)))))
+    && timeline.nodes.some(event =>
+    event?.__typename === 'RemovedFromMergeQueueEvent'
+    && mqFailureReasons.has(mqRemovalReason(event))
+    && mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid) === currentHead);
   if (!decision.hold && decision.line) log(decision.line);
   if (decision.hold) {
     log(decision.line);
     if (timelineHasFailedChecks(timeline, currentHead))
       log(`mq-same-head-retry-declined: #${String(pr).replace(/\D/g, '')} head ${currentHead} — ${mqRetryDeclineReason(retryEvidence, decision.line)}${retryEvidence?.failedNames?.length ? `; failed check(s): ${retryEvidence.failedNames.join(', ')}` : ''}${mqDerivedDetails(retryEvidence)}${retryEvidence?.derivedNames?.length && retryEvidence.mainRunId != null ? `; main run ${retryEvidence.mainRunId}` : ''}`);
-    // Unknown/incomplete history cannot authorize recovery. Require a failed removal bound to H.
-    const confirmed = !timeline?.error && timeline?.hasPreviousPage === false
-      && Array.isArray(timeline.nodes) && timeline.nodes.every(event =>
-        event?.__typename === 'AddedToMergeQueueEvent' || event?.__typename === 'HeadRefForcePushedEvent'
-        || (event?.__typename === 'RemovedFromMergeQueueEvent'
-          && (['manual', 'merged'].includes(mqRemovalReason(event))
-            || (mqFailureReasons.has(mqRemovalReason(event))
-              && mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid)))))
-      && timeline.nodes.some(event =>
-      event?.__typename === 'RemovedFromMergeQueueEvent'
-      && mqFailureReasons.has(mqRemovalReason(event))
-      && mqOid(event.beforeCommit?.parents?.nodes?.[1]?.oid) === currentHead);
     if (refresh && confirmed) mqSameHeadRefresh({ repo, pr, head: currentHead, exec, log, ...refresh });
   }
   // Keep the historical enumerable hold/line shape for existing callers. Outcome producers
@@ -1271,6 +1273,7 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
     ? `${decision.line}; ${mqRetryDeclineReason(retryEvidence, decision.line)}${mqDerivedDetails(retryEvidence)}${retryEvidence?.mainRunId != null ? `; main run ${retryEvidence.mainRunId}` : ''}`
     : decision.line;
   Object.defineProperties(decision, {
+    cause: { value: decision.hold ? (confirmed ? 'head-failed' : 'unknown') : null },
     reason: { value: reason }, mainRunId: { value: retryEvidence?.mainRunId ?? null },
   });
   return decision;

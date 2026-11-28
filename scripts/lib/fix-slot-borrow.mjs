@@ -179,20 +179,26 @@ export const PR_BASE_MERGE_TARGET = '@pr-base';
  *  {@link PR_BASE_MERGE_TARGET} so fix-run reads it — a guessed `main` could merge main into a stacked PR. null = no merge. */
 export const mergeOntoFor = (planned) => planned.restack?.onto ?? (planned.isConflict ? planned.baseRefName || PR_BASE_MERGE_TARGET : null);
 
+export const ROUTED_NON_MODEL_CAUSES = Object.freeze(['launcher', 'input', 'infra']);
+export const ROUTED_HEAD_MAX_ROWS = 3;
+/** Pure; only explicit non-model causes discount a row; legacy or invalid causes count as model. */
+export const routedOutcomeCause = entry => ROUTED_NON_MODEL_CAUSES.includes(entry?.cause) ? entry.cause : 'model';
+
 export function consecutiveUnproductiveOnHead(table, { repo = 'we', pr, head }) {
   if (!head) return 0;
-  let count = 0;
+  let model = 0, total = 0;
   for (const entry of [...(table?.[`${repo}#${pr}`] ?? [])].reverse()) {
     if (entry.head !== head || entry.outcome === 'pushed') break;
-    count++;
+    total++;
+    if (routedOutcomeCause(entry) === 'model') model++;
   }
-  return count;
+  return total >= ROUTED_HEAD_MAX_ROWS ? Math.max(model, total - 1) : model;
 }
 
 const oneLine = (t) => String(t ?? '').replace(/\s+/g, ' ').trim().slice(0, 300);
 
 /** `reason` is the local diagnosis (may hold command errors); `note` is the agent's final message, the only text a PR comment shows. */
-export function recordRoutedOutcome({ repo = 'we', pr, head, outcome, reason = '', note = '', now = Date.now(), store = fileLedger(routedOutcomePath({ repo, pr })),
+export function recordRoutedOutcome({ repo = 'we', pr, head, outcome, cause, reason = '', note = '', now = Date.now(), store = fileLedger(routedOutcomePath({ repo, pr })),
   readClaim = (kind) => readLockEntry(fixDispatchClaimRoot(), fixDispatchResource({ repo, pr, kind })),
 }) {
   // Borrowed launches keep their existing ledger and retry policy.
@@ -200,7 +206,8 @@ export function recordRoutedOutcome({ repo = 'we', pr, head, outcome, reason = '
   const table = store.read() ?? {};
   const key = `${repo}#${pr}`;
   if (outcome === 'pushed') delete table[key];
-  else table[key] = [...(table[key] ?? []), { at: now, head, outcome, reason: oneLine(reason), note: oneLine(note) }].slice(-10);
+  else table[key] = [...(table[key] ?? []), { at: now, head, outcome, reason: oneLine(reason), note: oneLine(note),
+    ...(cause === undefined ? {} : { cause: routedOutcomeCause({ cause }) }) }].slice(-10);
   store.write(table);
   return table;
 }

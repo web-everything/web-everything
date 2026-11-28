@@ -78,13 +78,13 @@
  * realpath into a repo (e.g. `~/.claude/settings.json`).
  *
  * ESCAPE HATCH: set `LANE_GUARD_OFF=1` for the rare sanctioned primary-tree edit (e.g. bootstrapping this
- * very guard, or an emergency hotfix the user directs). The escape is loud by being explicit.
+ * very guard, or an emergency hotfix the user directs). It does not bypass Standards ownership.
  *
  * Protocol: reads the PreToolUse event JSON on stdin, denies via exit code 2 + a stderr message (mirrors
- * scripts/backlog-guard.mjs). Fail-OPEN on any internal error — a guard bug must never wedge the agent.
+ * scripts/backlog-guard.mjs). Standards identity errors fail closed; other internal errors fail open.
  */
 import { hookRoot } from './lib/hook-root.mjs';
-import { readFileSync, realpathSync } from 'node:fs';
+import { readFileSync, readlinkSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isForeignOccupancy, laneWorkerSession, isLeaseStale, describeLease } from './lib/lane-lease.mjs';
@@ -97,6 +97,7 @@ import { laneRootFromCwd, readLaneLease } from './guard-bash.mjs';
 // can never disagree about which paths are a resident daemon's OWN clone (same reuse discipline as the
 // lease pair above).
 import { daemonCloneRoots, isDaemonCloneRealpath } from './lib/daemon-clone-registry.mjs';
+import { classifySession } from './operations/session-role.mjs';
 
 const PRIMARY_REPOS = ['webeverything', 'web-everything', 'frontierui', 'plateau-app'];
 const SEP = path.sep;
@@ -144,16 +145,17 @@ export function workspaceRootOf(weRoot) {
  * Kept separate from the stdin/exit-code wrapper so it is unit-testable (mirrors guard-git-push.mjs).
  * @param {string} real  the target's resolved real path (symlinks already followed by the caller)
  * @param {string} weRoot  this guard's repo root (`<workspace>/<repo>`); `<workspace>` is its parent
- * @param {{lease?: object|null, mySessionId?: string|null, daemonCloneRoots?: string[]}} [ctx]  #2997 — the LIVE
+ * @param {{lease?: object|null, mySessionId?: string|null, daemonCloneRoots?: string[], sessionRole?: string|null}} [ctx]  #2997 — the LIVE
  *   lease of the lane clone `real` sits in (null when the target is not in a lane, or the lane holds no live
  *   lease), plus this caller's durable session id. Liveness needs a clock and the lease needs an fs read, so
  *   BOTH are collected by the CLI wrapper and injected here — keeping this function pure and unit-testable,
  *   exactly as `guard-bash.mjs#reason` takes `foreignLiveLease` rather than reading the marker itself.
  *   `daemonCloneRoots` (#xpt9fvd) is the same shape: `daemon-clone-registry.mjs#daemonCloneRoots`'s output,
  *   collected once by the CLI wrapper (it does its own fs reads) and injected here as plain strings.
+ *   `sessionRole` is classified by the CLI; null preserves callers that do not supply a role.
  * @returns {string|null}
  */
-export function laneGuardDecision(real, weRoot, { lease = null, mySessionId = null, daemonCloneRoots: daemonRoots = [] } = {}) {
+export function laneGuardDecision(real, weRoot, { lease = null, mySessionId = null, daemonCloneRoots: daemonRoots = [], sessionRole = null } = {}) {
   if (!real) return null; // no path to judge (never block)
   const workspace = workspaceRootOf(weRoot);
   const primaries = PRIMARY_REPOS.map((r) => path.join(workspace, r) + SEP);
@@ -178,6 +180,9 @@ export function laneGuardDecision(real, weRoot, { lease = null, mySessionId = nu
       `for the other sanctioned rebuild routes — both run from a lane, targeting the daemon clone by \`--clone=\`.`
     );
   }
+
+  const standardsMsg = standardsOwnershipDecision(real, weRoot, sessionRole);
+  if (standardsMsg) return standardsMsg;
 
   // A lane clone lives under `<workspace>/.lanes/…` — never under a primary root — so a primary-root prefix
   // test alone cleanly separates the two. Agent memory is NO LONGER exempt (2026-07-09): its realpath
@@ -221,26 +226,94 @@ export function laneGuardDecision(real, weRoot, { lease = null, mySessionId = nu
   );
 }
 
+function standardsOwnershipDecision(real, weRoot, sessionRole, filesystemMatch = false) {
+  const standardsRoot = path.join(workspaceRootOf(weRoot), '.operations', 'handoff', 'standards');
+  // The lexical check also protects not-yet-created trees. The CLI supplements it with filesystem
+  // identity: realpath and JS lowercasing do not canonicalize every Unicode filesystem alias.
+  if ((sessionRole === 'worker' || sessionRole === 'unknown')
+      && (filesystemMatch || (real + SEP).toLowerCase().startsWith((standardsRoot + SEP).toLowerCase()))) {
+    return 'edit BLOCKED — standards/ is Standards-owned: propose the change in handoff/designs/<id>-standards-request.md, never edit it';
+  }
+  return null;
+}
+
+function hasStandardsAncestor(real, weRoot) {
+  const standardsRoot = path.join(workspaceRootOf(weRoot), '.operations', 'handoff', 'standards');
+  let protectedStat;
+  try { protectedStat = statSync(standardsRoot, { bigint: true }); } catch (error) {
+    return error.code !== 'ENOENT' && error.code !== 'ENOTDIR'; // unreadable identity fails closed
+  }
+  let current = real;
+  while (true) {
+    let parent;
+    try {
+      const actual = statSync(current, { bigint: true });
+      if (actual.dev === protectedStat.dev && actual.ino === protectedStat.ino) return true;
+      // Once an ancestor exists, follow symlinks before ascending, including when several children
+      // do not exist yet. Merely realpath-ing the immediate parent leaves that case unresolved.
+      parent = path.dirname(realpathSync(current));
+    } catch (error) {
+      if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') return true;
+      parent = path.dirname(current);
+    }
+    if (parent === current) return false;
+    current = parent;
+  }
+}
+
 /** Resolve a target to its REAL path: follow symlinks; for a not-yet-existing file realpath the nearest
  *  existing ancestor dir so the location still classifies; fall back to the raw resolved path. */
 export function resolveReal(file) {
-  let real = path.resolve(file);
-  try { real = realpathSync(real); } catch {
-    try { real = path.join(realpathSync(path.dirname(real)), path.basename(real)); } catch { /* keep raw */ }
+  // The OS applies `..` AFTER following a symlink, so the raw string must NOT be lexically collapsed
+  // first (`path.resolve`/`join` would turn `link/../x` into a sibling of `link`). Walk segment by segment,
+  // keeping a canonical prefix: a symlink (even a dangling one) is expanded in place, `..` pops the REAL
+  // prefix, and once a segment does not exist the remaining tail can no longer be traversed, so it is
+  // appended lexically.
+  const raw = String(file);
+  const queue = (path.isAbsolute(raw) ? raw : process.cwd() + SEP + raw).split(SEP).filter((s) => s !== '' && s !== '.');
+  let current = SEP;
+  let hops = 0;
+  try {
+    while (queue.length) {
+      const seg = queue.shift();
+      if (seg === '..') { current = path.dirname(current); continue; }
+      const next = path.join(current, seg);
+      let link = null;
+      try { link = readlinkSync(next); } catch (error) {
+        if (error.code !== 'EINVAL' && error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error;
+        if (error.code !== 'EINVAL') return path.join(current, seg, ...queue); // missing tail: lexical
+      }
+      if (link === null) { current = next; continue; } // not a symlink (an existing file or directory)
+      if (++hops > 40) throw Object.assign(new Error('symlink loop'), { code: 'ELOOP' });
+      if (path.isAbsolute(link)) current = SEP;
+      queue.unshift(...link.split(SEP).filter((s) => s !== '' && s !== '.'));
+    }
+    return current;
+  } catch {
+    // Unreadable/looping path: keep the previous best-effort behaviour (the CLI's ancestry check fails closed).
+    let real = path.resolve(raw);
+    try { real = realpathSync(real); } catch {
+      try { real = path.join(realpathSync(path.dirname(real)), path.basename(real)); } catch { /* keep raw */ }
+    }
+    return real + '';
   }
-  return real + '';
 }
 
 // ── CLI wrapper: stdin event → exit code (only when run directly, not when imported by the test) ──────────
 if (process.argv[1] && realpathSyncSafe(process.argv[1]) === realpathSyncSafe(fileURLToPath(import.meta.url))) {
   try {
+    const ev = JSON.parse(readFileSync(0, 'utf8') || '{}');
+    const file = ev?.tool_input?.file_path;
+    const weRoot = hookRoot(import.meta.url);
+    const real = file ? resolveReal(file) : null;
+    const sessionRole = classifySession(process.env).role;
+    // Standards ownership has no worker escape hatch; LANE_GUARD_OFF only bypasses lane checks.
+    if (real && (sessionRole === 'worker' || sessionRole === 'unknown')) {
+      const msg = standardsOwnershipDecision(real, weRoot, sessionRole, hasStandardsAncestor(real, weRoot));
+      if (msg) { process.stderr.write('guard-lane: ' + msg + '\n'); process.exit(2); }
+    }
     if (process.env.LANE_GUARD_OFF !== '1') {
-      const ev = JSON.parse(readFileSync(0, 'utf8') || '{}');
-      const file = ev?.tool_input?.file_path;
       if (file) {
-        // The launcher supplies the operated checkout; unpinned calls retain the script-location root.
-        const weRoot = hookRoot(import.meta.url);
-        const real = resolveReal(file);
         // #2997 — collect the target lane's LIVE lease + this caller's durable session id (the impure half),
         // then hand both to the pure decision. Keyed on `CLAUDE_CODE_SESSION_ID` FIRST, the SAME source
         // `lane-pool.mjs adopt` stamps into `workerSession` and `guard-bash.mjs` reads, so a lane I adopted can
@@ -255,7 +328,8 @@ if (process.argv[1] && realpathSyncSafe(process.argv[1]) === realpathSyncSafe(fi
         // list, `isDaemonCloneRealpath` then answers false for everything) rather than wedging the agent.
         let daemonRoots = [];
         try { daemonRoots = daemonCloneRoots(workspaceRootOf(weRoot)); } catch { /* fail-open */ }
-        const msg = laneGuardDecision(real, weRoot, { lease, mySessionId, daemonCloneRoots: daemonRoots });
+        const msg = laneGuardDecision(real, weRoot, { lease, mySessionId, daemonCloneRoots: daemonRoots,
+          sessionRole });
         if (msg) { process.stderr.write('guard-lane: ' + msg + '\n'); process.exit(2); }
       }
     }
